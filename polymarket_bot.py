@@ -38,7 +38,7 @@ BUYBACK_STD_DEVS       = 1      # std-dev multiplier for buyback zone
 BUYBACK_STD_DEV_PCT    = 0.10   # one std dev = this fraction of avg_entry
 PRICE_HISTORY_WINDOW   = 30     # rolling trade count for std dev
 RUNTIME_LIMIT_SECONDS  = 20700  # 5 h 45 min — exits before 6 h GH runner limit
-STATUS_LOG_INTERVAL_S  = 900    # log status every 15 min
+STATUS_LOG_INTERVAL_S  = 300    # log status every 5 min
 STATE_SAVE_INTERVAL_S  = 60     # persist state every 60 s
 POLLING_INTERVAL_S     = 300    # REST fallback polling interval (5 min)
 TICK_INTERVAL_S        = 0.5    # main-loop tick
@@ -224,6 +224,10 @@ class PolymarketBot:
         self._rl          = _RateLimiter(REST_RATE_LIMIT)
 
         self._tracked_slugs: list[str] = [m["market_slug"] for m in markets]
+        self._slug_to_team:  dict[str, str] = {
+            m["market_slug"]: m.get("team", m["market_slug"]) for m in markets
+        }
+        self._last_bbo_logged: dict[str, float] = {}  # dedup: skip if bid unchanged
 
     # ------------------------------------------------------------------
     # Rate-limited REST helper
@@ -444,11 +448,19 @@ class PolymarketBot:
     # Sync WS callbacks (called from WS thread — GIL-safe dict writes only)
     # ------------------------------------------------------------------
 
+    def _team(self, slug: str) -> str:
+        return self._slug_to_team.get(slug, slug)
+
     def _on_position_snapshot(self, data: dict) -> None:
         positions = (data.get("positionSubscriptionSnapshot") or {}).get("positions", {}) or {}
         for slug, pos in positions.items():
             self._live_positions[slug] = pos
-        log(f"INFO  WS position snapshot: {len(positions)} position(s).")
+        log(f"[POS-SNAP]  {len(positions)} position(s) received")
+        for slug, pos in positions.items():
+            qty  = float(pos.get("netPosition", "0") or "0")
+            cost = float((pos.get("cost") or {}).get("value", 0) or 0)
+            avg  = cost / qty if qty > 0 else 0
+            log(f"  held  {self._team(slug):<28s}  qty={int(qty)}  avg_entry=${avg:.4f}  cost=${cost:.4f}")
 
     def _on_position_update(self, data: dict) -> None:
         upd  = data.get("positionSubscriptionUpdate") or {}
@@ -456,6 +468,12 @@ class PolymarketBot:
         pos  = upd.get("position")
         if slug and pos is not None:
             self._live_positions[slug] = pos
+            qty  = float(pos.get("netPosition", "0") or "0")
+            cost = float((pos.get("cost") or {}).get("value", 0) or 0)
+            avg  = cost / qty if qty > 0 else 0
+            bid  = self._latest_bbo.get(slug, 0)
+            pnl  = (bid - avg) * qty if avg > 0 and bid > 0 else 0
+            log(f"[POS-UPD]   {self._team(slug):<28s}  qty={int(qty)}  avg_entry=${avg:.4f}  bid=${bid:.4f}  P&L=${pnl:+.4f}")
 
     def _on_balance_snapshot(self, data: dict) -> None:
         snap = data.get("accountBalanceSubscriptionSnapshot") or {}
@@ -463,34 +481,65 @@ class PolymarketBot:
             "balance":     snap.get("balance",    0),
             "buyingPower": snap.get("buyingPower", 0),
         }
-        log(f"INFO  WS balance snapshot: ${self._balance['balance']:.2f}  buying_power=${self._balance['buyingPower']:.2f}")
+        log(f"[BAL-SNAP]  balance=${self._balance['balance']:.2f}  buying_power=${self._balance['buyingPower']:.2f}")
 
     def _on_balance_update(self, data: dict) -> None:
         upd = data.get("accountBalanceSubscriptionUpdate") or {}
         if upd:
+            prev = self._balance.get("balance", 0)
             self._balance = {
-                "balance":     upd.get("balance",    self._balance.get("balance", 0)),
+                "balance":     upd.get("balance",    prev),
                 "buyingPower": upd.get("buyingPower", self._balance.get("buyingPower", 0)),
             }
+            delta = float(self._balance["balance"]) - float(prev)
+            log(f"[BAL-UPD]   balance=${self._balance['balance']:.2f}  buying_power=${self._balance['buyingPower']:.2f}  delta=${delta:+.4f}")
 
     def _on_bbo_sync(self, data: dict) -> None:
         md   = data.get("marketDataLite") or {}
         slug = md.get("marketSlug", "")
-        if slug and (md.get("closed") or md.get("active") is False):
-            self._closed_slugs_pending.add(slug)
+        if not slug:
             return
-        bid = (md.get("bestBid") or {}).get("value")
-        if slug and bid is not None:
-            self._latest_bbo[slug] = float(bid)
+        if md.get("closed") or md.get("active") is False:
+            self._closed_slugs_pending.add(slug)
+            log(f"[BBO]  {self._team(slug):<28s}  MARKET CLOSED")
+            return
+        bid_raw = (md.get("bestBid") or {}).get("value")
+        ask_raw = (md.get("bestAsk") or {}).get("value")
+        if bid_raw is None:
+            return
+        bid = float(bid_raw)
+        ask = float(ask_raw) if ask_raw is not None else 0.0
+        self._latest_bbo[slug] = bid
+        if self._last_bbo_logged.get(slug) == bid:
+            return  # price unchanged — skip log
+        self._last_bbo_logged[slug] = bid
+        pos = self._live_positions.get(slug)
+        if pos:
+            qty  = float(pos.get("netPosition", "0") or "0")
+            cost = float((pos.get("cost") or {}).get("value", 0) or 0)
+            avg  = cost / qty if qty > 0 else 0
+            tp   = avg * TAKE_PROFIT_MULTIPLIER
+            pct  = (bid / tp * 100) if tp > 0 else 0
+            pnl  = (bid - avg) * qty
+            log(
+                f"[BBO]  {self._team(slug):<28s}  bid=${bid:.4f}  ask=${ask:.4f}"
+                f"  qty={int(qty)}  entry=${avg:.4f}  P&L=${pnl:+.4f}  TP={pct:.1f}%"
+            )
+        else:
+            log(f"[BBO]  {self._team(slug):<28s}  bid=${bid:.4f}  ask=${ask:.4f}")
 
     def _on_trade_sync(self, data: dict) -> None:
         trade = data.get("trade") or {}
         slug  = trade.get("marketSlug", "")
-        price = (trade.get("price") or {}).get("value")
-        if slug and price is not None:
+        price_raw = (trade.get("price") or {}).get("value")
+        if slug and price_raw is not None:
+            price = float(price_raw)
             if slug not in self._price_history:
                 self._price_history[slug] = deque(maxlen=PRICE_HISTORY_WINDOW)
-            self._price_history[slug].append(float(price))
+            self._price_history[slug].append(price)
+            qty  = trade.get("quantity", "?")
+            side = trade.get("side", "")
+            log(f"[TRADE] {self._team(slug):<28s}  ${price:.4f} × {qty}  {side}")
 
     # ------------------------------------------------------------------
     # REST polling fallback
@@ -738,14 +787,37 @@ class PolymarketBot:
 
     def _log_status(self, elapsed_s: float) -> None:
         remaining_min = (RUNTIME_LIMIT_SECONDS - elapsed_s) / 60
-        pending       = len([b for b in self._state.get("pending_buybacks", []) if not b.get("processed")])
+        buybacks      = [b for b in self._state.get("pending_buybacks", []) if not b.get("processed")]
         log(
-            f"STATUS  elapsed={elapsed_s/60:.1f} min  remaining={remaining_min:.1f} min  "
+            f"{'─'*72}\n"
+            f"[STATUS]  elapsed={elapsed_s/60:.1f} min  remaining={remaining_min:.1f} min  "
             f"ws={'ON' if self._ws_ok else 'OFF(polling)'}  "
             f"balance=${self._balance.get('balance', 0):.2f}  "
-            f"live_positions={len(self._live_positions)}  "
-            f"pending_buybacks={pending}  tracked_bbo={len(self._latest_bbo)}"
+            f"buying_power=${self._balance.get('buyingPower', 0):.2f}"
         )
+        if self._live_positions:
+            log(f"[STATUS]  held positions ({len(self._live_positions)}):")
+            for slug, pos in self._live_positions.items():
+                qty  = float(pos.get("netPosition", "0") or "0")
+                cost = float((pos.get("cost") or {}).get("value", 0) or 0)
+                avg  = cost / qty if qty > 0 else 0
+                bid  = self._latest_bbo.get(slug, 0)
+                tp   = avg * TAKE_PROFIT_MULTIPLIER
+                pct  = (bid / tp * 100) if tp > 0 else 0
+                pnl  = (bid - avg) * qty
+                log(f"  {self._team(slug):<28s}  qty={int(qty)}  bid=${bid:.4f}  "
+                    f"entry=${avg:.4f}  P&L=${pnl:+.4f}  TP={pct:.1f}%")
+        else:
+            log("[STATUS]  no open positions")
+        if buybacks:
+            log(f"[STATUS]  pending buybacks ({len(buybacks)}):")
+            for b in buybacks:
+                slug = b.get("market_slug", "")
+                bid  = self._latest_bbo.get(slug, 0)
+                avg  = b.get("avg_entry_price", 0)
+                std  = b.get("entry_std_dev", 0)
+                log(f"  {self._team(slug):<28s}  target=${avg:.4f} ±{std:.4f}  current_bid=${bid:.4f}")
+        log(f"{'─'*72}")
 
     # ------------------------------------------------------------------
     # Main loop
