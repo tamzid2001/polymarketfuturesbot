@@ -1,20 +1,23 @@
 # Polymarket Futures Bot
 
-Automated take-profit and re-entry bot for Polymarket US Futures markets (MLB World Series focus).
+Async WebSocket-driven take-profit and re-entry bot for Polymarket US Futures markets (MLB World Series 2026 focus).
 
-The bot runs continuously inside GitHub Actions as a long-lived loop (up to 5 h 45 min), then self-triggers the next run for uninterrupted 24/7 operation. It monitors open MLB positions every 15 minutes and closes any that have doubled in value, then re-enters automatically when the price returns to the original entry level.
+The bot connects to Polymarket's WebSocket feeds on startup, reacts to every price update in real time, and runs inside GitHub Actions for up to 5 h 45 min before self-triggering the next run for uninterrupted 24/7 operation.
 
 ---
 
 ## How it works
 
-| Step | What happens |
+| Event | What happens |
 |---|---|
-| Every 15 min | Health check: verify API, log balance, scan positions |
-| Take-profit | If `current_bid ≥ 2× avg_entry` → close entire position, queue buyback |
-| Buyback | When price returns within 1 std dev of original entry → re-buy |
-| 10 AM EST | Telegram daily report (balance change + all closed P&Ls) |
-| 5 h 45 min | Self-trigger next GitHub Actions run, persist state, exit cleanly |
+| Startup | Fetch live portfolio; open $1 positions in every `is_underdog: true` market not already held |
+| Price update (WS) | Check each tracked market's bid against take-profit threshold and buyback zone |
+| Take-profit | `bid ≥ 3× avg_entry` → close 100% of position, queue a buyback |
+| Buyback | `bid` returns within ±1 std dev of original entry price → re-enter same quantity |
+| Every 60 s | Persist `state.json` to disk |
+| Every 15 min | Log status: balance, open positions, pending buybacks, runtime remaining |
+| 10 AM EST | Telegram daily report (balance Δ + all closed P&Ls) |
+| 5 h 45 min | Self-trigger next GitHub Actions run, save state, exit cleanly |
 
 ---
 
@@ -26,11 +29,11 @@ Click **Fork** at the top-right of this page. Your fork is where GitHub Actions 
 
 ### 2. Set your secrets
 
-Go to **Settings → Secrets and variables → Actions → New repository secret**.
+Go to **Settings → Environments → Polymarket US Futures → Add secret**.
 
-> Secrets must be added to the **`Polymarket US Futures` environment** (Settings → Environments → Polymarket US Futures), not the repository-level secrets tab.
+> All secrets must be in the **`Polymarket US Futures` environment**, not the repository-level secrets tab.
 
-#### Required (bot will not start without these)
+#### Required
 
 | Secret | Description |
 |---|---|
@@ -41,22 +44,15 @@ Get these from [polymarket.us/developer](https://polymarket.us/developer) after 
 
 #### Optional — Telegram notifications
 
-If these are absent, the bot runs silently (logs only). No error is raised.
-
 | Secret | Description |
 |---|---|
 | `TELEGRAM_KEY` | Telegram bot token from [@BotFather](https://t.me/BotFather) |
 
-The bot auto-detects whether `TELEGRAM_KEY` is set at startup and prints:
+If absent the bot runs silently (logs only). The bot auto-detects the key at startup:
 ```
 INFO   Telegram notifications: ENABLED (TELEGRAM_KEY found)
-```
-or
-```
 INFO   Telegram notifications: DISABLED (TELEGRAM_KEY not set — running silently)
 ```
-
-No manual flag or config change is needed.
 
 #### Optional — workflow self-trigger (recommended for 24/7 operation)
 
@@ -69,83 +65,118 @@ With `GH_PAT`: the bot self-triggers a new run at 5 h 45 min, keeping the chain 
 
 To create a PAT: GitHub → Settings → Developer settings → Personal access tokens → Fine-grained tokens → select `workflow` permission for this repository.
 
-#### Example: minimal configuration (trading only, no notifications)
-
-```
-POLYMARKET_PUBLIC_KEY = <your key id>
-POLYMARKET_SECRET_KEY = <your secret key>
-```
-
-#### Example: full configuration
-
-```
-POLYMARKET_PUBLIC_KEY = <your key id>
-POLYMARKET_SECRET_KEY = <your secret key>
-TELEGRAM_KEY          = <your telegram bot token>
-GH_PAT                = <your github PAT>
-```
-
 ---
 
 ### 3. Verify setup with the QA test
 
-Before the live bot runs, confirm everything works:
+Before running the production bot:
 
-1. Go to **Actions** tab → **"Polymarket QA — Secrets, Telegram & Wallet Balance"**
-2. Click **Run workflow → Run workflow**
+1. Go to **Actions → "Polymarket QA — Secrets, Telegram & Wallet Balance"**
+2. Click **Run workflow**
 
-The test will:
-- Verify Polymarket credentials and fetch your wallet balance
-- If `TELEGRAM_KEY` is set: send a greeting + full portfolio report to Telegram
-- If `TELEGRAM_KEY` is absent: print the report to the workflow log (still passes)
-- List all MLB World Series team contracts (2025 + 2026)
-- Show your open positions with unrealized P&L
+The test runs 6 steps:
+1. Confirms credentials are present
+2. Sends a Telegram greeting (if `TELEGRAM_KEY` is set)
+3. Fetches and logs your wallet balance
+4. Lists all open MLB positions with P&L
+5. Discovers all 30 2026 World Series team markets via `search.query`, sorted by price — prints exact slugs
+6. Cross-checks `markets.json` entries against live API slugs (PASS / WARN)
+
+If step 6 shows mismatches, copy the slugs from step 5 into `markets.json` and re-run.
 
 ---
 
-### 4. Enable the scheduled bot
+### 4. Configure `markets.json`
 
-Go to the **Actions** tab and enable workflows if prompted. The bot starts automatically:
+`markets.json` is the single source of truth for which markets the bot tracks and enters.
 
+```json
+{
+  "settings": {
+    "initial_deployment_usd": 1.00
+  },
+  "mlb_world_series": [
+    {
+      "team": "Colorado Rockies",
+      "event_slug": "mlb-champ-2026-09-27",
+      "market_slug": "tec-mlb-champ-2026-09-27-col",
+      "is_underdog": true,
+      "slug_verified": true,
+      "max_deployment_usd": 1.00
+    }
+  ]
+}
+```
+
+| Field | Description |
+|---|---|
+| `event_slug` | The Polymarket event identifier (parent of all team contracts) |
+| `market_slug` | The specific team contract slug — must match the API exactly |
+| `is_underdog` | `true` → bot opens a $1 position at startup if not already held. `false` → bot monitors the market but **never opens a position** |
+| `slug_verified` | `true` once you confirm the slug matches what the QA test step [5] returns |
+| `max_deployment_usd` | Capital for the initial entry order. Overrides `settings.initial_deployment_usd` |
+
+**The bot will never open a position for any market where `is_underdog` is `false`.** Those entries exist only so you can add them to the WS subscription for monitoring, or flip the flag later without editing code.
+
+---
+
+### 5. Start the production bot
+
+Actions → **"Polymarket Portfolio Execution Engine"** → **Run workflow**.
+
+The bot also starts automatically:
 - **Daily cron** (`00:07 UTC`): safety-net restart
-- **Self-trigger**: at 5 h 45 min the bot dispatches the next run itself (requires `GH_PAT`)
-
-To start immediately: Actions → **"Polymarket Portfolio Execution Engine"** → **Run workflow**.
+- **Self-trigger**: at 5 h 45 min, if `GH_PAT` is configured
 
 ---
 
-## Configuration
+## Strategy configuration
 
-All strategy parameters are constants at the top of `polymarket_bot.py`:
+All tunable constants are at the top of `polymarket_bot.py`:
 
 | Constant | Default | Description |
 |---|---|---|
-| `TAKE_PROFIT_MULTIPLIER` | `2.0` | Close position when bid ≥ N× avg entry price |
-| `BUYBACK_AMOUNT_USD` | `1.00` | USD allocated per re-entry order (fallback when qty unknown) |
-| `BUYBACK_STD_DEVS` | `1` | Std-dev width for buyback trigger zone |
-| `BUYBACK_STD_DEV_PCT` | `0.10` | One std dev = this fraction of avg entry (10% → ±10% zone at 1 dev) |
-| `LOOP_INTERVAL_SECONDS` | `900` | Seconds between health checks (15 min) |
-| `RUNTIME_LIMIT_SECONDS` | `20700` | Bot exits and self-triggers after this many seconds (5 h 45 min) |
+| `TAKE_PROFIT_MULTIPLIER` | `3.0` | Close when `bid ≥ N × avg_entry` |
+| `BUYBACK_AMOUNT_USD` | `1.00` | USD per re-entry when original quantity is unknown |
+| `BUYBACK_STD_DEVS` | `1` | Std-dev half-width of the buyback trigger zone |
+| `BUYBACK_STD_DEV_PCT` | `0.10` | Fallback std dev = 10% of entry price (used when < 3 trades in history) |
+| `PRICE_HISTORY_WINDOW` | `30` | Rolling trade count used to compute live std dev |
+| `RUNTIME_LIMIT_SECONDS` | `20700` | 5 h 45 min — bot exits and self-triggers before 6 h GitHub runner limit |
+| `STATUS_LOG_INTERVAL_S` | `900` | Log status every 15 min |
+| `STATE_SAVE_INTERVAL_S` | `60` | Persist `state.json` every 60 s |
+
+---
+
+## Take-profit logic
+
+```
+threshold = avg_entry_price × TAKE_PROFIT_MULTIPLIER   (default: 3×)
+
+if current_bid >= threshold:
+    close_position(market_slug)   # closes 100% via orders.close_position()
+    queue_buyback(avg_entry, qty_sold)
+```
 
 ---
 
 ## Buyback logic
 
-When a position is sold at take-profit, the bot records the original average entry price and queued quantity. On every subsequent health check it fetches a live BBO and compares:
+When a position is sold at take-profit, the bot records the original average entry price and the closing std dev. On every subsequent price update it checks:
 
 ```
-std_dev = avg_entry_price × BUYBACK_STD_DEV_PCT
-zone    = [avg_entry_price − BUYBACK_STD_DEVS × std_dev,
-           avg_entry_price + BUYBACK_STD_DEVS × std_dev]
+std_dev = rolling population std dev of last 30 trades (from WS trade events)
+        = avg_entry × BUYBACK_STD_DEV_PCT   if fewer than 3 trades in history
 
-→ execute buyback if current_bid is inside zone
+zone = [avg_entry − BUYBACK_STD_DEVS × std_dev,
+        avg_entry + BUYBACK_STD_DEVS × std_dev]
+
+if current_bid is inside zone:
+    re-enter same quantity at current bid
 ```
 
-Example with `avg_entry = $0.10`, 1 std dev, 10% width:
-- Zone: `[$0.09, $0.11]`
-- Buyback fires the moment the price trades back into this range
-
-The previous time-based 5 AM buyback window has been removed.
+Example with `avg_entry = $0.01`, 1 std dev, 10% fallback:
+- Zone: `[$0.009, $0.011]`
+- Buyback fires the moment the bid returns into this range
 
 ---
 
@@ -154,9 +185,9 @@ The previous time-based 5 AM buyback window has been removed.
 GitHub Actions runners terminate after 6 hours. The bot handles this gracefully:
 
 1. At **5 h 45 min** it calls the GitHub API to dispatch a new `workflow_dispatch` run (requires `GH_PAT`)
-2. The `concurrency: group` setting ensures at most one run is active or queued at any time
+2. The `concurrency: group: polymarket-bot-singleton` setting ensures at most one run is active at a time
 3. If `GH_PAT` is absent, the daily `00:07 UTC` cron provides an automatic restart
-4. `state.json` is committed after every run, so no trading state is lost across restarts
+4. `state.json` is committed to the repo after every run — pending buybacks and balance history survive restarts
 
 ---
 
@@ -177,7 +208,7 @@ export POLYMARKET_SECRET_KEY="your_secret_key"
 export TELEGRAM_KEY="your_telegram_token"
 export GH_PAT="your_github_pat"
 
-# Run the bot (loops forever, Ctrl+C to stop)
+# Run the bot (WebSocket loop, Ctrl+C to stop)
 python polymarket_bot.py
 
 # Run the QA test once
@@ -190,9 +221,10 @@ python test_bot.py
 
 ```
 polymarketfuturesbot/
-├── polymarket_bot.py           # Main bot: health checks, take-profit, buyback, handoff
-├── test_bot.py                 # QA test: credentials, balance, MLB positions
-├── state.json                  # Persisted state: buybacks, balance history, closed positions
+├── polymarket_bot.py           # Async WebSocket bot: take-profit, buyback, WS handlers, handoff
+├── test_bot.py                 # QA test: credentials, balance, positions, slug discovery
+├── markets.json                # Source of truth: which markets to track and enter
+├── state.json                  # Persisted state: pending buybacks, balance history, closed P&Ls
 ├── requirements.txt            # pip dependencies
 └── .github/
     └── workflows/
