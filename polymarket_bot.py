@@ -1,13 +1,12 @@
 """
-Polymarket US Futures — async WebSocket-driven trading bot.
+Polymarket US Futures — trading bot.
 
-Architecture:
-  markets WS  → market_data_lite drives take-profit / buyback checks
-  markets WS  → trade events build per-slug price history (std dev)
-  private WS  → position / balance snapshots keep local state current
+Primary mode: WebSocket-driven (market_data_lite BBO events, trade events,
+private position/balance events).
 
-Sync WS callbacks update shared dicts (GIL-safe); the async main loop
-reads those dicts every 200 ms and fires REST calls when thresholds are hit.
+Fallback mode: REST polling every POLLING_INTERVAL_S seconds. Activates
+automatically when WS is unavailable or produces no BBO data for tracked slugs.
+Both modes write to the same shared dicts so all trading logic is path-agnostic.
 """
 
 import asyncio
@@ -41,7 +40,8 @@ PRICE_HISTORY_WINDOW   = 30     # rolling trade count for std dev
 RUNTIME_LIMIT_SECONDS  = 20700  # 5 h 45 min — exits before 6 h GH runner limit
 STATUS_LOG_INTERVAL_S  = 900    # log status every 15 min
 STATE_SAVE_INTERVAL_S  = 60     # persist state every 60 s
-TICK_INTERVAL_S        = 0.2    # main-loop tick (200 ms)
+POLLING_INTERVAL_S     = 300    # REST fallback polling interval (5 min)
+TICK_INTERVAL_S        = 0.5    # main-loop tick
 # ==============================================================
 
 MARKETS_FILE     = "markets.json"
@@ -91,7 +91,6 @@ class Notifier:
                 timeout=10,
             )
             if not r.ok:
-                # Retry without Markdown on parse errors (400)
                 r = requests.post(
                     url,
                     json={"chat_id": self.chat_id, "text": text},
@@ -104,7 +103,7 @@ class Notifier:
 
 
 # ------------------------------------------------------------------
-# State persistence
+# State + markets persistence
 # ------------------------------------------------------------------
 
 def load_state() -> dict:
@@ -127,7 +126,6 @@ def save_state(state: dict) -> None:
 
 
 def load_markets() -> tuple[list, dict]:
-    """Return (markets_list, settings_dict) from markets.json."""
     try:
         with open(MARKETS_FILE) as fh:
             data = json.load(fh)
@@ -141,7 +139,7 @@ def load_markets() -> tuple[list, dict]:
 
 
 # ------------------------------------------------------------------
-# Workflow rollover (self-trigger before 6 h runner limit)
+# Workflow rollover
 # ------------------------------------------------------------------
 
 def trigger_workflow_handoff() -> bool:
@@ -175,23 +173,26 @@ def trigger_workflow_handoff() -> bool:
 class PolymarketBot:
 
     def __init__(self, markets: list, settings: dict, state: dict, notifier: Notifier) -> None:
-        self._markets   = markets
-        self._settings  = settings
-        self._state     = state
-        self._notifier  = notifier
+        self._markets  = markets
+        self._settings = settings
+        self._state    = state
+        self._notifier = notifier
 
-        # Shared dicts updated by sync WS callbacks (GIL-safe for simple assignments)
-        self._live_positions: dict[str, dict] = {}   # slug → position payload
+        # Shared dicts — written by sync WS callbacks, read by async main loop
+        self._live_positions: dict[str, dict]  = {}  # slug → position payload
         self._latest_bbo:     dict[str, float] = {}  # slug → latest bid
         self._price_history:  dict[str, deque] = {}  # slug → deque(maxlen=30)
         self._balance:        dict             = {}
 
-        self._active_trades:       set[str] = set()   # slugs with in-flight REST calls
-        self._closed_slugs_pending: set[str] = set()  # closures detected via WS, processed next tick
-        self._client: AsyncPolymarketUS | None = None
-        self._start_time  = time.monotonic()
+        self._active_trades:        set[str] = set()
+        self._closed_slugs_pending: set[str] = set()
 
-        # Tracked slugs for WS subscriptions
+        self._ws_ok    = False   # at least one WS feed is live
+        self._loop:    asyncio.AbstractEventLoop | None = None
+        self._client:  AsyncPolymarketUS | None = None
+        self._start_time  = time.monotonic()
+        self._last_poll   = 0.0   # monotonic time of last REST poll
+
         self._tracked_slugs: list[str] = [m["market_slug"] for m in markets]
 
     # ------------------------------------------------------------------
@@ -200,7 +201,8 @@ class PolymarketBot:
 
     async def run(self, client: AsyncPolymarketUS) -> None:
         self._client = client
-        log(f"INFO  Tracking {len(self._tracked_slugs)} market(s): {self._tracked_slugs}")
+        self._loop   = asyncio.get_running_loop()
+        log(f"INFO  Tracking {len(self._tracked_slugs)} market(s).")
 
         await self._initialize_positions()
         await self._connect_ws()
@@ -211,18 +213,18 @@ class PolymarketBot:
     # ------------------------------------------------------------------
 
     async def _initialize_positions(self) -> None:
-        log("INFO  Fetching live portfolio to check existing positions...")
+        log("INFO  Fetching live portfolio...")
         try:
-            resp = await self._client.portfolio.positions()
+            resp      = await self._client.portfolio.positions()
             positions = resp.get("positions", {}) if isinstance(resp, dict) else {}
         except AuthenticationError as exc:
-            log(f"ERROR  Authentication failed at startup: {exc.message}")
+            log(f"ERROR  Auth failed: {exc.message}")
             raise
         except (APIConnectionError, APITimeoutError) as exc:
-            log(f"WARN  Could not fetch portfolio at startup ({type(exc).__name__}): {exc.message}. Skipping auto-entry.")
+            log(f"WARN  Portfolio fetch failed ({type(exc).__name__}): {exc.message}. Skipping auto-entry.")
             return
         except Exception as exc:
-            log(f"WARN  Could not fetch portfolio at startup: {exc}. Skipping auto-entry.")
+            log(f"WARN  Portfolio fetch failed: {exc}. Skipping auto-entry.")
             return
 
         held: set[str] = set()
@@ -241,7 +243,7 @@ class PolymarketBot:
                 continue
             slug = market["market_slug"]
             if slug in held:
-                log(f"SKIP  {market['team']} ({slug}) — position already open.")
+                log(f"SKIP  {market['team']} ({slug}) — already held.")
                 continue
             deployment = market.get("max_deployment_usd",
                                     self._settings.get("initial_deployment_usd", 1.0))
@@ -256,11 +258,11 @@ class PolymarketBot:
             bbo = await self._client.markets.bbo(slug)
             ask = float((bbo.get("bestAsk") or {}).get("value", 0) or 0) if isinstance(bbo, dict) else 0
             if ask <= 0:
-                log(f"WARN  No ask price for {slug} — skipping initial entry.")
+                log(f"WARN  No ask price for {slug} — skipping entry.")
                 return
             qty = max(1, math.floor(deployment_usd / ask))
-            log(f"INFO  Opening: {market['team']} ({slug}) qty={qty} @ ${ask:.4f} (~${deployment_usd:.2f})")
-            resp = await self._client.orders.create({
+            log(f"INFO  Opening: {market['team']} ({slug}) qty={qty} @ ${ask:.4f}")
+            resp     = await self._client.orders.create({
                 "marketSlug": slug,
                 "intent":     "ORDER_INTENT_BUY_LONG",
                 "type":       "ORDER_TYPE_LIMIT",
@@ -277,14 +279,14 @@ class PolymarketBot:
             log(f"ERROR  Auth failure opening {slug}: {exc.message}")
             raise
         except BadRequestError as exc:
-            log(f"ERROR  Bad order params for {slug}: {exc.message}")
+            log(f"ERROR  Bad order params {slug}: {exc.message}")
         except NotFoundError as exc:
-            log(f"WARN  Market not found / closed {slug}: {exc.message}")
+            log(f"WARN  Market closed/missing {slug}: {exc.message}")
             self._mark_market_inactive(slug)
         except RateLimitError as exc:
             log(f"WARN  Rate limited opening {slug}: {exc.message}")
         except (APIConnectionError, APITimeoutError) as exc:
-            log(f"WARN  Network error opening {slug} ({type(exc).__name__}): {exc.message}")
+            log(f"WARN  Network error opening {slug}: {exc.message}")
         except Exception as exc:
             log(f"ERROR  Unexpected error opening {slug}: {exc}")
         finally:
@@ -295,30 +297,22 @@ class PolymarketBot:
     # ------------------------------------------------------------------
 
     def _mark_market_inactive(self, slug: str) -> None:
-        """
-        Flip is_underdog to false for a closed/missing market and persist markets.json.
-        The bot will stop attempting entries for this slug; existing positions are
-        still monitored and closed normally by the take-profit logic.
-        """
         for market in self._markets:
             if market.get("market_slug") == slug and market.get("is_underdog"):
                 market["is_underdog"] = False
-                log(f"INFO  {market.get('team', slug)} ({slug}) — market closed, is_underdog set to false.")
-                self._notifier.send(
-                    f"⚠️ *Market Closed*\n`{slug}` — marked inactive, no further entries."
-                )
+                log(f"INFO  {market.get('team', slug)} ({slug}) — closed, is_underdog → false.")
+                self._notifier.send(f"⚠️ *Market Closed*\n`{slug}` — no further entries.")
                 self._save_markets()
                 return
 
     def _save_markets(self) -> None:
-        """Write the current in-memory markets list back to markets.json."""
         try:
             with open(MARKETS_FILE) as fh:
                 data = json.load(fh)
             data["mlb_world_series"] = self._markets
             with open(MARKETS_FILE, "w") as fh:
                 json.dump(data, fh, indent=2)
-            log(f"INFO  markets.json updated on disk.")
+            log("INFO  markets.json updated on disk.")
         except Exception as exc:
             log(f"WARN  Could not save markets.json: {exc}")
 
@@ -332,36 +326,71 @@ class PolymarketBot:
 
     async def _connect_private_ws(self) -> None:
         try:
-            ws = await self._client.ws.private()
-            ws.on("position_snapshot", self._on_position_snapshot)
-            ws.on("position_update",   self._on_position_update)
-            ws.on("account_balance_snapshot", self._on_balance_snapshot)
-            ws.on("account_balance_update",   self._on_balance_update)
-            ws.on("close", lambda: asyncio.get_event_loop().create_task(self._reconnect_private()))
-            await ws.subscribe_positions()
-            await ws.subscribe_account_balance()
-            asyncio.create_task(ws.listen())
+            # WS objects are synchronous — do NOT await them
+            ws = self._client.ws.private()
+            ws.on("position_snapshot",        self._on_position_snapshot)
+            ws.on("position_update",           self._on_position_update)
+            ws.on("account_balance_snapshot",  self._on_balance_snapshot)
+            ws.on("account_balance_update",    self._on_balance_update)
+            # Use run_coroutine_threadsafe for thread-safe reconnect from WS callback
+            ws.on("close", lambda: asyncio.run_coroutine_threadsafe(
+                self._reconnect_private(), self._loop))
+
+            # Subscriptions may be sync or async
+            for sub in (ws.subscribe_positions, ws.subscribe_account_balance):
+                result = sub()
+                if asyncio.iscoroutine(result):
+                    await result
+
+            # Start the WS listener — sync blocking → run in executor
+            await self._start_ws_listener(ws, "private")
+            self._ws_ok = True
             log("INFO  Private WebSocket connected.")
         except Exception as exc:
-            log(f"WARN  Private WS failed to connect: {exc}. Will retry in 30 s.")
-            asyncio.get_event_loop().call_later(30, lambda: asyncio.create_task(self._reconnect_private()))
+            log(f"WARN  Private WS failed: {exc}. REST polling will cover positions.")
+            self._loop.call_later(60, lambda: asyncio.run_coroutine_threadsafe(
+                self._reconnect_private(), self._loop))
 
     async def _connect_markets_ws(self) -> None:
         if not self._tracked_slugs:
             log("WARN  No tracked slugs — skipping markets WS.")
             return
         try:
-            ws = await self._client.ws.markets()
+            ws = self._client.ws.markets()
             ws.on("market_data_lite", self._on_bbo_sync)
             ws.on("trade",            self._on_trade_sync)
-            ws.on("close", lambda: asyncio.get_event_loop().create_task(self._reconnect_markets()))
-            await ws.subscribe_market_data_lite(self._tracked_slugs)
-            await ws.subscribe_trades(self._tracked_slugs)
-            asyncio.create_task(ws.listen())
+            ws.on("close", lambda: asyncio.run_coroutine_threadsafe(
+                self._reconnect_markets(), self._loop))
+
+            for sub, args in (
+                (ws.subscribe_market_data_lite, (self._tracked_slugs,)),
+                (ws.subscribe_trades,           (self._tracked_slugs,)),
+            ):
+                result = sub(*args)
+                if asyncio.iscoroutine(result):
+                    await result
+
+            await self._start_ws_listener(ws, "markets")
+            self._ws_ok = True
             log(f"INFO  Markets WebSocket connected ({len(self._tracked_slugs)} slugs).")
         except Exception as exc:
-            log(f"WARN  Markets WS failed to connect: {exc}. Will retry in 30 s.")
-            asyncio.get_event_loop().call_later(30, lambda: asyncio.create_task(self._reconnect_markets()))
+            log(f"WARN  Markets WS failed: {exc}. REST polling will cover BBO.")
+            self._loop.call_later(60, lambda: asyncio.run_coroutine_threadsafe(
+                self._reconnect_markets(), self._loop))
+
+    async def _start_ws_listener(self, ws, label: str) -> None:
+        """Find and start the WS receive loop (sync or async)."""
+        for name in ("listen", "run", "run_forever", "start"):
+            fn = getattr(ws, name, None)
+            if fn is None:
+                continue
+            if asyncio.iscoroutinefunction(fn):
+                asyncio.create_task(fn())
+            else:
+                asyncio.create_task(self._loop.run_in_executor(None, fn))
+            log(f"INFO  WS [{label}] listener started via .{name}()")
+            return
+        log(f"WARN  WS [{label}] — no listener method found (tried listen/run/run_forever/start).")
 
     async def _reconnect_private(self) -> None:
         log("INFO  Reconnecting private WS...")
@@ -374,14 +403,14 @@ class PolymarketBot:
         await self._connect_markets_ws()
 
     # ------------------------------------------------------------------
-    # Sync WS callbacks (called from WS thread — only mutate simple dicts)
+    # Sync WS callbacks (called from WS thread — GIL-safe dict writes only)
     # ------------------------------------------------------------------
 
     def _on_position_snapshot(self, data: dict) -> None:
         positions = (data.get("positionSubscriptionSnapshot") or {}).get("positions", {}) or {}
         for slug, pos in positions.items():
             self._live_positions[slug] = pos
-        log(f"INFO  Position snapshot: {len(positions)} position(s).")
+        log(f"INFO  WS position snapshot: {len(positions)} position(s).")
 
     def _on_position_update(self, data: dict) -> None:
         upd  = data.get("positionSubscriptionUpdate") or {}
@@ -396,7 +425,7 @@ class PolymarketBot:
             "balance":     snap.get("balance",    0),
             "buyingPower": snap.get("buyingPower", 0),
         }
-        log(f"INFO  Balance snapshot: ${self._balance['balance']:.2f}  buying_power=${self._balance['buyingPower']:.2f}")
+        log(f"INFO  WS balance snapshot: ${self._balance['balance']:.2f}  buying_power=${self._balance['buyingPower']:.2f}")
 
     def _on_balance_update(self, data: dict) -> None:
         upd = data.get("accountBalanceSubscriptionUpdate") or {}
@@ -409,11 +438,10 @@ class PolymarketBot:
     def _on_bbo_sync(self, data: dict) -> None:
         md   = data.get("marketDataLite") or {}
         slug = md.get("marketSlug", "")
-        # Detect market closure via WS payload (closed/active fields)
         if slug and (md.get("closed") or md.get("active") is False):
             self._closed_slugs_pending.add(slug)
             return
-        bid  = (md.get("bestBid") or {}).get("value")
+        bid = (md.get("bestBid") or {}).get("value")
         if slug and bid is not None:
             self._latest_bbo[slug] = float(bid)
 
@@ -427,6 +455,39 @@ class PolymarketBot:
             self._price_history[slug].append(float(price))
 
     # ------------------------------------------------------------------
+    # REST polling fallback
+    # ------------------------------------------------------------------
+
+    async def _poll_positions_rest(self) -> None:
+        """Refresh positions and BBOs via REST. Used when WS is unavailable or stale."""
+        log("INFO  REST poll: refreshing positions and BBO...")
+        try:
+            resp      = await self._client.portfolio.positions()
+            positions = resp.get("positions", {}) if isinstance(resp, dict) else {}
+            for _, pos in positions.items():
+                meta = pos.get("marketMetadata", {}) or {}
+                slug = meta.get("slug", "")
+                if slug:
+                    self._live_positions[slug] = pos
+            log(f"INFO  REST poll: {len(positions)} position(s) refreshed.")
+        except AuthenticationError as exc:
+            log(f"ERROR  Auth failed during REST poll: {exc.message}")
+            raise
+        except Exception as exc:
+            log(f"WARN  REST position poll failed: {exc}")
+
+        for slug in list(self._tracked_slugs):
+            try:
+                bbo = await self._client.markets.bbo(slug)
+                bid = float((bbo.get("bestBid") or {}).get("value", 0) or 0) if isinstance(bbo, dict) else 0
+                if bid > 0:
+                    self._latest_bbo[slug] = bid
+            except NotFoundError:
+                self._mark_market_inactive(slug)
+            except Exception:
+                pass  # transient — try next cycle
+
+    # ------------------------------------------------------------------
     # Std dev
     # ------------------------------------------------------------------
 
@@ -436,8 +497,7 @@ class PolymarketBot:
             mean     = sum(history) / len(history)
             variance = sum((p - mean) ** 2 for p in history) / len(history)
             return math.sqrt(variance)
-        base = fallback_entry or 0.0
-        return base * BUYBACK_STD_DEV_PCT
+        return (fallback_entry or 0.0) * BUYBACK_STD_DEV_PCT
 
     # ------------------------------------------------------------------
     # Take-profit
@@ -450,27 +510,23 @@ class PolymarketBot:
         qty = float(pos.get("netPosition", "0") or "0")
         if qty <= 0:
             return
-        cost = float((pos.get("cost") or {}).get("value", 0) or 0)
+        cost      = float((pos.get("cost") or {}).get("value", 0) or 0)
         avg_entry = cost / qty if qty > 0 else 0
-        if avg_entry <= 0:
-            return
-        threshold = avg_entry * TAKE_PROFIT_MULTIPLIER
-        if bid < threshold:
+        if avg_entry <= 0 or bid < avg_entry * TAKE_PROFIT_MULTIPLIER:
             return
 
         log(f"TAKE-PROFIT {slug}: bid=${bid:.4f} >= {TAKE_PROFIT_MULTIPLIER}× ${avg_entry:.4f}")
         self._active_trades.add(slug)
         try:
             resp     = await self._client.orders.close_position({"marketSlug": slug})
-            close_id = (resp.get("id", "?") if isinstance(resp, dict) else "?")
+            close_id = resp.get("id", "?") if isinstance(resp, dict) else "?"
             profit   = (bid - avg_entry) * qty
-            log(f"INFO  Position closed: {slug}  id={close_id}  est_profit=${profit:.2f}")
+            log(f"INFO  Closed {slug} id={close_id}  est_profit=${profit:.2f}")
 
             meta  = pos.get("marketMetadata", {}) or {}
-            event = meta.get("eventSlug", "")
             self._state.setdefault("pending_buybacks", []).append({
                 "market_slug":     slug,
-                "event_slug":      event,
+                "event_slug":      meta.get("eventSlug", ""),
                 "intent":          "ORDER_INTENT_BUY_LONG",
                 "avg_entry_price": round(avg_entry, 6),
                 "entry_std_dev":   self._compute_std_dev(slug, avg_entry),
@@ -481,12 +537,9 @@ class PolymarketBot:
                 "failed_attempts": 0,
             })
             self._state.setdefault("today_closed", []).append({
-                "slug":       slug,
-                "qty":        int(qty),
-                "avg_price":  round(avg_entry, 4),
-                "exit_price": round(bid, 4),
-                "profit":     round(profit, 2),
-                "time":       datetime.now(EST).isoformat(),
+                "slug": slug, "qty": int(qty),
+                "avg_price": round(avg_entry, 4), "exit_price": round(bid, 4),
+                "profit": round(profit, 2), "time": datetime.now(EST).isoformat(),
             })
             self._live_positions.pop(slug, None)
             self._notifier.send(
@@ -500,12 +553,12 @@ class PolymarketBot:
         except BadRequestError as exc:
             log(f"ERROR  Bad request closing {slug}: {exc.message}")
         except NotFoundError as exc:
-            log(f"WARN  Market not found on close {slug}: {exc.message}")
+            log(f"WARN  Market closed on take-profit {slug}: {exc.message}")
             self._mark_market_inactive(slug)
         except RateLimitError as exc:
-            log(f"WARN  Rate limited on close {slug}: {exc.message}")
+            log(f"WARN  Rate limited closing {slug}: {exc.message}")
         except (APIConnectionError, APITimeoutError) as exc:
-            log(f"WARN  Network error closing {slug} ({type(exc).__name__}): {exc.message}")
+            log(f"WARN  Network error closing {slug}: {exc.message}")
         except Exception as exc:
             log(f"ERROR  Unexpected error closing {slug}: {exc}")
         finally:
@@ -521,11 +574,9 @@ class PolymarketBot:
         if avg_entry <= 0 or not slug:
             return
 
-        # Prefer stored std dev (captured at time of close) over recomputed
         std_dev = float(buyback.get("entry_std_dev") or 0) or self._compute_std_dev(slug, avg_entry)
         lower   = avg_entry - BUYBACK_STD_DEVS * std_dev
         upper   = avg_entry + BUYBACK_STD_DEVS * std_dev
-
         if not (lower <= bid <= upper):
             return
 
@@ -533,12 +584,8 @@ class PolymarketBot:
         self._active_trades.add(slug)
         try:
             qty_sold = int(buyback.get("qty_sold", 0) or 0)
-            if qty_sold > 0 and avg_entry > 0:
-                buy_qty   = qty_sold
-                alloc_usd = round(buy_qty * bid, 2)
-            else:
-                buy_qty   = max(1, math.floor(BUYBACK_AMOUNT_USD / bid))
-                alloc_usd = BUYBACK_AMOUNT_USD
+            buy_qty  = qty_sold if qty_sold > 0 else max(1, math.floor(BUYBACK_AMOUNT_USD / bid))
+            alloc    = round(buy_qty * bid, 2)
 
             resp     = await self._client.orders.create({
                 "marketSlug": slug,
@@ -549,11 +596,10 @@ class PolymarketBot:
                 "tif":        "TIME_IN_FORCE_GOOD_TILL_CANCEL",
             })
             order_id = resp.get("id", "?") if isinstance(resp, dict) else "?"
-            log(f"INFO  Buyback order placed: {slug} qty={buy_qty} @ ${bid:.4f}  id={order_id}")
+            log(f"INFO  Buyback placed: {slug} qty={buy_qty} @ ${bid:.4f}  id={order_id}")
             buyback["processed"] = True
             self._notifier.send(
-                f"🔄 *Buyback*\n`{slug}`\n"
-                f"qty={buy_qty} @ `${bid:.4f}` (~`${alloc_usd:.2f}`)\n"
+                f"🔄 *Buyback*\n`{slug}`\nqty={buy_qty} @ `${bid:.4f}` (~`${alloc:.2f}`)\n"
                 f"Trigger: price back within {BUYBACK_STD_DEVS} std dev of `${avg_entry:.4f}`"
             )
         except AuthenticationError as exc:
@@ -561,11 +607,11 @@ class PolymarketBot:
             raise
         except BadRequestError as exc:
             buyback["failed_attempts"] = buyback.get("failed_attempts", 0) + 1
-            log(f"ERROR  Bad order params for buyback {slug}: {exc.message}  (attempt #{buyback['failed_attempts']})")
+            log(f"ERROR  Bad order params buyback {slug}: {exc.message}  (attempt #{buyback['failed_attempts']})")
         except RateLimitError as exc:
             log(f"WARN  Rate limited on buyback {slug}: {exc.message}")
         except (APIConnectionError, APITimeoutError) as exc:
-            log(f"WARN  Network error on buyback {slug} ({type(exc).__name__}): {exc.message}")
+            log(f"WARN  Network error on buyback {slug}: {exc.message}")
         except Exception as exc:
             buyback["failed_attempts"] = buyback.get("failed_attempts", 0) + 1
             log(f"ERROR  Buyback {slug}: {exc}  (attempt #{buyback['failed_attempts']})")
@@ -577,7 +623,6 @@ class PolymarketBot:
     # ------------------------------------------------------------------
 
     async def _scan(self) -> None:
-        # Drain WS-signalled closures first
         for slug in list(self._closed_slugs_pending):
             self._closed_slugs_pending.discard(slug)
             self._mark_market_inactive(slug)
@@ -614,21 +659,19 @@ class PolymarketBot:
         today = date.today().isoformat()
         if self._state.get("daily_report_sent") == today:
             return
-        snaps  = self._state.get("balance_snapshots", {})
-        days   = sorted(snaps)
-        t_snap = snaps.get(today, {})
-        y_snap = snaps.get(days[-2], {}) if len(days) >= 2 and days[-1] == today else {}
-
+        snaps     = self._state.get("balance_snapshots", {})
+        days      = sorted(snaps)
+        t_snap    = snaps.get(today, {})
+        y_snap    = snaps.get(days[-2], {}) if len(days) >= 2 and days[-1] == today else {}
         today_bal = float(t_snap.get("balance", 0))
         yest_bal  = float(y_snap.get("balance", 0))
         delta     = today_bal - yest_bal
-        arrow     = "📈" if delta >= 0 else "📉"
         closed    = self._state.get("today_closed", [])
         total_pnl = sum(p.get("profit", 0) for p in closed)
 
         lines = [
             f"🌅 *Daily Report — {today}*",
-            f"💰 Balance: `${today_bal:.2f}` {arrow} (`${delta:+.2f}` vs yesterday)",
+            f"💰 Balance: `${today_bal:.2f}` {'📈' if delta >= 0 else '📉'} (`${delta:+.2f}` vs yesterday)",
             f"✅ Closed today: {len(closed)} trade(s) | total P&L `${total_pnl:+.2f}`",
         ]
         for p in closed:
@@ -645,7 +688,7 @@ class PolymarketBot:
         else:
             log("INFO  Daily report (Telegram disabled):")
             for line in lines:
-                log(f"       {line}")
+                log(f"      {line}")
 
         self._state["daily_report_sent"] = today
         self._state["today_closed"]      = []
@@ -659,11 +702,10 @@ class PolymarketBot:
         pending       = len([b for b in self._state.get("pending_buybacks", []) if not b.get("processed")])
         log(
             f"STATUS  elapsed={elapsed_s/60:.1f} min  remaining={remaining_min:.1f} min  "
+            f"ws={'ON' if self._ws_ok else 'OFF(polling)'}  "
             f"balance=${self._balance.get('balance', 0):.2f}  "
             f"live_positions={len(self._live_positions)}  "
-            f"pending_buybacks={pending}  "
-            f"tracked_bbo={len(self._latest_bbo)}  "
-            f"active_trades={len(self._active_trades)}"
+            f"pending_buybacks={pending}  tracked_bbo={len(self._latest_bbo)}"
         )
 
     # ------------------------------------------------------------------
@@ -678,29 +720,29 @@ class PolymarketBot:
             now     = time.monotonic()
             elapsed = now - self._start_time
 
-            # --- Runtime rollover ---
             if elapsed >= RUNTIME_LIMIT_SECONDS:
-                log(f"INFO  Runtime limit reached ({RUNTIME_LIMIT_SECONDS // 60} min). Initiating handoff...")
+                log(f"INFO  Runtime limit ({RUNTIME_LIMIT_SECONDS // 60} min). Initiating handoff...")
                 save_state(self._state)
                 trigger_workflow_handoff()
                 log("INFO  Handoff complete. Exiting.")
                 break
 
-            # --- Core scan ---
+            # REST polling fallback: always run every POLLING_INTERVAL_S regardless of WS status
+            if now - self._last_poll >= POLLING_INTERVAL_S:
+                await self._poll_positions_rest()
+                self._last_poll = time.monotonic()
+
             await self._scan()
 
-            # --- Periodic state save ---
             if now - last_save >= STATE_SAVE_INTERVAL_S:
                 save_state(self._state)
                 self._snapshot_balance()
                 last_save = time.monotonic()
 
-            # --- Status log ---
             if now - last_status >= STATUS_LOG_INTERVAL_S:
                 self._log_status(elapsed)
                 last_status = time.monotonic()
 
-            # --- Daily 10 AM report ---
             now_est = datetime.now(EST)
             if now_est.hour == 10 and now_est.minute < 1:
                 self._maybe_daily_report()
@@ -723,12 +765,13 @@ async def run_async() -> None:
     notifier = Notifier(tg_token, TELEGRAM_CHAT_ID)
 
     log("=" * 64)
-    log("STARTUP  Polymarket Futures Bot (async WebSocket)")
+    log("STARTUP  Polymarket Futures Bot")
     log(f"         Python {sys.version.split()[0]}  PID {os.getpid()}")
     log(f"CONFIG   TAKE_PROFIT_MULTIPLIER = {TAKE_PROFIT_MULTIPLIER}×")
     log(f"CONFIG   BUYBACK_AMOUNT_USD     = ${BUYBACK_AMOUNT_USD:.2f}")
     log(f"CONFIG   BUYBACK_STD_DEVS       = {BUYBACK_STD_DEVS}  ({BUYBACK_STD_DEV_PCT*100:.0f}% per dev)")
     log(f"CONFIG   RUNTIME_LIMIT          = {RUNTIME_LIMIT_SECONDS // 60} min")
+    log(f"CONFIG   POLLING_INTERVAL       = {POLLING_INTERVAL_S // 60} min (REST fallback)")
     log(f"INFO     Telegram: {'ENABLED' if notifier.enabled else 'DISABLED (TELEGRAM_KEY not set)'}")
     log("=" * 64)
 
@@ -742,10 +785,10 @@ async def run_async() -> None:
         except KeyboardInterrupt:
             log("INFO  KeyboardInterrupt — shutting down.")
         except AuthenticationError as exc:
-            log(f"FATAL  Authentication failed — check POLYMARKET_PUBLIC_KEY / POLYMARKET_SECRET_KEY: {exc.message}")
+            log(f"FATAL  Auth failed — check credentials: {exc.message}")
             sys.exit(1)
         except (APIConnectionError, APITimeoutError) as exc:
-            log(f"FATAL  Cannot reach Polymarket API ({type(exc).__name__}): {exc.message}")
+            log(f"FATAL  Cannot reach API ({type(exc).__name__}): {exc.message}")
             sys.exit(1)
         except Exception as exc:
             log(f"ERROR  Unhandled exception: {exc}")
