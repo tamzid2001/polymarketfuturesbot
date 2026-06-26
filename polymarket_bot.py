@@ -736,7 +736,7 @@ async def run_async() -> None:
     state             = load_state()
     bot               = PolymarketBot(markets, settings, state, notifier)
 
-    async with AsyncPolymarketUS(key_id=api_key, secret_key=secret_key, timeout=30.0, max_retries=2) as client:
+    async with AsyncPolymarketUS(key_id=api_key, secret_key=secret_key) as client:
         try:
             await bot.run(client)
         except KeyboardInterrupt:

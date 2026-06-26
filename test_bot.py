@@ -430,7 +430,7 @@ def main() -> None:
 
     test_telegram(tg_token)
 
-    client = PolymarketUS(key_id=api_key, secret_key=secret_key, timeout=30.0, max_retries=2)
+    client = PolymarketUS(key_id=api_key, secret_key=secret_key)
     try:
         balance_text  = test_balance(client)
         mlb_positions = test_open_mlb_positions(client)
