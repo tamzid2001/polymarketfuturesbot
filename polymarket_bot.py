@@ -42,6 +42,8 @@ STATUS_LOG_INTERVAL_S  = 900    # log status every 15 min
 STATE_SAVE_INTERVAL_S  = 60     # persist state every 60 s
 POLLING_INTERVAL_S     = 300    # REST fallback polling interval (5 min)
 TICK_INTERVAL_S        = 0.5    # main-loop tick
+REST_RATE_LIMIT        = 20.0   # max REST req/s (firm cap: 100/s avg'd over 1 min; we use 20%)
+REST_MAX_RETRIES       = 3      # retry attempts on 429  (waits: 2 s → 4 s → 8 s)
 # ==============================================================
 
 MARKETS_FILE     = "markets.json"
@@ -139,6 +141,31 @@ def load_markets() -> tuple[list, dict]:
 
 
 # ------------------------------------------------------------------
+# Token-bucket rate limiter
+# ------------------------------------------------------------------
+
+class _RateLimiter:
+    """Caps REST API throughput to stay well under Polymarket's 100 req/s firm cap."""
+
+    def __init__(self, rate: float) -> None:
+        self._rate   = rate      # tokens per second
+        self._tokens = rate      # start full
+        self._last   = time.monotonic()
+        self._lock   = asyncio.Lock()
+
+    async def acquire(self) -> None:
+        async with self._lock:
+            now = time.monotonic()
+            self._tokens = min(self._rate, self._tokens + (now - self._last) * self._rate)
+            self._last   = now
+            if self._tokens < 1.0:
+                await asyncio.sleep((1.0 - self._tokens) / self._rate)
+                self._tokens = 0.0
+            else:
+                self._tokens -= 1.0
+
+
+# ------------------------------------------------------------------
 # Workflow rollover
 # ------------------------------------------------------------------
 
@@ -192,8 +219,27 @@ class PolymarketBot:
         self._client:  AsyncPolymarketUS | None = None
         self._start_time  = time.monotonic()
         self._last_poll   = 0.0   # monotonic time of last REST poll
+        self._rl          = _RateLimiter(REST_RATE_LIMIT)
 
         self._tracked_slugs: list[str] = [m["market_slug"] for m in markets]
+
+    # ------------------------------------------------------------------
+    # Rate-limited REST helper
+    # ------------------------------------------------------------------
+
+    async def _api(self, make_coro, *, retries: int = REST_MAX_RETRIES):
+        """Acquire a rate-limit token then execute one REST call.
+        Retries up to `retries` times on RateLimitError with exponential backoff."""
+        for attempt in range(retries):
+            await self._rl.acquire()
+            try:
+                return await make_coro()
+            except RateLimitError as exc:
+                if attempt == retries - 1:
+                    raise
+                wait = 2 ** (attempt + 1)   # 2 s, 4 s, 8 s
+                log(f"WARN  429 rate-limited — retrying in {wait}s (attempt {attempt + 1}/{retries}): {exc.message}")
+                await asyncio.sleep(wait)
 
     # ------------------------------------------------------------------
     # Entry point
@@ -215,7 +261,7 @@ class PolymarketBot:
     async def _initialize_positions(self) -> None:
         log("INFO  Fetching live portfolio...")
         try:
-            resp      = await self._client.portfolio.positions()
+            resp      = await self._api(lambda: self._client.portfolio.positions())
             positions = resp.get("positions", {}) if isinstance(resp, dict) else {}
         except AuthenticationError as exc:
             log(f"ERROR  Auth failed: {exc.message}")
@@ -255,21 +301,22 @@ class PolymarketBot:
             return
         self._active_trades.add(slug)
         try:
-            bbo = await self._client.markets.bbo(slug)
+            bbo = await self._api(lambda: self._client.markets.bbo(slug))
             ask = float((bbo.get("bestAsk") or {}).get("value", 0) or 0) if isinstance(bbo, dict) else 0
             if ask <= 0:
                 log(f"WARN  No ask price for {slug} — skipping entry.")
                 return
             qty = max(1, math.floor(deployment_usd / ask))
             log(f"INFO  Opening: {market['team']} ({slug}) qty={qty} @ ${ask:.4f}")
-            resp     = await self._client.orders.create({
+            order_payload = {
                 "marketSlug": slug,
                 "intent":     "ORDER_INTENT_BUY_LONG",
                 "type":       "ORDER_TYPE_LIMIT",
                 "price":      {"value": f"{ask:.4f}", "currency": "USD"},
                 "quantity":   qty,
                 "tif":        "TIME_IN_FORCE_GOOD_TILL_CANCEL",
-            })
+            }
+            resp     = await self._api(lambda: self._client.orders.create(order_payload))
             order_id = resp.get("id", "?") if isinstance(resp, dict) else "?"
             log(f"INFO  Opened {slug} order_id={order_id}")
             self._notifier.send(
@@ -284,7 +331,7 @@ class PolymarketBot:
             log(f"WARN  Market closed/missing {slug}: {exc.message}")
             self._mark_market_inactive(slug)
         except RateLimitError as exc:
-            log(f"WARN  Rate limited opening {slug}: {exc.message}")
+            log(f"WARN  Rate limited opening {slug} (retries exhausted): {exc.message}")
         except (APIConnectionError, APITimeoutError) as exc:
             log(f"WARN  Network error opening {slug}: {exc.message}")
         except Exception as exc:
@@ -462,7 +509,7 @@ class PolymarketBot:
         """Refresh positions and BBOs via REST. Used when WS is unavailable or stale."""
         log("INFO  REST poll: refreshing positions and BBO...")
         try:
-            resp      = await self._client.portfolio.positions()
+            resp      = await self._api(lambda: self._client.portfolio.positions())
             positions = resp.get("positions", {}) if isinstance(resp, dict) else {}
             for _, pos in positions.items():
                 meta = pos.get("marketMetadata", {}) or {}
@@ -478,7 +525,7 @@ class PolymarketBot:
 
         for slug in list(self._tracked_slugs):
             try:
-                bbo = await self._client.markets.bbo(slug)
+                bbo = await self._api(lambda s=slug: self._client.markets.bbo(s))
                 bid = float((bbo.get("bestBid") or {}).get("value", 0) or 0) if isinstance(bbo, dict) else 0
                 if bid > 0:
                     self._latest_bbo[slug] = bid
@@ -518,7 +565,7 @@ class PolymarketBot:
         log(f"TAKE-PROFIT {slug}: bid=${bid:.4f} >= {TAKE_PROFIT_MULTIPLIER}× ${avg_entry:.4f}")
         self._active_trades.add(slug)
         try:
-            resp     = await self._client.orders.close_position({"marketSlug": slug})
+            resp     = await self._api(lambda: self._client.orders.close_position({"marketSlug": slug}))
             close_id = resp.get("id", "?") if isinstance(resp, dict) else "?"
             profit   = (bid - avg_entry) * qty
             log(f"INFO  Closed {slug} id={close_id}  est_profit=${profit:.2f}")
@@ -556,7 +603,7 @@ class PolymarketBot:
             log(f"WARN  Market closed on take-profit {slug}: {exc.message}")
             self._mark_market_inactive(slug)
         except RateLimitError as exc:
-            log(f"WARN  Rate limited closing {slug}: {exc.message}")
+            log(f"WARN  Rate limited closing {slug} (retries exhausted): {exc.message}")
         except (APIConnectionError, APITimeoutError) as exc:
             log(f"WARN  Network error closing {slug}: {exc.message}")
         except Exception as exc:
@@ -587,14 +634,15 @@ class PolymarketBot:
             buy_qty  = qty_sold if qty_sold > 0 else max(1, math.floor(BUYBACK_AMOUNT_USD / bid))
             alloc    = round(buy_qty * bid, 2)
 
-            resp     = await self._client.orders.create({
+            bb_payload = {
                 "marketSlug": slug,
                 "intent":     buyback.get("intent", "ORDER_INTENT_BUY_LONG"),
                 "type":       "ORDER_TYPE_LIMIT",
                 "price":      {"value": f"{bid:.4f}", "currency": "USD"},
                 "quantity":   buy_qty,
                 "tif":        "TIME_IN_FORCE_GOOD_TILL_CANCEL",
-            })
+            }
+            resp     = await self._api(lambda: self._client.orders.create(bb_payload))
             order_id = resp.get("id", "?") if isinstance(resp, dict) else "?"
             log(f"INFO  Buyback placed: {slug} qty={buy_qty} @ ${bid:.4f}  id={order_id}")
             buyback["processed"] = True
@@ -609,7 +657,7 @@ class PolymarketBot:
             buyback["failed_attempts"] = buyback.get("failed_attempts", 0) + 1
             log(f"ERROR  Bad order params buyback {slug}: {exc.message}  (attempt #{buyback['failed_attempts']})")
         except RateLimitError as exc:
-            log(f"WARN  Rate limited on buyback {slug}: {exc.message}")
+            log(f"WARN  Rate limited on buyback {slug} (retries exhausted): {exc.message}")
         except (APIConnectionError, APITimeoutError) as exc:
             log(f"WARN  Network error on buyback {slug}: {exc.message}")
         except Exception as exc:
@@ -772,6 +820,7 @@ async def run_async() -> None:
     log(f"CONFIG   BUYBACK_STD_DEVS       = {BUYBACK_STD_DEVS}  ({BUYBACK_STD_DEV_PCT*100:.0f}% per dev)")
     log(f"CONFIG   RUNTIME_LIMIT          = {RUNTIME_LIMIT_SECONDS // 60} min")
     log(f"CONFIG   POLLING_INTERVAL       = {POLLING_INTERVAL_S // 60} min (REST fallback)")
+    log(f"CONFIG   REST_RATE_LIMIT        = {REST_RATE_LIMIT:.0f} req/s  max_retries={REST_MAX_RETRIES} (429 backoff: 2/4/8 s)")
     log(f"INFO     Telegram: {'ENABLED' if notifier.enabled else 'DISABLED (TELEGRAM_KEY not set)'}")
     log("=" * 64)
 
