@@ -186,7 +186,8 @@ class PolymarketBot:
         self._price_history:  dict[str, deque] = {}  # slug → deque(maxlen=30)
         self._balance:        dict             = {}
 
-        self._active_trades: set[str] = set()  # slugs with in-flight REST calls
+        self._active_trades:       set[str] = set()   # slugs with in-flight REST calls
+        self._closed_slugs_pending: set[str] = set()  # closures detected via WS, processed next tick
         self._client: AsyncPolymarketUS | None = None
         self._start_time  = time.monotonic()
 
@@ -243,7 +244,7 @@ class PolymarketBot:
                 log(f"SKIP  {market['team']} ({slug}) — position already open.")
                 continue
             deployment = market.get("max_deployment_usd",
-                                    self._settings.get("initial_deployment_usd", 5.0))
+                                    self._settings.get("initial_deployment_usd", 1.0))
             await self._open_position(market, deployment)
 
     async def _open_position(self, market: dict, deployment_usd: float) -> None:
@@ -278,7 +279,8 @@ class PolymarketBot:
         except BadRequestError as exc:
             log(f"ERROR  Bad order params for {slug}: {exc.message}")
         except NotFoundError as exc:
-            log(f"ERROR  Market not found {slug}: {exc.message}")
+            log(f"WARN  Market not found / closed {slug}: {exc.message}")
+            self._mark_market_inactive(slug)
         except RateLimitError as exc:
             log(f"WARN  Rate limited opening {slug}: {exc.message}")
         except (APIConnectionError, APITimeoutError) as exc:
@@ -287,6 +289,38 @@ class PolymarketBot:
             log(f"ERROR  Unexpected error opening {slug}: {exc}")
         finally:
             self._active_trades.discard(slug)
+
+    # ------------------------------------------------------------------
+    # Market closure detection
+    # ------------------------------------------------------------------
+
+    def _mark_market_inactive(self, slug: str) -> None:
+        """
+        Flip is_underdog to false for a closed/missing market and persist markets.json.
+        The bot will stop attempting entries for this slug; existing positions are
+        still monitored and closed normally by the take-profit logic.
+        """
+        for market in self._markets:
+            if market.get("market_slug") == slug and market.get("is_underdog"):
+                market["is_underdog"] = False
+                log(f"INFO  {market.get('team', slug)} ({slug}) — market closed, is_underdog set to false.")
+                self._notifier.send(
+                    f"⚠️ *Market Closed*\n`{slug}` — marked inactive, no further entries."
+                )
+                self._save_markets()
+                return
+
+    def _save_markets(self) -> None:
+        """Write the current in-memory markets list back to markets.json."""
+        try:
+            with open(MARKETS_FILE) as fh:
+                data = json.load(fh)
+            data["mlb_world_series"] = self._markets
+            with open(MARKETS_FILE, "w") as fh:
+                json.dump(data, fh, indent=2)
+            log(f"INFO  markets.json updated on disk.")
+        except Exception as exc:
+            log(f"WARN  Could not save markets.json: {exc}")
 
     # ------------------------------------------------------------------
     # WebSocket connections
@@ -375,6 +409,10 @@ class PolymarketBot:
     def _on_bbo_sync(self, data: dict) -> None:
         md   = data.get("marketDataLite") or {}
         slug = md.get("marketSlug", "")
+        # Detect market closure via WS payload (closed/active fields)
+        if slug and (md.get("closed") or md.get("active") is False):
+            self._closed_slugs_pending.add(slug)
+            return
         bid  = (md.get("bestBid") or {}).get("value")
         if slug and bid is not None:
             self._latest_bbo[slug] = float(bid)
@@ -462,7 +500,8 @@ class PolymarketBot:
         except BadRequestError as exc:
             log(f"ERROR  Bad request closing {slug}: {exc.message}")
         except NotFoundError as exc:
-            log(f"WARN  Position not found on close {slug}: {exc.message}")
+            log(f"WARN  Market not found on close {slug}: {exc.message}")
+            self._mark_market_inactive(slug)
         except RateLimitError as exc:
             log(f"WARN  Rate limited on close {slug}: {exc.message}")
         except (APIConnectionError, APITimeoutError) as exc:
@@ -538,6 +577,11 @@ class PolymarketBot:
     # ------------------------------------------------------------------
 
     async def _scan(self) -> None:
+        # Drain WS-signalled closures first
+        for slug in list(self._closed_slugs_pending):
+            self._closed_slugs_pending.discard(slug)
+            self._mark_market_inactive(slug)
+
         for slug, bid in list(self._latest_bbo.items()):
             if slug in self._active_trades or bid <= 0:
                 continue
