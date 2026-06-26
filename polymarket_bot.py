@@ -20,7 +20,15 @@ from collections import deque
 from datetime import datetime, date
 import zoneinfo
 import requests
-from polymarket_us import AsyncPolymarketUS, APIError
+from polymarket_us import (
+    AsyncPolymarketUS,
+    APIConnectionError,
+    APITimeoutError,
+    AuthenticationError,
+    BadRequestError,
+    NotFoundError,
+    RateLimitError,
+)
 
 # ==============================================================
 # CONFIGURATION
@@ -72,6 +80,9 @@ class Notifier:
     def send(self, text: str) -> None:
         if not self.enabled:
             return
+        MAX_LEN = 4000
+        if len(text) > MAX_LEN:
+            text = text[:MAX_LEN] + "\n_[truncated]_"
         url = f"https://api.telegram.org/bot{self.token}/sendMessage"
         try:
             r = requests.post(
@@ -79,6 +90,13 @@ class Notifier:
                 json={"chat_id": self.chat_id, "text": text, "parse_mode": "Markdown"},
                 timeout=10,
             )
+            if not r.ok:
+                # Retry without Markdown on parse errors (400)
+                r = requests.post(
+                    url,
+                    json={"chat_id": self.chat_id, "text": text},
+                    timeout=10,
+                )
             r.raise_for_status()
             log(f"INFO  Telegram sent (msg_id={r.json()['result']['message_id']})")
         except Exception as exc:
@@ -196,6 +214,12 @@ class PolymarketBot:
         try:
             resp = await self._client.portfolio.positions()
             positions = resp.get("positions", {}) if isinstance(resp, dict) else {}
+        except AuthenticationError as exc:
+            log(f"ERROR  Authentication failed at startup: {exc.message}")
+            raise
+        except (APIConnectionError, APITimeoutError) as exc:
+            log(f"WARN  Could not fetch portfolio at startup ({type(exc).__name__}): {exc.message}. Skipping auto-entry.")
+            return
         except Exception as exc:
             log(f"WARN  Could not fetch portfolio at startup: {exc}. Skipping auto-entry.")
             return
@@ -248,8 +272,19 @@ class PolymarketBot:
             self._notifier.send(
                 f"✅ *Position Opened*\n`{slug}`\nqty={qty} @ `${ask:.4f}` (~`${deployment_usd:.2f}`)"
             )
+        except AuthenticationError as exc:
+            log(f"ERROR  Auth failure opening {slug}: {exc.message}")
+            raise
+        except BadRequestError as exc:
+            log(f"ERROR  Bad order params for {slug}: {exc.message}")
+        except NotFoundError as exc:
+            log(f"ERROR  Market not found {slug}: {exc.message}")
+        except RateLimitError as exc:
+            log(f"WARN  Rate limited opening {slug}: {exc.message}")
+        except (APIConnectionError, APITimeoutError) as exc:
+            log(f"WARN  Network error opening {slug} ({type(exc).__name__}): {exc.message}")
         except Exception as exc:
-            log(f"ERROR opening {slug}: {exc}")
+            log(f"ERROR  Unexpected error opening {slug}: {exc}")
         finally:
             self._active_trades.discard(slug)
 
@@ -421,8 +456,19 @@ class PolymarketBot:
                 f"Entry `${avg_entry:.4f}` → Exit `${bid:.4f}` ({TAKE_PROFIT_MULTIPLIER}×)\n"
                 f"Profit ≈ `${profit:+.2f} USD`"
             )
+        except AuthenticationError as exc:
+            log(f"ERROR  Auth failure closing {slug}: {exc.message}")
+            raise
+        except BadRequestError as exc:
+            log(f"ERROR  Bad request closing {slug}: {exc.message}")
+        except NotFoundError as exc:
+            log(f"WARN  Position not found on close {slug}: {exc.message}")
+        except RateLimitError as exc:
+            log(f"WARN  Rate limited on close {slug}: {exc.message}")
+        except (APIConnectionError, APITimeoutError) as exc:
+            log(f"WARN  Network error closing {slug} ({type(exc).__name__}): {exc.message}")
         except Exception as exc:
-            log(f"ERROR close_position {slug}: {exc}")
+            log(f"ERROR  Unexpected error closing {slug}: {exc}")
         finally:
             self._active_trades.discard(slug)
 
@@ -471,9 +517,19 @@ class PolymarketBot:
                 f"qty={buy_qty} @ `${bid:.4f}` (~`${alloc_usd:.2f}`)\n"
                 f"Trigger: price back within {BUYBACK_STD_DEVS} std dev of `${avg_entry:.4f}`"
             )
+        except AuthenticationError as exc:
+            log(f"ERROR  Auth failure on buyback {slug}: {exc.message}")
+            raise
+        except BadRequestError as exc:
+            buyback["failed_attempts"] = buyback.get("failed_attempts", 0) + 1
+            log(f"ERROR  Bad order params for buyback {slug}: {exc.message}  (attempt #{buyback['failed_attempts']})")
+        except RateLimitError as exc:
+            log(f"WARN  Rate limited on buyback {slug}: {exc.message}")
+        except (APIConnectionError, APITimeoutError) as exc:
+            log(f"WARN  Network error on buyback {slug} ({type(exc).__name__}): {exc.message}")
         except Exception as exc:
             buyback["failed_attempts"] = buyback.get("failed_attempts", 0) + 1
-            log(f"ERROR buyback {slug}: {exc}  (attempt #{buyback['failed_attempts']})")
+            log(f"ERROR  Buyback {slug}: {exc}  (attempt #{buyback['failed_attempts']})")
         finally:
             self._active_trades.discard(slug)
 
@@ -636,11 +692,17 @@ async def run_async() -> None:
     state             = load_state()
     bot               = PolymarketBot(markets, settings, state, notifier)
 
-    async with AsyncPolymarketUS(key_id=api_key, secret_key=secret_key) as client:
+    async with AsyncPolymarketUS(key_id=api_key, secret_key=secret_key, timeout=30.0, max_retries=2) as client:
         try:
             await bot.run(client)
         except KeyboardInterrupt:
             log("INFO  KeyboardInterrupt — shutting down.")
+        except AuthenticationError as exc:
+            log(f"FATAL  Authentication failed — check POLYMARKET_PUBLIC_KEY / POLYMARKET_SECRET_KEY: {exc.message}")
+            sys.exit(1)
+        except (APIConnectionError, APITimeoutError) as exc:
+            log(f"FATAL  Cannot reach Polymarket API ({type(exc).__name__}): {exc.message}")
+            sys.exit(1)
         except Exception as exc:
             log(f"ERROR  Unhandled exception: {exc}")
             raise

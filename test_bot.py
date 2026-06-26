@@ -9,7 +9,15 @@ import os
 import sys
 import json
 import requests
-from polymarket_us import PolymarketUS
+from polymarket_us import (
+    PolymarketUS,
+    APIConnectionError,
+    APITimeoutError,
+    AuthenticationError,
+    BadRequestError,
+    NotFoundError,
+    RateLimitError,
+)
 
 TELEGRAM_CHAT_ID = "@moneyballpredictions"
 MARKETS_FILE     = "markets.json"
@@ -20,13 +28,25 @@ MARKETS_FILE     = "markets.json"
 # ------------------------------------------------------------------
 
 def send_telegram(tg_token: str, text: str) -> int:
+    """Send a Telegram message. Truncates at 4000 chars to stay under API limit."""
+    MAX_LEN = 4000
+    if len(text) > MAX_LEN:
+        text = text[:MAX_LEN] + "\n\n_[message truncated]_"
     url  = f"https://api.telegram.org/bot{tg_token}/sendMessage"
     resp = requests.post(
         url,
         json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"},
         timeout=10,
     )
-    resp.raise_for_status()
+    if not resp.ok:
+        # Retry once without Markdown if parse error
+        resp2 = requests.post(
+            url,
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": text},
+            timeout=10,
+        )
+        resp2.raise_for_status()
+        return resp2.json()["result"]["message_id"]
     return resp.json()["result"]["message_id"]
 
 
@@ -410,7 +430,7 @@ def main() -> None:
 
     test_telegram(tg_token)
 
-    client = PolymarketUS(key_id=api_key, secret_key=secret_key)
+    client = PolymarketUS(key_id=api_key, secret_key=secret_key, timeout=30.0, max_retries=2)
     try:
         balance_text  = test_balance(client)
         mlb_positions = test_open_mlb_positions(client)
@@ -420,11 +440,27 @@ def main() -> None:
         report = build_report(balance_text, mlb_positions, underdogs)
 
         if tg_token:
-            send_telegram(tg_token, report)
-            print("PASS — Full report sent to Telegram.")
+            try:
+                msg_id = send_telegram(tg_token, report)
+                print(f"PASS — Full report sent to Telegram (msg_id={msg_id}).")
+            except Exception as tg_exc:
+                print(f"WARN — Telegram report send failed (non-fatal): {tg_exc}")
+                print("INFO — Report (log only):")
+                print(report)
         else:
             print("INFO — Telegram not configured. Report:")
             print(report)
+    except AuthenticationError as exc:
+        print(f"FAIL — Authentication error: {exc.message}")
+        sys.exit(1)
+    except RateLimitError as exc:
+        print(f"WARN — Rate limit hit: {exc.message}")
+    except APIConnectionError as exc:
+        print(f"FAIL — Connection error: {exc.message}")
+        sys.exit(1)
+    except APITimeoutError:
+        print("FAIL — Request timed out.")
+        sys.exit(1)
     finally:
         client.close()
 

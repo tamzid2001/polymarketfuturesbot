@@ -1,13 +1,10 @@
 {
-  "_description": "MLB World Series 2026 — Underdog futures markets. Single source of truth for the bot.",
+  "_description": "MLB World Series 2026 — all 30 team markets. Slugs verified from live API.",
   "_instructions": [
-    "IMPORTANT: Run 'python test_bot.py' first — step [5] prints the EXACT slugs from the API.",
-    "Copy those slugs into market_slug below. Values here are guesses until verified.",
-    "market_slug must match exactly what the Polymarket US API returns.",
-    "is_underdog: true  → bot opens a position at startup if not already held.",
-    "is_underdog: false → bot monitors but does NOT auto-enter.",
-    "max_deployment_usd: per-market capital for the initial entry order.",
-    "slug_verified: true once you confirm the slug matches test_bot.py step [5] output."
+    "event_slug and market_slug verified from live portfolio positions + search.query.",
+    "is_underdog: true  → bot opens $1 position at startup if not already held.",
+    "is_underdog: false → bot monitors the market but does NOT auto-enter.",
+    "slug_verified: true means the slug was confirmed against the Polymarket US API."
   ],
   "settings": {
     "initial_deployment_usd": 1.00,
@@ -15,163 +12,243 @@
   },
   "mlb_world_series": [
     {
-      "team": "Chicago Cubs",
-      "event_slug": "mlb-world-series-champion-2026",
-      "market_slug": "mlb-world-series-champion-2026-chicago-cubs",
-      "is_underdog": true,
-      "slug_verified": false,
-      "max_deployment_usd": 1.00
-    },
-    {
-      "team": "Cincinnati Reds",
-      "event_slug": "mlb-world-series-champion-2026",
-      "market_slug": "mlb-world-series-champion-2026-cincinnati-reds",
-      "is_underdog": true,
-      "slug_verified": false,
-      "max_deployment_usd": 1.00
-    },
-    {
       "team": "Colorado Rockies",
-      "event_slug": "mlb-world-series-champion-2026",
-      "market_slug": "mlb-world-series-champion-2026-colorado-rockies",
+      "event_slug": "mlb-champ-2026-09-27",
+      "market_slug": "tec-mlb-champ-2026-09-27-col",
       "is_underdog": true,
-      "slug_verified": false,
-      "max_deployment_usd": 1.00
-    },
-    {
-      "team": "Pittsburgh Pirates",
-      "event_slug": "mlb-world-series-champion-2026",
-      "market_slug": "mlb-world-series-champion-2026-pittsburgh-pirates",
-      "is_underdog": true,
-      "slug_verified": false,
-      "max_deployment_usd": 1.00
-    },
-    {
-      "team": "Kansas City Royals",
-      "event_slug": "mlb-world-series-champion-2026",
-      "market_slug": "mlb-world-series-champion-2026-kansas-city-royals",
-      "is_underdog": true,
-      "slug_verified": false,
-      "max_deployment_usd": 1.00
-    },
-    {
-      "team": "Washington Nationals",
-      "event_slug": "mlb-world-series-champion-2026",
-      "market_slug": "mlb-world-series-champion-2026-washington-nationals",
-      "is_underdog": true,
-      "slug_verified": false,
-      "max_deployment_usd": 1.00
-    },
-    {
-      "team": "Miami Marlins",
-      "event_slug": "mlb-world-series-champion-2026",
-      "market_slug": "mlb-world-series-champion-2026-miami-marlins",
-      "is_underdog": true,
-      "slug_verified": false,
-      "max_deployment_usd": 1.00
-    },
-    {
-      "team": "Oakland Athletics",
-      "event_slug": "mlb-world-series-champion-2026",
-      "market_slug": "mlb-world-series-champion-2026-athletics",
-      "is_underdog": true,
-      "slug_verified": false,
-      "max_deployment_usd": 1.00
-    },
-    {
-      "team": "Tampa Bay Rays",
-      "event_slug": "mlb-world-series-champion-2026",
-      "market_slug": "mlb-world-series-champion-2026-tampa-bay-rays",
-      "is_underdog": true,
-      "slug_verified": false,
-      "max_deployment_usd": 1.00
-    },
-    {
-      "team": "Arizona Diamondbacks",
-      "event_slug": "mlb-world-series-champion-2026",
-      "market_slug": "mlb-world-series-champion-2026-arizona-diamondbacks",
-      "is_underdog": true,
-      "slug_verified": false,
-      "max_deployment_usd": 1.00
-    },
-    {
-      "team": "Chicago White Sox",
-      "event_slug": "mlb-world-series-champion-2026",
-      "market_slug": "mlb-world-series-champion-2026-chicago-white-sox",
-      "is_underdog": true,
-      "slug_verified": false,
-      "max_deployment_usd": 1.00
-    },
-    {
-      "team": "Minnesota Twins",
-      "event_slug": "mlb-world-series-champion-2026",
-      "market_slug": "mlb-world-series-champion-2026-minnesota-twins",
-      "is_underdog": true,
-      "slug_verified": false,
-      "max_deployment_usd": 1.00
-    },
-    {
-      "team": "Toronto Blue Jays",
-      "event_slug": "mlb-world-series-champion-2026",
-      "market_slug": "mlb-world-series-champion-2026-toronto-blue-jays",
-      "is_underdog": true,
-      "slug_verified": false,
-      "max_deployment_usd": 1.00
-    },
-    {
-      "team": "Detroit Tigers",
-      "event_slug": "mlb-world-series-champion-2026",
-      "market_slug": "mlb-world-series-champion-2026-detroit-tigers",
-      "is_underdog": true,
-      "slug_verified": false,
+      "slug_verified": true,
       "max_deployment_usd": 1.00
     },
     {
       "team": "San Francisco Giants",
-      "event_slug": "mlb-world-series-champion-2026",
-      "market_slug": "mlb-world-series-champion-2026-san-francisco-giants",
-      "is_underdog": false,
-      "slug_verified": false,
+      "event_slug": "mlb-champ-2026-09-27",
+      "market_slug": "tec-mlb-champ-2026-09-27-sf",
+      "is_underdog": true,
+      "slug_verified": true,
+      "max_deployment_usd": 1.00
+    },
+    {
+      "team": "Kansas City Royals",
+      "event_slug": "mlb-champ-2026-09-27",
+      "market_slug": "tec-mlb-champ-2026-09-27-kc",
+      "is_underdog": true,
+      "slug_verified": true,
+      "max_deployment_usd": 1.00
+    },
+    {
+      "team": "Cincinnati Reds",
+      "event_slug": "mlb-champ-2026-09-27",
+      "market_slug": "tec-mlb-champ-2026-09-27-cin",
+      "is_underdog": true,
+      "slug_verified": true,
+      "max_deployment_usd": 1.00
+    },
+    {
+      "team": "Miami Marlins",
+      "event_slug": "mlb-champ-2026-09-27",
+      "market_slug": "tec-mlb-champ-2026-09-27-mia",
+      "is_underdog": true,
+      "slug_verified": true,
+      "max_deployment_usd": 1.00
+    },
+    {
+      "team": "Los Angeles Angels",
+      "event_slug": "mlb-champ-2026-09-27",
+      "market_slug": "tec-mlb-champ-2026-09-27-laa",
+      "is_underdog": true,
+      "slug_verified": true,
       "max_deployment_usd": 1.00
     },
     {
       "team": "Boston Red Sox",
-      "event_slug": "mlb-world-series-champion-2026",
-      "market_slug": "mlb-world-series-champion-2026-boston-red-sox",
-      "is_underdog": false,
-      "slug_verified": false,
+      "event_slug": "mlb-champ-2026-09-27",
+      "market_slug": "tec-mlb-champ-2026-09-27-bos",
+      "is_underdog": true,
+      "slug_verified": true,
       "max_deployment_usd": 1.00
     },
     {
-      "team": "Baltimore Orioles",
-      "event_slug": "mlb-world-series-champion-2026",
-      "market_slug": "mlb-world-series-champion-2026-baltimore-orioles",
-      "is_underdog": false,
-      "slug_verified": false,
+      "team": "Washington Nationals",
+      "event_slug": "mlb-champ-2026-09-27",
+      "market_slug": "tec-mlb-champ-2026-09-27-wsh",
+      "is_underdog": true,
+      "slug_verified": true,
       "max_deployment_usd": 1.00
     },
     {
-      "team": "Seattle Mariners",
-      "event_slug": "mlb-world-series-champion-2026",
-      "market_slug": "mlb-world-series-champion-2026-seattle-mariners",
-      "is_underdog": false,
-      "slug_verified": false,
+      "team": "Minnesota Twins",
+      "event_slug": "mlb-champ-2026-09-27",
+      "market_slug": "tec-mlb-champ-2026-09-27-min",
+      "is_underdog": true,
+      "slug_verified": true,
+      "max_deployment_usd": 1.00
+    },
+    {
+      "team": "New York Mets",
+      "event_slug": "mlb-champ-2026-09-27",
+      "market_slug": "tec-mlb-champ-2026-09-27-nym",
+      "is_underdog": true,
+      "slug_verified": true,
       "max_deployment_usd": 1.00
     },
     {
       "team": "St. Louis Cardinals",
-      "event_slug": "mlb-world-series-champion-2026",
-      "market_slug": "mlb-world-series-champion-2026-st-louis-cardinals",
+      "event_slug": "mlb-champ-2026-09-27",
+      "market_slug": "tec-mlb-champ-2026-09-27-stl",
+      "is_underdog": true,
+      "slug_verified": true,
+      "max_deployment_usd": 1.00
+    },
+    {
+      "team": "Baltimore Orioles",
+      "event_slug": "mlb-champ-2026-09-27",
+      "market_slug": "tec-mlb-champ-2026-09-27-bal",
+      "is_underdog": true,
+      "slug_verified": true,
+      "max_deployment_usd": 1.00
+    },
+    {
+      "team": "San Diego Padres",
+      "event_slug": "mlb-champ-2026-09-27",
+      "market_slug": "tec-mlb-champ-2026-09-27-sd",
+      "is_underdog": true,
+      "slug_verified": true,
+      "max_deployment_usd": 1.00
+    },
+    {
+      "team": "Detroit Tigers",
+      "event_slug": "mlb-champ-2026-09-27",
+      "market_slug": "tec-mlb-champ-2026-09-27-det",
+      "is_underdog": true,
+      "slug_verified": true,
+      "max_deployment_usd": 1.00
+    },
+    {
+      "team": "Pittsburgh Pirates",
+      "event_slug": "mlb-champ-2026-09-27",
+      "market_slug": "tec-mlb-champ-2026-09-27-pit",
+      "is_underdog": true,
+      "slug_verified": true,
+      "max_deployment_usd": 1.00
+    },
+    {
+      "team": "Athletics",
+      "event_slug": "mlb-champ-2026-09-27",
+      "market_slug": "tec-mlb-champ-2026-09-27-ath",
+      "is_underdog": true,
+      "slug_verified": true,
+      "max_deployment_usd": 1.00
+    },
+    {
+      "team": "Arizona Diamondbacks",
+      "event_slug": "mlb-champ-2026-09-27",
+      "market_slug": "tec-mlb-champ-2026-09-27-az",
+      "is_underdog": true,
+      "slug_verified": true,
+      "max_deployment_usd": 1.00
+    },
+    {
+      "team": "Toronto Blue Jays",
+      "event_slug": "mlb-champ-2026-09-27",
+      "market_slug": "tec-mlb-champ-2026-09-27-tor",
+      "is_underdog": true,
+      "slug_verified": true,
+      "max_deployment_usd": 1.00
+    },
+    {
+      "team": "Seattle Mariners",
+      "event_slug": "mlb-champ-2026-09-27",
+      "market_slug": "tec-mlb-champ-2026-09-27-sea",
+      "is_underdog": true,
+      "slug_verified": true,
+      "max_deployment_usd": 1.00
+    },
+    {
+      "team": "Chicago White Sox",
+      "event_slug": "mlb-champ-2026-09-27",
+      "market_slug": "tec-mlb-champ-2026-09-27-cws",
+      "is_underdog": true,
+      "slug_verified": true,
+      "max_deployment_usd": 1.00
+    },
+    {
+      "team": "Texas Rangers",
+      "event_slug": "mlb-champ-2026-09-27",
+      "market_slug": "tec-mlb-champ-2026-09-27-tex",
+      "is_underdog": true,
+      "slug_verified": true,
+      "max_deployment_usd": 1.00
+    },
+    {
+      "team": "Tampa Bay Rays",
+      "event_slug": "mlb-champ-2026-09-27",
+      "market_slug": "tec-mlb-champ-2026-09-27-tb",
+      "is_underdog": true,
+      "slug_verified": true,
+      "max_deployment_usd": 1.00
+    },
+    {
+      "team": "Chicago Cubs",
+      "event_slug": "mlb-champ-2026-09-27",
+      "market_slug": "tec-mlb-champ-2026-09-27-chc",
+      "is_underdog": true,
+      "slug_verified": true,
+      "max_deployment_usd": 1.00
+    },
+    {
+      "team": "Cleveland Guardians",
+      "event_slug": "mlb-champ-2026-09-27",
+      "market_slug": "tec-mlb-champ-2026-09-27-cle",
+      "is_underdog": true,
+      "slug_verified": true,
+      "max_deployment_usd": 1.00
+    },
+    {
+      "team": "Houston Astros",
+      "event_slug": "mlb-champ-2026-09-27",
+      "market_slug": "tec-mlb-champ-2026-09-27-hou",
+      "is_underdog": true,
+      "slug_verified": true,
+      "max_deployment_usd": 1.00
+    },
+    {
+      "team": "Milwaukee Brewers",
+      "event_slug": "mlb-champ-2026-09-27",
+      "market_slug": "tec-mlb-champ-2026-09-27-mil",
       "is_underdog": false,
-      "slug_verified": false,
+      "slug_verified": true,
       "max_deployment_usd": 1.00
     },
     {
       "team": "Philadelphia Phillies",
-      "event_slug": "mlb-world-series-champion-2026",
-      "market_slug": "mlb-world-series-champion-2026-philadelphia-phillies",
+      "event_slug": "mlb-champ-2026-09-27",
+      "market_slug": "tec-mlb-champ-2026-09-27-phi",
       "is_underdog": false,
-      "slug_verified": false,
+      "slug_verified": true,
+      "max_deployment_usd": 1.00
+    },
+    {
+      "team": "Atlanta Braves",
+      "event_slug": "mlb-champ-2026-09-27",
+      "market_slug": "tec-mlb-champ-2026-09-27-atl",
+      "is_underdog": false,
+      "slug_verified": true,
+      "max_deployment_usd": 1.00
+    },
+    {
+      "team": "New York Yankees",
+      "event_slug": "mlb-champ-2026-09-27",
+      "market_slug": "tec-mlb-champ-2026-09-27-nyy",
+      "is_underdog": false,
+      "slug_verified": true,
+      "max_deployment_usd": 1.00
+    },
+    {
+      "team": "Los Angeles Dodgers",
+      "event_slug": "mlb-champ-2026-09-27",
+      "market_slug": "tec-mlb-champ-2026-09-27-lad",
+      "is_underdog": false,
+      "slug_verified": true,
       "max_deployment_usd": 1.00
     }
   ]
