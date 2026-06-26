@@ -1,11 +1,13 @@
 {
   "_description": "MLB World Series 2026 — Underdog futures markets. Single source of truth for the bot.",
   "_instructions": [
-    "Run 'python test_bot.py' to discover your actual position slugs from the Polymarket API.",
-    "market_slug must match the exact slug used by the Polymarket US API.",
-    "is_underdog: true marks markets the bot will open positions in at startup.",
-    "max_deployment_usd: per-market capital allocation for the initial entry.",
-    "Set is_underdog: false to monitor without auto-entry."
+    "IMPORTANT: Run 'python test_bot.py' first — step [5] prints the EXACT slugs from the API.",
+    "Copy those slugs into market_slug below. Values here are guesses until verified.",
+    "market_slug must match exactly what the Polymarket US API returns.",
+    "is_underdog: true  → bot opens a position at startup if not already held.",
+    "is_underdog: false → bot monitors but does NOT auto-enter.",
+    "max_deployment_usd: per-market capital for the initial entry order.",
+    "slug_verified: true once you confirm the slug matches test_bot.py step [5] output."
   ],
   "settings": {
     "initial_deployment_usd": 1.00,
@@ -16,72 +18,160 @@
       "team": "Chicago Cubs",
       "event_slug": "mlb-world-series-champion-2026",
       "market_slug": "mlb-world-series-champion-2026-chicago-cubs",
-      "url": "https://polymarket.com/event/mlb-world-series-champion-2026",
       "is_underdog": true,
+      "slug_verified": false,
       "max_deployment_usd": 1.00
     },
     {
       "team": "Cincinnati Reds",
       "event_slug": "mlb-world-series-champion-2026",
       "market_slug": "mlb-world-series-champion-2026-cincinnati-reds",
-      "url": "https://polymarket.com/event/mlb-world-series-champion-2026",
       "is_underdog": true,
+      "slug_verified": false,
       "max_deployment_usd": 1.00
     },
     {
       "team": "Colorado Rockies",
       "event_slug": "mlb-world-series-champion-2026",
       "market_slug": "mlb-world-series-champion-2026-colorado-rockies",
-      "url": "https://polymarket.com/event/mlb-world-series-champion-2026",
       "is_underdog": true,
+      "slug_verified": false,
       "max_deployment_usd": 1.00
     },
     {
       "team": "Pittsburgh Pirates",
       "event_slug": "mlb-world-series-champion-2026",
       "market_slug": "mlb-world-series-champion-2026-pittsburgh-pirates",
-      "url": "https://polymarket.com/event/mlb-world-series-champion-2026",
       "is_underdog": true,
+      "slug_verified": false,
       "max_deployment_usd": 1.00
     },
     {
       "team": "Kansas City Royals",
       "event_slug": "mlb-world-series-champion-2026",
       "market_slug": "mlb-world-series-champion-2026-kansas-city-royals",
-      "url": "https://polymarket.com/event/mlb-world-series-champion-2026",
       "is_underdog": true,
+      "slug_verified": false,
       "max_deployment_usd": 1.00
     },
     {
       "team": "Washington Nationals",
       "event_slug": "mlb-world-series-champion-2026",
       "market_slug": "mlb-world-series-champion-2026-washington-nationals",
-      "url": "https://polymarket.com/event/mlb-world-series-champion-2026",
       "is_underdog": true,
+      "slug_verified": false,
       "max_deployment_usd": 1.00
     },
     {
       "team": "Miami Marlins",
       "event_slug": "mlb-world-series-champion-2026",
       "market_slug": "mlb-world-series-champion-2026-miami-marlins",
-      "url": "https://polymarket.com/event/mlb-world-series-champion-2026",
       "is_underdog": true,
+      "slug_verified": false,
       "max_deployment_usd": 1.00
     },
     {
       "team": "Oakland Athletics",
       "event_slug": "mlb-world-series-champion-2026",
       "market_slug": "mlb-world-series-champion-2026-athletics",
-      "url": "https://polymarket.com/event/mlb-world-series-champion-2026",
       "is_underdog": true,
+      "slug_verified": false,
       "max_deployment_usd": 1.00
     },
     {
       "team": "Tampa Bay Rays",
       "event_slug": "mlb-world-series-champion-2026",
       "market_slug": "mlb-world-series-champion-2026-tampa-bay-rays",
-      "url": "https://polymarket.com/event/mlb-world-series-champion-2026",
       "is_underdog": true,
+      "slug_verified": false,
+      "max_deployment_usd": 1.00
+    },
+    {
+      "team": "Arizona Diamondbacks",
+      "event_slug": "mlb-world-series-champion-2026",
+      "market_slug": "mlb-world-series-champion-2026-arizona-diamondbacks",
+      "is_underdog": true,
+      "slug_verified": false,
+      "max_deployment_usd": 1.00
+    },
+    {
+      "team": "Chicago White Sox",
+      "event_slug": "mlb-world-series-champion-2026",
+      "market_slug": "mlb-world-series-champion-2026-chicago-white-sox",
+      "is_underdog": true,
+      "slug_verified": false,
+      "max_deployment_usd": 1.00
+    },
+    {
+      "team": "Minnesota Twins",
+      "event_slug": "mlb-world-series-champion-2026",
+      "market_slug": "mlb-world-series-champion-2026-minnesota-twins",
+      "is_underdog": true,
+      "slug_verified": false,
+      "max_deployment_usd": 1.00
+    },
+    {
+      "team": "Toronto Blue Jays",
+      "event_slug": "mlb-world-series-champion-2026",
+      "market_slug": "mlb-world-series-champion-2026-toronto-blue-jays",
+      "is_underdog": true,
+      "slug_verified": false,
+      "max_deployment_usd": 1.00
+    },
+    {
+      "team": "Detroit Tigers",
+      "event_slug": "mlb-world-series-champion-2026",
+      "market_slug": "mlb-world-series-champion-2026-detroit-tigers",
+      "is_underdog": true,
+      "slug_verified": false,
+      "max_deployment_usd": 1.00
+    },
+    {
+      "team": "San Francisco Giants",
+      "event_slug": "mlb-world-series-champion-2026",
+      "market_slug": "mlb-world-series-champion-2026-san-francisco-giants",
+      "is_underdog": false,
+      "slug_verified": false,
+      "max_deployment_usd": 1.00
+    },
+    {
+      "team": "Boston Red Sox",
+      "event_slug": "mlb-world-series-champion-2026",
+      "market_slug": "mlb-world-series-champion-2026-boston-red-sox",
+      "is_underdog": false,
+      "slug_verified": false,
+      "max_deployment_usd": 1.00
+    },
+    {
+      "team": "Baltimore Orioles",
+      "event_slug": "mlb-world-series-champion-2026",
+      "market_slug": "mlb-world-series-champion-2026-baltimore-orioles",
+      "is_underdog": false,
+      "slug_verified": false,
+      "max_deployment_usd": 1.00
+    },
+    {
+      "team": "Seattle Mariners",
+      "event_slug": "mlb-world-series-champion-2026",
+      "market_slug": "mlb-world-series-champion-2026-seattle-mariners",
+      "is_underdog": false,
+      "slug_verified": false,
+      "max_deployment_usd": 1.00
+    },
+    {
+      "team": "St. Louis Cardinals",
+      "event_slug": "mlb-world-series-champion-2026",
+      "market_slug": "mlb-world-series-champion-2026-st-louis-cardinals",
+      "is_underdog": false,
+      "slug_verified": false,
+      "max_deployment_usd": 1.00
+    },
+    {
+      "team": "Philadelphia Phillies",
+      "event_slug": "mlb-world-series-champion-2026",
+      "market_slug": "mlb-world-series-champion-2026-philadelphia-phillies",
+      "is_underdog": false,
+      "slug_verified": false,
       "max_deployment_usd": 1.00
     }
   ]
