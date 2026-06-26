@@ -1,41 +1,52 @@
 """
-Polymarket US Futures — automated scalping bot.
+Polymarket US Futures — async WebSocket-driven trading bot.
 
-Runs as a continuous loop (every 15 min) for up to 5h 45m, then
-self-triggers the next GitHub Actions workflow run so the chain never
-breaks. Telegram notifications are fully optional.
+Architecture:
+  markets WS  → market_data_lite drives take-profit / buyback checks
+  markets WS  → trade events build per-slug price history (std dev)
+  private WS  → position / balance snapshots keep local state current
+
+Sync WS callbacks update shared dicts (GIL-safe); the async main loop
+reads those dicts every 200 ms and fires REST calls when thresholds are hit.
 """
 
+import asyncio
+import json
 import math
 import os
 import sys
 import time
-import json
+from collections import deque
 from datetime import datetime, date
 import zoneinfo
 import requests
-from polymarket_us import PolymarketUS, APIError
+from polymarket_us import AsyncPolymarketUS, APIError
 
 # ==============================================================
-# CONFIGURATION  — change these to tune strategy behaviour
+# CONFIGURATION
 # ==============================================================
-TAKE_PROFIT_MULTIPLIER  = 2.0   # close when bid >= N × avg_entry
-BUYBACK_AMOUNT_USD      = 1.00  # USD allocated per re-entry order
-BUYBACK_STD_DEVS        = 1     # std-dev window for buyback trigger
-BUYBACK_STD_DEV_PCT     = 0.10  # one std dev = this % of avg_entry
-LOOP_INTERVAL_SECONDS   = 900   # 15 minutes between health checks
-RUNTIME_LIMIT_SECONDS   = 20700 # 5 h 45 min — exit before 6 h GH limit
+TAKE_PROFIT_MULTIPLIER = 3.0    # close when bid >= N × avg_entry
+BUYBACK_AMOUNT_USD     = 1.00   # USD per re-entry (fallback when qty unknown)
+BUYBACK_STD_DEVS       = 1      # std-dev multiplier for buyback zone
+BUYBACK_STD_DEV_PCT    = 0.10   # one std dev = this fraction of avg_entry
+PRICE_HISTORY_WINDOW   = 30     # rolling trade count for std dev
+RUNTIME_LIMIT_SECONDS  = 20700  # 5 h 45 min — exits before 6 h GH runner limit
+STATUS_LOG_INTERVAL_S  = 900    # log status every 15 min
+STATE_SAVE_INTERVAL_S  = 60     # persist state every 60 s
+TICK_INTERVAL_S        = 0.2    # main-loop tick (200 ms)
 # ==============================================================
 
+MARKETS_FILE     = "markets.json"
 STATE_FILE       = "state.json"
 TELEGRAM_CHAT_ID = "@moneyballpredictions"
 EST              = zoneinfo.ZoneInfo("America/New_York")
 
-EMPTY_STATE = {
-    "pending_buybacks":   [],
-    "balance_snapshots":  {},
-    "today_closed":       [],
-    "daily_report_sent":  "",
+EMPTY_STATE: dict = {
+    "positions":         {},
+    "pending_buybacks":  [],
+    "balance_snapshots": {},
+    "today_closed":      [],
+    "daily_report_sent": "",
 }
 
 
@@ -49,15 +60,10 @@ def log(msg: str) -> None:
 
 
 # ------------------------------------------------------------------
-# Optional Telegram Notifier
+# Optional Telegram
 # ------------------------------------------------------------------
 
 class Notifier:
-    """
-    Wraps Telegram messaging. Silently no-ops when credentials are absent.
-    Enabled automatically when TELEGRAM_KEY env-var is present.
-    """
-
     def __init__(self, token: str | None, chat_id: str) -> None:
         self.token   = token
         self.chat_id = chat_id
@@ -68,13 +74,13 @@ class Notifier:
             return
         url = f"https://api.telegram.org/bot{self.token}/sendMessage"
         try:
-            resp = requests.post(
+            r = requests.post(
                 url,
                 json={"chat_id": self.chat_id, "text": text, "parse_mode": "Markdown"},
                 timeout=10,
             )
-            resp.raise_for_status()
-            log(f"INFO  Telegram sent (msg_id={resp.json()['result']['message_id']})")
+            r.raise_for_status()
+            log(f"INFO  Telegram sent (msg_id={r.json()['result']['message_id']})")
         except Exception as exc:
             log(f"WARN  Telegram send failed (non-fatal): {exc}")
 
@@ -88,7 +94,6 @@ def load_state() -> dict:
         try:
             with open(STATE_FILE) as fh:
                 data = json.load(fh)
-            # Back-fill any missing keys from older state files
             for k, v in EMPTY_STATE.items():
                 data.setdefault(k, type(v)())
             log("INFO  State loaded from disk.")
@@ -100,530 +105,553 @@ def load_state() -> dict:
 
 def save_state(state: dict) -> None:
     with open(STATE_FILE, "w") as fh:
-        json.dump(state, fh, indent=4)
-    log("INFO  State persisted to disk.")
+        json.dump(state, fh, indent=2)
 
 
-# ------------------------------------------------------------------
-# Polymarket API helpers
-# ------------------------------------------------------------------
-
-def fetch_balance(client: PolymarketUS) -> dict:
-    """Return first UserBalance dict or {} on failure."""
+def load_markets() -> tuple[list, dict]:
+    """Return (markets_list, settings_dict) from markets.json."""
     try:
-        resp     = client.account.balances()
-        balances = resp.get("balances", []) if isinstance(resp, dict) else []
-        if not balances:
-            log("WARN  account.balances() returned empty list.")
-            return {}
-        b = balances[0]
-        log(
-            f"INFO  Balance — cash=${b.get('currentBalance', 0):.2f}  "
-            f"buyingPower=${b.get('buyingPower', 0):.2f}  "
-            f"notional=${b.get('assetNotional', 0):.2f}  "
-            f"openOrders=${b.get('openOrders', 0):.2f}"
-        )
-        return b
-    except APIError as exc:
-        log(f"ERROR fetch_balance API error {exc.status_code}: {exc.message}")
-        return {}
+        with open(MARKETS_FILE) as fh:
+            data = json.load(fh)
+        markets  = data.get("mlb_world_series", [])
+        settings = data.get("settings", {})
+        log(f"INFO  Loaded {len(markets)} market(s) from {MARKETS_FILE}.")
+        return markets, settings
     except Exception as exc:
-        log(f"ERROR fetch_balance unexpected: {exc}")
-        return {}
-
-
-def fetch_bbo(client: PolymarketUS, slug: str) -> tuple[float | None, float | None]:
-    """Return (best_bid, best_ask) floats or (None, None) on failure."""
-    try:
-        bbo = client.markets.bbo(slug)
-        if not isinstance(bbo, dict):
-            log(f"WARN  BBO for {slug} — unexpected type {type(bbo)}")
-            return None, None
-        bid = float((bbo.get("bestBid") or {}).get("value", 0) or 0)
-        ask = float((bbo.get("bestAsk") or {}).get("value", 0) or 0)
-        log(
-            f"INFO  BBO {slug} — "
-            f"bid=${bid:.4f} (depth={bbo.get('bidDepth', '?')})  "
-            f"ask=${ask:.4f} (depth={bbo.get('askDepth', '?')})  "
-            f"lastTrade=${float((bbo.get('lastTradePx') or {}).get('value', 0) or 0):.4f}"
-        )
-        return bid, ask
-    except APIError as exc:
-        log(f"ERROR BBO {slug} API error {exc.status_code}: {exc.message}")
-        return None, None
-    except Exception as exc:
-        log(f"ERROR BBO {slug} unexpected: {exc}")
-        return None, None
+        log(f"WARN  Could not load {MARKETS_FILE}: {exc}. Using empty market list.")
+        return [], {}
 
 
 # ------------------------------------------------------------------
-# Balance snapshotting (daily, for 10 AM report)
-# ------------------------------------------------------------------
-
-def snapshot_balance_today(state: dict, balance: dict) -> None:
-    today = date.today().isoformat()
-    snaps = state.setdefault("balance_snapshots", {})
-    if balance and today not in snaps:
-        snaps[today] = {
-            "currentBalance": balance.get("currentBalance", 0),
-            "buyingPower":    balance.get("buyingPower",    0),
-            "assetNotional":  balance.get("assetNotional",  0),
-        }
-        log(f"INFO  Balance snapshot saved for {today}.")
-    # Rolling 7-day window
-    while len(snaps) > 7:
-        del snaps[sorted(snaps)[0]]
-
-
-# ------------------------------------------------------------------
-# Daily 10 AM report
-# ------------------------------------------------------------------
-
-def send_daily_report(notifier: Notifier, state: dict) -> None:
-    today = date.today().isoformat()
-    if state.get("daily_report_sent") == today:
-        log("INFO  Daily report already sent today — skipping.")
-        return
-
-    snaps      = state.get("balance_snapshots", {})
-    days       = sorted(snaps)
-    today_snap = snaps.get(today, {})
-    yest_snap  = snaps.get(days[-2], {}) if len(days) >= 2 and days[-1] == today else {}
-
-    today_bal = today_snap.get("currentBalance", 0)
-    yest_bal  = yest_snap.get("currentBalance",  0)
-    delta     = today_bal - yest_bal
-    delta_pct = (delta / yest_bal * 100) if yest_bal else 0
-    arrow     = "📈" if delta >= 0 else "📉"
-
-    closed       = state.get("today_closed", [])
-    total_profit = sum(p.get("profit", 0) for p in closed)
-
-    lines = [f"🌅 *Polymarket Daily Report — {today}*\n",
-             "💰 *Balance*",
-             f"  Yesterday: `${yest_bal:.2f}`" if yest_bal else "  Yesterday: _no snapshot_",
-             f"  Today:     `${today_bal:.2f}`",
-             f"  Change:    {arrow} `${delta:+.2f}` ({delta_pct:+.1f}%)\n"]
-
-    if closed:
-        lines.append(f"✅ *Closed Positions ({len(closed)} trades | total P&L: `${total_profit:+.2f}`)*")
-        for p in closed:
-            e = "🟢" if p.get("profit", 0) >= 0 else "🔴"
-            lines.append(
-                f"{e} `{p.get('slug', '?')}` — {p.get('outcome', '')}\n"
-                f"   Qty {p.get('qty')} | Entry `${p.get('avg_price', 0):.4f}` "
-                f"→ Exit `${p.get('exit_price', 0):.4f}` | P&L `${p.get('profit', 0):+.2f}`"
-            )
-    else:
-        lines.append("_No positions closed today._")
-
-    if notifier.enabled:
-        notifier.send("\n".join(lines))
-    else:
-        log("INFO  Daily report (Telegram disabled — printing to log only):")
-        for line in lines:
-            log(f"       {line}")
-
-    state["daily_report_sent"] = today
-    state["today_closed"]      = []
-    log("INFO  Daily report complete; today_closed list reset.")
-
-
-# ------------------------------------------------------------------
-# Health check (every loop iteration)
-# ------------------------------------------------------------------
-
-def run_health_check(
-    client:    PolymarketUS,
-    notifier:  Notifier,
-    state:     dict,
-    elapsed_s: float,
-    loop_num:  int,
-) -> None:
-    remaining_min = (RUNTIME_LIMIT_SECONDS - elapsed_s) / 60
-    log("")
-    log("=" * 64)
-    log(f"HEALTH CHECK #{loop_num}  |  elapsed={elapsed_s/60:.1f} min  |  remaining={remaining_min:.1f} min")
-    log(f"  Telegram notifications : {'ENABLED' if notifier.enabled else 'DISABLED (TELEGRAM_KEY not set)'}")
-    log(f"  Take-profit threshold  : {TAKE_PROFIT_MULTIPLIER}× avg entry")
-    log(f"  Buyback window         : avg_entry ± {BUYBACK_STD_DEVS} std dev  ({BUYBACK_STD_DEV_PCT*100:.0f}% per std dev)")
-    log(f"  Buyback amount         : ${BUYBACK_AMOUNT_USD:.2f} USD per re-entry")
-    pending = [b for b in state.get("pending_buybacks", []) if not b.get("processed")]
-    log(f"  Pending buybacks       : {len(pending)}")
-    log(f"  Today closed           : {len(state.get('today_closed', []))} position(s)")
-    log(f"  Runtime rollover at    : 5 h 45 min")
-
-    # Verify API reachability
-    try:
-        client.account.balances()
-        log("  API connectivity       : OK")
-    except Exception as exc:
-        log(f"  API connectivity       : WARN — {exc}")
-
-    log("=" * 64)
-    log("")
-
-
-# ------------------------------------------------------------------
-# Position evaluation (take-profit)
-# ------------------------------------------------------------------
-
-def evaluate_positions(
-    client:   PolymarketUS,
-    notifier: Notifier,
-    state:    dict,
-) -> None:
-    log("INFO  Fetching portfolio positions...")
-    try:
-        pos_resp = client.portfolio.positions()
-    except APIError as exc:
-        log(f"ERROR portfolio.positions() {exc.status_code}: {exc.message}")
-        return
-    except Exception as exc:
-        log(f"ERROR portfolio.positions(): {exc}")
-        return
-
-    positions = pos_resp.get("positions", {}) if isinstance(pos_resp, dict) else {}
-    log(f"INFO  Total open positions found: {len(positions)}")
-
-    mlb_seen = 0
-    for token_id, pos in positions.items():
-        meta       = pos.get("marketMetadata", {}) or {}
-        m_slug     = meta.get("slug",      "") or ""
-        event_slug = meta.get("eventSlug", "") or ""
-        outcome    = meta.get("outcome",   "") or m_slug
-        title      = meta.get("title",     "") or m_slug
-
-        combined = (event_slug + " " + m_slug).lower()
-        if not any(kw in combined for kw in ["mlb", "world-series"]):
-            log(f"SKIP  token={token_id[:12]}… not an MLB market — skipping.")
-            continue
-
-        mlb_seen += 1
-        qty = float(pos.get("netPosition", "0") or "0")
-        if qty == 0:
-            log(f"SKIP  {title} ({outcome}) — zero net position.")
-            continue
-
-        cost_val  = float((pos.get("cost",      {}) or {}).get("value", "0") or "0")
-        avg_price = cost_val / qty if qty != 0 else 0
-
-        log(f"INFO  Evaluating [{title}] outcome='{outcome}'  qty={qty}  avg_entry=${avg_price:.4f}  token={token_id[:12]}…")
-
-        bid, ask = fetch_bbo(client, m_slug)
-        if bid is None:
-            log(f"WARN  {m_slug} — BBO unavailable, cannot evaluate this cycle.")
-            continue
-
-        threshold = avg_price * TAKE_PROFIT_MULTIPLIER
-        decision  = "TRIGGER ✓" if bid >= threshold else f"hold (need ${threshold:.4f})"
-        log(
-            f"INFO  Take-profit check: bid=${bid:.4f}  threshold=${threshold:.4f} "
-            f"({TAKE_PROFIT_MULTIPLIER}× ${avg_price:.4f}) → {decision}"
-        )
-
-        if avg_price <= 0 or bid < threshold:
-            continue
-
-        # ---- Close entire position ----
-        intent       = "ORDER_INTENT_SELL_LONG" if qty > 0 else "ORDER_INTENT_SELL_SHORT"
-        qty_to_close = abs(int(qty))
-        fractional   = abs(qty) - qty_to_close
-        if fractional > 0:
-            log(f"WARN  {m_slug} — fractional qty {fractional:.4f} cannot be closed; closing {qty_to_close} integer shares.")
-        profit = (bid - avg_price) * qty_to_close
-
-        log(f"INFO  TAKE PROFIT: sell {qty_to_close}x {m_slug} @ bid=${bid:.4f}  est_profit=${profit:.2f}")
-
-        try:
-            order    = client.orders.create({
-                "marketSlug": m_slug,
-                "intent":     intent,
-                "type":       "ORDER_TYPE_LIMIT",
-                "price":      {"value": f"{bid:.4f}", "currency": "USD"},
-                "quantity":   qty_to_close,
-                "tif":        "TIME_IN_FORCE_GOOD_TILL_CANCEL",
-            })
-            order_id = (order.get("id", "?") if isinstance(order, dict) else "?")
-            log(f"INFO  Order placed: id={order_id}  sell {qty_to_close}x {m_slug} @ ${bid:.4f}")
-
-            state.setdefault("today_closed", []).append({
-                "slug":       m_slug,
-                "outcome":    outcome,
-                "qty":        qty_to_close,
-                "avg_price":  round(avg_price, 4),
-                "exit_price": round(bid, 4),
-                "profit":     round(profit, 2),
-                "time":       datetime.now(EST).isoformat(),
-            })
-
-            state.setdefault("pending_buybacks", []).append({
-                "market_slug":     m_slug,
-                "intent":          "ORDER_INTENT_BUY_LONG" if qty > 0 else "ORDER_INTENT_BUY_SHORT",
-                "avg_entry_price": round(avg_price, 6),
-                "qty_sold":        qty_to_close,
-                "sell_price":      round(bid, 6),
-                "sell_time":       datetime.now(EST).isoformat(),
-                "processed":       False,
-            })
-
-            notifier.send(
-                f"🚨 *Take-Profit Executed!*\n\n"
-                f"• *Market:* `{m_slug}`\n"
-                f"• *Outcome:* {outcome}\n"
-                f"• *Qty Closed:* {qty_to_close} (100% of position)\n"
-                f"• *Entry:* `${avg_price:.4f}` → *Exit:* `${bid:.4f}` ({TAKE_PROFIT_MULTIPLIER}× trigger)\n"
-                f"• *Estimated Profit:* `${profit:+.2f} USD`\n"
-                f"• *Order ID:* `{order_id}`"
-            )
-
-        except APIError as exc:
-            log(f"ERROR Order placement {m_slug} — {exc.status_code}: {exc.message}")
-        except Exception as exc:
-            log(f"ERROR Order placement {m_slug}: {exc}")
-
-    log(f"INFO  Position scan complete — {mlb_seen} MLB position(s) evaluated.")
-
-
-# ------------------------------------------------------------------
-# Buyback logic (price-based, replaces time-based 5 AM approach)
-# ------------------------------------------------------------------
-
-def _buyback_zone(avg_entry: float) -> tuple[float, float]:
-    """
-    Return (lower, upper) price bounds for the buyback trigger.
-    Zone = avg_entry ± BUYBACK_STD_DEVS × (avg_entry × BUYBACK_STD_DEV_PCT)
-    """
-    std_dev = avg_entry * BUYBACK_STD_DEV_PCT
-    half    = BUYBACK_STD_DEVS * std_dev
-    return round(avg_entry - half, 6), round(avg_entry + half, 6)
-
-
-def process_buybacks(
-    client:   PolymarketUS,
-    notifier: Notifier,
-    state:    dict,
-) -> None:
-    """
-    Re-enter queued positions when the market price returns within
-    BUYBACK_STD_DEVS standard deviations of the original average entry price.
-    Runs on every health-check cycle (no time-window restriction).
-    """
-    pending = [b for b in state.get("pending_buybacks", []) if not b.get("processed")]
-    if not pending:
-        log("INFO  Buyback check — no pending buybacks.")
-        return
-
-    log(f"INFO  Buyback check — evaluating {len(pending)} pending buyback(s).")
-
-    for buyback in pending:
-        m_slug     = buyback.get("market_slug", "")
-        intent     = buyback.get("intent", "ORDER_INTENT_BUY_LONG")
-        avg_entry  = float(buyback.get("avg_entry_price", 0) or 0)
-        qty_sold   = int(buyback.get("qty_sold", 0) or 0)
-
-        if avg_entry <= 0:
-            log(f"WARN  Buyback for {m_slug} — no avg_entry_price recorded (legacy entry). "
-                f"Falling back to ${BUYBACK_AMOUNT_USD:.2f} USD allocation.")
-
-        lower, upper = _buyback_zone(avg_entry) if avg_entry > 0 else (0.0, 9999.0)
-        log(
-            f"INFO  Buyback [{m_slug}] — original_entry=${avg_entry:.4f}  "
-            f"zone=[${lower:.4f}, ${upper:.4f}]  ({BUYBACK_STD_DEVS} std dev)"
-        )
-
-        bid, ask = fetch_bbo(client, m_slug)
-        if bid is None or bid <= 0:
-            log(f"WARN  Buyback {m_slug} — no valid bid; will retry next cycle.")
-            continue
-
-        in_zone = lower <= bid <= upper
-        log(
-            f"INFO  Buyback decision: bid=${bid:.4f} {'IN' if in_zone else 'OUTSIDE'} "
-            f"zone=[${lower:.4f}, ${upper:.4f}] → {'EXECUTE' if in_zone else 'skip (price not back to entry zone)'}"
-        )
-
-        if not in_zone:
-            continue
-
-        # Compute qty: prefer restoring the same number of shares sold; fall back to USD amount
-        if qty_sold > 0 and avg_entry > 0:
-            buy_qty = qty_sold
-            alloc_usd = round(buy_qty * bid, 2)
-            log(f"INFO  Buyback qty={buy_qty} (same as sold) @ bid=${bid:.4f} ≈ ${alloc_usd:.2f} USD")
-        else:
-            buy_qty   = max(1, math.floor(BUYBACK_AMOUNT_USD / bid))
-            alloc_usd = BUYBACK_AMOUNT_USD
-            log(f"INFO  Buyback qty={buy_qty} (${alloc_usd:.2f} allocation) @ bid=${bid:.4f}")
-
-        try:
-            order    = client.orders.create({
-                "marketSlug": m_slug,
-                "intent":     intent,
-                "type":       "ORDER_TYPE_LIMIT",
-                "price":      {"value": f"{bid:.4f}", "currency": "USD"},
-                "quantity":   buy_qty,
-                "tif":        "TIME_IN_FORCE_GOOD_TILL_CANCEL",
-            })
-            order_id = (order.get("id", "?") if isinstance(order, dict) else "?")
-            log(f"INFO  Buyback order placed: id={order_id}  buy {buy_qty}x {m_slug} @ ${bid:.4f}")
-            buyback["processed"] = True
-
-            notifier.send(
-                f"🔄 *Automated Buyback Complete*\n\n"
-                f"• *Market:* `{m_slug}`\n"
-                f"• *Trigger:* price returned within {BUYBACK_STD_DEVS} std dev of original entry `${avg_entry:.4f}`\n"
-                f"• *Qty:* {buy_qty} @ `${bid:.4f}` (~${alloc_usd:.2f} USD)\n"
-                f"• *Order ID:* `{order_id}`"
-            )
-
-        except APIError as exc:
-            log(f"ERROR Buyback order {m_slug} — {exc.status_code}: {exc.message}")
-        except Exception as exc:
-            log(f"ERROR Buyback order {m_slug}: {exc}")
-
-    state["pending_buybacks"] = [b for b in state["pending_buybacks"] if not b.get("processed")]
-    still_pending = len(state["pending_buybacks"])
-    log(f"INFO  Buyback cycle complete — {still_pending} still pending for next cycle.")
-
-
-# ------------------------------------------------------------------
-# Workflow rollover (self-trigger before 6 h runner termination)
+# Workflow rollover (self-trigger before 6 h runner limit)
 # ------------------------------------------------------------------
 
 def trigger_workflow_handoff() -> bool:
-    """
-    Dispatch a new workflow_dispatch run so the chain never breaks.
-    Requires GH_PAT secret (with 'workflow' scope) passed as GH_PAT env var.
-    Falls back gracefully — daily cron at 00:07 UTC provides a safety net.
-    """
     gh_pat = os.environ.get("GH_PAT") or os.environ.get("GH_TOKEN")
     repo   = os.environ.get("GITHUB_REPOSITORY", "tamzid2001/polymarketfuturesbot")
-
     if not gh_pat:
-        log(
-            "WARN  Workflow handoff skipped — GH_PAT secret not set. "
-            "The daily cron at 00:07 UTC will restart the chain automatically."
-        )
+        log("WARN  GH_PAT not set — daily cron at 00:07 UTC is the fallback restart.")
         return False
-
     url     = f"https://api.github.com/repos/{repo}/actions/workflows/polymarket_monitor.yml/dispatches"
     headers = {
         "Authorization":        f"Bearer {gh_pat}",
         "Accept":               "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
     }
-    log(f"INFO  Workflow handoff: triggering next run on repo={repo} ...")
     try:
-        resp = requests.post(url, headers=headers, json={"ref": "main"}, timeout=15)
-        if resp.status_code == 204:
+        r = requests.post(url, headers=headers, json={"ref": "main"}, timeout=15)
+        if r.status_code == 204:
             log("INFO  Workflow handoff SUCCESS — next run queued.")
             return True
-        log(f"ERROR Workflow handoff HTTP {resp.status_code}: {resp.text[:200]}")
+        log(f"ERROR Workflow handoff HTTP {r.status_code}: {r.text[:200]}")
         return False
     except Exception as exc:
-        log(f"ERROR Workflow handoff request failed: {exc}")
+        log(f"ERROR Workflow handoff failed: {exc}")
         return False
 
 
 # ------------------------------------------------------------------
-# Main entry point
+# Bot
 # ------------------------------------------------------------------
 
-def main() -> None:
-    start_time = time.monotonic()
+class PolymarketBot:
 
-    log("=" * 64)
-    log("STARTUP  Polymarket Futures Bot")
-    log(f"         Python {sys.version.split()[0]}")
-    log(f"         PID   {os.getpid()}")
-    log(f"         CWD   {os.getcwd()}")
+    def __init__(self, markets: list, settings: dict, state: dict, notifier: Notifier) -> None:
+        self._markets   = markets
+        self._settings  = settings
+        self._state     = state
+        self._notifier  = notifier
 
-    # Required credentials
-    api_key    = os.environ.get("POLYMARKET_PUBLIC_KEY")
-    secret_key = os.environ.get("POLYMARKET_SECRET_KEY")
+        # Shared dicts updated by sync WS callbacks (GIL-safe for simple assignments)
+        self._live_positions: dict[str, dict] = {}   # slug → position payload
+        self._latest_bbo:     dict[str, float] = {}  # slug → latest bid
+        self._price_history:  dict[str, deque] = {}  # slug → deque(maxlen=30)
+        self._balance:        dict             = {}
 
-    if not api_key or not secret_key:
-        log("ERROR  POLYMARKET_PUBLIC_KEY and/or POLYMARKET_SECRET_KEY not set — cannot continue.")
-        sys.exit(1)
+        self._active_trades: set[str] = set()  # slugs with in-flight REST calls
+        self._client: AsyncPolymarketUS | None = None
+        self._start_time  = time.monotonic()
 
-    # Optional Telegram
-    tg_token = os.environ.get("TELEGRAM_KEY")
-    notifier = Notifier(tg_token, TELEGRAM_CHAT_ID)
-    if notifier.enabled:
-        log("INFO   Telegram notifications: ENABLED (TELEGRAM_KEY found)")
-    else:
-        log("INFO   Telegram notifications: DISABLED (TELEGRAM_KEY not set — running silently)")
+        # Tracked slugs for WS subscriptions
+        self._tracked_slugs: list[str] = [m["market_slug"] for m in markets]
 
-    log(f"CONFIG  TAKE_PROFIT_MULTIPLIER = {TAKE_PROFIT_MULTIPLIER}×")
-    log(f"CONFIG  BUYBACK_AMOUNT_USD     = ${BUYBACK_AMOUNT_USD:.2f}")
-    log(f"CONFIG  BUYBACK_STD_DEVS       = {BUYBACK_STD_DEVS}  ({BUYBACK_STD_DEV_PCT*100:.0f}% per dev)")
-    log(f"CONFIG  LOOP_INTERVAL          = {LOOP_INTERVAL_SECONDS}s ({LOOP_INTERVAL_SECONDS//60} min)")
-    log(f"CONFIG  RUNTIME_LIMIT          = {RUNTIME_LIMIT_SECONDS}s ({RUNTIME_LIMIT_SECONDS//60} min)")
-    log("=" * 64)
+    # ------------------------------------------------------------------
+    # Entry point
+    # ------------------------------------------------------------------
 
-    client = PolymarketUS(key_id=api_key, secret_key=secret_key)
-    state  = load_state()
+    async def run(self, client: AsyncPolymarketUS) -> None:
+        self._client = client
+        log(f"INFO  Tracking {len(self._tracked_slugs)} market(s): {self._tracked_slugs}")
 
-    try:
-        loop_num = 0
+        await self._initialize_positions()
+        await self._connect_ws()
+        await self._main_loop()
+
+    # ------------------------------------------------------------------
+    # Startup: open positions for underdogs not yet held
+    # ------------------------------------------------------------------
+
+    async def _initialize_positions(self) -> None:
+        log("INFO  Fetching live portfolio to check existing positions...")
+        try:
+            resp = await self._client.portfolio.positions()
+            positions = resp.get("positions", {}) if isinstance(resp, dict) else {}
+        except Exception as exc:
+            log(f"WARN  Could not fetch portfolio at startup: {exc}. Skipping auto-entry.")
+            return
+
+        held: set[str] = set()
+        for _, pos in positions.items():
+            meta = pos.get("marketMetadata", {}) or {}
+            slug = meta.get("slug", "")
+            qty  = float(pos.get("netPosition", "0") or "0")
+            if slug and qty > 0:
+                held.add(slug)
+                self._live_positions[slug] = pos
+
+        log(f"INFO  Already holding: {held or '(none)'}")
+
+        for market in self._markets:
+            if not market.get("is_underdog"):
+                continue
+            slug = market["market_slug"]
+            if slug in held:
+                log(f"SKIP  {market['team']} ({slug}) — position already open.")
+                continue
+            deployment = market.get("max_deployment_usd",
+                                    self._settings.get("initial_deployment_usd", 5.0))
+            await self._open_position(market, deployment)
+
+    async def _open_position(self, market: dict, deployment_usd: float) -> None:
+        slug = market["market_slug"]
+        if slug in self._active_trades:
+            return
+        self._active_trades.add(slug)
+        try:
+            bbo = await self._client.markets.bbo(slug)
+            ask = float((bbo.get("bestAsk") or {}).get("value", 0) or 0) if isinstance(bbo, dict) else 0
+            if ask <= 0:
+                log(f"WARN  No ask price for {slug} — skipping initial entry.")
+                return
+            qty = max(1, math.floor(deployment_usd / ask))
+            log(f"INFO  Opening: {market['team']} ({slug}) qty={qty} @ ${ask:.4f} (~${deployment_usd:.2f})")
+            resp = await self._client.orders.create({
+                "marketSlug": slug,
+                "intent":     "ORDER_INTENT_BUY_LONG",
+                "type":       "ORDER_TYPE_LIMIT",
+                "price":      {"value": f"{ask:.4f}", "currency": "USD"},
+                "quantity":   qty,
+                "tif":        "TIME_IN_FORCE_GOOD_TILL_CANCEL",
+            })
+            order_id = resp.get("id", "?") if isinstance(resp, dict) else "?"
+            log(f"INFO  Opened {slug} order_id={order_id}")
+            self._notifier.send(
+                f"✅ *Position Opened*\n`{slug}`\nqty={qty} @ `${ask:.4f}` (~`${deployment_usd:.2f}`)"
+            )
+        except Exception as exc:
+            log(f"ERROR opening {slug}: {exc}")
+        finally:
+            self._active_trades.discard(slug)
+
+    # ------------------------------------------------------------------
+    # WebSocket connections
+    # ------------------------------------------------------------------
+
+    async def _connect_ws(self) -> None:
+        await self._connect_private_ws()
+        await self._connect_markets_ws()
+
+    async def _connect_private_ws(self) -> None:
+        try:
+            ws = await self._client.ws.private()
+            ws.on("position_snapshot", self._on_position_snapshot)
+            ws.on("position_update",   self._on_position_update)
+            ws.on("account_balance_snapshot", self._on_balance_snapshot)
+            ws.on("account_balance_update",   self._on_balance_update)
+            ws.on("close", lambda: asyncio.get_event_loop().create_task(self._reconnect_private()))
+            await ws.subscribe_positions()
+            await ws.subscribe_account_balance()
+            asyncio.create_task(ws.listen())
+            log("INFO  Private WebSocket connected.")
+        except Exception as exc:
+            log(f"WARN  Private WS failed to connect: {exc}. Will retry in 30 s.")
+            asyncio.get_event_loop().call_later(30, lambda: asyncio.create_task(self._reconnect_private()))
+
+    async def _connect_markets_ws(self) -> None:
+        if not self._tracked_slugs:
+            log("WARN  No tracked slugs — skipping markets WS.")
+            return
+        try:
+            ws = await self._client.ws.markets()
+            ws.on("market_data_lite", self._on_bbo_sync)
+            ws.on("trade",            self._on_trade_sync)
+            ws.on("close", lambda: asyncio.get_event_loop().create_task(self._reconnect_markets()))
+            await ws.subscribe_market_data_lite(self._tracked_slugs)
+            await ws.subscribe_trades(self._tracked_slugs)
+            asyncio.create_task(ws.listen())
+            log(f"INFO  Markets WebSocket connected ({len(self._tracked_slugs)} slugs).")
+        except Exception as exc:
+            log(f"WARN  Markets WS failed to connect: {exc}. Will retry in 30 s.")
+            asyncio.get_event_loop().call_later(30, lambda: asyncio.create_task(self._reconnect_markets()))
+
+    async def _reconnect_private(self) -> None:
+        log("INFO  Reconnecting private WS...")
+        await asyncio.sleep(5)
+        await self._connect_private_ws()
+
+    async def _reconnect_markets(self) -> None:
+        log("INFO  Reconnecting markets WS...")
+        await asyncio.sleep(5)
+        await self._connect_markets_ws()
+
+    # ------------------------------------------------------------------
+    # Sync WS callbacks (called from WS thread — only mutate simple dicts)
+    # ------------------------------------------------------------------
+
+    def _on_position_snapshot(self, data: dict) -> None:
+        positions = (data.get("positionSubscriptionSnapshot") or {}).get("positions", {}) or {}
+        for slug, pos in positions.items():
+            self._live_positions[slug] = pos
+        log(f"INFO  Position snapshot: {len(positions)} position(s).")
+
+    def _on_position_update(self, data: dict) -> None:
+        upd  = data.get("positionSubscriptionUpdate") or {}
+        slug = upd.get("marketSlug", "")
+        pos  = upd.get("position")
+        if slug and pos is not None:
+            self._live_positions[slug] = pos
+
+    def _on_balance_snapshot(self, data: dict) -> None:
+        snap = data.get("accountBalanceSubscriptionSnapshot") or {}
+        self._balance = {
+            "balance":     snap.get("balance",    0),
+            "buyingPower": snap.get("buyingPower", 0),
+        }
+        log(f"INFO  Balance snapshot: ${self._balance['balance']:.2f}  buying_power=${self._balance['buyingPower']:.2f}")
+
+    def _on_balance_update(self, data: dict) -> None:
+        upd = data.get("accountBalanceSubscriptionUpdate") or {}
+        if upd:
+            self._balance = {
+                "balance":     upd.get("balance",    self._balance.get("balance", 0)),
+                "buyingPower": upd.get("buyingPower", self._balance.get("buyingPower", 0)),
+            }
+
+    def _on_bbo_sync(self, data: dict) -> None:
+        md   = data.get("marketDataLite") or {}
+        slug = md.get("marketSlug", "")
+        bid  = (md.get("bestBid") or {}).get("value")
+        if slug and bid is not None:
+            self._latest_bbo[slug] = float(bid)
+
+    def _on_trade_sync(self, data: dict) -> None:
+        trade = data.get("trade") or {}
+        slug  = trade.get("marketSlug", "")
+        price = (trade.get("price") or {}).get("value")
+        if slug and price is not None:
+            if slug not in self._price_history:
+                self._price_history[slug] = deque(maxlen=PRICE_HISTORY_WINDOW)
+            self._price_history[slug].append(float(price))
+
+    # ------------------------------------------------------------------
+    # Std dev
+    # ------------------------------------------------------------------
+
+    def _compute_std_dev(self, slug: str, fallback_entry: float = 0.0) -> float:
+        history = list(self._price_history.get(slug, []))
+        if len(history) >= 3:
+            mean     = sum(history) / len(history)
+            variance = sum((p - mean) ** 2 for p in history) / len(history)
+            return math.sqrt(variance)
+        base = fallback_entry or 0.0
+        return base * BUYBACK_STD_DEV_PCT
+
+    # ------------------------------------------------------------------
+    # Take-profit
+    # ------------------------------------------------------------------
+
+    async def _check_take_profit(self, slug: str, bid: float) -> None:
+        pos = self._live_positions.get(slug)
+        if not pos:
+            return
+        qty = float(pos.get("netPosition", "0") or "0")
+        if qty <= 0:
+            return
+        cost = float((pos.get("cost") or {}).get("value", 0) or 0)
+        avg_entry = cost / qty if qty > 0 else 0
+        if avg_entry <= 0:
+            return
+        threshold = avg_entry * TAKE_PROFIT_MULTIPLIER
+        if bid < threshold:
+            return
+
+        log(f"TAKE-PROFIT {slug}: bid=${bid:.4f} >= {TAKE_PROFIT_MULTIPLIER}× ${avg_entry:.4f}")
+        self._active_trades.add(slug)
+        try:
+            resp     = await self._client.orders.close_position({"marketSlug": slug})
+            close_id = (resp.get("id", "?") if isinstance(resp, dict) else "?")
+            profit   = (bid - avg_entry) * qty
+            log(f"INFO  Position closed: {slug}  id={close_id}  est_profit=${profit:.2f}")
+
+            meta  = pos.get("marketMetadata", {}) or {}
+            event = meta.get("eventSlug", "")
+            self._state.setdefault("pending_buybacks", []).append({
+                "market_slug":     slug,
+                "event_slug":      event,
+                "intent":          "ORDER_INTENT_BUY_LONG",
+                "avg_entry_price": round(avg_entry, 6),
+                "entry_std_dev":   self._compute_std_dev(slug, avg_entry),
+                "qty_sold":        int(qty),
+                "sell_price":      round(bid, 6),
+                "sell_time":       datetime.now(EST).isoformat(),
+                "processed":       False,
+                "failed_attempts": 0,
+            })
+            self._state.setdefault("today_closed", []).append({
+                "slug":       slug,
+                "qty":        int(qty),
+                "avg_price":  round(avg_entry, 4),
+                "exit_price": round(bid, 4),
+                "profit":     round(profit, 2),
+                "time":       datetime.now(EST).isoformat(),
+            })
+            self._live_positions.pop(slug, None)
+            self._notifier.send(
+                f"🚨 *Take-Profit!*\n`{slug}`\n"
+                f"Entry `${avg_entry:.4f}` → Exit `${bid:.4f}` ({TAKE_PROFIT_MULTIPLIER}×)\n"
+                f"Profit ≈ `${profit:+.2f} USD`"
+            )
+        except Exception as exc:
+            log(f"ERROR close_position {slug}: {exc}")
+        finally:
+            self._active_trades.discard(slug)
+
+    # ------------------------------------------------------------------
+    # Buyback
+    # ------------------------------------------------------------------
+
+    async def _check_buyback(self, buyback: dict, bid: float) -> None:
+        slug      = buyback.get("market_slug", "")
+        avg_entry = float(buyback.get("avg_entry_price", 0) or 0)
+        if avg_entry <= 0 or not slug:
+            return
+
+        # Prefer stored std dev (captured at time of close) over recomputed
+        std_dev = float(buyback.get("entry_std_dev") or 0) or self._compute_std_dev(slug, avg_entry)
+        lower   = avg_entry - BUYBACK_STD_DEVS * std_dev
+        upper   = avg_entry + BUYBACK_STD_DEVS * std_dev
+
+        if not (lower <= bid <= upper):
+            return
+
+        log(f"BUYBACK {slug}: bid=${bid:.4f} in zone [${lower:.4f}, ${upper:.4f}]")
+        self._active_trades.add(slug)
+        try:
+            qty_sold = int(buyback.get("qty_sold", 0) or 0)
+            if qty_sold > 0 and avg_entry > 0:
+                buy_qty   = qty_sold
+                alloc_usd = round(buy_qty * bid, 2)
+            else:
+                buy_qty   = max(1, math.floor(BUYBACK_AMOUNT_USD / bid))
+                alloc_usd = BUYBACK_AMOUNT_USD
+
+            resp     = await self._client.orders.create({
+                "marketSlug": slug,
+                "intent":     buyback.get("intent", "ORDER_INTENT_BUY_LONG"),
+                "type":       "ORDER_TYPE_LIMIT",
+                "price":      {"value": f"{bid:.4f}", "currency": "USD"},
+                "quantity":   buy_qty,
+                "tif":        "TIME_IN_FORCE_GOOD_TILL_CANCEL",
+            })
+            order_id = resp.get("id", "?") if isinstance(resp, dict) else "?"
+            log(f"INFO  Buyback order placed: {slug} qty={buy_qty} @ ${bid:.4f}  id={order_id}")
+            buyback["processed"] = True
+            self._notifier.send(
+                f"🔄 *Buyback*\n`{slug}`\n"
+                f"qty={buy_qty} @ `${bid:.4f}` (~`${alloc_usd:.2f}`)\n"
+                f"Trigger: price back within {BUYBACK_STD_DEVS} std dev of `${avg_entry:.4f}`"
+            )
+        except Exception as exc:
+            buyback["failed_attempts"] = buyback.get("failed_attempts", 0) + 1
+            log(f"ERROR buyback {slug}: {exc}  (attempt #{buyback['failed_attempts']})")
+        finally:
+            self._active_trades.discard(slug)
+
+    # ------------------------------------------------------------------
+    # Scan all tracked markets each tick
+    # ------------------------------------------------------------------
+
+    async def _scan(self) -> None:
+        for slug, bid in list(self._latest_bbo.items()):
+            if slug in self._active_trades or bid <= 0:
+                continue
+            await self._check_take_profit(slug, bid)
+
+        pending = [b for b in self._state.get("pending_buybacks", []) if not b.get("processed")]
+        for buyback in pending:
+            slug = buyback.get("market_slug", "")
+            bid  = self._latest_bbo.get(slug, 0)
+            if bid > 0 and slug not in self._active_trades:
+                await self._check_buyback(buyback, bid)
+
+        self._state["pending_buybacks"] = [
+            b for b in self._state.get("pending_buybacks", []) if not b.get("processed")
+        ]
+
+    # ------------------------------------------------------------------
+    # Daily report
+    # ------------------------------------------------------------------
+
+    def _snapshot_balance(self) -> None:
+        today = date.today().isoformat()
+        snaps = self._state.setdefault("balance_snapshots", {})
+        if today not in snaps and self._balance:
+            snaps[today] = dict(self._balance)
+        while len(snaps) > 7:
+            del snaps[sorted(snaps)[0]]
+
+    def _maybe_daily_report(self) -> None:
+        today = date.today().isoformat()
+        if self._state.get("daily_report_sent") == today:
+            return
+        snaps  = self._state.get("balance_snapshots", {})
+        days   = sorted(snaps)
+        t_snap = snaps.get(today, {})
+        y_snap = snaps.get(days[-2], {}) if len(days) >= 2 and days[-1] == today else {}
+
+        today_bal = float(t_snap.get("balance", 0))
+        yest_bal  = float(y_snap.get("balance", 0))
+        delta     = today_bal - yest_bal
+        arrow     = "📈" if delta >= 0 else "📉"
+        closed    = self._state.get("today_closed", [])
+        total_pnl = sum(p.get("profit", 0) for p in closed)
+
+        lines = [
+            f"🌅 *Daily Report — {today}*",
+            f"💰 Balance: `${today_bal:.2f}` {arrow} (`${delta:+.2f}` vs yesterday)",
+            f"✅ Closed today: {len(closed)} trade(s) | total P&L `${total_pnl:+.2f}`",
+        ]
+        for p in closed:
+            e = "🟢" if p.get("profit", 0) >= 0 else "🔴"
+            lines.append(
+                f"{e} `{p.get('slug')}` — qty={p.get('qty')}  "
+                f"entry `${p.get('avg_price', 0):.4f}` → exit `${p.get('exit_price', 0):.4f}` "
+                f"P&L `${p.get('profit', 0):+.2f}`"
+            )
+
+        report = "\n".join(lines)
+        if self._notifier.enabled:
+            self._notifier.send(report)
+        else:
+            log("INFO  Daily report (Telegram disabled):")
+            for line in lines:
+                log(f"       {line}")
+
+        self._state["daily_report_sent"] = today
+        self._state["today_closed"]      = []
+
+    # ------------------------------------------------------------------
+    # Periodic status log
+    # ------------------------------------------------------------------
+
+    def _log_status(self, elapsed_s: float) -> None:
+        remaining_min = (RUNTIME_LIMIT_SECONDS - elapsed_s) / 60
+        pending       = len([b for b in self._state.get("pending_buybacks", []) if not b.get("processed")])
+        log(
+            f"STATUS  elapsed={elapsed_s/60:.1f} min  remaining={remaining_min:.1f} min  "
+            f"balance=${self._balance.get('balance', 0):.2f}  "
+            f"live_positions={len(self._live_positions)}  "
+            f"pending_buybacks={pending}  "
+            f"tracked_bbo={len(self._latest_bbo)}  "
+            f"active_trades={len(self._active_trades)}"
+        )
+
+    # ------------------------------------------------------------------
+    # Main loop
+    # ------------------------------------------------------------------
+
+    async def _main_loop(self) -> None:
+        last_status = time.monotonic()
+        last_save   = time.monotonic()
+
         while True:
-            elapsed_s   = time.monotonic() - start_time
-            remaining_s = RUNTIME_LIMIT_SECONDS - elapsed_s
+            now     = time.monotonic()
+            elapsed = now - self._start_time
 
-            # ---- Rollover check ----
-            if remaining_s <= 0:
+            # --- Runtime rollover ---
+            if elapsed >= RUNTIME_LIMIT_SECONDS:
                 log(f"INFO  Runtime limit reached ({RUNTIME_LIMIT_SECONDS // 60} min). Initiating handoff...")
-                save_state(state)
+                save_state(self._state)
                 trigger_workflow_handoff()
-                log("INFO  Handoff complete. Exiting cleanly.")
+                log("INFO  Handoff complete. Exiting.")
                 break
 
-            loop_num += 1
-            iter_start = time.monotonic()
+            # --- Core scan ---
+            await self._scan()
 
-            run_health_check(client, notifier, state, elapsed_s, loop_num)
+            # --- Periodic state save ---
+            if now - last_save >= STATE_SAVE_INTERVAL_S:
+                save_state(self._state)
+                self._snapshot_balance()
+                last_save = time.monotonic()
 
-            # Balance snapshot (once/day)
-            balance = fetch_balance(client)
-            snapshot_balance_today(state, balance)
+            # --- Status log ---
+            if now - last_status >= STATUS_LOG_INTERVAL_S:
+                self._log_status(elapsed)
+                last_status = time.monotonic()
 
-            # 10 AM EST daily report
+            # --- Daily 10 AM report ---
             now_est = datetime.now(EST)
-            if now_est.hour == 10 and now_est.minute < 15:
-                log("INFO  10 AM window — sending daily report.")
-                send_daily_report(notifier, state)
+            if now_est.hour == 10 and now_est.minute < 1:
+                self._maybe_daily_report()
 
-            # Core trading logic
-            evaluate_positions(client, notifier, state)
-            process_buybacks(client, notifier, state)
+            await asyncio.sleep(TICK_INTERVAL_S)
 
+
+# ------------------------------------------------------------------
+# Async entry
+# ------------------------------------------------------------------
+
+async def run_async() -> None:
+    api_key    = os.environ.get("POLYMARKET_PUBLIC_KEY")
+    secret_key = os.environ.get("POLYMARKET_SECRET_KEY")
+    if not api_key or not secret_key:
+        log("ERROR  POLYMARKET_PUBLIC_KEY / POLYMARKET_SECRET_KEY not set.")
+        sys.exit(1)
+
+    tg_token = os.environ.get("TELEGRAM_KEY")
+    notifier = Notifier(tg_token, TELEGRAM_CHAT_ID)
+
+    log("=" * 64)
+    log("STARTUP  Polymarket Futures Bot (async WebSocket)")
+    log(f"         Python {sys.version.split()[0]}  PID {os.getpid()}")
+    log(f"CONFIG   TAKE_PROFIT_MULTIPLIER = {TAKE_PROFIT_MULTIPLIER}×")
+    log(f"CONFIG   BUYBACK_AMOUNT_USD     = ${BUYBACK_AMOUNT_USD:.2f}")
+    log(f"CONFIG   BUYBACK_STD_DEVS       = {BUYBACK_STD_DEVS}  ({BUYBACK_STD_DEV_PCT*100:.0f}% per dev)")
+    log(f"CONFIG   RUNTIME_LIMIT          = {RUNTIME_LIMIT_SECONDS // 60} min")
+    log(f"INFO     Telegram: {'ENABLED' if notifier.enabled else 'DISABLED (TELEGRAM_KEY not set)'}")
+    log("=" * 64)
+
+    markets, settings = load_markets()
+    state             = load_state()
+    bot               = PolymarketBot(markets, settings, state, notifier)
+
+    async with AsyncPolymarketUS(key_id=api_key, secret_key=secret_key) as client:
+        try:
+            await bot.run(client)
+        except KeyboardInterrupt:
+            log("INFO  KeyboardInterrupt — shutting down.")
+        except Exception as exc:
+            log(f"ERROR  Unhandled exception: {exc}")
+            raise
+        finally:
             save_state(state)
+            log("END    State saved. Bot complete.")
+            log("=" * 64)
 
-            # ---- Sleep for remainder of 15-min interval ----
-            iter_elapsed = time.monotonic() - iter_start
-            sleep_s      = max(0.0, LOOP_INTERVAL_SECONDS - iter_elapsed)
-            # Don't sleep past the rollover deadline
-            sleep_s      = min(sleep_s, RUNTIME_LIMIT_SECONDS - (time.monotonic() - start_time))
 
-            if sleep_s > 1:
-                log(
-                    f"INFO  Iteration {loop_num} took {iter_elapsed:.1f}s. "
-                    f"Sleeping {sleep_s:.0f}s until next health check. "
-                    f"Runtime remaining: {remaining_s/60:.1f} min."
-                )
-                time.sleep(sleep_s)
-
-    except KeyboardInterrupt:
-        log("INFO  KeyboardInterrupt received — shutting down gracefully.")
-    except Exception as exc:
-        log(f"ERROR  Unhandled exception in main loop: {exc}")
-        raise
-    finally:
-        client.close()
-        save_state(state)
-        log("END    Client closed. State saved. Bot execution complete.")
-        log("=" * 64)
+def main() -> None:
+    asyncio.run(run_async())
 
 
 if __name__ == "__main__":
