@@ -1,0 +1,29 @@
+name: Polymarket QA — Secrets, Telegram & Wallet Balance
+
+on:
+  workflow_dispatch:
+
+jobs:
+  qa-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install polymarket-us requests
+
+      - name: Run QA Test Suite
+        env:
+          POLYMARKET_PUBLIC_KEY: ${{ secrets.POLYMARKET_PUBLIC_KEY }}
+          POLYMARKET_SECRET_KEY: ${{ secrets.POLYMARKET_SECRET_KEY }}
+          TELEGRAM_KEY: ${{ secrets.TELEGRAM_KEY }}
+        run: python test_bot.py
