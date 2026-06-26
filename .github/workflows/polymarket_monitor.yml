@@ -1,12 +1,22 @@
 name: Polymarket Portfolio Execution Engine
 
+# ---------------------------------------------------------------
+# Schedule: daily at 00:07 UTC as a safety-net restart.
+# The bot self-triggers the next run at the 5h 45m mark via GH_PAT
+# (if configured), so the chain is usually unbroken. The daily cron
+# only fires if self-triggering has been unavailable or the chain
+# was interrupted for any reason.
+# ---------------------------------------------------------------
 on:
   schedule:
-    # Fires at :07 past every hour (avoids the congested :00 slot).
-    # The job loops internally 4× with 14-min sleeps, giving real
-    # ~15-min cadence: HH:07 → HH:21 → HH:35 → HH:49.
-    - cron: '7 * * * *'
+    - cron: '7 0 * * *'
   workflow_dispatch:
+
+# At most one run at a time. A newly queued run waits; it never
+# cancels the currently running bot mid-execution.
+concurrency:
+  group: polymarket-bot-singleton
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -15,13 +25,15 @@ jobs:
   execute-monitor:
     runs-on: ubuntu-latest
     environment: "Polymarket US Futures"
-    timeout-minutes: 60
+    # Hard ceiling: 6 h 10 min. The bot exits cleanly at 5 h 45 min,
+    # so this only fires if the process hangs.
+    timeout-minutes: 370
 
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v7
 
-      - name: Setup Python
+      - name: Setup Python 3.11
         uses: actions/setup-python@v6
         with:
           python-version: '3.11'
@@ -31,25 +43,14 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Execute Bot — 4× loop (~15 min cadence)
+      - name: Run Bot (continuous 5 h 45 min loop)
         env:
           POLYMARKET_PUBLIC_KEY: ${{ secrets.POLYMARKET_PUBLIC_KEY }}
           POLYMARKET_SECRET_KEY: ${{ secrets.POLYMARKET_SECRET_KEY }}
           TELEGRAM_KEY: ${{ secrets.TELEGRAM_KEY }}
-        run: |
-          for i in 1 2 3 4; do
-            echo ""
-            echo "================================================="
-            echo "=== BOT RUN $i/4 — $(date -u '+%Y-%m-%d %H:%M:%S UTC') ==="
-            echo "================================================="
-            python polymarket_bot.py
-            EXIT_CODE=$?
-            echo "=== Run $i finished — exit code: $EXIT_CODE ==="
-            if [ $i -lt 4 ]; then
-              echo "=== Sleeping 14 minutes before run $((i+1))... ==="
-              sleep 840
-            fi
-          done
+          GH_PAT: ${{ secrets.GH_PAT }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: python polymarket_bot.py
 
       - name: Persist State
         if: always()

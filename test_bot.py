@@ -1,3 +1,9 @@
+"""
+QA test suite — validates secrets, API connectivity, wallet balance,
+and MLB position data. Telegram is optional: if TELEGRAM_KEY is absent
+the test still passes; Telegram steps are simply skipped.
+"""
+
 import os
 import sys
 import requests
@@ -21,23 +27,12 @@ MLB_EVENT_SLUGS = [
 ]
 
 
-def check_secrets():
-    print("=== [1/4] Secrets Check ===")
-    required = {
-        "POLYMARKET_PUBLIC_KEY": os.environ.get("POLYMARKET_PUBLIC_KEY"),
-        "POLYMARKET_SECRET_KEY": os.environ.get("POLYMARKET_SECRET_KEY"),
-        "TELEGRAM_KEY": os.environ.get("TELEGRAM_KEY"),
-    }
-    missing = [k for k, v in required.items() if not v]
-    if missing:
-        print(f"FAIL — Missing secrets: {', '.join(missing)}")
-        sys.exit(1)
-    print("PASS — All 3 secrets present.\n")
-    return required
+# ------------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------------
 
-
-def send_telegram(tg_token, text):
-    url = f"https://api.telegram.org/bot{tg_token}/sendMessage"
+def send_telegram(tg_token: str, text: str) -> int:
+    url  = f"https://api.telegram.org/bot{tg_token}/sendMessage"
     resp = requests.post(
         url,
         json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"},
@@ -47,22 +42,56 @@ def send_telegram(tg_token, text):
     return resp.json()["result"]["message_id"]
 
 
-def test_telegram(tg_token):
-    print("=== [2/4] Telegram Greeting ===")
+# ------------------------------------------------------------------
+# Test steps
+# ------------------------------------------------------------------
+
+def check_secrets() -> dict:
+    print("=== [1] Secrets Check ===")
+    required = {
+        "POLYMARKET_PUBLIC_KEY": os.environ.get("POLYMARKET_PUBLIC_KEY"),
+        "POLYMARKET_SECRET_KEY": os.environ.get("POLYMARKET_SECRET_KEY"),
+    }
+    optional = {
+        "TELEGRAM_KEY": os.environ.get("TELEGRAM_KEY"),
+    }
+
+    missing_required = [k for k, v in required.items() if not v]
+    if missing_required:
+        print(f"FAIL — Missing required secrets: {', '.join(missing_required)}")
+        sys.exit(1)
+
+    print("PASS — Polymarket credentials present.")
+
+    tg = optional["TELEGRAM_KEY"]
+    if tg:
+        print("INFO — TELEGRAM_KEY present: Telegram notifications will be tested.")
+    else:
+        print("INFO — TELEGRAM_KEY absent: Telegram steps will be skipped (non-fatal).")
+
+    print()
+    return {**required, **optional}
+
+
+def test_telegram(tg_token: str | None) -> None:
+    print("=== [2] Telegram Connectivity ===")
+    if not tg_token:
+        print("SKIP — TELEGRAM_KEY not set. Skipping Telegram test.\n")
+        return
+
     msg_id = send_telegram(
         tg_token,
         "👋 *Polymarket Bot — QA Test Started*\n\n"
-        "✅ Secrets loaded\n"
+        "✅ Polymarket credentials loaded\n"
         "✅ Telegram connectivity verified\n"
         "⏳ Fetching wallet balance and MLB positions...",
     )
-    print(f"PASS — Message delivered (id: {msg_id})\n")
+    print(f"PASS — Telegram message delivered (id: {msg_id})\n")
 
 
-def test_balance(client):
-    print("=== [3/4] Wallet Balance ===")
-    resp = client.account.balances()
-
+def test_balance(client: PolymarketUS) -> str:
+    print("=== [3] Wallet Balance ===")
+    resp         = client.account.balances()
     balance_list = resp.get("balances", []) if isinstance(resp, dict) else []
 
     if not balance_list:
@@ -71,158 +100,161 @@ def test_balance(client):
 
     lines = []
     for b in balance_list:
-        currency = b.get("currency", "USD")
-        current = b.get("currentBalance", 0) or 0
-        buying_power = b.get("buyingPower", 0) or 0
-        asset_notional = b.get("assetNotional", 0) or 0
-        open_orders = b.get("openOrders", 0) or 0
+        currency      = b.get("currency",       "USD")
+        current       = b.get("currentBalance", 0) or 0
+        buying_power  = b.get("buyingPower",    0) or 0
+        asset_notional= b.get("assetNotional",  0) or 0
+        open_orders   = b.get("openOrders",     0) or 0
         lines.append(
             f"  • *{currency}*\n"
-            f"    Cash balance: `${current:.2f}`\n"
-            f"    Buying power: `${buying_power:.2f}`\n"
+            f"    Cash balance:      `${current:.2f}`\n"
+            f"    Buying power:      `${buying_power:.2f}`\n"
             f"    Position notional: `${asset_notional:.2f}`\n"
-            f"    In open orders: `${open_orders:.2f}`"
+            f"    In open orders:    `${open_orders:.2f}`"
         )
-        print(f"  {currency}: cash=${current:.2f}, buying_power=${buying_power:.2f}, notional=${asset_notional:.2f}")
+        print(f"  {currency}: cash=${current:.2f}  buyingPower=${buying_power:.2f}  notional=${asset_notional:.2f}")
 
     print("PASS — Balance fetched.\n")
     return "\n".join(lines)
 
 
-def test_mlb_positions(client):
-    print("=== [4/4] MLB World Series Positions & Event Contracts ===")
+def test_mlb_positions(client: PolymarketUS) -> tuple[list, list]:
+    print("=== [4] MLB Positions & World Series Contracts ===")
 
-    # --- Fetch live positions ---
-    pos_resp = client.portfolio.positions()
+    pos_resp       = client.portfolio.positions()
     positions_dict = pos_resp.get("positions", {}) if isinstance(pos_resp, dict) else {}
 
     mlb_positions = []
     for token_id, pos in positions_dict.items():
-        meta = pos.get("marketMetadata", {}) or {}
-        event_slug = meta.get("eventSlug", "") or ""
-        slug = meta.get("slug", "") or ""
+        meta       = pos.get("marketMetadata", {}) or {}
+        event_slug = meta.get("eventSlug",     "") or ""
+        slug       = meta.get("slug",          "") or ""
+        combined   = (event_slug + " " + slug).lower()
 
-        is_mlb = (
-            any(s in event_slug.lower() for s in ["mlb", "world-series"])
-            or any(s in slug.lower() for s in ["mlb", "world-series"])
-        )
-        if not is_mlb:
+        if not any(kw in combined for kw in ["mlb", "world-series"]):
             continue
 
-        net_pos = pos.get("netPosition", "0") or "0"
-        qty_available = pos.get("qtyAvailable", "0") or "0"
-        cost = pos.get("cost", {}) or {}
-        cash_value = pos.get("cashValue", {}) or {}
-        realized = pos.get("realized", {}) or {}
+        qty       = float(pos.get("netPosition",  "0") or "0")
+        cost_val  = float((pos.get("cost",      {}) or {}).get("value", "0") or "0")
+        cash_val  = float((pos.get("cashValue", {}) or {}).get("value", "0") or "0")
+        real_val  = float((pos.get("realized",  {}) or {}).get("value", "0") or "0")
+        qty_avail = pos.get("qtyAvailable", "0") or "0"
 
-        cost_val = float(cost.get("value", "0") or "0")
-        cash_val = float(cash_value.get("value", "0") or "0")
-        realized_val = float(realized.get("value", "0") or "0")
-        qty = float(net_pos)
-
-        avg_price = round(cost_val / qty, 4) if qty != 0 else 0
-        cur_price = round(cash_val / qty, 4) if qty != 0 else 0
-        unrealized_pnl = cash_val - cost_val
+        avg_price     = round(cost_val / qty, 4) if qty else 0
+        cur_price     = round(cash_val / qty, 4) if qty else 0
+        unrealized    = cash_val - cost_val
 
         mlb_positions.append({
-            "token_id": token_id,
-            "slug": slug,
-            "event_slug": event_slug,
-            "title": meta.get("title", ""),
-            "outcome": meta.get("outcome", ""),
-            "net_pos": qty,
-            "qty_available": qty_available,
-            "avg_price": avg_price,
-            "cur_price": cur_price,
-            "cost_val": cost_val,
-            "cash_val": cash_val,
-            "unrealized_pnl": unrealized_pnl,
-            "realized_val": realized_val,
+            "token_id":      token_id,
+            "slug":          slug,
+            "event_slug":    event_slug,
+            "title":         meta.get("title",   ""),
+            "outcome":       meta.get("outcome", ""),
+            "net_pos":       qty,
+            "qty_available": qty_avail,
+            "avg_price":     avg_price,
+            "cur_price":     cur_price,
+            "cost_val":      cost_val,
+            "cash_val":      cash_val,
+            "unrealized":    unrealized,
+            "realized":      real_val,
         })
-
-        print(f"  POSITION: {meta.get('title', slug)} | {meta.get('outcome', '')} | qty={qty} avg=${avg_price} cur=${cur_price}")
+        print(
+            f"  POSITION: {meta.get('title', slug)} | {meta.get('outcome', '')} | "
+            f"qty={qty}  avg=${avg_price}  cur=${cur_price}  unrealized=${unrealized:.2f}"
+        )
 
     if not mlb_positions:
         print("  (no open MLB positions found)")
 
-    # --- Fetch World Series 2026 event contracts ---
-    # retrieve_by_slug returns {"event": {"markets": [{"slug", "outcome", ...}]}}
-    print("\n  Fetching MLB World Series 2026 event contracts...")
+    # Fetch World Series event contracts
+    # retrieve_by_slug → {"event": {"markets": [{"slug", "outcome", ...}]}}
+    print("\n  Fetching World Series event contracts (2025 + 2026)...")
     ws_markets = []
-    for event_slug_to_check in ["mlb-world-series-champion-2026", "mlb-world-series-champion-2025"]:
+    for es in ["mlb-world-series-champion-2026", "mlb-world-series-champion-2025"]:
         try:
-            event_resp = client.events.retrieve_by_slug(event_slug_to_check)
+            event_resp = client.events.retrieve_by_slug(es)
             if not isinstance(event_resp, dict):
-                print(f"  WARN — Unexpected response type for {event_slug_to_check}: {type(event_resp)}")
+                print(f"  WARN — Unexpected type for {es}: {type(event_resp)}")
                 continue
-            event_obj = event_resp.get("event", {}) or {}
+            event_obj   = event_resp.get("event", {}) or {}
             raw_markets = event_obj.get("markets", []) or []
             if not raw_markets:
-                print(f"  INFO — {event_slug_to_check}: no markets returned (may be inactive/settled).")
+                print(f"  INFO — {es}: no markets found (may be inactive/settled).")
                 continue
-            print(f"  {event_slug_to_check}: {len(raw_markets)} team contracts")
+            print(f"  {es}: {len(raw_markets)} team contract(s)")
             for m in raw_markets:
-                mslug = m.get("slug", "")
-                outcome = m.get("outcome", "") or m.get("title", "")
-                active = m.get("active", False)
-                closed = m.get("closed", False)
+                mslug     = m.get("slug",      "")
+                outcome   = m.get("outcome",   "") or m.get("title", "")
+                active    = m.get("active",    False)
                 liquidity = m.get("liquidity", 0)
-                ws_markets.append({"slug": mslug, "outcome": outcome, "active": active, "closed": closed, "liquidity": liquidity})
-                print(f"    {'✓' if active else '✗'} {outcome:<30} slug: {mslug}  liq=${liquidity:.0f}")
-        except Exception as e:
-            print(f"  WARN — Could not fetch {event_slug_to_check}: {e}")
+                ws_markets.append({"slug": mslug, "outcome": outcome, "active": active, "liquidity": liquidity})
+                print(f"    {'✓' if active else '✗'} {outcome:<32} slug: {mslug}  liq=${liquidity:.0f}")
+        except Exception as exc:
+            print(f"  WARN — Could not fetch {es}: {exc}")
 
-    print("PASS — Positions and event contracts fetched.\n")
+    print("PASS — MLB positions and event contracts fetched.\n")
     return mlb_positions, ws_markets
 
 
-def build_telegram_report(balance_text, mlb_positions, ws_markets):
-    lines = ["📊 *Polymarket QA — Full Portfolio Report*\n"]
+def build_report(balance_text: str, mlb_positions: list, ws_markets: list) -> str:
+    lines = ["📊 *Polymarket QA — Full Portfolio Report*\n",
+             "💰 *Wallet Balance*", balance_text,
+             "\n⚾ *Open MLB Positions*"]
 
-    lines.append("💰 *Wallet Balance*")
-    lines.append(balance_text)
-
-    lines.append("\n⚾ *Open MLB World Series Positions*")
     if mlb_positions:
         for p in mlb_positions:
-            pnl_emoji = "🟢" if p["unrealized_pnl"] >= 0 else "🔴"
+            emoji = "🟢" if p["unrealized"] >= 0 else "🔴"
             lines.append(
-                f"{pnl_emoji} *{p['title'] or p['slug']}*\n"
+                f"{emoji} *{p['title'] or p['slug']}*\n"
                 f"   Outcome: `{p['outcome']}`\n"
                 f"   Qty: `{p['net_pos']}` | Avg: `${p['avg_price']}` | Cur: `${p['cur_price']}`\n"
-                f"   Unrealized PnL: `${p['unrealized_pnl']:.2f}` | Realized: `${p['realized_val']:.2f}`"
+                f"   Unrealized P&L: `${p['unrealized']:.2f}` | Realized: `${p['realized']:.2f}`"
             )
     else:
-        lines.append("_No open MLB positions found._")
+        lines.append("_No open MLB positions._")
 
     if ws_markets:
-        lines.append(f"\n📋 *World Series 2026 Contracts ({len(ws_markets)} teams)*")
-        for m in ws_markets[:10]:
-            lines.append(f"  • `{m['slug']}` — {m['outcome'] or m['title']}")
-        if len(ws_markets) > 10:
-            lines.append(f"  _...and {len(ws_markets) - 10} more_")
+        active = [m for m in ws_markets if m["active"]]
+        lines.append(f"\n📋 *World Series Contracts ({len(ws_markets)} total, {len(active)} active)*")
+        for m in ws_markets[:12]:
+            lines.append(f"  {'✓' if m['active'] else '✗'} `{m['slug']}` — {m['outcome']}")
+        if len(ws_markets) > 12:
+            lines.append(f"  _...and {len(ws_markets) - 12} more_")
 
-    lines.append("\n✅ *QA Test Complete — All checks passed.*")
+    lines.append("\n✅ *QA Test Complete.*")
     return "\n".join(lines)
 
 
-def main():
-    print("=== Polymarket Bot QA Test Suite ===\n")
+# ------------------------------------------------------------------
+# Main
+# ------------------------------------------------------------------
 
-    secrets = check_secrets()
-    api_key = secrets["POLYMARKET_PUBLIC_KEY"]
+def main() -> None:
+    print("=" * 56)
+    print("=== Polymarket Bot QA Test Suite ===")
+    print("=" * 56 + "\n")
+
+    secrets    = check_secrets()
+    api_key    = secrets["POLYMARKET_PUBLIC_KEY"]
     secret_key = secrets["POLYMARKET_SECRET_KEY"]
-    tg_token = secrets["TELEGRAM_KEY"]
+    tg_token   = secrets.get("TELEGRAM_KEY")
 
     test_telegram(tg_token)
 
     client = PolymarketUS(key_id=api_key, secret_key=secret_key)
     try:
-        balance_text = test_balance(client)
+        balance_text             = test_balance(client)
         mlb_positions, ws_markets = test_mlb_positions(client)
-        report = build_telegram_report(balance_text, mlb_positions, ws_markets)
-        send_telegram(tg_token, report)
-        print("PASS — Full report sent to Telegram.")
+
+        report = build_report(balance_text, mlb_positions, ws_markets)
+
+        if tg_token:
+            send_telegram(tg_token, report)
+            print("PASS — Full report sent to Telegram.")
+        else:
+            print("INFO — Telegram not configured. Report (log only):")
+            print(report)
     finally:
         client.close()
 
