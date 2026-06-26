@@ -146,24 +146,31 @@ def test_mlb_positions(client):
         print("  (no open MLB positions found)")
 
     # --- Fetch World Series 2026 event contracts ---
+    # retrieve_by_slug returns {"event": {"markets": [{"slug", "outcome", ...}]}}
     print("\n  Fetching MLB World Series 2026 event contracts...")
     ws_markets = []
-    try:
-        event = client.events.retrieve_by_slug("mlb-world-series-champion-2026")
-        raw_markets = None
-        if isinstance(event, dict):
-            raw_markets = event.get("markets") or event.get("event", {}).get("markets")
-        if raw_markets:
+    for event_slug_to_check in ["mlb-world-series-champion-2026", "mlb-world-series-champion-2025"]:
+        try:
+            event_resp = client.events.retrieve_by_slug(event_slug_to_check)
+            if not isinstance(event_resp, dict):
+                print(f"  WARN — Unexpected response type for {event_slug_to_check}: {type(event_resp)}")
+                continue
+            event_obj = event_resp.get("event", {}) or {}
+            raw_markets = event_obj.get("markets", []) or []
+            if not raw_markets:
+                print(f"  INFO — {event_slug_to_check}: no markets returned (may be inactive/settled).")
+                continue
+            print(f"  {event_slug_to_check}: {len(raw_markets)} team contracts")
             for m in raw_markets:
                 mslug = m.get("slug", "")
-                title = m.get("title", "")
-                outcome = m.get("outcome", "")
-                ws_markets.append({"slug": mslug, "title": title, "outcome": outcome})
-                print(f"    Contract: {outcome or title} — slug: {mslug}")
-        else:
-            print(f"  WARN — Event returned but no markets field found. Keys: {list(event.keys()) if isinstance(event, dict) else type(event)}")
-    except Exception as e:
-        print(f"  WARN — Could not fetch WS 2026 event: {e}")
+                outcome = m.get("outcome", "") or m.get("title", "")
+                active = m.get("active", False)
+                closed = m.get("closed", False)
+                liquidity = m.get("liquidity", 0)
+                ws_markets.append({"slug": mslug, "outcome": outcome, "active": active, "closed": closed, "liquidity": liquidity})
+                print(f"    {'✓' if active else '✗'} {outcome:<30} slug: {mslug}  liq=${liquidity:.0f}")
+        except Exception as e:
+            print(f"  WARN — Could not fetch {event_slug_to_check}: {e}")
 
     print("PASS — Positions and event contracts fetched.\n")
     return mlb_positions, ws_markets

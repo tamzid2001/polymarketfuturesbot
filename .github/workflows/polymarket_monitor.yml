@@ -2,7 +2,10 @@ name: Polymarket Portfolio Execution Engine
 
 on:
   schedule:
-    - cron: '*/15 * * * *'
+    # Fires at :07 past every hour (avoids the congested :00 slot).
+    # The job loops internally 4× with 14-min sleeps, giving real
+    # ~15-min cadence: HH:07 → HH:21 → HH:35 → HH:49.
+    - cron: '7 * * * *'
   workflow_dispatch:
 
 permissions:
@@ -12,30 +15,47 @@ jobs:
   execute-monitor:
     runs-on: ubuntu-latest
     environment: "Polymarket US Futures"
+    timeout-minutes: 60
+
     steps:
-      - name: Checkout Repository Context
+      - name: Checkout Repository
         uses: actions/checkout@v7
 
-      - name: Setup Runtime Environment
+      - name: Setup Python
         uses: actions/setup-python@v6
         with:
           python-version: '3.11'
 
-      - name: Install System Dependencies
+      - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Execute Portfolio Inspection Engine
+      - name: Execute Bot — 4× loop (~15 min cadence)
         env:
           POLYMARKET_PUBLIC_KEY: ${{ secrets.POLYMARKET_PUBLIC_KEY }}
           POLYMARKET_SECRET_KEY: ${{ secrets.POLYMARKET_SECRET_KEY }}
           TELEGRAM_KEY: ${{ secrets.TELEGRAM_KEY }}
-        run: python polymarket_bot.py
+        run: |
+          for i in 1 2 3 4; do
+            echo ""
+            echo "================================================="
+            echo "=== BOT RUN $i/4 — $(date -u '+%Y-%m-%d %H:%M:%S UTC') ==="
+            echo "================================================="
+            python polymarket_bot.py
+            EXIT_CODE=$?
+            echo "=== Run $i finished — exit code: $EXIT_CODE ==="
+            if [ $i -lt 4 ]; then
+              echo "=== Sleeping 14 minutes before run $((i+1))... ==="
+              sleep 840
+            fi
+          done
 
-      - name: Reconcile State Machine Data
+      - name: Persist State
+        if: always()
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git pull --rebase origin main
           git add state.json
-          git diff-index --quiet HEAD || (git commit -m "chore: persist automated execution state [skip ci]" && git push)
+          git diff-index --quiet HEAD || (git commit -m "chore: persist bot state [skip ci]" && git push)
