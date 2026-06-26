@@ -214,11 +214,13 @@ class PolymarketBot:
         self._active_trades:        set[str] = set()
         self._closed_slugs_pending: set[str] = set()
 
-        self._ws_ok    = False   # at least one WS feed is live
-        self._loop:    asyncio.AbstractEventLoop | None = None
-        self._client:  AsyncPolymarketUS | None = None
+        self._ws_ok       = False
+        self._loop:       asyncio.AbstractEventLoop | None = None
+        self._client:     AsyncPolymarketUS | None = None
+        self._private_ws  = None
+        self._markets_ws  = None
         self._start_time  = time.monotonic()
-        self._last_poll   = 0.0   # monotonic time of last REST poll
+        self._last_poll   = 0.0
         self._rl          = _RateLimiter(REST_RATE_LIMIT)
 
         self._tracked_slugs: list[str] = [m["market_slug"] for m in markets]
@@ -373,24 +375,20 @@ class PolymarketBot:
 
     async def _connect_private_ws(self) -> None:
         try:
-            # WS objects are synchronous — do NOT await them
             ws = self._client.ws.private()
             ws.on("position_snapshot",        self._on_position_snapshot)
             ws.on("position_update",           self._on_position_update)
             ws.on("account_balance_snapshot",  self._on_balance_snapshot)
             ws.on("account_balance_update",    self._on_balance_update)
-            # Use run_coroutine_threadsafe for thread-safe reconnect from WS callback
+            ws.on("error", lambda err: log(f"WARN  Private WS error: {err}"))
             ws.on("close", lambda: asyncio.run_coroutine_threadsafe(
                 self._reconnect_private(), self._loop))
 
-            # Subscriptions may be sync or async
-            for sub in (ws.subscribe_positions, ws.subscribe_account_balance):
-                result = sub()
-                if asyncio.iscoroutine(result):
-                    await result
+            await ws.connect()
+            await ws.subscribe_positions("positions-1")
+            await ws.subscribe_account_balance("balance-1")
 
-            # Start the WS listener — sync blocking → run in executor
-            await self._start_ws_listener(ws, "private")
+            self._private_ws = ws
             self._ws_ok = True
             log("INFO  Private WebSocket connected.")
         except Exception as exc:
@@ -406,38 +404,21 @@ class PolymarketBot:
             ws = self._client.ws.markets()
             ws.on("market_data_lite", self._on_bbo_sync)
             ws.on("trade",            self._on_trade_sync)
+            ws.on("error", lambda err: log(f"WARN  Markets WS error: {err}"))
             ws.on("close", lambda: asyncio.run_coroutine_threadsafe(
                 self._reconnect_markets(), self._loop))
 
-            for sub, args in (
-                (ws.subscribe_market_data_lite, (self._tracked_slugs,)),
-                (ws.subscribe_trades,           (self._tracked_slugs,)),
-            ):
-                result = sub(*args)
-                if asyncio.iscoroutine(result):
-                    await result
+            await ws.connect()
+            await ws.subscribe_market_data_lite("md-lite-1", self._tracked_slugs)
+            await ws.subscribe_trades("trades-1", self._tracked_slugs)
 
-            await self._start_ws_listener(ws, "markets")
+            self._markets_ws = ws
             self._ws_ok = True
             log(f"INFO  Markets WebSocket connected ({len(self._tracked_slugs)} slugs).")
         except Exception as exc:
             log(f"WARN  Markets WS failed: {exc}. REST polling will cover BBO.")
             self._loop.call_later(60, lambda: asyncio.run_coroutine_threadsafe(
                 self._reconnect_markets(), self._loop))
-
-    async def _start_ws_listener(self, ws, label: str) -> None:
-        """Find and start the WS receive loop (sync or async)."""
-        for name in ("listen", "run", "run_forever", "start"):
-            fn = getattr(ws, name, None)
-            if fn is None:
-                continue
-            if asyncio.iscoroutinefunction(fn):
-                asyncio.create_task(fn())
-            else:
-                asyncio.create_task(self._loop.run_in_executor(None, fn))
-            log(f"INFO  WS [{label}] listener started via .{name}()")
-            return
-        log(f"WARN  WS [{label}] — no listener method found (tried listen/run/run_forever/start).")
 
     async def _reconnect_private(self) -> None:
         log("INFO  Reconnecting private WS...")
@@ -448,6 +429,16 @@ class PolymarketBot:
         log("INFO  Reconnecting markets WS...")
         await asyncio.sleep(5)
         await self._connect_markets_ws()
+
+    async def _close_ws(self) -> None:
+        for ws, label in ((self._private_ws, "private"), (self._markets_ws, "markets")):
+            if ws is None:
+                continue
+            try:
+                await ws.close()
+                log(f"INFO  {label.capitalize()} WS closed.")
+            except Exception as exc:
+                log(f"WARN  Error closing {label} WS: {exc}")
 
     # ------------------------------------------------------------------
     # Sync WS callbacks (called from WS thread — GIL-safe dict writes only)
@@ -770,6 +761,7 @@ class PolymarketBot:
 
             if elapsed >= RUNTIME_LIMIT_SECONDS:
                 log(f"INFO  Runtime limit ({RUNTIME_LIMIT_SECONDS // 60} min). Initiating handoff...")
+                await self._close_ws()
                 save_state(self._state)
                 trigger_workflow_handoff()
                 log("INFO  Handoff complete. Exiting.")
