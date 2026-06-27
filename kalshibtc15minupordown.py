@@ -120,6 +120,11 @@ DRY_RUN           = os.getenv("DRY_RUN", "true").lower() in ("1", "true", "yes")
 BET_AMOUNT_USD    = float(os.getenv("BET_AMOUNT_USD", "1"))
 
 PRICE_DELTA_GATE  = float(os.getenv("PRICE_DELTA_GATE", "10"))
+# Near-the-money guard: only trade when the contract's YES price is in this band,
+# so both sides are liquid (skips deep-OTM "lottery ticket" contracts that can't
+# be exited because Kalshi's min price is $0.01).
+NTM_MIN           = float(os.getenv("NEAR_THE_MONEY_MIN", "0.05"))
+NTM_MAX           = float(os.getenv("NEAR_THE_MONEY_MAX", "0.95"))
 NOW_WINDOW_S      = int(float(os.getenv("NOW_WINDOW_S", "60")))
 PRINT_NOW_PRICE   = os.getenv("PRINT_NOW_PRICE", "true").lower() in ("1", "true", "yes")
 PRINT_SPOT        = os.getenv("PRINT_SPOT", "true").lower() in ("1", "true", "yes")
@@ -469,6 +474,29 @@ def get_kalshi_quote(ticker: str) -> Optional[dict]:
     return dict(q) if q else None
 
 
+def get_active_yes_price(market: dict) -> Optional[float]:
+    """Best estimate of the contract's YES price (dollars): WS last/mid, else REST."""
+    q = get_kalshi_quote(market["ticker"])
+    if q:
+        if q.get("last") is not None:
+            return q["last"]
+        b, a = q.get("yes_bid"), q.get("yes_ask")
+        if b is not None and a is not None:
+            return (b + a) / 2
+        if a is not None:
+            return a
+        if b is not None:
+            return b
+    raw = market.get("raw_market")
+    if raw is not None:
+        for f in ("last_price_dollars", "yes_ask_dollars", "yes_bid_dollars",
+                  "previous_price_dollars"):
+            v = _to_dollars(getattr(raw, f, None))
+            if v is not None:
+                return v
+    return None
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Kalshi async REST wrapper
 # ─────────────────────────────────────────────────────────────────────────────
@@ -704,6 +732,12 @@ def log_snapshot(live, market, delta) -> None:
     tgt_s = f"${tgt:,.2f}" if tgt is not None else "n/a"
     gate_ok = "✓" if abs(delta) >= PRICE_DELTA_GATE else "·"
     settle_s = settle.strftime("%H:%M") if settle else "?"
+    yp = get_active_yes_price(market)
+    if yp is not None:
+        ntm = "✓ tradable" if (NTM_MIN <= yp <= NTM_MAX) else "✗ deep-OTM (skip)"
+        contract_s = f"${yp:.3f}  [near-money {NTM_MIN:.2f}–{NTM_MAX:.2f}: {ntm}]"
+    else:
+        contract_s = "n/a"
     log.info(
         "\n"
         "┌─── Snapshot ───────────────────────────────────────────────\n"
@@ -711,6 +745,7 @@ def log_snapshot(live, market, delta) -> None:
         f"│  NOW 60s-avg : ${now_price:,.2f}   (Δ live−now = {delta:+,.2f}, "
         f"gate ${PRICE_DELTA_GATE:.0f} {gate_ok})\n"
         f"│  Kalshi tgt  : {tgt_s}\n"
+        f"│  Contract YES: {contract_s}\n"
         f"│  Kalshi WS   : {ws_line}\n"
         f"│  Market      : {market['ticker']}  (settle {settle_s} ET, {tleft})\n"
         f"│  Next pred.  : {market['next_ticker']}\n"
@@ -850,8 +885,19 @@ async def strategy_loop(rest: KalshiREST, market_ws: KalshiMarketWS,
                 open_position["ticker"] == ct:
             continue             # already positioned correctly
 
+        # Near-the-money guard: skip deep-OTM contracts (illiquid / can't exit)
+        yes_p = get_active_yes_price(market)
+        if yes_p is None:
+            log.info("GATE: no contract price yet for %s — skip entry", ct)
+            continue
+        if not (NTM_MIN <= yes_p <= NTM_MAX):
+            log.info("GATE: contract YES=$%.3f outside near-the-money [$%.2f, $%.2f] "
+                     "— skip lottery-ticket trade", yes_p, NTM_MIN, NTM_MAX)
+            continue
+
         direction = "UP (BUY YES)" if desired == "yes" else "DOWN (BUY NO)"
-        log.info("✦ SIGNAL %s  live=$%.2f now=$%.2f Δ=%+.2f", direction, live, now_price, delta)
+        log.info("✦ SIGNAL %s  live=$%.2f now=$%.2f Δ=%+.2f  contractYES=$%.3f",
+                 direction, live, now_price, delta, yes_p)
         await open_market(rest, ct, desired)
 
 
