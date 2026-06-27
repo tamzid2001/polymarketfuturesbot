@@ -4,29 +4,28 @@ test_kalshi_bot.py
 Pre-production QA suite for the ASYNC Kalshi BTC 15-min bot.
 
 Runs end-to-end against LIVE credentials but NEVER submits a real order.
-Exits non-zero if any CRITICAL check fails, so CI goes red on a real problem.
+Exits non-zero if any CRITICAL check fails.
 
-It prints LIVE INFO with substantial logging:
+Prints LIVE INFO with substantial logging:
   • live BTC/USD price (Alpaca REST + WS tick)
-  • full live Kalshi BTC 15-min up/down market snapshot (bids/asks/last/strike)
-  • a live stream of Kalshi market WebSocket messages (verbose)
-  • the predicted NEXT 15-min up/down ticker
+  • the rolling 60-second NOW price, printed EVERY SECOND
+  • the current & next 15-min ET tickers + full live Kalshi market snapshot
+  • a live verbose stream of Kalshi market WebSocket messages
 
 Checks
 ──────
-  1.  Secrets / env present
-  2.  RSA private key (PEM) loads as RSA
-  3.  Dependencies import
-  4.  Ticker build/parse round-trip + NEXT-ticker prediction
-  5.  Alpaca REST auth + live BTC/USD price
-  6.  Alpaca real-time trade WebSocket delivers a tick
-  7.  Kalshi REST auth + balance              (async)
-  8.  Kalshi active market resolves + LIVE MARKET SNAPSHOT  (async)
-  9.  Kalshi market WebSocket live stream (RSA handshake, verbose)  (async)
-  10. V2 MARKET order build: BUY YES / BUY NO / CLOSE (validation only)
-  11. market_buy / market_close under DRY_RUN submit nothing
-
-Run:  python test_kalshi_bot.py
+  1  Secrets / env present
+  2  RSA private key (PEM) loads as RSA
+  3  Dependencies import
+  4  Ticker build/parse (US Eastern) + current/next markets
+  5  Alpaca REST auth + live BTC/USD price
+  6  Alpaca real-time trade WebSocket tick
+  7  Rolling 60-second NOW price printed every second
+  8  Kalshi REST auth + balance                (async)
+  9  Kalshi active market + target + LIVE SNAPSHOT  (async)
+  10 Kalshi market WebSocket live stream (verbose) (async)
+  11 Bet sizing + V2 MARKET order build (BUY/SELL/CLOSE, no submit)
+  12 DRY_RUN open/close submit nothing + one-position rule
 """
 
 from __future__ import annotations
@@ -37,7 +36,7 @@ import sys
 import time
 import threading
 import traceback
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 RESULTS: list = []
 PASS, FAIL, WARN, SKIP = "PASS", "FAIL", "WARN", "SKIP"
@@ -53,7 +52,7 @@ def section(title):
     print(f"\n=== {title} ===", flush=True)
 
 
-# 1 ───────────────────────────────────────────────────────────────────────────
+# 1 ────────────────────────────────────────────────────────────────────────────
 def check_secrets():
     section("1. Secrets / environment")
     for var in ("ALPACA_API_KEY", "ALPACA_API_SECRET", "KALSHI_API_KEY_ID"):
@@ -68,7 +67,7 @@ def check_secrets():
         record("Kalshi PEM source", FAIL, "no PEM file and no KALSHI_PRIVATE_KEY")
 
 
-# 2 ───────────────────────────────────────────────────────────────────────────
+# 2 ────────────────────────────────────────────────────────────────────────────
 def check_pem():
     section("2. RSA private key")
     try:
@@ -85,7 +84,7 @@ def check_pem():
         record("PEM is RSA private key", FAIL, str(exc))
 
 
-# 3 ───────────────────────────────────────────────────────────────────────────
+# 3 ────────────────────────────────────────────────────────────────────────────
 def check_imports():
     section("3. Dependency imports")
     for mod in ("alpaca.data.live", "kalshi_python_async", "aiohttp", "cryptography"):
@@ -96,41 +95,31 @@ def check_imports():
             record(f"import {mod}", FAIL, str(exc))
 
 
-# 4 ───────────────────────────────────────────────────────────────────────────
+# 4 ────────────────────────────────────────────────────────────────────────────
 def check_tickers(bot):
     section("4. Ticker build/parse (US Eastern) + current/next markets")
     try:
-        from datetime import timedelta
-        # tickers are denominated in US Eastern time, e.g. 11:45 ET → -1145-45
         dt_et = datetime(2026, 6, 27, 11, 45, tzinfo=bot.ET)
         t = bot.build_ticker("KXBTC15M", dt_et)
         record("build_ticker (ET)", PASS if t == "KXBTC15M-26JUN271145-45" else FAIL, t)
         p = bot.parse_ticker(t)
         record("parse_ticker round-trip",
-               PASS if (p and p["settle_et"] == dt_et and p["market_type"] == "absolute") else FAIL,
-               str(p))
-        rel = bot.parse_ticker("KXBTC15M-26JUN271200-00")
-        record("relative detection",
-               PASS if rel and rel["market_type"] == "relative" else FAIL,
-               rel["market_type"] if rel else "None")
-
-        # LIVE check: current ticker must match the ET wall-clock right now
+               PASS if (p and p["settle_et"] == dt_et) else FAIL, str(p))
         now_et = datetime.now(tz=bot.ET)
         slot = (now_et.minute // 15) * 15
-        exp_settle = now_et.replace(minute=slot, second=0, microsecond=0) + timedelta(minutes=15)
-        exp_current = bot.build_ticker("KXBTC15M", exp_settle)
+        exp = bot.build_ticker("KXBTC15M",
+                               now_et.replace(minute=slot, second=0, microsecond=0)
+                               + timedelta(minutes=15))
         ct, nt = bot.current_and_next_tickers()
         print(f"      CURRENT open market (ET {now_et.strftime('%H:%M')}): {ct}", flush=True)
         print(f"      NEXT market                       : {nt}", flush=True)
         record("current ticker matches ET clock",
-               PASS if ct == exp_current else FAIL, f"{ct} (expected {exp_current})")
-        nxt = bot.log_next_ticker_prediction()
-        record("NEXT-ticker prediction", PASS if bot.parse_ticker(nxt) else FAIL, nxt)
+               PASS if ct == exp else FAIL, f"{ct} (expected {exp})")
     except Exception as exc:  # noqa: BLE001
         record("ticker helpers", FAIL, str(exc))
 
 
-# 5 ───────────────────────────────────────────────────────────────────────────
+# 5 ────────────────────────────────────────────────────────────────────────────
 def check_alpaca_rest():
     section("5. Alpaca REST auth + live BTC/USD price")
     try:
@@ -147,60 +136,76 @@ def check_alpaca_rest():
         record("Alpaca REST BTC/USD", FAIL, str(exc))
 
 
-# 6 ───────────────────────────────────────────────────────────────────────────
-def check_alpaca_ws():
+# 6 ────────────────────────────────────────────────────────────────────────────
+def check_alpaca_ws(bot):
+    """Start the bot's Alpaca stream (feeds bot.latest_btc_price) and confirm a tick."""
     section("6. Alpaca real-time trade WebSocket")
-    got = {"tick": None}
-
-    async def _on_trade(trade):
-        got["tick"] = float(trade.price)
-
-    stream = None
     try:
         from alpaca.data.live import CryptoDataStream
         stream = CryptoDataStream(os.getenv("ALPACA_API_KEY"), os.getenv("ALPACA_API_SECRET"))
-        stream.subscribe_trades(_on_trade, "BTC/USD")
+        stream.subscribe_trades(bot.on_trade, "BTC/USD")   # populates bot price state
         threading.Thread(target=stream.run, daemon=True).start()
         deadline = time.time() + 25
-        while time.time() < deadline and got["tick"] is None:
+        while time.time() < deadline:
+            p, _ = bot.read_btc_price()
+            if p > 0:
+                print(f"      LIVE BTC/USD (Alpaca WS tick): ${p:,.2f}", flush=True)
+                record("Alpaca WS tick", PASS, f"${p:,.2f}")
+                return
             time.sleep(0.5)
-        if got["tick"]:
-            print(f"      LIVE BTC/USD (Alpaca WS tick): ${got['tick']:,.2f}", flush=True)
-            record("Alpaca WS tick", PASS, f"${got['tick']:,.2f}")
-        else:
-            record("Alpaca WS tick", WARN, "no tick in 25s", critical=False)
+        record("Alpaca WS tick", WARN, "no tick in 25s", critical=False)
     except Exception as exc:  # noqa: BLE001
         record("Alpaca WS tick", FAIL, str(exc))
-    finally:
+
+
+# 7 (async) ─────────────────────────────────────────────────────────────────────
+async def check_now_price(bot):
+    section("7. Rolling 60-second NOW price (printed EVERY SECOND)")
+    try:
+        bot.PRINT_NOW_PRICE = True
+        # demo the target-anchor: seed with a sample target, then blend live ticks
+        live, _ = bot.read_btc_price()
+        if live > 0:
+            bot.anchor_now_price(round(live, 2))
+        task = asyncio.create_task(bot.price_sampler())
+        await asyncio.sleep(22)               # ~22 one-second prints
+        task.cancel()
         try:
-            if stream is not None:
-                stream.stop()
-        except Exception:  # noqa: BLE001
+            await task
+        except asyncio.CancelledError:
             pass
+        if bot.now_price > 0 and len(bot.price_samples) >= bot.MIN_SAMPLES:
+            record("rolling NOW price", PASS,
+                   f"now=${bot.now_price:,.2f} over {len(bot.price_samples)} samples")
+        else:
+            record("rolling NOW price", WARN,
+                   "insufficient samples (Alpaca quiet?)", critical=False)
+    except Exception as exc:  # noqa: BLE001
+        record("rolling NOW price", FAIL, str(exc))
 
 
-# 7-9 (async) ──────────────────────────────────────────────────────────────────
+# 8-10 (async) ──────────────────────────────────────────────────────────────────
 def _print_market_snapshot(market: dict):
     raw = market["raw_market"]
-    fields = ["ticker", "status", "yes_sub_title", "no_sub_title",
-              "yes_bid_dollars", "yes_ask_dollars", "no_bid_dollars", "no_ask_dollars",
-              "last_price_dollars", "previous_price_dollars",
-              "floor_strike", "cap_strike", "strike_type",
-              "volume", "open_interest", "liquidity_dollars"]
+    tgt_s = "${:,.2f}".format(market["target"]) if market.get("target") is not None else "n/a"
     print("      ┌─ LIVE KALSHI BTC 15-MIN MARKET ──────────────────────", flush=True)
-    print(f"      │ resolved type : {market['market_type']}  "
-          f"ref=${market['reference_price']:,.2f}", flush=True)
-    print(f"      │ settle (ET)   : {market['settle_et'].strftime('%Y-%m-%dT%H:%M %Z')}", flush=True)
+    print(f"      │ ticker        : {market['ticker']}", flush=True)
+    print(f"      │ target (strike): {tgt_s}", flush=True)
+    if market.get("settle_et"):
+        print(f"      │ settle (ET)   : {market['settle_et'].strftime('%Y-%m-%dT%H:%M %Z')}",
+              flush=True)
     print(f"      │ next ticker   : {market['next_ticker']}", flush=True)
-    for f in fields:
+    for f in ("status", "yes_sub_title", "no_sub_title", "yes_bid_dollars",
+              "yes_ask_dollars", "no_bid_dollars", "no_ask_dollars",
+              "last_price_dollars", "floor_strike", "volume", "open_interest"):
         v = getattr(raw, f, None)
         if v is not None:
-            print(f"      │ {f:<22}: {v}", flush=True)
+            print(f"      │ {f:<18}: {v}", flush=True)
     print("      └───────────────────────────────────────────────────────", flush=True)
 
 
 async def check_kalshi_async(bot):
-    section("7. Kalshi REST auth + balance (async)")
+    section("8. Kalshi REST auth + balance (async)")
     rest = None
     try:
         rest = bot.KalshiREST()
@@ -212,31 +217,25 @@ async def check_kalshi_async(bot):
         traceback.print_exc()
         return None
 
-    section("8. Kalshi active market + LIVE SNAPSHOT (async)")
-    market = None
+    section("9. Kalshi active market + target + LIVE SNAPSHOT (async)")
     try:
         market = await bot.resolve_active_market(rest)
-        if market and market.get("reference_price") is not None:
+        if market:
             _print_market_snapshot(market)
-            record("resolve_active_market", PASS,
-                   f"{market['ticker']} ref=${market['reference_price']:,.2f}")
+            tgt_s = ("${:,.2f}".format(market["target"])
+                     if market.get("target") is not None else "n/a")
+            record("resolve_active_market", PASS, f"{market['ticker']} target={tgt_s}")
         else:
             record("resolve_active_market", WARN, "no open market yet", critical=False)
     except Exception as exc:  # noqa: BLE001
         record("resolve_active_market", FAIL, str(exc))
 
-    section("9. Kalshi market WebSocket LIVE STREAM (verbose, async)")
+    section("10. Kalshi market WebSocket LIVE STREAM (verbose, async)")
     try:
         ws = bot.KalshiMarketWS(rest.auth)
-        ct, nt = bot.current_and_next_tickers()
-        ws.set_tickers((ct, nt))
+        ws.set_tickers(bot.current_and_next_tickers())
         task = asyncio.create_task(ws.run())
-        # let it connect + stream live messages for ~12s (verbose logging on)
-        for _ in range(24):
-            await asyncio.sleep(0.5)
-            if ws.connected and ws.msg_count >= 1:
-                pass
-        await asyncio.sleep(8)
+        await asyncio.sleep(12)
         task.cancel()
         try:
             await task
@@ -247,39 +246,38 @@ async def check_kalshi_async(bot):
                    f"connected={ws.connected}, {ws.msg_count} msg(s), "
                    f"{len(bot.kalshi_quotes)} quote(s)")
         else:
-            record("Kalshi WS live stream", FAIL, "no connection / no messages (auth/url?)")
+            record("Kalshi WS live stream", FAIL, "no connection / messages (auth/url?)")
     except Exception as exc:  # noqa: BLE001
         record("Kalshi WS live stream", FAIL, str(exc))
-
     return rest
 
 
-# 10-11 ────────────────────────────────────────────────────────────────────────
+# 11-12 ─────────────────────────────────────────────────────────────────────────
 async def check_orders_async(bot, rest):
-    section("10. V2 MARKET order build: BUY YES / BUY NO / CLOSE (no submit)")
+    section("11. Bet sizing + V2 MARKET order build (no submit)")
     try:
         from kalshi_python_async import (CreateOrderV2Request, BookSide,
                                          SelfTradePreventionType)
         import uuid
-        cases = [
-            ("BUY YES",   BookSide.BID, "0.99", False),
-            ("BUY NO",    BookSide.ASK, "0.01", False),
-            ("CLOSE YES", BookSide.ASK, "0.01", True),
-            ("CLOSE NO",  BookSide.BID, "0.99", True),
-        ]
-        for label, side, price, reduce_only in cases:
+        record("BET_AMOUNT_USD", PASS, f"${bot.BET_AMOUNT_USD:.2f} → {bot.bet_count()} contract(s)")
+        cases = [("BUY YES", BookSide.BID, "0.99", False),
+                 ("BUY NO",  BookSide.ASK, "0.01", False),
+                 ("CLOSE YES", BookSide.ASK, "0.01", True),
+                 ("CLOSE NO",  BookSide.BID, "0.99", True)]
+        for label, side, price, ro in cases:
             req = CreateOrderV2Request(
-                ticker="KXBTC15M-26JUN270045-45", side=side, count="5.00", price=price,
+                ticker="KXBTC15M-26JUN271145-45", side=side,
+                count=f"{float(bot.bet_count()):.2f}", price=price,
                 time_in_force="immediate_or_cancel", client_order_id=str(uuid.uuid4()),
                 self_trade_prevention_type=SelfTradePreventionType.TAKER_AT_CROSS,
-                reduce_only=reduce_only)
-            ok = (req.side == side and req.price == price and req.reduce_only == reduce_only)
+                reduce_only=ro)
+            ok = (req.side == side and req.price == price and req.reduce_only == ro)
             record(f"build {label}", PASS if ok else FAIL,
-                   f"side={req.side.value} price={req.price} reduce_only={req.reduce_only}")
+                   f"side={req.side.value} price={req.price} count={req.count} reduce_only={req.reduce_only}")
     except Exception as exc:  # noqa: BLE001
         record("V2 order build", FAIL, str(exc))
 
-    section("11. DRY_RUN market_buy / market_close submit nothing")
+    section("12. DRY_RUN open/close + one-position rule (no submit)")
     try:
         class _FakeOrders:
             async def create_order_v2(self, **k):
@@ -287,31 +285,38 @@ async def check_orders_async(bot, rest):
         prev = bot.DRY_RUN
         bot.DRY_RUN = True
         rest.orders = _FakeOrders()
-        tk = "KXBTC15M-26JUN270045-45"
-        r1 = await bot.market_buy(rest, tk, "yes", 1)
-        r2 = await bot.market_close(rest, tk)
+        bot.open_position = None
+        tk = bot.current_and_next_tickers()[0]
+        await bot.open_market(rest, tk, "yes")
+        s1 = bot.open_position and bot.open_position["side"] == "yes"
+        # flip → should close YES and open NO; still exactly one position
+        await bot.open_market(rest, tk, "no")
+        s2 = bot.open_position and bot.open_position["side"] == "no"
+        await bot.close_position(rest)
+        s3 = bot.open_position is None
         bot.DRY_RUN = prev
-        ok = (r1 is None and r2 is None and tk not in bot.positions)
-        record("DRY_RUN no-submit", PASS if ok else FAIL,
-               "buy+close returned None, position cleared" if ok else "submitted something!")
+        record("DRY_RUN open/close + flip", PASS if (s1 and s2 and s3) else FAIL,
+               "open YES → flip NO → close, one position throughout"
+               if (s1 and s2 and s3) else "state mismatch")
     except Exception as exc:  # noqa: BLE001
-        record("DRY_RUN no-submit", FAIL, str(exc))
+        record("DRY_RUN open/close", FAIL, str(exc))
 
 
 async def _run_async(bot):
+    await check_now_price(bot)
     rest = await check_kalshi_async(bot)
     if rest is not None:
         await check_orders_async(bot, rest)
         await rest.close()
     else:
-        section("10-11. Orders")
+        section("11-12. Orders")
         record("order checks", SKIP, "Kalshi REST unavailable", critical=False)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 def main():
-    # verbose WS logging + dry-run must be set before importing the bot module
     os.environ.setdefault("KALSHI_WS_VERBOSE", "true")
+    os.environ.setdefault("PRINT_NOW_PRICE", "true")
     os.environ.setdefault("DRY_RUN", "true")
 
     print("=" * 70)
@@ -336,7 +341,7 @@ def main():
     if bot is not None:
         check_tickers(bot)
         check_alpaca_rest()
-        check_alpaca_ws()
+        check_alpaca_ws(bot)
         try:
             asyncio.run(_run_async(bot))
         except Exception as exc:  # noqa: BLE001
@@ -346,7 +351,7 @@ def main():
     print("\n" + "=" * 70)
     counts = {PASS: 0, FAIL: 0, WARN: 0, SKIP: 0}
     crit_fail = 0
-    for _name, status, _detail, critical in RESULTS:
+    for _n, status, _d, critical in RESULTS:
         counts[status] += 1
         if status == FAIL and critical:
             crit_fail += 1

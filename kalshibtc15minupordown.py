@@ -3,72 +3,67 @@ kalshibtc15minupordown.py
 ─────────────────────────────────────────────────────────────────────────────
 BTC 15-min Kalshi market algo-trader  (fully ASYNC).
 
+NOW PRICE (rolling 60-second simple average)
+────────────────────────────────────────────
+  Kalshi BTC 15-min markets resolve on CF Benchmarks' BRTI — the simple
+  average of the 60 one-second index values before settlement. Kalshi's trade
+  API exposes the TARGET (floor_strike, == the previous window's 60-s average)
+  but not a live BTC spot price, so we derive a "NOW price" from Alpaca:
+
+    • Sample Alpaca's live BTC/USD price once PER SECOND.
+    • NOW price = simple average of the last 60 one-second samples.
+    • On each new 15-min window we ANCHOR the average to the Kalshi target
+      (floor_strike) and then blend in each new second's price — keeping the
+      rolling 60-s average aligned with the official BRTI value.
+    • The NOW price is printed every second.
+
+SIGNAL  (momentum vs the rolling average)
+─────────────────────────────────────────
+    delta = live_price − NOW_price
+      delta ≥ +PRICE_DELTA_GATE ($10)  → BUY UP   (YES)
+      delta ≤ −PRICE_DELTA_GATE        → BUY DOWN (NO)
+    Only ONE position (UP or DOWN) is open at any time; flipping closes the
+    other side first. Orders are MARKET (marketable IOC). Bet size is
+    BET_AMOUNT_USD per buy (each contract = $1 notional).
+
 DATA SOURCES
 ────────────
-  • Alpaca CryptoDataStream      → real-time BTC/USD trades (WS, own thread)
-  • Kalshi market WebSocket      → real-time ticker / trade for the active
-                                   KXBTC15M contract (aiohttp, RSA-signed)
-  • Kalshi REST (kalshi-python-async, V2) → market metadata, balance,
-                                   positions, MARKET orders
+  • Alpaca CryptoDataStream  → real-time BTC/USD trades (WS, own thread)
+  • Kalshi market WebSocket  → live ticker/trade for the active contract
+  • Kalshi REST (kalshi-python-async, V2) → market metadata (target), balance,
+                               MARKET orders
 
-ASYNC ARCHITECTURE
-──────────────────
-  asyncio main loop runs:
-    • kalshi_ws task        — live contract quotes
-    • strategy loop task    — decisions + order placement
-  Alpaca's CryptoDataStream runs in its own thread (it owns an event loop)
-  and writes BTC price into shared state guarded by a threading.Lock.
-
-TICKER FORMAT  (verified from live Kalshi pages)
-─────────────────────────────────────────────────
+TICKER FORMAT  (US EASTERN time, auto-DST — NOT UTC)
+─────────────────────────────────────────────────────
   Pattern : {SERIES}-{YY}{MON}{DD}{HHMM}-{MM}
-  Example : KXBTC15M-26JUN271145-45   (settles 11:45 US EASTERN time)
-  IMPORTANT: HHMM/DD are US EASTERN time (auto-DST), NOT UTC.
-  Suffix = zero-padded minute of settlement:
-    :00 → "-00" RELATIVE up/down (ref = previous window close)
-    :15/:30/:45 → ABSOLUTE price (ref = floor_strike)
+  Example : KXBTC15M-26JUN271145-45   (settles 11:45 ET)
+  Suffix = zero-padded minute of settlement (00/15/30/45).
 
-STRATEGY
-────────
-1. Alpaca BTC/USD trades → rolling 1-min bars (pace decisions to 1/min).
-2. Resolve the active KXBTC15M market (async REST) + reference price.
-3. Predict & log the NEXT 15-min up/down ticker every cycle.
-4. delta = live BTC − reference. Gate: |delta| > PRICE_DELTA_GATE and no
-   open position in this window.  delta>0 → BUY YES, delta<0 → BUY NO.
-5. Orders are MARKET (marketable IOC) — buy to open, sell/close to exit.
-   Positions are closed before settlement (CLOSE_BEFORE_SETTLE_S) or on an
-   opposite signal.
-6. DRY_RUN (default ON): orders are logged but NOT submitted.
+KALSHI ASYNC SDK NOTES (kalshi-python-async ≥ 3.22, Python ≥ 3.13)
+──────────────────────────────────────────────────────────────────
+  • Auth   : config.api_key_id + config.private_key_pem → KalshiClient(config)
+             (do NOT use the broken client.set_kalshi_auth)
+  • Balance: await PortfolioApi(client).get_balance()
+  • Market : await MarketApi(client).get_market(ticker)   (.market.floor_strike)
+  • Order  : await OrdersApi(client).create_order_v2(create_order_v2_request=
+               CreateOrderV2Request(ticker, side=BookSide.BID|ASK, count="1.00",
+                 price="0.99", time_in_force="immediate_or_cancel",
+                 self_trade_prevention_type=..., reduce_only=<bool>))
+             BID → buy YES; ASK → buy NO (sell YES). reduce_only closes.
 
-KALSHI ASYNC SDK NOTES (kalshi-python-async ≥ 3.22, needs Python ≥ 3.13)
-────────────────────────────────────────────────────────────────────────
-  • Auth     : config.api_key_id + config.private_key_pem → KalshiClient(config)
-               (RSA-PSS signing; do NOT use the broken client.set_kalshi_auth)
-  • Balance  : await PortfolioApi(client).get_balance()
-  • Market   : await MarketApi(client).get_market(ticker)
-  • Events   : await EventsApi(client).get_events(series_ticker=, status=, ...)
-  • Positions: await PortfolioApi(client).get_positions(ticker=)
-  • Order V2 : await OrdersApi(client).create_order_v2(create_order_v2_request=
-                 CreateOrderV2Request(ticker, side=BookSide.BID|ASK,
-                   count="5.00", price="0.99", time_in_force="immediate_or_cancel",
-                   self_trade_prevention_type=..., reduce_only=<bool>))
-    Single-book: side=BID → buy YES, side=ASK → buy NO (sell YES).
-    A marketable IOC at the price cap (0.99 / 0.01) behaves as a market order.
-    Closing uses reduce_only=True on the opposite side.
-  • Prod REST: https://api.elections.kalshi.com/trade-api/v2
-  • Prod WS  : wss://api.elections.kalshi.com/trade-api/ws/v2
-
-CREDENTIALS (env vars)
-──────────────────────
-    ALPACA_API_KEY / ALPACA_API_SECRET    Alpaca key id / secret
-    KALSHI_API_KEY_ID                     Kalshi API key id (UUID)
-    KALSHI_PEM_PATH                       RSA private-key .pem path  (or…)
-    KALSHI_PRIVATE_KEY                    …the PEM content directly
+CREDENTIALS / SETTINGS (env vars)
+─────────────────────────────────
+    ALPACA_API_KEY / ALPACA_API_SECRET
+    KALSHI_API_KEY_ID / KALSHI_PEM_PATH (or KALSHI_PRIVATE_KEY content)
     KALSHI_DEMO            "true" for sandbox (default false)
     DRY_RUN               "true" (default) — log orders, do not submit
+    BET_AMOUNT_USD        notional $ per buy (default 1 → 1 contract)
+    PRICE_DELTA_GATE      $ momentum gate (default 10)
+    NOW_WINDOW_S          rolling-average window seconds (default 60)
+    PRINT_NOW_PRICE       "true" (default) — print NOW price every second
     RUNTIME_LIMIT_MIN     clean-exit after N minutes (default 345 = 5h45m)
-    CLOSE_BEFORE_SETTLE_S close open positions this many secs before settle (30)
-    KALSHI_WS_VERBOSE     "true" — log every WS message (QA uses this)
+    CLOSE_BEFORE_SETTLE_S close position this many secs before settle (30)
+    KALSHI_WS_VERBOSE     "true" — log every Kalshi WS message
 """
 
 from __future__ import annotations
@@ -87,10 +82,6 @@ from typing import Optional
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
-# Kalshi KXBTC15M tickers are denominated in US EASTERN time (ET, auto-DST),
-# NOT UTC. e.g. KXBTC15M-26JUN271145-45 settles 11:45 ET.
-ET = ZoneInfo("America/New_York")
-
 import aiohttp
 
 from alpaca.data.live import CryptoDataStream
@@ -108,6 +99,9 @@ from kalshi_python_async import (
     SelfTradePreventionType,
 )
 
+# Kalshi KXBTC15M tickers are denominated in US EASTERN time (auto-DST), NOT UTC.
+ET = ZoneInfo("America/New_York")
+
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
@@ -117,9 +111,23 @@ KALSHI_API_KEY_ID = os.getenv("KALSHI_API_KEY_ID", "")
 KALSHI_PEM_PATH   = os.getenv("KALSHI_PEM_PATH",   "kalshi_private_key.pem")
 KALSHI_DEMO       = os.getenv("KALSHI_DEMO", "false").lower() in ("1", "true", "yes")
 DRY_RUN           = os.getenv("DRY_RUN", "true").lower() in ("1", "true", "yes")
+
+# ── Bet sizing ──────────────────────────────────────────────────────────────
+# Initial bet amount in USD notional per buy. Each Kalshi contract settles to
+# $1, so $1 of notional == 1 contract.  Change here (or via env) to scale up.
+BET_AMOUNT_USD    = float(os.getenv("BET_AMOUNT_USD", "1"))
+
+PRICE_DELTA_GATE  = float(os.getenv("PRICE_DELTA_GATE", "10"))
+NOW_WINDOW_S      = int(float(os.getenv("NOW_WINDOW_S", "60")))
+PRINT_NOW_PRICE   = os.getenv("PRINT_NOW_PRICE", "true").lower() in ("1", "true", "yes")
 RUNTIME_LIMIT_MIN = float(os.getenv("RUNTIME_LIMIT_MIN", "345"))
 CLOSE_BEFORE_SETTLE_S = float(os.getenv("CLOSE_BEFORE_SETTLE_S", "30"))
 KALSHI_WS_VERBOSE = os.getenv("KALSHI_WS_VERBOSE", "false").lower() in ("1", "true", "yes")
+
+ORDER_TIF      = "immediate_or_cancel"   # marketable IOC == market order
+SERIES_TICKER  = "KXBTC15M"
+BTC_SYMBOL     = "BTC/USD"
+MIN_SAMPLES    = 3                       # need a few samples before trading
 
 KALSHI_BASE_URL = (
     "https://demo-api.kalshi.co/trade-api/v2"
@@ -133,12 +141,11 @@ KALSHI_WS_URL = os.getenv(
     else "wss://api.elections.kalshi.com/trade-api/ws/v2",
 )
 
-BTC_SYMBOL       = "BTC/USD"
-HISTORY_BARS     = 60     # 60 × 1-min bars = 1 hour (paces the decision cycle)
-PRICE_DELTA_GATE = 10.0   # |real_price − reference| must exceed $10 to trade
-ORDER_CONTRACTS  = 5      # contracts per signal
-ORDER_TIF        = "immediate_or_cancel"   # marketable IOC == market order
-SERIES_TICKER    = "KXBTC15M"
+
+def bet_count() -> int:
+    """Number of contracts for one buy ($1 notional == 1 contract)."""
+    return max(1, int(round(BET_AMOUNT_USD)))
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Logging
@@ -156,27 +163,23 @@ log = logging.getLogger("kalshi_btc_bot")
 # ─────────────────────────────────────────────────────────────────────────────
 # Shared state
 # ─────────────────────────────────────────────────────────────────────────────
-minute_bars: deque                       = deque(maxlen=HISTORY_BARS)
-_current_bar: Optional[dict]             = None
-_current_bar_minute: Optional[datetime]  = None
-_bar_lock = threading.Lock()
-
-latest_btc_price: float                  = 0.0
-latest_btc_ts:    Optional[datetime]     = None
+latest_btc_price: float              = 0.0
+latest_btc_ts:    Optional[datetime] = None
 _price_lock = threading.Lock()
 
-# Live Kalshi WS quotes per ticker (main-loop only): {ticker: {yes_bid,yes_ask,last,ts}}
+# Rolling NOW-price (per-second samples → simple average). Main-loop only.
+price_samples: deque = deque(maxlen=NOW_WINDOW_S)
+now_price: float     = 0.0
+
+# Live Kalshi WS quotes per ticker (main-loop only).
 kalshi_quotes: dict = {}
 
-# Open positions (main-loop only): {ticker: {"side": "yes"|"no", "count": int}}
-positions: dict = {}
-
-prev_window_close: Optional[float]  = None
-prev_window_ticker: Optional[str]   = None
+# Single open position (main-loop only): {"ticker","side","count"} or None.
+open_position: Optional[dict] = None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Ticker helpers (deterministic)
+# Ticker helpers (US Eastern time)
 # ─────────────────────────────────────────────────────────────────────────────
 _MONTHS = {
     "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY":  5, "JUN": 6,
@@ -190,7 +193,6 @@ _TICKER_RE = re.compile(
 
 
 def build_ticker(series: str, settle_et: datetime) -> str:
-    """Build the ticker from a settlement datetime expressed in ET wall-clock."""
     return (f"{series}-{settle_et.strftime('%y')}{settle_et.strftime('%b').upper()}"
             f"{settle_et.strftime('%d')}{settle_et.strftime('%H%M')}-"
             f"{settle_et.strftime('%M')}")
@@ -204,7 +206,6 @@ def parse_ticker(ticker: str) -> Optional[dict]:
     if mon_num is None:
         return None
     hhmm = m.group("hhmm")
-    # HHMM/DD are US Eastern time → build an ET-aware settlement datetime.
     settle = datetime(2000 + int(m.group("yy")), mon_num, int(m.group("dd")),
                       int(hhmm[:2]), int(hhmm[2:]), tzinfo=ET)
     suffix = m.group("suffix")
@@ -213,7 +214,7 @@ def parse_ticker(ticker: str) -> Optional[dict]:
 
 
 def current_and_next_tickers(series: str = SERIES_TICKER) -> tuple:
-    """Current & next 15-min KXBTC15M tickers, computed in US EASTERN time."""
+    """Current & next 15-min KXBTC15M tickers, in US EASTERN time."""
     now_et     = datetime.now(tz=ET)
     slot_min   = (now_et.minute // 15) * 15
     current_dt = now_et.replace(minute=slot_min, second=0, microsecond=0)
@@ -223,48 +224,25 @@ def current_and_next_tickers(series: str = SERIES_TICKER) -> tuple:
 
 
 def log_next_ticker_prediction() -> str:
-    """Predict, print and return the NEXT 15-min up/down market ticker."""
     _, nxt = current_and_next_tickers()
     p = parse_ticker(nxt)
     log.info("⏭  NEXT 15-MIN UP/DOWN TICKER PREDICTION: %s  (settles %s ET, type=%s)",
-             nxt,
-             p["settle_et"].strftime("%H:%M") if p else "?",
+             nxt, p["settle_et"].strftime("%H:%M") if p else "?",
              p["market_type"] if p else "?")
     return nxt
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Alpaca WebSocket (own thread)
+# Alpaca WebSocket (own thread) + per-second NOW-price sampler
 # ─────────────────────────────────────────────────────────────────────────────
-def _minute_bucket(ts: datetime) -> datetime:
-    return ts.replace(second=0, microsecond=0, tzinfo=timezone.utc)
-
-
 async def on_trade(trade) -> None:
-    global _current_bar, _current_bar_minute, latest_btc_price, latest_btc_ts
-    price = float(trade.price)
-    size  = float(trade.size)
+    global latest_btc_price, latest_btc_ts
     ts: datetime = trade.timestamp
     if ts.tzinfo is None:
         ts = ts.replace(tzinfo=timezone.utc)
-
     with _price_lock:
-        latest_btc_price = price
+        latest_btc_price = float(trade.price)
         latest_btc_ts    = ts
-
-    bucket = _minute_bucket(ts)
-    with _bar_lock:
-        if _current_bar_minute is None or bucket != _current_bar_minute:
-            if _current_bar is not None:
-                minute_bars.append(_current_bar.copy())
-            _current_bar_minute = bucket
-            _current_bar = {"ds": bucket, "open": price, "high": price,
-                            "low": price, "close": price, "volume": size}
-        else:
-            _current_bar["high"]    = max(_current_bar["high"], price)
-            _current_bar["low"]     = min(_current_bar["low"],  price)
-            _current_bar["close"]   = price
-            _current_bar["volume"] += size
 
 
 def run_alpaca_stream() -> None:
@@ -284,11 +262,38 @@ def read_btc_price() -> tuple:
         return latest_btc_price, latest_btc_ts
 
 
+def anchor_now_price(target: Optional[float]) -> None:
+    """Reset the rolling buffer and seed it with the Kalshi target so the
+    60-s average re-anchors to the official BRTI value at each new window."""
+    global now_price
+    price_samples.clear()
+    if target is not None and target > 0:
+        price_samples.append(target)
+        now_price = target
+        log.info(f"Anchored NOW price (60s avg) to target ${target:,.2f}")
+
+
+async def price_sampler() -> None:
+    """Sample the live BTC price once per second; update + print the rolling
+    60-second simple average (the NOW price)."""
+    global now_price
+    while True:
+        await asyncio.sleep(1)
+        price, _ = read_btc_price()
+        if price <= 0:
+            continue
+        price_samples.append(price)
+        now_price = sum(price_samples) / len(price_samples)
+        if PRINT_NOW_PRICE:
+            log.info(f"NOW 60s-avg=${now_price:,.2f} | live=${price:,.2f} | "
+                     f"Δ(live−now)={price - now_price:+.2f} | "
+                     f"samples={len(price_samples)}/{NOW_WINDOW_S}")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Kalshi market WebSocket (aiohttp, async, RSA-signed)
 # ─────────────────────────────────────────────────────────────────────────────
 def _to_dollars(val) -> Optional[float]:
-    """Best-effort convert a Kalshi price field to USD dollars."""
     if val is None:
         return None
     try:
@@ -430,10 +435,9 @@ class KalshiREST:
 
     def __init__(self):
         pem = load_pem()
-        # Official auth pattern: set credentials on the Configuration BEFORE
-        # constructing the client. KalshiClient.__init__ builds its internal
-        # KalshiAuth from these. (The client.set_kalshi_auth() helper is broken
-        # in the 3.22 build — NameError on KalshiAuth — so we avoid it.)
+        # Official auth pattern: set credentials on Configuration BEFORE building
+        # the client (KalshiClient.__init__ builds its KalshiAuth from these).
+        # client.set_kalshi_auth() is broken in the 3.22 build, so we avoid it.
         config = Configuration(host=KALSHI_BASE_URL)
         config.api_key_id = KALSHI_API_KEY_ID
         config.private_key_pem = pem
@@ -484,18 +488,6 @@ class KalshiREST:
             log.error("get_events fallback failed: %s", exc)
             return []
 
-    async def get_position_count(self, ticker: str) -> Optional[float]:
-        """Return signed position size (positive=long YES, negative=long NO)."""
-        try:
-            resp = await self.portfolio.get_positions(ticker=ticker)
-            for mp in (getattr(resp, "market_positions", None) or []):
-                if getattr(mp, "ticker", None) == ticker:
-                    pf = getattr(mp, "position_fp", None)
-                    return float(pf) if pf is not None else None
-        except Exception as exc:  # noqa: BLE001
-            log.warning("get_positions(%s) failed: %s", ticker, exc)
-        return None
-
 
 def _field(obj, *names):
     for n in names:
@@ -505,83 +497,55 @@ def _field(obj, *names):
     return None
 
 
+def _extract_target(market) -> Optional[float]:
+    """Target price = floor_strike (min value for YES); fall back to subtitle."""
+    val = _field(market, "floor_strike", "cap_strike", "functional_strike")
+    if val is not None:
+        try:
+            f = float(val)
+            if f > 0:
+                return f
+        except (TypeError, ValueError):
+            pass
+    for tf in ("yes_sub_title", "no_sub_title"):
+        m = re.search(r"\$([0-9,]+(?:\.\d+)?)", str(_field(market, tf) or ""))
+        if m:
+            return float(m.group(1).replace(",", ""))
+    return None
+
+
 async def resolve_active_market(rest: KalshiREST) -> Optional[dict]:
-    global prev_window_close, prev_window_ticker
-    current_ticker, next_ticker = current_and_next_tickers()
-    parsed = parse_ticker(current_ticker)
-    if parsed is None:
-        log.error("Cannot parse constructed ticker %s", current_ticker)
-        return None
-
-    market_type = parsed["market_type"]
-    settle_et   = parsed["settle_et"]
-    suffix      = parsed["suffix"]
-
-    market = await rest.get_market(current_ticker)
+    """Resolve the current open KXBTC15M market and its target (floor_strike)."""
+    ct, nt = current_and_next_tickers()
+    parsed = parse_ticker(ct) or {}
+    market = await rest.get_market(ct)
     if market is None:
-        log.warning("Direct lookup of %s failed – trying events query", current_ticker)
+        log.warning("Direct lookup of %s failed – trying events query", ct)
         markets = await rest.get_open_series_markets()
         if markets:
             market = markets[0]
-            current_ticker = _field(market, "ticker") or current_ticker
-            parsed = parse_ticker(current_ticker) or parsed
-            market_type = parsed["market_type"]
-            settle_et   = parsed["settle_et"]
-            suffix      = parsed["suffix"]
+            ct = _field(market, "ticker") or ct
+            parsed = parse_ticker(ct) or parsed
     if market is None:
         log.info("No open KXBTC15M market found")
         return None
-
-    reference_price: Optional[float] = None
-    if market_type == "absolute":
-        strike = _field(market, "floor_strike", "cap_strike", "functional_strike")
-        if strike is not None:
-            try:
-                reference_price = float(strike)
-            except (TypeError, ValueError):
-                reference_price = None
-        if reference_price is None or reference_price <= 0:
-            for tf in ("yes_sub_title", "no_sub_title"):
-                m = re.search(r"\$([0-9,]+(?:\.\d+)?)", str(_field(market, tf) or ""))
-                if m:
-                    reference_price = float(m.group(1).replace(",", ""))
-                    break
-        if reference_price is None:
-            log.error("Cannot find strike for absolute market %s", current_ticker)
-            return None
-    else:
-        if prev_window_close is not None:
-            reference_price = prev_window_close
-        else:
-            prev_ticker = build_ticker(SERIES_TICKER, settle_et - timedelta(minutes=15))
-            prev = await rest.get_market(prev_ticker)
-            if prev is not None:
-                strike = _field(prev, "floor_strike", "functional_strike")
-                if strike is not None:
-                    try:
-                        reference_price = float(strike)
-                    except (TypeError, ValueError):
-                        reference_price = None
-            if reference_price is None:
-                reference_price, _ = read_btc_price()
-                log.warning("Relative ref unavailable – using live Alpaca $%.2f",
-                            reference_price)
-
-    return {"ticker": current_ticker, "next_ticker": next_ticker,
-            "market_type": market_type, "suffix": suffix,
-            "reference_price": reference_price, "settle_et": settle_et,
+    return {"ticker": ct, "next_ticker": nt,
+            "market_type": parsed.get("market_type", "?"),
+            "settle_et": parsed.get("settle_et"),
+            "target": _extract_target(market),
             "raw_market": market}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Orders (MARKET = marketable IOC)
+# Orders (MARKET = marketable IOC) — single open position
 # ─────────────────────────────────────────────────────────────────────────────
 async def _submit(rest: KalshiREST, *, ticker, side: BookSide, price: str,
                   count: int, reduce_only: bool, tag: str):
     order_id = str(uuid.uuid4())
-    log.info("ORDER %s  %s  side=%s price=%s count=%d reduce_only=%s ticker=%s id=%s",
+    log.info("ORDER %s  %s  side=%s price=%s count=%d (~$%.0f) reduce_only=%s "
+             "ticker=%s id=%s",
              "[DRY-RUN]" if DRY_RUN else "[LIVE]", tag, side.value, price, count,
-             reduce_only, ticker, order_id)
+             BET_AMOUNT_USD, reduce_only, ticker, order_id)
     if DRY_RUN:
         log.info("DRY_RUN active — order NOT submitted.")
         return None
@@ -602,170 +566,155 @@ async def _submit(rest: KalshiREST, *, ticker, side: BookSide, price: str,
         return None
 
 
-async def market_buy(rest: KalshiREST, ticker: str, buy_side: str,
-                     count: int = ORDER_CONTRACTS):
-    """Open a position with a marketable IOC (market) order.
-    buy YES → BID@0.99 ; buy NO → ASK@0.01."""
-    side  = BookSide.BID if buy_side == "yes" else BookSide.ASK
-    price = "0.99" if buy_side == "yes" else "0.01"
-    resp = await _submit(rest, ticker=ticker, side=side, price=price, count=count,
-                         reduce_only=False, tag=f"MARKET BUY {buy_side.upper()}")
+async def close_position(rest: KalshiREST):
+    """Close the single open position (reduce-only marketable order)."""
+    global open_position
+    if not open_position:
+        return None
+    if open_position["side"] == "yes":
+        side, price = BookSide.ASK, "0.01"      # sell YES → close long YES
+    else:
+        side, price = BookSide.BID, "0.99"      # buy YES  → close long NO
+    resp = await _submit(rest, ticker=open_position["ticker"], side=side, price=price,
+                         count=open_position["count"], reduce_only=True,
+                         tag=f"MARKET CLOSE {open_position['side'].upper()}")
     if DRY_RUN or resp is not None:
-        positions[ticker] = {"side": buy_side, "count": count}
+        open_position = None
     return resp
 
 
-async def market_close(rest: KalshiREST, ticker: str):
-    """Close an open position with a reduce-only marketable IOC (market) order.
-    long YES → SELL YES (ASK@0.01) ; long NO → BUY YES (BID@0.99)."""
-    pos = positions.get(ticker)
-    if not pos:
-        return None
-    if pos["side"] == "yes":
-        side, price = BookSide.ASK, "0.01"      # sell YES to close long YES
-    else:
-        side, price = BookSide.BID, "0.99"      # buy YES to close long NO
-    resp = await _submit(rest, ticker=ticker, side=side, price=price,
-                         count=pos["count"], reduce_only=True,
-                         tag=f"MARKET CLOSE {pos['side'].upper()}")
+async def open_market(rest: KalshiREST, ticker: str, side: str):
+    """Open a single position; closes the opposite first (one position rule)."""
+    global open_position
+    if open_position:
+        if open_position["ticker"] == ticker and open_position["side"] == side:
+            return None                         # already in the desired position
+        await close_position(rest)              # flip → close the other side
+    enum  = BookSide.BID if side == "yes" else BookSide.ASK
+    price = "0.99" if side == "yes" else "0.01"
+    count = bet_count()
+    resp = await _submit(rest, ticker=ticker, side=enum, price=price, count=count,
+                         reduce_only=False, tag=f"MARKET BUY {side.upper()}")
     if DRY_RUN or resp is not None:
-        positions.pop(ticker, None)
+        open_position = {"ticker": ticker, "side": side, "count": count}
     return resp
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Snapshot logging
 # ─────────────────────────────────────────────────────────────────────────────
-def log_snapshot(btc_price, btc_ts, market, delta) -> None:
+def log_snapshot(live, market, delta) -> None:
     now_utc = datetime.now(tz=timezone.utc)
-    ts_str  = (btc_ts.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z") if btc_ts else "no tick"
-    settle  = market["settle_et"]
-    secs    = (settle - now_utc).total_seconds()
-    tleft   = f"{secs/60:.1f} min" if secs > 0 else "EXPIRED"
-    ref_lbl = "floor_strike" if market["market_type"] == "absolute" else "prev close"
-    q       = get_kalshi_quote(market["ticker"])
+    settle  = market.get("settle_et")
+    tleft   = "?"
+    if settle:
+        secs = (settle - now_utc).total_seconds()
+        tleft = f"{secs/60:.1f} min" if secs > 0 else "EXPIRED"
+    q = get_kalshi_quote(market["ticker"])
     ws_line = (f"yes_bid={q.get('yes_bid','?')} yes_ask={q.get('yes_ask','?')} "
                f"last={q.get('last','?')}") if q else "no WS quote yet"
-    held    = positions.get(market["ticker"])
-    pos_line = f"{held['side'].upper()} x{held['count']}" if held else "flat"
+    pos = (f"{open_position['side'].upper()} x{open_position['count']} "
+           f"({open_position['ticker']})") if open_position else "flat"
+    tgt = market.get("target")
+    tgt_s = f"${tgt:,.2f}" if tgt is not None else "n/a"
+    gate_ok = "✓" if abs(delta) >= PRICE_DELTA_GATE else "·"
+    settle_s = settle.strftime("%H:%M") if settle else "?"
     log.info(
         "\n"
         "┌─── Snapshot ───────────────────────────────────────────────\n"
-        "│  Cycle UTC   : %s\n"
-        "│  Alpaca BTC  : $%,.2f  (tick %s)\n"
-        "│  Kalshi ref  : $%,.2f  (%s)\n"
-        "│  Kalshi WS   : %s\n"
-        "│  Market      : %s  type=%s\n"
-        "│  Next pred.  : %s\n"
-        "│  Settle      : %s ET  (%s)\n"
-        "│  Position    : %s\n"
-        "│  Delta       : %s$%,.2f  [gate=$%.0f %s]\n"
-        "└────────────────────────────────────────────────────────────",
-        now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"), btc_price, ts_str,
-        market["reference_price"], ref_lbl, ws_line,
-        market["ticker"], market["market_type"], market["next_ticker"],
-        settle.strftime("%H:%M"), tleft, pos_line,
-        ("▲" if delta > 0 else "▼" if delta < 0 else "="),
-        abs(delta), PRICE_DELTA_GATE, ("✓" if abs(delta) >= PRICE_DELTA_GATE else "✗"),
+        f"│  Live BTC    : ${live:,.2f}\n"
+        f"│  NOW 60s-avg : ${now_price:,.2f}   (Δ live−now = {delta:+,.2f}, "
+        f"gate ${PRICE_DELTA_GATE:.0f} {gate_ok})\n"
+        f"│  Kalshi tgt  : {tgt_s}\n"
+        f"│  Kalshi WS   : {ws_line}\n"
+        f"│  Market      : {market['ticker']}  (settle {settle_s} ET, {tleft})\n"
+        f"│  Next pred.  : {market['next_ticker']}\n"
+        f"│  Position    : {pos}\n"
+        "└────────────────────────────────────────────────────────────"
     )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Strategy loop
+# Strategy loop  (decision = live price vs rolling 60-s NOW price)
 # ─────────────────────────────────────────────────────────────────────────────
 async def strategy_loop(rest: KalshiREST, market_ws: KalshiMarketWS,
                         started_at: float) -> None:
-    global prev_window_close, prev_window_ticker
-    log.info("Strategy loop started – waiting for bars …")
-    last_bar_count = 0
-    last_window_ticker: Optional[str] = None
+    log.info("Strategy loop started …")
+    cached_ticker: Optional[str] = None
+    market: Optional[dict] = None
 
     while True:
-        await asyncio.sleep(5)
+        await asyncio.sleep(2)
         if (time.time() - started_at) / 60.0 >= RUNTIME_LIMIT_MIN:
             log.info("Runtime limit (%.0f min) reached — clean exit.", RUNTIME_LIMIT_MIN)
+            if open_position:
+                await close_position(rest)
             return
 
         ct, nt = current_and_next_tickers()
         market_ws.set_tickers((ct, nt))
 
-        with _bar_lock:
-            n = len(minute_bars)
-        if n == last_bar_count or n < 5:
-            continue
-        last_bar_count = n
-        log.info("── New bar (buffer %d/%d) ─────────────────────", n, HISTORY_BARS)
-        log_next_ticker_prediction()
+        # New 15-min window → close stale position, re-resolve, re-anchor NOW price
+        if ct != cached_ticker:
+            if open_position and open_position["ticker"] == cached_ticker:
+                log.info("Window rolled → closing stale position in %s", cached_ticker)
+                await close_position(rest)
+            log_next_ticker_prediction()
+            market = await resolve_active_market(rest)
+            cached_ticker = ct
+            if market:
+                anchor_now_price(market.get("target"))
 
-        btc_price, btc_ts = read_btc_price()
-        if btc_price == 0.0:
-            log.warning("No Alpaca tick yet – skipping")
-            continue
+        if market is None or market["ticker"] != ct:
+            market = await resolve_active_market(rest)
+            if market is None:
+                continue
 
-        market = await resolve_active_market(rest)
-        if market is None:
-            continue
-        market_ws.set_tickers((market["ticker"], market["next_ticker"]))
-
-        # window rollover → close any stale position from the prior window
-        if last_window_ticker is not None and market["ticker"] != last_window_ticker:
-            prev_window_close  = btc_price
-            prev_window_ticker = last_window_ticker
-            log.info("Window rolled %s → %s  cached close=$%.2f",
-                     last_window_ticker, market["ticker"], prev_window_close)
-            if last_window_ticker in positions:
-                log.info("Closing stale position in %s before settlement", last_window_ticker)
-                await market_close(rest, last_window_ticker)
-        last_window_ticker = market["ticker"]
-
-        ticker = market["ticker"]
-        ref    = market["reference_price"]
-        delta  = btc_price - ref
-        log_snapshot(btc_price, btc_ts, market, delta)
-
-        secs_left = (market["settle_et"] - datetime.now(tz=timezone.utc)).total_seconds()
-
-        # close current position near settlement
-        if ticker in positions and 0 < secs_left < CLOSE_BEFORE_SETTLE_S:
-            log.info("Near settlement (%.0fs) — closing %s", secs_left, ticker)
-            await market_close(rest, ticker)
+        live, _ = read_btc_price()
+        if live <= 0 or len(price_samples) < MIN_SAMPLES:
             continue
 
-        if abs(delta) < PRICE_DELTA_GATE:
-            log.info("GATE MISS: |delta|=$%.2f < $%.0f", abs(delta), PRICE_DELTA_GATE)
-            continue
+        delta = live - now_price
+        log_snapshot(live, market, delta)
 
-        want_side = "yes" if delta > 0 else "no"
-        held = positions.get(ticker)
-        if held:
-            if held["side"] != want_side:
-                log.info("Opposite signal — closing %s %s then re-evaluating",
-                         ticker, held["side"].upper())
-                await market_close(rest, ticker)
-            else:
-                log.info("GATE MISS: already holding %s in %s", want_side.upper(), ticker)
-            continue
+        # close before settlement
+        if open_position and market.get("settle_et"):
+            secs_left = (market["settle_et"] - datetime.now(tz=timezone.utc)).total_seconds()
+            if 0 < secs_left < CLOSE_BEFORE_SETTLE_S:
+                log.info("Near settlement (%.0fs) — closing position", secs_left)
+                await close_position(rest)
+                continue
 
-        direction = "UP (BUY YES)" if delta > 0 else "DOWN (BUY NO)"
-        log.info("✦ SIGNAL %s  delta=$%.2f ref=$%.2f btc=$%.2f",
-                 direction, delta, ref, btc_price)
-        await market_buy(rest, ticker, want_side, ORDER_CONTRACTS)
+        # momentum decision vs the rolling NOW price
+        if delta >= PRICE_DELTA_GATE:
+            desired = "yes"      # UP move
+        elif delta <= -PRICE_DELTA_GATE:
+            desired = "no"       # DOWN move
+        else:
+            continue             # inside the band → no action
+
+        if open_position and open_position["side"] == desired and \
+                open_position["ticker"] == ct:
+            continue             # already positioned correctly
+
+        direction = "UP (BUY YES)" if desired == "yes" else "DOWN (BUY NO)"
+        log.info("✦ SIGNAL %s  live=$%.2f now=$%.2f Δ=%+.2f", direction, live, now_price, delta)
+        await open_market(rest, ct, desired)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Entry point
 # ─────────────────────────────────────────────────────────────────────────────
 async def main_async() -> None:
-    now_utc = datetime.now(tz=timezone.utc)
-    ct, nt  = current_and_next_tickers()
+    ct, nt = current_and_next_tickers()
     log.info("=" * 68)
     log.info("  BTC Kalshi 15-min algo-trader (ASYNC)")
-    log.info("  Now (UTC)       : %s", now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"))
+    log.info("  Now (UTC)       : %s", datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
     log.info("  Current window  : %s", ct)
-    log.info("  Kalshi REST     : %s", KALSHI_BASE_URL)
-    log.info("  Kalshi WS       : %s", KALSHI_WS_URL)
+    log.info("  Kalshi REST/WS  : %s", KALSHI_BASE_URL)
     log.info("  Demo / DRY_RUN  : %s / %s", KALSHI_DEMO, DRY_RUN)
-    log.info("  Delta gate      : $%.0f   contracts/trade: %d", PRICE_DELTA_GATE, ORDER_CONTRACTS)
+    log.info("  Bet amount      : $%.2f  (%d contract(s)/buy)", BET_AMOUNT_USD, bet_count())
+    log.info("  Delta gate      : $%.0f   NOW window: %ds", PRICE_DELTA_GATE, NOW_WINDOW_S)
     log.info("  Runtime limit   : %.0f min", RUNTIME_LIMIT_MIN)
     log.info("=" * 68)
     log_next_ticker_prediction()
@@ -787,15 +736,17 @@ async def main_async() -> None:
 
     market_ws = KalshiMarketWS(rest.auth)
     market_ws.set_tickers(current_and_next_tickers())
-    ws_task = asyncio.create_task(market_ws.run(), name="kalshi-ws")
+    ws_task  = asyncio.create_task(market_ws.run(), name="kalshi-ws")
+    smp_task = asyncio.create_task(price_sampler(), name="now-price-sampler")
     try:
         await strategy_loop(rest, market_ws, started_at=time.time())
     finally:
-        ws_task.cancel()
-        try:
-            await ws_task
-        except asyncio.CancelledError:
-            pass
+        for t in (ws_task, smp_task):
+            t.cancel()
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
         await rest.close()
 
 

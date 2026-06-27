@@ -63,17 +63,25 @@ jobs:
           KALSHI_API_KEY_ID: ${{ secrets.KALSHI_PROD_API_KEY }}
           KALSHI_PEM_PATH:   kalshi_private_key.pem
           KALSHI_DEMO:       "false"
-          # DRY_RUN defaults to true. Dispatch with dry_run=false to trade live.
-          DRY_RUN:           ${{ github.event.inputs.dry_run || 'true' }}
+          # LIVE TRADING SWITCH (real money):
+          #   • Continuous live  → set the repo/environment variable DRY_RUN=false
+          #     (gh variable set DRY_RUN --env Kalshi --body false). Then every run
+          #     in the chain (dispatch + 5h45m handoff + cron) trades live.
+          #   • One-off override → dispatch with the dry_run input.
+          #   • Default (nothing set) → DRY_RUN=true (safe, logs orders only).
+          DRY_RUN:           ${{ github.event.inputs.dry_run || vars.DRY_RUN || 'true' }}
+          BET_AMOUNT_USD:    ${{ vars.BET_AMOUNT_USD || '1' }}
+          PRICE_DELTA_GATE:  ${{ vars.PRICE_DELTA_GATE || '10' }}
+          PRINT_NOW_PRICE:   ${{ vars.PRINT_NOW_PRICE || 'true' }}
           RUNTIME_LIMIT_MIN: "345"
         run: python kalshibtc15minupordown.py
 
-      - name: Re-trigger next run (handoff)
+      - name: Re-trigger next run (5 h 45 min handoff)
         if: success()
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
-          gh workflow run kalshi_monitor.yml \
-            -R "${{ github.repository }}" \
-            -f dry_run="${{ github.event.inputs.dry_run || 'true' }}" \
+          # Re-dispatch with no inputs so the next run honours the DRY_RUN
+          # variable — a live chain stays live, a default chain stays dry.
+          gh workflow run kalshi_monitor.yml -R "${{ github.repository }}" \
             && echo "Handoff: next run queued." || echo "Handoff skipped (no GH_PAT?)."

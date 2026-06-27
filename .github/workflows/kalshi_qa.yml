@@ -44,4 +44,6 @@ jobs:
           KALSHI_PEM_PATH:   kalshi_private_key.pem
           KALSHI_DEMO:       "false"
           KALSHI_WS_VERBOSE: "true"
+          PRINT_NOW_PRICE:   "true"
+          BET_AMOUNT_USD:    ${{ vars.BET_AMOUNT_USD || '1' }}
         run: python test_kalshi_bot.py
