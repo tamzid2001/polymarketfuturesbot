@@ -1,0 +1,46 @@
+name: Kalshi QA — Secrets, Alpaca/Kalshi WS, Balance & Order Build
+
+# Manual pre-production check. Runs the full QA suite against live
+# credentials WITHOUT ever submitting a real order.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  qa-test:
+    runs-on: ubuntu-latest
+    environment: "Kalshi"
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements_kalshi.txt
+
+      - name: Write Kalshi RSA private key
+        env:
+          KALSHI_PRIVATE_KEY: ${{ secrets.KALSHI_PRIVATE_KEY }}
+        run: |
+          printf '%s\n' "$KALSHI_PRIVATE_KEY" > kalshi_private_key.pem
+          chmod 600 kalshi_private_key.pem
+          head -1 kalshi_private_key.pem
+
+      - name: Run QA Suite (no real orders)
+        env:
+          ALPACA_API_KEY:    ${{ secrets.ALPACA_PUBLIC_KEY }}
+          ALPACA_API_SECRET: ${{ secrets.ALPACA_SECRETS_KEY }}
+          KALSHI_API_KEY_ID: ${{ secrets.KALSHI_PROD_API_KEY }}
+          KALSHI_PEM_PATH:   kalshi_private_key.pem
+          KALSHI_DEMO:       "false"
+        run: python test_kalshi_bot.py

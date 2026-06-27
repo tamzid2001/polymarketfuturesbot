@@ -1,0 +1,79 @@
+name: Kalshi BTC 15-min Execution Engine
+
+# ---------------------------------------------------------------
+# Schedule: every 6 h as a safety-net restart. The bot exits
+# cleanly at RUNTIME_LIMIT_MIN (default 5 h 45 min) and the final
+# step re-triggers the next run via GH_PAT, so the chain is usually
+# unbroken. The cron only fires if self-triggering was unavailable.
+# ---------------------------------------------------------------
+on:
+  schedule:
+    - cron: '11 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Place real orders? Set to false to trade live."
+        required: false
+        default: "true"
+
+# At most one run at a time. A newly queued run waits; it never
+# cancels the currently running bot mid-execution.
+concurrency:
+  group: kalshi-bot-singleton
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  execute-monitor:
+    runs-on: ubuntu-latest
+    environment: "Kalshi"
+    # Hard ceiling: 6 h 10 min. The bot exits cleanly at 5 h 45 min,
+    # so this only fires if the process hangs.
+    timeout-minutes: 370
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements_kalshi.txt
+
+      - name: Write Kalshi RSA private key
+        env:
+          KALSHI_PRIVATE_KEY: ${{ secrets.KALSHI_PRIVATE_KEY }}
+        run: |
+          printf '%s\n' "$KALSHI_PRIVATE_KEY" > kalshi_private_key.pem
+          chmod 600 kalshi_private_key.pem
+          # sanity: confirm it is a PEM (does not print the key body)
+          head -1 kalshi_private_key.pem
+
+      - name: Run Bot (continuous 5 h 45 min loop)
+        env:
+          ALPACA_API_KEY:    ${{ secrets.ALPACA_PUBLIC_KEY }}
+          ALPACA_API_SECRET: ${{ secrets.ALPACA_SECRETS_KEY }}
+          KALSHI_API_KEY_ID: ${{ secrets.KALSHI_PROD_API_KEY }}
+          KALSHI_PEM_PATH:   kalshi_private_key.pem
+          KALSHI_DEMO:       "false"
+          # DRY_RUN defaults to true. Dispatch with dry_run=false to trade live.
+          DRY_RUN:           ${{ github.event.inputs.dry_run || 'true' }}
+          RUNTIME_LIMIT_MIN: "345"
+        run: python kalshibtc15minupordown.py
+
+      - name: Re-trigger next run (handoff)
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          gh workflow run kalshi_monitor.yml \
+            -R "${{ github.repository }}" \
+            -f dry_run="${{ github.event.inputs.dry_run || 'true' }}" \
+            && echo "Handoff: next run queued." || echo "Handoff skipped (no GH_PAT?)."
