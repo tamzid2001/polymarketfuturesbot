@@ -50,17 +50,15 @@ STRATEGY
 ────────
 1. Stream BTC/USD real-time trades via Alpaca WebSocket → 1-min OHLCV bars
    (rolling 60-bar / 1-hour buffer).
-2. Each completed 1-min bar triggers a Prophet forecast:
-   – Input  : last 60 bars (log-price transform)
-   – Output : yhat + P01/P99 at the +15-min horizon
-3. Fetch the active KXBTC15M market from the Kalshi REST API.
-   Determine market type from the suffix (absolute vs relative).
-   Resolve the effective reference price accordingly.
-4. Every cycle log a TIMESTAMPED snapshot:
+2. Every completed 1-min bar:
+   – Get real-time Alpaca BTC price.
+   – Fetch the active KXBTC15M market from Kalshi REST API.
+   – Determine market type (absolute vs relative) from the suffix.
+   – Resolve the effective reference price accordingly.
+3. Log a TIMESTAMPED snapshot every cycle:
    Alpaca real-time price vs Kalshi reference price + signed delta.
-5. Decision gate:
+4. Decision gate:
    – |delta| > PRICE_DELTA_GATE ($10 default)
-   – reference price ∈ [Prophet P01, P99]
    – No existing position in this 15-min window
    Then: delta > 0 → BUY YES; delta < 0 → BUY NO.
 
@@ -71,7 +69,7 @@ SETTLEMENT
 
 DEPENDENCIES
 ────────────
-    pip install alpaca-py kalshi-python-sync prophet pandas numpy
+    pip install alpaca-py kalshi-python-sync
 
 CREDENTIALS  (env vars or edit CONFIG below)
 ────────────────────────────────────────────
@@ -98,11 +96,6 @@ import time
 import uuid
 from collections import deque
 from datetime import datetime, timedelta, timezone
-from typing import Optional
-
-import numpy as np
-import pandas as pd
-from prophet import Prophet
 
 from alpaca.data.live import CryptoDataStream
 from kalshi_python_sync import Configuration, KalshiClient
@@ -123,8 +116,7 @@ KALSHI_BASE_URL = (
 )
 
 BTC_SYMBOL       = "BTC/USD"
-HISTORY_BARS     = 60     # 60 × 1-min bars = 1 hour
-FORECAST_STEPS   = 15     # 15-min horizon
+HISTORY_BARS     = 60     # 60 × 1-min bars = 1 hour (kept for bar-close trigger)
 PRICE_DELTA_GATE = 10.0   # |real_price − reference| must exceed $10 to trade
 ORDER_CONTRACTS  = 5      # contracts per signal
 SERIES_TICKER    = "KXBTC15M"
@@ -137,32 +129,30 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%dT%H:%M:%SZ",
 )
-for _noisy in ("prophet", "cmdstanpy", "numexpr"):
-    logging.getLogger(_noisy).setLevel(logging.WARNING)
 log = logging.getLogger("kalshi_btc_bot")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Shared state
 # ─────────────────────────────────────────────────────────────────────────────
-minute_bars: deque[dict]        = deque(maxlen=HISTORY_BARS)
-_current_bar: dict | None       = None
+minute_bars: deque[dict]          = deque(maxlen=HISTORY_BARS)
+_current_bar: dict | None         = None
 _current_bar_minute: datetime | None = None
 _bar_lock = threading.Lock()
 
-latest_btc_price: float         = 0.0
+latest_btc_price: float           = 0.0
 latest_btc_ts:    datetime | None = None
 _price_lock = threading.Lock()
 
 # Previous window's settlement reference (used for relative -00 markets)
-prev_window_close: float | None = None
-prev_window_ticker: str | None  = None
+prev_window_close:  float | None  = None
+prev_window_ticker: str | None    = None
 
 positions_held: set[str] = set()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Ticker helpers  (fully deterministic — no opaque suffix needed)
+# Ticker helpers  (fully deterministic)
 # ─────────────────────────────────────────────────────────────────────────────
 
 _MONTHS = {
@@ -180,30 +170,21 @@ def build_ticker(series: str, settle_utc: datetime) -> str:
     """
     Construct the full KXBTC15M ticker for a given settlement UTC datetime.
 
-    Suffix rule (verified from live pages):
-        suffix = zero-padded minute of the settlement time
+    Suffix = zero-padded minute of the settlement time:
         :00 → "00",  :15 → "15",  :30 → "30",  :45 → "45"
-
-    Examples:
-        build_ticker("KXBTC15M", datetime(2026,6,27, 0,45,tz=UTC))
-          → "KXBTC15M-26JUN270045-45"
-
-        build_ticker("KXBTC15M", datetime(2026,6,27, 1, 0,tz=UTC))
-          → "KXBTC15M-26JUN270100-00"
     """
-    yy     = settle_utc.strftime("%y")          # "26"
-    mon    = settle_utc.strftime("%b").upper()   # "JUN"
-    dd     = settle_utc.strftime("%d")           # "27"
-    hhmm   = settle_utc.strftime("%H%M")         # "0045"
-    suffix = settle_utc.strftime("%M")           # "45"
+    yy     = settle_utc.strftime("%y")
+    mon    = settle_utc.strftime("%b").upper()
+    dd     = settle_utc.strftime("%d")
+    hhmm   = settle_utc.strftime("%H%M")
+    suffix = settle_utc.strftime("%M")
     return f"{series}-{yy}{mon}{dd}{hhmm}-{suffix}"
 
 
 def parse_ticker(ticker: str) -> dict | None:
     """
     Parse a KXBTC15M ticker into its components.
-    Returns dict with keys: series, settle_utc, suffix, market_type.
-    Returns None on mismatch.
+    Returns dict: series, settle_utc, suffix, market_type.
 
     market_type:
         "absolute"  → suffix in {"15","30","45"}  (fixed strike)
@@ -222,36 +203,27 @@ def parse_ticker(ticker: str) -> dict | None:
         tzinfo=timezone.utc,
     )
     suffix = m.group("suffix")
-    mtype  = "relative" if suffix == "00" else "absolute"
     return {
         "series":      m.group("series"),
         "settle_utc":  settle,
         "suffix":      suffix,
-        "market_type": mtype,
+        "market_type": "relative" if suffix == "00" else "absolute",
     }
 
 
 def current_and_next_tickers(series: str = SERIES_TICKER) -> tuple[str, str]:
     """
-    Return (current_window_ticker, next_window_ticker) based on UTC now,
-    floored to the nearest 15-min boundary.
-
-    Current window  = most recently opened 15-min slot.
-    Next window     = 15 minutes after current.
+    Return (current_window_ticker, next_window_ticker) based on UTC now.
+    Settlement time = start of window + 15 min.
     """
-    now   = datetime.now(tz=timezone.utc)
-    # Floor to nearest 15-min boundary
-    slot_min   = (now.minute // 15) * 15
-    current_dt = now.replace(minute=slot_min, second=0, microsecond=0)
-    next_dt    = current_dt + timedelta(minutes=15)
-
-    # Settlement time = END of the 15-min window = open + 15 min
-    current_settle = current_dt + timedelta(minutes=15)
-    next_settle    = next_dt    + timedelta(minutes=15)
+    now       = datetime.now(tz=timezone.utc)
+    slot_min  = (now.minute // 15) * 15
+    curr_open = now.replace(minute=slot_min, second=0, microsecond=0)
+    next_open = curr_open + timedelta(minutes=15)
 
     return (
-        build_ticker(series, current_settle),
-        build_ticker(series, next_settle),
+        build_ticker(series, curr_open + timedelta(minutes=15)),
+        build_ticker(series, next_open + timedelta(minutes=15)),
     )
 
 
@@ -268,8 +240,7 @@ async def on_trade(trade) -> None:
 
     price: float = float(trade.price)
     size:  float = float(trade.size)
-
-    ts: datetime = trade.timestamp
+    ts:    datetime = trade.timestamp
     if ts.tzinfo is None:
         ts = ts.replace(tzinfo=timezone.utc)
 
@@ -309,57 +280,6 @@ def run_alpaca_stream() -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Prophet forecast
-# ─────────────────────────────────────────────────────────────────────────────
-
-def run_prophet_forecast(bars: list[dict]) -> dict | None:
-    if len(bars) < 10:
-        log.warning("Prophet: only %d bars, need ≥ 10 – skip", len(bars))
-        return None
-
-    df = pd.DataFrame(bars)[["ds", "close"]].copy()
-    df.rename(columns={"close": "y_raw"}, inplace=True)
-    df["ds"] = pd.to_datetime(df["ds"], utc=True)
-    df["y"]  = np.log(df["y_raw"])
-
-    model = Prophet(
-        daily_seasonality=False,
-        weekly_seasonality=False,
-        yearly_seasonality=False,
-        changepoint_prior_scale=0.05,
-        seasonality_prior_scale=10.0,
-        interval_width=0.98,        # P01 / P99
-        uncertainty_samples=500,
-        mcmc_samples=0,
-    )
-    model.fit(df[["ds", "y"]], iter=1000)
-
-    last_ts: datetime = df["ds"].iloc[-1]
-    future_times = [last_ts + timedelta(minutes=i + 1) for i in range(FORECAST_STEPS)]
-    future_df = pd.concat(
-        [df[["ds"]], pd.DataFrame({"ds": future_times})],
-        ignore_index=True,
-    )
-    fc = model.predict(future_df)
-    fc["yhat_usd"]  = np.exp(fc["yhat"])
-    fc["lower_usd"] = np.exp(fc["yhat_lower"])
-    fc["upper_usd"] = np.exp(fc["yhat_upper"])
-
-    row = fc.iloc[-1]
-    result = {
-        "ds":   row["ds"],
-        "yhat": round(float(row["yhat_usd"]),  2),
-        "p01":  round(float(row["lower_usd"]), 2),
-        "p99":  round(float(row["upper_usd"]), 2),
-    }
-    log.info(
-        "Prophet +15-min → yhat=$%.2f  P01=$%.2f  P99=$%.2f",
-        result["yhat"], result["p01"], result["p99"],
-    )
-    return result
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Kalshi helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -382,26 +302,23 @@ def get_market_detail(client: KalshiClient, ticker: str) -> dict | None:
         return None
 
 
-def get_active_btc15m_market(
-    client: KalshiClient,
-) -> dict | None:
+def get_active_btc15m_market(client: KalshiClient) -> dict | None:
     """
     Determine the active KXBTC15M market and resolve all parameters.
 
     Returns a dict:
         ticker          str    full market ticker
+        next_ticker     str    next window's full ticker
         market_type     str    "absolute" | "relative"
+        suffix          str    "00"|"15"|"30"|"45"
         reference_price float  the price to compare real BTC against:
                                – absolute: floor_strike from market record
                                – relative: previous window's close
         settle_utc      datetime UTC settlement time
-        suffix          str    "00"|"15"|"30"|"45"
         raw_market      dict   full API market record
 
     Returns None if the market cannot be resolved.
     """
-    global prev_window_close, prev_window_ticker
-
     current_ticker, next_ticker = current_and_next_tickers()
     parsed = parse_ticker(current_ticker)
     if parsed is None:
@@ -418,17 +335,12 @@ def get_active_btc15m_market(
         settle_utc.strftime("%H:%M"), next_ticker,
     )
 
-    # ── Fetch the live market record ──────────────────────────────────────
-    # First try the deterministically built ticker directly
+    # Fetch live market record — try deterministic ticker first
     raw = get_market_detail(client, current_ticker)
 
-    # If not found (market not yet opened or slightly off), fall back to
-    # querying the event list and grabbing the first open market
+    # Fallback to events list if direct lookup misses
     if raw is None:
-        log.warning(
-            "Direct lookup of %s failed – falling back to events query",
-            current_ticker,
-        )
+        log.warning("Direct lookup of %s failed – trying events list", current_ticker)
         try:
             resp = client.get(
                 "/events",
@@ -445,10 +357,10 @@ def get_active_btc15m_market(
                 if markets:
                     raw = markets[0]
                     current_ticker = raw["ticker"]
-                    parsed = parse_ticker(current_ticker) or parsed
-                    market_type = parsed["market_type"]
-                    settle_utc  = parsed["settle_utc"]
-                    suffix      = parsed["suffix"]
+                    parsed         = parse_ticker(current_ticker) or parsed
+                    market_type    = parsed["market_type"]
+                    settle_utc     = parsed["settle_utc"]
+                    suffix         = parsed["suffix"]
         except Exception as exc:
             log.error("Events fallback failed: %s", exc)
             return None
@@ -461,7 +373,6 @@ def get_active_btc15m_market(
     reference_price: float | None = None
 
     if market_type == "absolute":
-        # floor_strike is a fixed USD dollar value set at market open
         for field in ("floor_strike", "floor_strike_fp", "result_value"):
             val = raw.get(field)
             if val is not None:
@@ -471,7 +382,7 @@ def get_active_btc15m_market(
                         break
                 except (ValueError, TypeError):
                     pass
-        # Fallback: parse from market subtitle / title
+        # Fallback: parse from subtitle
         if reference_price is None:
             for text_field in ("yes_sub_title", "no_sub_title"):
                 text = raw.get(text_field, "")
@@ -487,26 +398,20 @@ def get_active_btc15m_market(
                 "Cannot find floor_strike for absolute market %s  raw=%s",
                 current_ticker,
                 {k: raw.get(k) for k in
-                 ["floor_strike","floor_strike_fp","result_value",
-                  "yes_sub_title","no_sub_title"]},
+                 ["floor_strike", "floor_strike_fp", "result_value",
+                  "yes_sub_title", "no_sub_title"]},
             )
             return None
 
-    else:
-        # relative market: reference = previous window's settlement close
-        # Try: prev_window_close cached from last cycle
-        if prev_window_close is not None and prev_window_ticker is not None:
+    else:  # relative
+        if prev_window_close is not None:
             reference_price = prev_window_close
             log.info(
                 "Relative market – using cached prev close $%.2f from %s",
                 reference_price, prev_window_ticker,
             )
         else:
-            # Fetch the previous window's market record to get result_value
-            prev_ticker = build_ticker(
-                SERIES_TICKER,
-                settle_utc - timedelta(minutes=15),
-            )
+            prev_ticker = build_ticker(SERIES_TICKER, settle_utc - timedelta(minutes=15))
             log.info("Relative market – fetching prev window: %s", prev_ticker)
             prev_raw = get_market_detail(client, prev_ticker)
             if prev_raw is not None:
@@ -520,13 +425,11 @@ def get_active_btc15m_market(
                         except (ValueError, TypeError):
                             pass
             if reference_price is None:
-                # Last resort: use real-time Alpaca price as the reference
                 with _price_lock:
                     reference_price = latest_btc_price
                 log.warning(
                     "Cannot get prev window close – using live Alpaca "
-                    "price $%.2f as relative reference",
-                    reference_price,
+                    "price $%.2f as relative reference", reference_price,
                 )
 
     return {
@@ -543,12 +446,13 @@ def get_active_btc15m_market(
 def place_kalshi_order(
     client:    KalshiClient,
     ticker:    str,
-    side:      str,    # "yes" | "no"
-    action:    str,    # "buy"
+    side:      str,
+    action:    str,
     contracts: int = ORDER_CONTRACTS,
 ) -> object | None:
     """
-    Fill-or-kill limit order.  yes_price is a dollar string (post-2026 API).
+    Fill-or-kill limit order.
+    yes_price is a dollar string per post-2026 Kalshi API.
     YES ceiling = "0.99"; NO ceiling expressed as yes_price = "0.01".
     """
     order_id      = str(uuid.uuid4())
@@ -585,48 +489,32 @@ def place_kalshi_order(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def log_price_delta_snapshot(
-    alpaca_price:    float,
-    alpaca_ts:       datetime | None,
-    market:          dict,       # the resolved market dict from get_active_btc15m_market
-    delta:           float,
-    p01:             float,
-    p99:             float,
+    alpaca_price: float,
+    alpaca_ts:    datetime | None,
+    market:       dict,
+    delta:        float,
 ) -> None:
     """
-    Log a rich timestamped snapshot every cycle.
-
-    Shows:
-    • UTC cycle time
-    • Alpaca real-time price + exact tick timestamp (nanosecond-level if available)
-    • Kalshi reference price + market type + ticker
-    • Signed delta with direction arrow
-    • Time remaining until settlement
-    • Prophet P01/P99 with gate pass/fail
-    • Predicted next-window ticker
+    Log a rich timestamped snapshot every cycle showing the live spread
+    between the Alpaca real-time BTC price and the Kalshi reference price.
     """
-    now_utc = datetime.now(tz=timezone.utc)
+    now_utc    = datetime.now(tz=timezone.utc)
+    settle_utc = market["settle_utc"]
+    secs_left  = (settle_utc - now_utc).total_seconds()
+    time_left  = f"{secs_left / 60:.1f} min" if secs_left > 0 else "EXPIRED"
 
     alpaca_ts_str = (
         alpaca_ts.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
         if alpaca_ts else "no tick yet"
     )
 
-    settle_utc  = market["settle_utc"]
-    secs_left   = (settle_utc - now_utc).total_seconds()
-    time_left   = (
-        f"{secs_left/60:.1f} min"
-        if secs_left > 0 else "EXPIRED"
-    )
-
-    mtype        = market["market_type"]
-    ref_label    = (
+    mtype     = market["market_type"]
+    ref_label = (
         "floor_strike (fixed)"
         if mtype == "absolute"
         else "prev window close (relative)"
     )
-
-    in_ci = p01 <= market["reference_price"] <= p99
-    gate_price_ok = abs(delta) >= PRICE_DELTA_GATE
+    gate_ok = abs(delta) >= PRICE_DELTA_GATE
 
     log.info(
         "\n"
@@ -643,9 +531,6 @@ def log_price_delta_snapshot(
         "│  Settle at         : %s UTC  (%s remaining)\n"
         "│\n"
         "│  Delta (Alp−Kal)   : %s$%,.2f  [gate=$%.0f  %s]\n"
-        "│  Prophet CI        : P01=$%,.2f  P99=$%,.2f\n"
-        "│  Ref in P01–P99    : %s\n"
-        "│  Gate pass         : price_delta=%s  ci=%s\n"
         "└──────────────────────────────────────────────────────────────",
         now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
         alpaca_price,
@@ -657,11 +542,7 @@ def log_price_delta_snapshot(
         settle_utc.strftime("%H:%M"), time_left,
         ("▲" if delta > 0 else "▼" if delta < 0 else "="),
         abs(delta), PRICE_DELTA_GATE,
-        ("✓" if gate_price_ok else "✗"),
-        p01, p99,
-        ("YES ✓" if in_ci else "NO ✗"),
-        ("✓" if gate_price_ok else "✗"),
-        ("✓" if in_ci else "✗"),
+        ("✓ GATE MET" if gate_ok else "✗ below gate"),
     )
 
 
@@ -673,17 +554,16 @@ def strategy_loop(client: KalshiClient) -> None:
     global prev_window_close, prev_window_ticker
 
     log.info("Strategy loop started – waiting for bars …")
-    last_bar_count = 0
-    last_window_ticker: str | None = None  # track window transitions
+    last_bar_count     = 0
+    last_window_ticker: str | None = None
 
     while True:
         time.sleep(5)
 
         with _bar_lock:
-            bars_snapshot = list(minute_bars)
+            n = len(minute_bars)
 
-        n = len(bars_snapshot)
-        if n == last_bar_count or n < 5:
+        if n == last_bar_count or n < 1:
             continue
         last_bar_count = n
         log.info("── New bar (buffer %d/%d) ──────────────────────────────", n, HISTORY_BARS)
@@ -696,61 +576,49 @@ def strategy_loop(client: KalshiClient) -> None:
             log.warning("No Alpaca tick yet – skipping")
             continue
 
-        # ── 2. Prophet forecast ───────────────────────────────────────────
-        forecast = run_prophet_forecast(bars_snapshot)
-        if forecast is None:
-            continue
-        p01  = forecast["p01"]
-        p99  = forecast["p99"]
-
-        # ── 3. Resolve active Kalshi market ───────────────────────────────
+        # ── 2. Resolve active Kalshi market ───────────────────────────────
         market = get_active_btc15m_market(client)
         if market is None:
             log.info("No active market resolved – skipping")
             continue
 
-        # Cache close for the next window's relative reference
-        # When the window changes, store the last Alpaca close as prev close
+        # Cache close on window rollover (for next relative market)
         if last_window_ticker is not None and market["ticker"] != last_window_ticker:
             prev_window_close  = btc_price
             prev_window_ticker = last_window_ticker
             log.info(
-                "Window rolled over %s → %s  cached close=$%.2f",
+                "Window rolled %s → %s  cached close=$%.2f",
                 last_window_ticker, market["ticker"], prev_window_close,
             )
         last_window_ticker = market["ticker"]
 
-        # ── 4. Delta + timestamped snapshot ──────────────────────────────
+        # ── 3. Delta + timestamped snapshot (always) ──────────────────────
         delta = btc_price - market["reference_price"]
         log_price_delta_snapshot(
             alpaca_price = btc_price,
             alpaca_ts    = btc_ts,
             market       = market,
             delta        = delta,
-            p01          = p01,
-            p99          = p99,
         )
 
-        # ── 5. Decision gate ──────────────────────────────────────────────
-        abs_delta  = abs(delta)
-        ref        = market["reference_price"]
-        ticker     = market["ticker"]
+        # ── 4. Decision gate ──────────────────────────────────────────────
+        ticker    = market["ticker"]
+        abs_delta = abs(delta)
 
         if abs_delta < PRICE_DELTA_GATE:
             log.info("GATE MISS: |delta|=$%.2f < $%.0f", abs_delta, PRICE_DELTA_GATE)
-            continue
-        if not (p01 <= ref <= p99):
-            log.info("GATE MISS: ref=$%.2f outside P01–P99", ref)
             continue
         if ticker in positions_held:
             log.info("GATE MISS: already in %s", ticker)
             continue
 
-        # ── 6. Signal → order ────────────────────────────────────────────
+        # ── 5. Signal → order ────────────────────────────────────────────
         side      = "yes" if delta > 0 else "no"
         direction = "UP (BUY YES)" if delta > 0 else "DOWN (BUY NO)"
-        log.info("✦ SIGNAL: %s  delta=$%.2f  ref=$%.2f  btc=$%.2f",
-                 direction, delta, ref, btc_price)
+        log.info(
+            "✦ SIGNAL: %s  delta=$%.2f  ref=$%.2f  btc=$%.2f",
+            direction, delta, market["reference_price"], btc_price,
+        )
 
         order = place_kalshi_order(client, ticker, side, "buy", ORDER_CONTRACTS)
         if order is not None:
@@ -767,7 +635,6 @@ def strategy_loop(client: KalshiClient) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    # Demonstrate ticker construction at startup
     now_utc = datetime.now(tz=timezone.utc)
     ct, nt  = current_and_next_tickers()
     ct_p    = parse_ticker(ct)
@@ -784,12 +651,18 @@ def main() -> None:
     log.info("    :45 → -45  (absolute price market, fixed strike)")
     log.info("")
     log.info("  Now (UTC)       : %s", now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"))
-    log.info("  Current window  : %s  type=%s  settle=%s UTC",
-             ct, ct_p["market_type"] if ct_p else "?",
-             ct_p["settle_utc"].strftime("%H:%M") if ct_p else "?")
-    log.info("  Next window     : %s  type=%s  settle=%s UTC",
-             nt, nt_p["market_type"] if nt_p else "?",
-             nt_p["settle_utc"].strftime("%H:%M") if nt_p else "?")
+    log.info(
+        "  Current window  : %s  type=%s  settle=%s UTC",
+        ct,
+        ct_p["market_type"] if ct_p else "?",
+        ct_p["settle_utc"].strftime("%H:%M") if ct_p else "?",
+    )
+    log.info(
+        "  Next window     : %s  type=%s  settle=%s UTC",
+        nt,
+        nt_p["market_type"] if nt_p else "?",
+        nt_p["settle_utc"].strftime("%H:%M") if nt_p else "?",
+    )
     log.info("")
     log.info("  Alpaca stream   : %s", BTC_SYMBOL)
     log.info("  Kalshi demo     : %s", KALSHI_DEMO)
