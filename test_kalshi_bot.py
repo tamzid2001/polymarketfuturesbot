@@ -98,20 +98,33 @@ def check_imports():
 
 # 4 ───────────────────────────────────────────────────────────────────────────
 def check_tickers(bot):
-    section("4. Ticker build/parse + NEXT-ticker prediction")
+    section("4. Ticker build/parse (US Eastern) + current/next markets")
     try:
-        dt = datetime(2026, 6, 27, 0, 45, tzinfo=timezone.utc)
-        t = bot.build_ticker("KXBTC15M", dt)
-        record("build_ticker", PASS if t == "KXBTC15M-26JUN270045-45" else FAIL, t)
+        from datetime import timedelta
+        # tickers are denominated in US Eastern time, e.g. 11:45 ET → -1145-45
+        dt_et = datetime(2026, 6, 27, 11, 45, tzinfo=bot.ET)
+        t = bot.build_ticker("KXBTC15M", dt_et)
+        record("build_ticker (ET)", PASS if t == "KXBTC15M-26JUN271145-45" else FAIL, t)
         p = bot.parse_ticker(t)
         record("parse_ticker round-trip",
-               PASS if (p and p["settle_utc"] == dt and p["market_type"] == "absolute") else FAIL,
+               PASS if (p and p["settle_et"] == dt_et and p["market_type"] == "absolute") else FAIL,
                str(p))
-        rel = bot.parse_ticker("KXBTC15M-26JUN270100-00")
+        rel = bot.parse_ticker("KXBTC15M-26JUN271200-00")
         record("relative detection",
                PASS if rel and rel["market_type"] == "relative" else FAIL,
                rel["market_type"] if rel else "None")
-        nxt = bot.log_next_ticker_prediction()  # prints prediction
+
+        # LIVE check: current ticker must match the ET wall-clock right now
+        now_et = datetime.now(tz=bot.ET)
+        slot = (now_et.minute // 15) * 15
+        exp_settle = now_et.replace(minute=slot, second=0, microsecond=0) + timedelta(minutes=15)
+        exp_current = bot.build_ticker("KXBTC15M", exp_settle)
+        ct, nt = bot.current_and_next_tickers()
+        print(f"      CURRENT open market (ET {now_et.strftime('%H:%M')}): {ct}", flush=True)
+        print(f"      NEXT market                       : {nt}", flush=True)
+        record("current ticker matches ET clock",
+               PASS if ct == exp_current else FAIL, f"{ct} (expected {exp_current})")
+        nxt = bot.log_next_ticker_prediction()
         record("NEXT-ticker prediction", PASS if bot.parse_ticker(nxt) else FAIL, nxt)
     except Exception as exc:  # noqa: BLE001
         record("ticker helpers", FAIL, str(exc))
@@ -177,7 +190,7 @@ def _print_market_snapshot(market: dict):
     print("      ┌─ LIVE KALSHI BTC 15-MIN MARKET ──────────────────────", flush=True)
     print(f"      │ resolved type : {market['market_type']}  "
           f"ref=${market['reference_price']:,.2f}", flush=True)
-    print(f"      │ settle (UTC)  : {market['settle_utc'].strftime('%Y-%m-%dT%H:%MZ')}", flush=True)
+    print(f"      │ settle (ET)   : {market['settle_et'].strftime('%Y-%m-%dT%H:%M %Z')}", flush=True)
     print(f"      │ next ticker   : {market['next_ticker']}", flush=True)
     for f in fields:
         v = getattr(raw, f, None)

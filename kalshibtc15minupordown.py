@@ -22,7 +22,8 @@ ASYNC ARCHITECTURE
 TICKER FORMAT  (verified from live Kalshi pages)
 ─────────────────────────────────────────────────
   Pattern : {SERIES}-{YY}{MON}{DD}{HHMM}-{MM}
-  Example : KXBTC15M-26JUN270045-45
+  Example : KXBTC15M-26JUN271145-45   (settles 11:45 US EASTERN time)
+  IMPORTANT: HHMM/DD are US EASTERN time (auto-DST), NOT UTC.
   Suffix = zero-padded minute of settlement:
     :00 → "-00" RELATIVE up/down (ref = previous window close)
     :15/:30/:45 → ABSOLUTE price (ref = floor_strike)
@@ -84,6 +85,11 @@ from collections import deque
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 from urllib.parse import urlparse
+from zoneinfo import ZoneInfo
+
+# Kalshi KXBTC15M tickers are denominated in US EASTERN time (ET, auto-DST),
+# NOT UTC. e.g. KXBTC15M-26JUN271145-45 settles 11:45 ET.
+ET = ZoneInfo("America/New_York")
 
 import aiohttp
 
@@ -183,10 +189,11 @@ _TICKER_RE = re.compile(
 )
 
 
-def build_ticker(series: str, settle_utc: datetime) -> str:
-    return (f"{series}-{settle_utc.strftime('%y')}{settle_utc.strftime('%b').upper()}"
-            f"{settle_utc.strftime('%d')}{settle_utc.strftime('%H%M')}-"
-            f"{settle_utc.strftime('%M')}")
+def build_ticker(series: str, settle_et: datetime) -> str:
+    """Build the ticker from a settlement datetime expressed in ET wall-clock."""
+    return (f"{series}-{settle_et.strftime('%y')}{settle_et.strftime('%b').upper()}"
+            f"{settle_et.strftime('%d')}{settle_et.strftime('%H%M')}-"
+            f"{settle_et.strftime('%M')}")
 
 
 def parse_ticker(ticker: str) -> Optional[dict]:
@@ -197,17 +204,19 @@ def parse_ticker(ticker: str) -> Optional[dict]:
     if mon_num is None:
         return None
     hhmm = m.group("hhmm")
+    # HHMM/DD are US Eastern time → build an ET-aware settlement datetime.
     settle = datetime(2000 + int(m.group("yy")), mon_num, int(m.group("dd")),
-                      int(hhmm[:2]), int(hhmm[2:]), tzinfo=timezone.utc)
+                      int(hhmm[:2]), int(hhmm[2:]), tzinfo=ET)
     suffix = m.group("suffix")
-    return {"series": m.group("series"), "settle_utc": settle, "suffix": suffix,
+    return {"series": m.group("series"), "settle_et": settle, "suffix": suffix,
             "market_type": "relative" if suffix == "00" else "absolute"}
 
 
 def current_and_next_tickers(series: str = SERIES_TICKER) -> tuple:
-    now        = datetime.now(tz=timezone.utc)
-    slot_min   = (now.minute // 15) * 15
-    current_dt = now.replace(minute=slot_min, second=0, microsecond=0)
+    """Current & next 15-min KXBTC15M tickers, computed in US EASTERN time."""
+    now_et     = datetime.now(tz=ET)
+    slot_min   = (now_et.minute // 15) * 15
+    current_dt = now_et.replace(minute=slot_min, second=0, microsecond=0)
     current_settle = current_dt + timedelta(minutes=15)
     next_settle    = current_settle + timedelta(minutes=15)
     return build_ticker(series, current_settle), build_ticker(series, next_settle)
@@ -217,9 +226,9 @@ def log_next_ticker_prediction() -> str:
     """Predict, print and return the NEXT 15-min up/down market ticker."""
     _, nxt = current_and_next_tickers()
     p = parse_ticker(nxt)
-    log.info("⏭  NEXT 15-MIN UP/DOWN TICKER PREDICTION: %s  (settles %s UTC, type=%s)",
+    log.info("⏭  NEXT 15-MIN UP/DOWN TICKER PREDICTION: %s  (settles %s ET, type=%s)",
              nxt,
-             p["settle_utc"].strftime("%H:%M") if p else "?",
+             p["settle_et"].strftime("%H:%M") if p else "?",
              p["market_type"] if p else "?")
     return nxt
 
@@ -505,7 +514,7 @@ async def resolve_active_market(rest: KalshiREST) -> Optional[dict]:
         return None
 
     market_type = parsed["market_type"]
-    settle_utc  = parsed["settle_utc"]
+    settle_et   = parsed["settle_et"]
     suffix      = parsed["suffix"]
 
     market = await rest.get_market(current_ticker)
@@ -517,7 +526,7 @@ async def resolve_active_market(rest: KalshiREST) -> Optional[dict]:
             current_ticker = _field(market, "ticker") or current_ticker
             parsed = parse_ticker(current_ticker) or parsed
             market_type = parsed["market_type"]
-            settle_utc  = parsed["settle_utc"]
+            settle_et   = parsed["settle_et"]
             suffix      = parsed["suffix"]
     if market is None:
         log.info("No open KXBTC15M market found")
@@ -544,7 +553,7 @@ async def resolve_active_market(rest: KalshiREST) -> Optional[dict]:
         if prev_window_close is not None:
             reference_price = prev_window_close
         else:
-            prev_ticker = build_ticker(SERIES_TICKER, settle_utc - timedelta(minutes=15))
+            prev_ticker = build_ticker(SERIES_TICKER, settle_et - timedelta(minutes=15))
             prev = await rest.get_market(prev_ticker)
             if prev is not None:
                 strike = _field(prev, "floor_strike", "functional_strike")
@@ -560,7 +569,7 @@ async def resolve_active_market(rest: KalshiREST) -> Optional[dict]:
 
     return {"ticker": current_ticker, "next_ticker": next_ticker,
             "market_type": market_type, "suffix": suffix,
-            "reference_price": reference_price, "settle_utc": settle_utc,
+            "reference_price": reference_price, "settle_et": settle_et,
             "raw_market": market}
 
 
@@ -630,7 +639,7 @@ async def market_close(rest: KalshiREST, ticker: str):
 def log_snapshot(btc_price, btc_ts, market, delta) -> None:
     now_utc = datetime.now(tz=timezone.utc)
     ts_str  = (btc_ts.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z") if btc_ts else "no tick"
-    settle  = market["settle_utc"]
+    settle  = market["settle_et"]
     secs    = (settle - now_utc).total_seconds()
     tleft   = f"{secs/60:.1f} min" if secs > 0 else "EXPIRED"
     ref_lbl = "floor_strike" if market["market_type"] == "absolute" else "prev close"
@@ -648,7 +657,7 @@ def log_snapshot(btc_price, btc_ts, market, delta) -> None:
         "│  Kalshi WS   : %s\n"
         "│  Market      : %s  type=%s\n"
         "│  Next pred.  : %s\n"
-        "│  Settle      : %s UTC  (%s)\n"
+        "│  Settle      : %s ET  (%s)\n"
         "│  Position    : %s\n"
         "│  Delta       : %s$%,.2f  [gate=$%.0f %s]\n"
         "└────────────────────────────────────────────────────────────",
@@ -714,7 +723,7 @@ async def strategy_loop(rest: KalshiREST, market_ws: KalshiMarketWS,
         delta  = btc_price - ref
         log_snapshot(btc_price, btc_ts, market, delta)
 
-        secs_left = (market["settle_utc"] - datetime.now(tz=timezone.utc)).total_seconds()
+        secs_left = (market["settle_et"] - datetime.now(tz=timezone.utc)).total_seconds()
 
         # close current position near settlement
         if ticker in positions and 0 < secs_left < CLOSE_BEFORE_SETTLE_S:
