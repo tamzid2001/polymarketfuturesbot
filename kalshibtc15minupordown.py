@@ -727,7 +727,13 @@ async def open_market(rest: KalshiREST, ticker: str, side: str):
             log.warning("Could not close existing position to flip — skipping new entry.")
             return
     enum  = BookSide.BID if side == "yes" else BookSide.ASK
-    price = "0.99" if side == "yes" else "0.01"
+    # Marketable IOC, but cap the limit at the near-the-money band edge so a fill
+    # can never land outside [NTM_MIN, NTM_MAX]. A YES buy crosses up to NTM_MAX;
+    # a NO buy (sell YES) crosses down to NTM_MIN (NO cost = 1 - YES sell price).
+    # If the executable price is out of band the IOC simply won't fill — which is
+    # exactly what the guard intends. (Exit orders in close_position keep 0.99/0.01
+    # because you must always be able to close a position.)
+    price = f"{NTM_MAX:.2f}" if side == "yes" else f"{NTM_MIN:.2f}"
     count = bet_count()
     _, filled = await _submit(rest, ticker=ticker, side=enum, price=price, count=count,
                               reduce_only=False, tag=f"MARKET BUY {side.upper()}")
