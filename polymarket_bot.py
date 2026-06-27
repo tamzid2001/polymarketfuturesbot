@@ -332,7 +332,11 @@ class PolymarketBot:
             log(f"ERROR  Auth failure opening {slug}: {exc.message}")
             raise
         except BadRequestError as exc:
-            log(f"ERROR  Bad order params {slug}: {exc.message}")
+            err = getattr(exc, "message", "") or ""
+            if any(kw in err.lower() for kw in ("insufficient", "funds", "buying power", "balance")):
+                log(f"SKIP  {slug} — insufficient funds (~${deployment_usd:.2f} needed). Skipping, continuing to next market.")
+            else:
+                log(f"ERROR  Bad order params {slug}: {err}")
         except NotFoundError as exc:
             log(f"WARN  Market closed/missing {slug}: {exc.message}")
             self._mark_market_inactive(slug)
@@ -476,22 +480,26 @@ class PolymarketBot:
             log(f"[POS-UPD]   {self._team(slug):<28s}  qty={int(qty)}  avg_entry=${avg:.4f}  bid=${bid:.4f}  P&L=${pnl:+.4f}")
 
     def _on_balance_snapshot(self, data: dict) -> None:
-        snap = data.get("accountBalanceSubscriptionSnapshot") or {}
-        self._balance = {
-            "balance":     snap.get("balance",    0),
-            "buyingPower": snap.get("buyingPower", 0),
-        }
+        # server may use either key name
+        snap = (data.get("accountBalanceSubscriptionSnapshot")
+                or data.get("accountBalancesSnapshot")
+                or {})
+        # server may use "balance" or "currentBalance"
+        bal  = snap.get("balance") or snap.get("currentBalance") or 0
+        bp   = snap.get("buyingPower", 0) or 0
+        self._balance = {"balance": float(bal), "buyingPower": float(bp)}
         log(f"[BAL-SNAP]  balance=${self._balance['balance']:.2f}  buying_power=${self._balance['buyingPower']:.2f}")
 
     def _on_balance_update(self, data: dict) -> None:
-        upd = data.get("accountBalanceSubscriptionUpdate") or {}
+        upd = (data.get("accountBalanceSubscriptionUpdate")
+               or data.get("accountBalanceUpdate")
+               or {})
         if upd:
-            prev = self._balance.get("balance", 0)
-            self._balance = {
-                "balance":     upd.get("balance",    prev),
-                "buyingPower": upd.get("buyingPower", self._balance.get("buyingPower", 0)),
-            }
-            delta = float(self._balance["balance"]) - float(prev)
+            prev = float(self._balance.get("balance", 0))
+            bal  = upd.get("balance") or upd.get("currentBalance") or prev
+            bp   = upd.get("buyingPower", self._balance.get("buyingPower", 0))
+            self._balance = {"balance": float(bal), "buyingPower": float(bp)}
+            delta = self._balance["balance"] - prev
             log(f"[BAL-UPD]   balance=${self._balance['balance']:.2f}  buying_power=${self._balance['buyingPower']:.2f}  delta=${delta:+.4f}")
 
     def _on_bbo_sync(self, data: dict) -> None:
@@ -537,17 +545,18 @@ class PolymarketBot:
             if slug not in self._price_history:
                 self._price_history[slug] = deque(maxlen=PRICE_HISTORY_WINDOW)
             self._price_history[slug].append(price)
-            qty  = trade.get("quantity", "?")
-            side = trade.get("side", "")
-            log(f"[TRADE] {self._team(slug):<28s}  ${price:.4f} × {qty}  {side}")
+            qty_raw = trade.get("quantity")
+            qty     = float((qty_raw or {}).get("value", 0)) if isinstance(qty_raw, dict) else float(qty_raw or 0)
+            side    = trade.get("side", "")
+            log(f"[TRADE] {self._team(slug):<28s}  ${price:.4f} × {qty:.0f}  {side}")
 
     # ------------------------------------------------------------------
     # REST polling fallback
     # ------------------------------------------------------------------
 
     async def _poll_positions_rest(self) -> None:
-        """Refresh positions and BBOs via REST. Used when WS is unavailable or stale."""
-        log("INFO  REST poll: refreshing positions and BBO...")
+        """Refresh positions, BBOs, and balance via REST."""
+        log("INFO  REST poll: refreshing positions, balance, and BBO...")
         try:
             resp      = await self._api(lambda: self._client.portfolio.positions())
             positions = resp.get("positions", {}) if isinstance(resp, dict) else {}
@@ -562,6 +571,23 @@ class PolymarketBot:
             raise
         except Exception as exc:
             log(f"WARN  REST position poll failed: {exc}")
+
+        try:
+            bal_resp = await self._api(lambda: self._client.account.balances())
+            bals     = bal_resp.get("balances", []) if isinstance(bal_resp, dict) else []
+            if bals:
+                b    = bals[0]
+                prev = float(self._balance.get("balance", 0))
+                self._balance = {
+                    "balance":     float(b.get("currentBalance", 0) or 0),
+                    "buyingPower": float(b.get("buyingPower",     0) or 0),
+                }
+                log(f"INFO  REST poll: balance=${self._balance['balance']:.2f}  buying_power=${self._balance['buyingPower']:.2f}  (was ${prev:.2f})")
+        except AuthenticationError as exc:
+            log(f"ERROR  Auth failed fetching balance: {exc.message}")
+            raise
+        except Exception as exc:
+            log(f"WARN  REST balance poll failed: {exc}")
 
         for slug in list(self._tracked_slugs):
             try:
