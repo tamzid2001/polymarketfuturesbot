@@ -18,10 +18,10 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v7
 
-      - name: Setup Python 3.11
+      - name: Setup Python 3.13
         uses: actions/setup-python@v6
         with:
-          python-version: '3.11'
+          python-version: '3.13'
 
       - name: Install Dependencies
         run: |
@@ -43,4 +43,5 @@ jobs:
           KALSHI_API_KEY_ID: ${{ secrets.KALSHI_PROD_API_KEY }}
           KALSHI_PEM_PATH:   kalshi_private_key.pem
           KALSHI_DEMO:       "false"
+          KALSHI_WS_VERBOSE: "true"
         run: python test_kalshi_bot.py
