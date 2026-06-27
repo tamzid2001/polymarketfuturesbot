@@ -41,7 +41,8 @@ STRATEGY
 
 KALSHI ASYNC SDK NOTES (kalshi-python-async ≥ 3.22, needs Python ≥ 3.13)
 ────────────────────────────────────────────────────────────────────────
-  • Auth     : client.set_kalshi_auth(key_id, pem)  (RSA-PSS signing)
+  • Auth     : config.api_key_id + config.private_key_pem → KalshiClient(config)
+               (RSA-PSS signing; do NOT use the broken client.set_kalshi_auth)
   • Balance  : await PortfolioApi(client).get_balance()
   • Market   : await MarketApi(client).get_market(ticker)
   • Events   : await EventsApi(client).get_events(series_ticker=, status=, ...)
@@ -420,9 +421,14 @@ class KalshiREST:
 
     def __init__(self):
         pem = load_pem()
+        # Official auth pattern: set credentials on the Configuration BEFORE
+        # constructing the client. KalshiClient.__init__ builds its internal
+        # KalshiAuth from these. (The client.set_kalshi_auth() helper is broken
+        # in the 3.22 build — NameError on KalshiAuth — so we avoid it.)
         config = Configuration(host=KALSHI_BASE_URL)
+        config.api_key_id = KALSHI_API_KEY_ID
+        config.private_key_pem = pem
         self.client = KalshiClient(config)
-        self.client.set_kalshi_auth(KALSHI_API_KEY_ID, pem)
         self.auth = KalshiAuth(KALSHI_API_KEY_ID, pem)   # reused for WS handshake
         self.portfolio = PortfolioApi(self.client)
         self.markets   = MarketApi(self.client)
