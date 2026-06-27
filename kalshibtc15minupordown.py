@@ -694,6 +694,11 @@ async def close_position(rest: KalshiREST) -> bool:
     return filled
 
 
+def _clear_open_position() -> None:
+    global open_position
+    open_position = None
+
+
 async def open_market(rest: KalshiREST, ticker: str, side: str):
     """Open a single position; closes the opposite first (one position rule)."""
     global open_position
@@ -837,11 +842,17 @@ async def strategy_loop(rest: KalshiREST, market_ws: KalshiMarketWS,
         ct, nt = current_and_next_tickers()
         market_ws.set_tickers((ct, nt))
 
-        # New 15-min window → close stale position, resolve the new market
+        # New 15-min window → the previous window has SETTLED. A position still
+        # open there resolved automatically (paid $1 or $0) — its realized P&L is
+        # already in the balance. Do NOT try to trade the settled market (that
+        # would fail and leave a stale position blocking new trades); just clear
+        # tracking. The real exit is the close-before-settlement step below.
         if ct != cached_ticker:
-            if open_position and open_position["ticker"] == cached_ticker:
-                log.info("Window rolled → closing stale position in %s", cached_ticker)
-                await close_position(rest)
+            if open_position and open_position["ticker"] != ct:
+                log.info("Window rolled — %s position in %s settled; clearing tracking. "
+                         "See PORTFOLIO report for realized P&L.",
+                         open_position["side"].upper(), open_position["ticker"])
+                _clear_open_position()
             log_next_ticker_prediction()
             market = await resolve_active_market(rest)
             cached_ticker = ct
@@ -866,13 +877,16 @@ async def strategy_loop(rest: KalshiREST, market_ws: KalshiMarketWS,
         delta = live - now_price
         log_snapshot(live, market, delta)
 
-        # close before settlement
-        if open_position and market.get("settle_et"):
+        # Settlement window: close any open position and DON'T open a new one
+        # (prevents a close→reopen loop in the dying window).
+        secs_left = None
+        if market.get("settle_et"):
             secs_left = (market["settle_et"] - datetime.now(tz=timezone.utc)).total_seconds()
-            if 0 < secs_left < CLOSE_BEFORE_SETTLE_S:
+        if secs_left is not None and 0 < secs_left < CLOSE_BEFORE_SETTLE_S:
+            if open_position:
                 log.info("Near settlement (%.0fs) — closing position", secs_left)
                 await close_position(rest)
-                continue
+            continue   # too close to settle to enter a new position
 
         # momentum decision vs the rolling NOW price
         if delta >= PRICE_DELTA_GATE:
