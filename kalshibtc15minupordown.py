@@ -28,7 +28,7 @@ SIGNAL  (momentum vs the rolling average)
 
 DATA SOURCES
 ────────────
-  • Alpaca CryptoDataStream  → real-time BTC/USD trades (WS, own thread)
+  • Alpaca CryptoDataStream  → real-time BTC/USD quotes (WS, own thread)
   • Kalshi market WebSocket  → live ticker/trade for the active contract
   • Kalshi REST (kalshi-python-async, V2) → market metadata (target), balance,
                                MARKET orders
@@ -86,7 +86,7 @@ import aiohttp
 
 from alpaca.data.live import CryptoDataStream
 from alpaca.data.historical import CryptoHistoricalDataClient
-from alpaca.data.requests import CryptoLatestTradeRequest
+from alpaca.data.requests import CryptoLatestQuoteRequest
 
 from kalshi_python_async import (
     BookSide,
@@ -272,20 +272,28 @@ def read_btc_full() -> tuple:
         return latest_btc_price, latest_btc_ts, last_price_source
 
 
-# ── WebSocket (real-time trades) ─────────────────────────────────────────────
-async def on_trade(trade) -> None:
-    ts: datetime = trade.timestamp
+# ── WebSocket (real-time quotes) ─────────────────────────────────────────────
+async def on_quote(quote) -> None:
+    # Use the bid/ask mid — quotes reprice continuously, so the price moves
+    # every tick even when no trade prints on Alpaca's thin crypto venue.
+    ts: datetime = quote.timestamp
     if ts.tzinfo is None:
         ts = ts.replace(tzinfo=timezone.utc)
-    _set_price(float(trade.price), "WS", ts)
+    bid, ask = float(quote.bid_price), float(quote.ask_price)
+    if bid > 0 and ask > 0:
+        mid = (bid + ask) / 2.0
+    else:
+        mid = bid or ask or 0.0
+    if mid > 0:
+        _set_price(mid, "WS", ts)
 
 
 def run_alpaca_stream() -> None:
     while True:
         try:
-            log.info("Alpaca WS: connecting, subscribing to %s …", BTC_SYMBOL)
+            log.info("Alpaca WS: connecting, subscribing to %s quotes …", BTC_SYMBOL)
             stream = CryptoDataStream(ALPACA_API_KEY, ALPACA_API_SECRET)
-            stream.subscribe_trades(on_trade, BTC_SYMBOL)
+            stream.subscribe_quotes(on_quote, BTC_SYMBOL)
             stream.run()
         except Exception as exc:  # noqa: BLE001
             log.error("Alpaca WS error: %s — reconnecting in 5s", exc)
@@ -297,14 +305,24 @@ _rest_client: Optional[CryptoHistoricalDataClient] = None
 
 
 def fetch_btc_spot_rest() -> Optional[float]:
-    """Blocking Alpaca REST call for the latest BTC/USD trade price."""
+    """Blocking Alpaca REST call for the latest BTC/USD quote mid-price.
+
+    Uses the latest *quote* (bid/ask mid) rather than the latest *trade*:
+    Alpaca's crypto venue is thin, so `get_crypto_latest_trade` returns the
+    same last-executed trade for minutes at a stretch (the price appears
+    frozen). Quotes reprice continuously, so the mid moves every second.
+    """
     global _rest_client
     try:
         if _rest_client is None:
             _rest_client = CryptoHistoricalDataClient(ALPACA_API_KEY, ALPACA_API_SECRET)
-        resp = _rest_client.get_crypto_latest_trade(
-            CryptoLatestTradeRequest(symbol_or_symbols=BTC_SYMBOL))
-        return float(resp[BTC_SYMBOL].price)
+        resp = _rest_client.get_crypto_latest_quote(
+            CryptoLatestQuoteRequest(symbol_or_symbols=BTC_SYMBOL))
+        q = resp[BTC_SYMBOL]
+        bid, ask = float(q.bid_price), float(q.ask_price)
+        if bid > 0 and ask > 0:
+            return (bid + ask) / 2.0
+        return (bid or ask) or None
     except Exception as exc:  # noqa: BLE001
         log.debug("Alpaca REST spot fetch failed: %s", exc)
         return None
