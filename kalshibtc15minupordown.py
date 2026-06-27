@@ -642,12 +642,13 @@ async def _submit(rest: KalshiREST, *, ticker, side: BookSide, price: str,
         log.info("DRY_RUN active — order NOT submitted.")
         return None, True                       # simulate a fill
     try:
-        req = CreateOrderV2Request(
+        # The async create_order_v2 builds CreateOrderV2Request(**kwargs) internally,
+        # so the order fields are passed DIRECTLY as kwargs (not wrapped).
+        resp = await rest.orders.create_order_v2(
             ticker=ticker, side=side, count=f"{float(count):.2f}", price=price,
             time_in_force=ORDER_TIF, client_order_id=order_id,
             self_trade_prevention_type=SelfTradePreventionType.TAKER_AT_CROSS,
             reduce_only=reduce_only)
-        resp = await rest.orders.create_order_v2(create_order_v2_request=req)
         try:
             fc = float(getattr(resp, "fill_count", 0) or 0)
         except (TypeError, ValueError):
