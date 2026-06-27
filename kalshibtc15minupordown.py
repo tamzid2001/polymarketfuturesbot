@@ -85,6 +85,8 @@ from zoneinfo import ZoneInfo
 import aiohttp
 
 from alpaca.data.live import CryptoDataStream
+from alpaca.data.historical import CryptoHistoricalDataClient
+from alpaca.data.requests import CryptoLatestTradeRequest
 
 from kalshi_python_async import (
     BookSide,
@@ -120,6 +122,7 @@ BET_AMOUNT_USD    = float(os.getenv("BET_AMOUNT_USD", "1"))
 PRICE_DELTA_GATE  = float(os.getenv("PRICE_DELTA_GATE", "10"))
 NOW_WINDOW_S      = int(float(os.getenv("NOW_WINDOW_S", "60")))
 PRINT_NOW_PRICE   = os.getenv("PRINT_NOW_PRICE", "true").lower() in ("1", "true", "yes")
+PRINT_SPOT        = os.getenv("PRINT_SPOT", "true").lower() in ("1", "true", "yes")
 RUNTIME_LIMIT_MIN = float(os.getenv("RUNTIME_LIMIT_MIN", "345"))
 CLOSE_BEFORE_SETTLE_S = float(os.getenv("CLOSE_BEFORE_SETTLE_S", "30"))
 KALSHI_WS_VERBOSE = os.getenv("KALSHI_WS_VERBOSE", "false").lower() in ("1", "true", "yes")
@@ -163,8 +166,9 @@ log = logging.getLogger("kalshi_btc_bot")
 # ─────────────────────────────────────────────────────────────────────────────
 # Shared state
 # ─────────────────────────────────────────────────────────────────────────────
-latest_btc_price: float              = 0.0
-latest_btc_ts:    Optional[datetime] = None
+latest_btc_price:  float              = 0.0
+latest_btc_ts:     Optional[datetime] = None
+last_price_source: str                = "?"     # "WS" | "REST"
 _price_lock = threading.Lock()
 
 # Rolling NOW-price (per-second samples → simple average). Main-loop only.
@@ -233,16 +237,34 @@ def log_next_ticker_prediction() -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Alpaca WebSocket (own thread) + per-second NOW-price sampler
+# Alpaca price feed:  WebSocket (own thread, sub-second) + per-second REST poll.
+# Both write the latest spot to shared state; the freshest write wins, so the
+# bot always has a real-time price even if the WebSocket goes quiet.
 # ─────────────────────────────────────────────────────────────────────────────
+def _set_price(price: float, source: str, ts: Optional[datetime] = None) -> None:
+    global latest_btc_price, latest_btc_ts, last_price_source
+    with _price_lock:
+        latest_btc_price  = price
+        latest_btc_ts     = ts or datetime.now(tz=timezone.utc)
+        last_price_source = source
+
+
+def read_btc_price() -> tuple:
+    with _price_lock:
+        return latest_btc_price, latest_btc_ts
+
+
+def read_btc_full() -> tuple:
+    with _price_lock:
+        return latest_btc_price, latest_btc_ts, last_price_source
+
+
+# ── WebSocket (real-time trades) ─────────────────────────────────────────────
 async def on_trade(trade) -> None:
-    global latest_btc_price, latest_btc_ts
     ts: datetime = trade.timestamp
     if ts.tzinfo is None:
         ts = ts.replace(tzinfo=timezone.utc)
-    with _price_lock:
-        latest_btc_price = float(trade.price)
-        latest_btc_ts    = ts
+    _set_price(float(trade.price), "WS", ts)
 
 
 def run_alpaca_stream() -> None:
@@ -257,9 +279,22 @@ def run_alpaca_stream() -> None:
             time.sleep(5)
 
 
-def read_btc_price() -> tuple:
-    with _price_lock:
-        return latest_btc_price, latest_btc_ts
+# ── REST spot (per-second fallback / cadence guarantee) ──────────────────────
+_rest_client: Optional[CryptoHistoricalDataClient] = None
+
+
+def fetch_btc_spot_rest() -> Optional[float]:
+    """Blocking Alpaca REST call for the latest BTC/USD trade price."""
+    global _rest_client
+    try:
+        if _rest_client is None:
+            _rest_client = CryptoHistoricalDataClient(ALPACA_API_KEY, ALPACA_API_SECRET)
+        resp = _rest_client.get_crypto_latest_trade(
+            CryptoLatestTradeRequest(symbol_or_symbols=BTC_SYMBOL))
+        return float(resp[BTC_SYMBOL].price)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("Alpaca REST spot fetch failed: %s", exc)
+        return None
 
 
 def anchor_now_price(target: Optional[float]) -> None:
@@ -273,21 +308,31 @@ def anchor_now_price(target: Optional[float]) -> None:
         log.info(f"Anchored NOW price (60s avg) to target ${target:,.2f}")
 
 
-async def price_sampler() -> None:
-    """Sample the live BTC price once per second; update + print the rolling
-    60-second simple average (the NOW price)."""
+async def btc_second_loop() -> None:
+    """Every second: poll Alpaca REST for the spot price (always, alongside the
+    WebSocket), update the rolling 60-second NOW average from the MOST RECENT
+    price (WS or REST), and print both. Buy/close logic reads this same state."""
     global now_price
+    loop = asyncio.get_event_loop()
     while True:
-        await asyncio.sleep(1)
-        price, _ = read_btc_price()
-        if price <= 0:
-            continue
-        price_samples.append(price)
-        now_price = sum(price_samples) / len(price_samples)
-        if PRINT_NOW_PRICE:
-            log.info(f"NOW 60s-avg=${now_price:,.2f} | live=${price:,.2f} | "
-                     f"Δ(live−now)={price - now_price:+.2f} | "
-                     f"samples={len(price_samples)}/{NOW_WINDOW_S}")
+        t0 = loop.time()
+        # 1) REST spot every second (runs in a thread so the loop stays free)
+        rprice = await loop.run_in_executor(None, fetch_btc_spot_rest)
+        if rprice and rprice > 0:
+            _set_price(rprice, "REST")
+            if PRINT_SPOT:
+                log.info(f"Alpaca REST spot (1s): ${rprice:,.2f}")
+        # 2) rolling average from the most-recent price (WS may be fresher)
+        price, _, source = read_btc_full()
+        if price > 0:
+            price_samples.append(price)
+            now_price = sum(price_samples) / len(price_samples)
+            if PRINT_NOW_PRICE:
+                log.info(f"NOW 60s-avg=${now_price:,.2f} | spot=${price:,.2f} ({source}) | "
+                         f"Δ(spot−now)={price - now_price:+.2f} | "
+                         f"samples={len(price_samples)}/{NOW_WINDOW_S}")
+        # 3) keep a ~1-second cadence
+        await asyncio.sleep(max(0.0, 1.0 - (loop.time() - t0)))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -737,7 +782,7 @@ async def main_async() -> None:
     market_ws = KalshiMarketWS(rest.auth)
     market_ws.set_tickers(current_and_next_tickers())
     ws_task  = asyncio.create_task(market_ws.run(), name="kalshi-ws")
-    smp_task = asyncio.create_task(price_sampler(), name="now-price-sampler")
+    smp_task = asyncio.create_task(btc_second_loop(), name="btc-1s-feed")
     try:
         await strategy_loop(rest, market_ws, started_at=time.time())
     finally:

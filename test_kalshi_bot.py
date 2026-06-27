@@ -138,36 +138,44 @@ def check_alpaca_rest():
 
 # 6 ────────────────────────────────────────────────────────────────────────────
 def check_alpaca_ws(bot):
-    """Start the bot's Alpaca stream (feeds bot.latest_btc_price) and confirm a tick."""
-    section("6. Alpaca real-time trade WebSocket")
+    """Start the bot's Alpaca WS (feeds price state); fall back to REST if quiet."""
+    section("6. Alpaca price feed (WebSocket + REST fallback)")
     try:
         from alpaca.data.live import CryptoDataStream
         stream = CryptoDataStream(os.getenv("ALPACA_API_KEY"), os.getenv("ALPACA_API_SECRET"))
         stream.subscribe_trades(bot.on_trade, "BTC/USD")   # populates bot price state
         threading.Thread(target=stream.run, daemon=True).start()
-        deadline = time.time() + 25
+        deadline = time.time() + 12
         while time.time() < deadline:
-            p, _ = bot.read_btc_price()
-            if p > 0:
-                print(f"      LIVE BTC/USD (Alpaca WS tick): ${p:,.2f}", flush=True)
-                record("Alpaca WS tick", PASS, f"${p:,.2f}")
+            p, _, src = bot.read_btc_full()
+            if p > 0 and src == "WS":
+                print(f"      LIVE BTC/USD (WS tick): ${p:,.2f}", flush=True)
+                record("Alpaca price feed (WS)", PASS, f"${p:,.2f}")
                 return
             time.sleep(0.5)
-        record("Alpaca WS tick", WARN, "no tick in 25s", critical=False)
+        # WS quiet → REST fallback is the DESIGNED behavior, not a failure
+        rp = bot.fetch_btc_spot_rest()
+        if rp and rp > 0:
+            bot._set_price(rp, "REST")
+            print(f"      WS quiet — REST fallback BTC/USD: ${rp:,.2f}", flush=True)
+            record("Alpaca price feed (REST fallback)", PASS, f"${rp:,.2f}")
+        else:
+            record("Alpaca price feed", FAIL, "neither WS nor REST returned a price")
     except Exception as exc:  # noqa: BLE001
-        record("Alpaca WS tick", FAIL, str(exc))
+        record("Alpaca price feed", FAIL, str(exc))
 
 
 # 7 (async) ─────────────────────────────────────────────────────────────────────
 async def check_now_price(bot):
-    section("7. Rolling 60-second NOW price (printed EVERY SECOND)")
+    section("7. Per-second BTC spot (REST) + rolling 60s NOW price (every second)")
     try:
+        bot.PRINT_SPOT = True
         bot.PRINT_NOW_PRICE = True
         # demo the target-anchor: seed with a sample target, then blend live ticks
         live, _ = bot.read_btc_price()
         if live > 0:
             bot.anchor_now_price(round(live, 2))
-        task = asyncio.create_task(bot.price_sampler())
+        task = asyncio.create_task(bot.btc_second_loop())   # REST every second + NOW avg
         await asyncio.sleep(22)               # ~22 one-second prints
         task.cancel()
         try:
@@ -175,13 +183,13 @@ async def check_now_price(bot):
         except asyncio.CancelledError:
             pass
         if bot.now_price > 0 and len(bot.price_samples) >= bot.MIN_SAMPLES:
-            record("rolling NOW price", PASS,
+            record("per-second spot + rolling NOW price", PASS,
                    f"now=${bot.now_price:,.2f} over {len(bot.price_samples)} samples")
         else:
-            record("rolling NOW price", WARN,
-                   "insufficient samples (Alpaca quiet?)", critical=False)
+            record("per-second spot + rolling NOW price", FAIL,
+                   "no price from WS or REST")
     except Exception as exc:  # noqa: BLE001
-        record("rolling NOW price", FAIL, str(exc))
+        record("per-second spot + rolling NOW price", FAIL, str(exc))
 
 
 # 8-10 (async) ──────────────────────────────────────────────────────────────────
@@ -317,6 +325,7 @@ async def _run_async(bot):
 def main():
     os.environ.setdefault("KALSHI_WS_VERBOSE", "true")
     os.environ.setdefault("PRINT_NOW_PRICE", "true")
+    os.environ.setdefault("PRINT_SPOT", "true")
     os.environ.setdefault("DRY_RUN", "true")
 
     print("=" * 70)
