@@ -220,6 +220,10 @@ async def check_kalshi_async(bot):
         bal = await rest.get_balance_dollars()
         record("Kalshi balance", PASS if (bal is not None and bal >= 0) else FAIL,
                f"${bal:,.2f}" if bal is not None else "None")
+        # portfolio report (recent positions, P&L, trades) — same as production prints
+        bot.start_balance = bal if bal is not None else 0.0
+        await bot.report_portfolio(rest)
+        record("portfolio report", PASS, "balance/positions/P&L printed")
     except Exception as exc:  # noqa: BLE001
         record("Kalshi REST auth", FAIL, str(exc))
         traceback.print_exc()

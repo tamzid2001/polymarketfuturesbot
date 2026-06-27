@@ -12,9 +12,9 @@ on:
   workflow_dispatch:
     inputs:
       dry_run:
-        description: "Place real orders? Set to false to trade live."
+        description: "Override DRY_RUN for THIS run only ('true' or 'false'). Leave BLANK to use the DRY_RUN repo/env variable."
         required: false
-        default: "true"
+        default: ""
 
 # At most one run at a time. A newly queued run waits; it never
 # cancels the currently running bot mid-execution.

@@ -125,6 +125,7 @@ PRINT_NOW_PRICE   = os.getenv("PRINT_NOW_PRICE", "true").lower() in ("1", "true"
 PRINT_SPOT        = os.getenv("PRINT_SPOT", "true").lower() in ("1", "true", "yes")
 RUNTIME_LIMIT_MIN = float(os.getenv("RUNTIME_LIMIT_MIN", "345"))
 CLOSE_BEFORE_SETTLE_S = float(os.getenv("CLOSE_BEFORE_SETTLE_S", "30"))
+REPORT_INTERVAL_S = float(os.getenv("REPORT_INTERVAL_S", "30"))   # portfolio report cadence
 KALSHI_WS_VERBOSE = os.getenv("KALSHI_WS_VERBOSE", "false").lower() in ("1", "true", "yes")
 
 ORDER_TIF      = "immediate_or_cancel"   # marketable IOC == market order
@@ -180,6 +181,13 @@ kalshi_quotes: dict = {}
 
 # Single open position (main-loop only): {"ticker","side","count"} or None.
 open_position: Optional[dict] = None
+
+# Running tallies (main-loop only)
+trades_placed: int = 0      # orders that reached the exchange (live)
+buys_placed:   int = 0
+closes_placed: int = 0
+fills_count:   int = 0      # orders that actually filled (fill_count > 0)
+start_balance: Optional[float] = None   # Kalshi cash balance at startup
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -520,6 +528,15 @@ class KalshiREST:
             log.warning("get_market(%s) failed: %s", ticker, exc)
             return None
 
+    async def get_positions(self) -> list:
+        """Return the account's market positions (MarketPosition objects)."""
+        try:
+            resp = await self.portfolio.get_positions(limit=200)
+            return getattr(resp, "market_positions", None) or []
+        except Exception as exc:  # noqa: BLE001
+            log.warning("get_positions failed: %s", exc)
+            return []
+
     async def get_open_series_markets(self) -> list:
         try:
             resp = await self.events.get_events(
@@ -585,7 +602,9 @@ async def resolve_active_market(rest: KalshiREST) -> Optional[dict]:
 # Orders (MARKET = marketable IOC) — single open position
 # ─────────────────────────────────────────────────────────────────────────────
 async def _submit(rest: KalshiREST, *, ticker, side: BookSide, price: str,
-                  count: int, reduce_only: bool, tag: str):
+                  count: int, reduce_only: bool, tag: str) -> tuple:
+    """Submit a marketable IOC order. Returns (resp, filled)."""
+    global trades_placed, buys_placed, closes_placed, fills_count
     order_id = str(uuid.uuid4())
     log.info("ORDER %s  %s  side=%s price=%s count=%d (~$%.0f) reduce_only=%s "
              "ticker=%s id=%s",
@@ -593,7 +612,7 @@ async def _submit(rest: KalshiREST, *, ticker, side: BookSide, price: str,
              BET_AMOUNT_USD, reduce_only, ticker, order_id)
     if DRY_RUN:
         log.info("DRY_RUN active — order NOT submitted.")
-        return None
+        return None, True                       # simulate a fill
     try:
         req = CreateOrderV2Request(
             ticker=ticker, side=side, count=f"{float(count):.2f}", price=price,
@@ -601,31 +620,49 @@ async def _submit(rest: KalshiREST, *, ticker, side: BookSide, price: str,
             self_trade_prevention_type=SelfTradePreventionType.TAKER_AT_CROSS,
             reduce_only=reduce_only)
         resp = await rest.orders.create_order_v2(create_order_v2_request=req)
+        try:
+            fc = float(getattr(resp, "fill_count", 0) or 0)
+        except (TypeError, ValueError):
+            fc = 0.0
         log.info("ORDER RESULT: order_id=%s fill_count=%s remaining=%s avg_price=%s",
                  getattr(resp, "order_id", "?"), getattr(resp, "fill_count", "?"),
                  getattr(resp, "remaining_count", "?"),
                  getattr(resp, "average_fill_price", "?"))
-        return resp
+        trades_placed += 1
+        if reduce_only:
+            closes_placed += 1
+        else:
+            buys_placed += 1
+        filled = fc > 0
+        if filled:
+            fills_count += 1
+        else:
+            log.warning("Order did NOT fill (IOC) — book too thin at price %s. "
+                        "Kalshi min price is $0.01, so a side priced below the best "
+                        "opposite quote cannot cross.", price)
+        return resp, filled
     except Exception as exc:  # noqa: BLE001
         log.error("create_order_v2 failed: %s", exc)
-        return None
+        return None, False
 
 
-async def close_position(rest: KalshiREST):
-    """Close the single open position (reduce-only marketable order)."""
+async def close_position(rest: KalshiREST) -> bool:
+    """Close the single open position (reduce-only marketable order). Returns filled."""
     global open_position
     if not open_position:
-        return None
+        return True
     if open_position["side"] == "yes":
         side, price = BookSide.ASK, "0.01"      # sell YES → close long YES
     else:
         side, price = BookSide.BID, "0.99"      # buy YES  → close long NO
-    resp = await _submit(rest, ticker=open_position["ticker"], side=side, price=price,
-                         count=open_position["count"], reduce_only=True,
-                         tag=f"MARKET CLOSE {open_position['side'].upper()}")
-    if DRY_RUN or resp is not None:
+    _, filled = await _submit(rest, ticker=open_position["ticker"], side=side, price=price,
+                              count=open_position["count"], reduce_only=True,
+                              tag=f"MARKET CLOSE {open_position['side'].upper()}")
+    if filled:
         open_position = None
-    return resp
+    else:
+        log.warning("CLOSE did not fill — position still open, will retry.")
+    return filled
 
 
 async def open_market(rest: KalshiREST, ticker: str, side: str):
@@ -633,16 +670,19 @@ async def open_market(rest: KalshiREST, ticker: str, side: str):
     global open_position
     if open_position:
         if open_position["ticker"] == ticker and open_position["side"] == side:
-            return None                         # already in the desired position
-        await close_position(rest)              # flip → close the other side
+            return                              # already in the desired position
+        if not await close_position(rest):      # flip → must close the other side first
+            log.warning("Could not close existing position to flip — skipping new entry.")
+            return
     enum  = BookSide.BID if side == "yes" else BookSide.ASK
     price = "0.99" if side == "yes" else "0.01"
     count = bet_count()
-    resp = await _submit(rest, ticker=ticker, side=enum, price=price, count=count,
-                         reduce_only=False, tag=f"MARKET BUY {side.upper()}")
-    if DRY_RUN or resp is not None:
+    _, filled = await _submit(rest, ticker=ticker, side=enum, price=price, count=count,
+                              reduce_only=False, tag=f"MARKET BUY {side.upper()}")
+    if filled:
         open_position = {"ticker": ticker, "side": side, "count": count}
-    return resp
+    else:
+        log.warning("BUY %s not filled — no position opened.", side.upper())
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -680,12 +720,74 @@ def log_snapshot(live, market, delta) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Portfolio report  (recent positions, P&L, trades placed)
+# ─────────────────────────────────────────────────────────────────────────────
+def _f(v, default=0.0) -> float:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
+async def report_portfolio(rest: KalshiREST) -> None:
+    """Fetch & print balance, recent positions, total P&L and trade counts."""
+    bal = await rest.get_balance_dollars()
+    positions = await rest.get_positions()
+
+    realized_total = 0.0
+    fees_total = 0.0
+    lines = []
+    for mp in positions:
+        pf  = _f(getattr(mp, "position_fp", 0))
+        rp  = _f(getattr(mp, "realized_pnl_dollars", 0))
+        exp = _f(getattr(mp, "market_exposure_dollars", 0))
+        fee = _f(getattr(mp, "fees_paid_dollars", 0))
+        realized_total += rp
+        fees_total += fee
+        if pf != 0 or rp != 0:
+            tk = getattr(mp, "ticker", "?")
+            state = "OPEN" if pf != 0 else "settled"
+            side = "YES" if pf > 0 else ("NO" if pf < 0 else "—")
+            lines.append(f"│   {tk}  {state}  pos={pf:+g} {side}  "
+                         f"exposure=${exp:,.2f}  realized=${rp:,.2f}")
+
+    net = (bal - start_balance) if (bal is not None and start_balance is not None) else None
+    net_s = f"${net:,.2f}" if net is not None else "n/a"
+    bal_s = f"${bal:,.2f}" if bal is not None else "n/a"
+    body = "\n".join(lines) if lines else "│   (none yet)"
+    log.info(
+        "\n"
+        "╔═══ PORTFOLIO ══════════════════════════════════════════════\n"
+        f"║  Balance        : {bal_s}   (start ${start_balance:,.2f})\n"
+        f"║  Net P&L (cash) : {net_s}   ← balance change since bot start\n"
+        f"║  Realized P&L   : ${realized_total:,.2f}   Fees: ${fees_total:,.2f}\n"
+        f"║  Trades placed  : {trades_placed}  (buys {buys_placed}, closes {closes_placed}, "
+        f"fills {fills_count})\n"
+        f"║  Bot position   : "
+        f"{(open_position['side'].upper()+' x'+str(open_position['count'])+' '+open_position['ticker']) if open_position else 'flat'}\n"
+        "║  Recent positions (Kalshi):\n"
+        f"{body}\n"
+        "╚════════════════════════════════════════════════════════════"
+    )
+
+
+async def portfolio_reporter(rest: KalshiREST) -> None:
+    while True:
+        await asyncio.sleep(REPORT_INTERVAL_S)
+        try:
+            await report_portfolio(rest)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("portfolio report failed: %s", exc)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Strategy loop  (decision = live price vs rolling 60-s NOW price)
 # ─────────────────────────────────────────────────────────────────────────────
 async def strategy_loop(rest: KalshiREST, market_ws: KalshiMarketWS,
                         started_at: float) -> None:
     log.info("Strategy loop started …")
     cached_ticker: Optional[str] = None
+    anchored_ticker: Optional[str] = None
     market: Optional[dict] = None
 
     while True:
@@ -699,7 +801,7 @@ async def strategy_loop(rest: KalshiREST, market_ws: KalshiMarketWS,
         ct, nt = current_and_next_tickers()
         market_ws.set_tickers((ct, nt))
 
-        # New 15-min window → close stale position, re-resolve, re-anchor NOW price
+        # New 15-min window → close stale position, resolve the new market
         if ct != cached_ticker:
             if open_position and open_position["ticker"] == cached_ticker:
                 log.info("Window rolled → closing stale position in %s", cached_ticker)
@@ -707,13 +809,19 @@ async def strategy_loop(rest: KalshiREST, market_ws: KalshiMarketWS,
             log_next_ticker_prediction()
             market = await resolve_active_market(rest)
             cached_ticker = ct
-            if market:
-                anchor_now_price(market.get("target"))
-
-        if market is None or market["ticker"] != ct:
+        # Keep re-resolving until we have the market AND its target. A just-opened
+        # market often has no floor_strike for a few seconds → target=None; refetch.
+        elif market is None or market["ticker"] != ct or market.get("target") is None:
             market = await resolve_active_market(rest)
-            if market is None:
-                continue
+
+        if market is None:
+            continue
+
+        # Anchor the rolling NOW price to the official target once it's available
+        # for this window (the target == the previous window's 60-s BRTI average).
+        if market.get("target") is not None and anchored_ticker != market["ticker"]:
+            anchor_now_price(market["target"])
+            anchored_ticker = market["ticker"]
 
         live, _ = read_btc_price()
         if live <= 0 or len(price_samples) < MIN_SAMPLES:
@@ -768,14 +876,18 @@ async def main_async() -> None:
         raise SystemExit("Missing credentials — set ALPACA_API_KEY, "
                          "ALPACA_API_SECRET, KALSHI_API_KEY_ID")
 
+    global start_balance
     rest = KalshiREST()
     try:
         bal = await rest.get_balance_dollars()
-        log.info("Kalshi auth OK – balance: $%.2f", bal if bal is not None else -1)
+        start_balance = bal if bal is not None else 0.0
+        log.info("Kalshi auth OK – balance: $%.2f", start_balance)
     except Exception as exc:
         log.error("Kalshi auth failed: %s", exc)
         await rest.close()
         raise
+
+    await report_portfolio(rest)   # initial portfolio snapshot
 
     threading.Thread(target=run_alpaca_stream, daemon=True, name="alpaca-ws").start()
 
@@ -783,15 +895,17 @@ async def main_async() -> None:
     market_ws.set_tickers(current_and_next_tickers())
     ws_task  = asyncio.create_task(market_ws.run(), name="kalshi-ws")
     smp_task = asyncio.create_task(btc_second_loop(), name="btc-1s-feed")
+    rpt_task = asyncio.create_task(portfolio_reporter(rest), name="portfolio-reporter")
     try:
         await strategy_loop(rest, market_ws, started_at=time.time())
     finally:
-        for t in (ws_task, smp_task):
+        for t in (ws_task, smp_task, rpt_task):
             t.cancel()
             try:
                 await t
             except asyncio.CancelledError:
                 pass
+        await report_portfolio(rest)   # final report before exit
         await rest.close()
 
 
