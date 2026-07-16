@@ -22,8 +22,10 @@ concurrency:
   group: kalshi-bot-singleton
   cancel-in-progress: false
 
+# contents: write — the Persist State step commits trade_history.json /
+# traded_market_tickers.json back to the repo after each run.
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   execute-monitor:
@@ -58,8 +60,6 @@ jobs:
 
       - name: Run Bot (continuous 5 h 45 min loop)
         env:
-          ALPACA_API_KEY:    ${{ secrets.ALPACA_PUBLIC_KEY }}
-          ALPACA_API_SECRET: ${{ secrets.ALPACA_SECRETS_KEY }}
           KALSHI_API_KEY_ID: ${{ secrets.KALSHI_PROD_API_KEY }}
           KALSHI_PEM_PATH:   kalshi_private_key.pem
           KALSHI_DEMO:       "false"
@@ -71,13 +71,24 @@ jobs:
           #   • Default (nothing set) → DRY_RUN=true (safe, logs orders only).
           DRY_RUN:           ${{ github.event.inputs.dry_run || vars.DRY_RUN || 'true' }}
           BET_AMOUNT_USD:    ${{ vars.BET_AMOUNT_USD || '1' }}
-          PRICE_DELTA_GATE:  ${{ vars.PRICE_DELTA_GATE || '10' }}
-          NEAR_THE_MONEY_MIN: ${{ vars.NEAR_THE_MONEY_MIN || '0.05' }}
-          NEAR_THE_MONEY_MAX: ${{ vars.NEAR_THE_MONEY_MAX || '0.95' }}
-          PRINT_NOW_PRICE:   ${{ vars.PRINT_NOW_PRICE || 'true' }}
-          PRINT_SPOT:        ${{ vars.PRINT_SPOT || 'true' }}
+          # Prophet strategy knobs (repo/environment variables, all optional)
+          HISTORY_MINUTES:     ${{ vars.HISTORY_MINUTES || '500' }}
+          FORECAST_MINUTES:    ${{ vars.FORECAST_MINUTES || '15' }}
+          UNCERTAINTY_SAMPLES: ${{ vars.UNCERTAINTY_SAMPLES || '1000' }}
           RUNTIME_LIMIT_MIN: "345"
         run: python kalshibtc15minupordown.py
+
+      - name: Persist State (trade history + traded windows)
+        if: always()
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          # Commit our state BEFORE pulling (same pattern as polymarket_monitor):
+          # commit first, then rebase with --autostash so the chain stays clean.
+          for f in trade_history.json traded_market_tickers.json; do
+            [ -f "$f" ] && git add "$f" || true
+          done
+          git diff-index --quiet HEAD || (git commit -m "chore: persist kalshi bot state [skip ci]" && git pull --rebase --autostash origin main && git push)
 
       - name: Re-trigger next run (5 h 45 min handoff)
         if: success()
