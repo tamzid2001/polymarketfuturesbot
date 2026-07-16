@@ -25,7 +25,10 @@ STRATEGY  (Prophet 15-minute BTC forecast)
        has already crossed that price, so the limit is marketable on arrival;
        if the price ticks back first it rests GTC on the book.
     6. Watches the take-profit order until it fills, books the realized P&L,
-       then waits for the NEXT contract to place a new trade.
+       then waits for the NEXT contract to place a new trade. If the position
+       is closed manually in the Kalshi app, the monitor detects it (live
+       position check before/while the TP is out), cancels any resting TP,
+       and books the Kalshi-reported realized P&L instead of erroring.
     7. Records the trade and, after take-profit or settlement, computes
        win/loss + P&L (TP fills are accounted at the TP exit price; a TP that
        only partially fills settles the remainder at the market result).
@@ -763,7 +766,9 @@ async def _submit(rest: KalshiREST, *, ticker, side: BookSide, price: str,
                         "opposite quote cannot cross.", price)
         return resp, filled
     except Exception as exc:  # noqa: BLE001
-        log.error("create_order_v2 failed: %s", exc)
+        body = getattr(exc, "body", None)
+        log.error("create_order_v2 failed: %s%s", exc,
+                  f"  raw_body={body}" if body else "")
         return None, False
 
 
@@ -1100,6 +1105,32 @@ async def _tp_fill_count(rest: KalshiREST, rec: dict) -> tuple:
         return 0.0, None
 
 
+async def _live_position(rest: KalshiREST, ticker: str) -> Optional[tuple]:
+    """(contracts held, realized_pnl_dollars) for ticker from Kalshi, or None
+    on API failure. Held is |position_fp| (YES>0 / NO<0 both count as held).
+    A ticker absent from the response means no position (realized unknown → 0)."""
+    try:
+        resp = await rest.portfolio.get_positions(ticker=ticker, limit=10)
+        for mp in (getattr(resp, "market_positions", None) or []):
+            if getattr(mp, "ticker", None) == ticker:
+                return (abs(_f(getattr(mp, "position_fp", 0))),
+                        _f(getattr(mp, "realized_pnl_dollars", 0)))
+        return 0.0, 0.0
+    except Exception as exc:  # noqa: BLE001
+        log.warning("get_positions(%s) failed: %s", ticker, exc)
+        return None
+
+
+def _settle_external(rec: dict, realized: float, extra: str = "") -> None:
+    """Book a position that was closed OUTSIDE the bot (e.g. manual sale in the
+    app) at Kalshi's reported realized P&L and stop monitoring it."""
+    rec["exit_method"] = "closed_externally"
+    tracker.settle(rec, "WIN" if realized > 0 else "LOSS", realized)
+    log.info("🤝 %s position was closed OUTSIDE the bot (manual sale?)%s — "
+             "booked Kalshi realized P&L $%+.2f. Waiting for the next contract.",
+             rec["ticker"], extra, realized)
+
+
 async def _monitor_position(rest: KalshiREST, rec: dict) -> None:
     """One monitor tick for one open position: log live unrealized P&L; place
     the reduce-only GTC take-profit limit once gains cross the target; then
@@ -1119,21 +1150,32 @@ async def _monitor_position(rest: KalshiREST, rec: dict) -> None:
         return                                # no live quote yet
     unreal = (cur - entry) * count
 
-    # 1) Take-profit already on the book → watch it until it fills.
+    # 1) Take-profit already on the book → watch it until it fills. If the
+    #    position vanishes while the TP rests (closed manually in the app),
+    #    cancel the TP and book Kalshi's realized P&L instead.
     if rec.get("tp_order_id"):
+        tp_count = _f(rec.get("tp_count"), count)
         filled_fp, status = await _tp_fill_count(rest, rec)
         log.info("P&L MONITOR %s  %s  entry=$%.2f mark=$%.2f unrealized=$%+.2f "
                  "| TP placed @ $%.2f: %s (%.2f/%.2f filled)",
                  ticker, side.upper(), entry, cur, unreal,
-                 tp_exit, status or "?", filled_fp, count)
-        if filled_fp >= count - 1e-9:
-            pnl = (tp_exit - entry) * count
+                 tp_exit, status or "?", filled_fp, tp_count)
+        if filled_fp >= tp_count - 1e-9:
+            pnl = (tp_exit - entry) * tp_count
             rec["exit_method"] = "take_profit"
             tracker.settle(rec, "WIN", pnl)
             log.info("🎯 TAKE-PROFIT FILLED %s — position CLOSED at $%.2f "
                      "(entry $%.2f × %.2f contracts) → realized P&L $%+.2f. "
                      "Waiting for the next contract to place a new trade.",
-                     ticker, tp_exit, entry, count, pnl)
+                     ticker, tp_exit, entry, tp_count, pnl)
+            return
+        pos = await _live_position(rest, ticker)
+        if pos is not None and pos[0] <= 1e-9:
+            try:
+                await rest.orders.cancel_order_v2(rec["tp_order_id"])
+            except Exception:  # noqa: BLE001
+                pass
+            _settle_external(rec, pos[1], " — canceled the resting take-profit")
         return
 
     log.info("P&L MONITOR %s  %s  entry=$%.2f mark=$%.2f unrealized=$%+.2f "
@@ -1152,16 +1194,33 @@ async def _monitor_position(rest: KalshiREST, rec: dict) -> None:
                  ticker, target, tp_exit, pnl)
         return
 
-    # 3) LIVE: place the reduce-only GTC limit that locks the gain. The market
-    #    already crossed the exit price, so it is marketable on arrival; if the
-    #    price ticked back it rests GTC until touched again (or settlement).
+    # 3) LIVE: confirm the position still exists on Kalshi — a reduce_only
+    #    order on a position that was closed manually in the app is rejected
+    #    with 400 — and size the exit to what is actually held.
+    pos = await _live_position(rest, ticker)
+    if pos is None:
+        return                                # API hiccup — retry next tick
+    held, realized = pos
+    if held <= 1e-9:
+        _settle_external(rec, realized)
+        return
+    place_count = min(count, held)
+    if place_count < count - 1e-9:
+        log.info("%s: holding %.2f of %.2f contracts (partially closed "
+                 "externally) — sizing the take-profit to %.2f.",
+                 ticker, held, count, place_count)
+
+    # Place the reduce-only GTC limit that locks the gain. The market already
+    # crossed the exit price, so it is marketable on arrival; if the price
+    # ticked back it rests GTC until touched again (or settlement).
     tp_side, tp_api_price, tp_exit = take_profit_exit(side, entry, count)
     log.info("💰 %s unrealized $%+.2f crossed the +$%.2f target — placing "
              "reduce-only GTC limit to close at $%.2f/contract.",
              ticker, unreal, target, tp_exit)
     resp, ok = await _submit(rest, ticker=ticker, side=tp_side,
-                             price=tp_api_price, count=count, reduce_only=True,
-                             tif=TP_ORDER_TIF, tag=f"TAKE-PROFIT {side.upper()}")
+                             price=tp_api_price, count=place_count,
+                             reduce_only=True, tif=TP_ORDER_TIF,
+                             tag=f"TAKE-PROFIT {side.upper()}")
     oid = getattr(resp, "order_id", None) if ok else None
     if not oid:
         log.warning("Take-profit placement failed for %s — monitor retries "
@@ -1170,10 +1229,11 @@ async def _monitor_position(rest: KalshiREST, rec: dict) -> None:
     rec["tp_order_id"] = oid
     rec["tp_exit_price"] = tp_exit
     rec["tp_api_price"] = tp_api_price
+    rec["tp_count"] = place_count
     tracker.save()
     fc = _f(getattr(resp, "fill_count", 0))
-    if fc >= count - 1e-9:
-        pnl = (tp_exit - entry) * count
+    if fc >= place_count - 1e-9:
+        pnl = (tp_exit - entry) * place_count
         rec["exit_method"] = "take_profit"
         tracker.settle(rec, "WIN", pnl)
         log.info("🎯 TAKE-PROFIT FILLED IMMEDIATELY %s — position CLOSED at "
