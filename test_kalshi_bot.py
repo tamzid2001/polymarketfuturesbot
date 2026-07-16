@@ -28,6 +28,7 @@ Checks
   11 Kalshi market WebSocket live stream              (async, non-critical)
   12 Bet sizing + V2 MARKET order build + DRY-RUN submit (nothing sent)
   13 PerformanceTracker round-trip (record → dedupe → settle → stats → reload)
+  14 Take-profit: exit-price math (YES/NO/cap) + P&L monitor trigger (DRY-RUN)
 """
 
 from __future__ import annotations
@@ -397,6 +398,59 @@ def check_tracker(bot):
         traceback.print_exc()
 
 
+# 14 ────────────────────────────────────────────────────────────────────────────
+def check_take_profit(bot):
+    section("14. Take-profit: exit math + P&L monitor trigger (DRY-RUN)")
+    try:
+        from kalshi_python_async import BookSide
+        # $1 bet @ $0.40 → 2.50 contracts; +$1 target → exit $0.80 (2× entry)
+        s, px, ex = bot.take_profit_exit("yes", 0.40, 2.50)
+        record("YES exit = entry + target/count (sell YES)",
+               PASS if (s, px, ex) == (BookSide.ASK, "0.80", 0.80) else FAIL,
+               f"ASK @ {px} (exit ${ex:.2f}/contract)")
+        # NO position closes by BUYING YES back at 1 − NO-exit
+        s, px, ex = bot.take_profit_exit("no", 0.40, 2.50)
+        record("NO exit → BID YES at 1 − NO-exit (reduce-only)",
+               PASS if (s, px, ex) == (BookSide.BID, "0.20", 0.80) else FAIL,
+               f"BID @ {px} (NO exit ${ex:.2f}/contract)")
+        # entry ≥ $0.50 can't double pre-settlement → capped at $0.99
+        s, px, ex = bot.take_profit_exit("yes", 0.73, 1.36)
+        record("exit price capped at $0.99 exchange max",
+               PASS if px == "0.99" else FAIL, f"entry $0.73 → {px}")
+
+        # Monitor trigger: below target holds; crossing +$1 books the TP win.
+        with tempfile.TemporaryDirectory() as tmp:
+            saved_tracker, saved_dry = bot.tracker, bot.DRY_RUN
+            bot.tracker = bot.PerformanceTracker(
+                os.path.join(tmp, "h.json"), os.path.join(tmp, "t.json"))
+            bot.DRY_RUN = True
+            rec = {"ticker": "KXBTC15M-QA-TP", "side": "YES", "entry_price": 0.40,
+                   "count": 2.50, "tp_exit_price": 0.80, "tp_api_price": "0.80",
+                   "tp_target_profit_usd": 1.0, "tp_order_id": None,
+                   "exit_method": "pending", "result": "pending",
+                   "settle_et": "2099-01-01T00:00:00+00:00",
+                   "timestamp": "qa", "btc_entry": 0.0, "p50_prediction": 0.0}
+            bot.tracker.trades.append(rec)
+            bot.kalshi_quotes["KXBTC15M-QA-TP"] = {"last": 0.75}   # +$0.875
+            asyncio.run(bot._monitor_position(None, rec))
+            held = rec["result"] == "pending"
+            bot.kalshi_quotes["KXBTC15M-QA-TP"] = {"last": 0.81}   # +$1.025
+            asyncio.run(bot._monitor_position(None, rec))
+            fired = (rec["result"] == "WIN"
+                     and abs(rec["profit_loss"] - 1.0) < 1e-9
+                     and rec["exit_method"].startswith("take_profit"))
+            del bot.kalshi_quotes["KXBTC15M-QA-TP"]
+            bot.tracker, bot.DRY_RUN = saved_tracker, saved_dry
+        record("monitor holds below +$1.00 unrealized", PASS if held else FAIL)
+        record("monitor fires TP when gains cross +$1.00",
+               PASS if fired else FAIL,
+               f"booked {rec['result']} ${rec['profit_loss']:+.2f} "
+               f"via {rec['exit_method']}")
+    except Exception as exc:  # noqa: BLE001
+        record("take-profit checks", FAIL, str(exc))
+        traceback.print_exc()
+
+
 async def _run_async(bot):
     rest = await check_kalshi_async(bot)
     if rest is not None:
@@ -445,6 +499,7 @@ def main():
             record("async checks", FAIL, str(exc))
             traceback.print_exc()
         check_tracker(bot)
+        check_take_profit(bot)
 
     print("\n" + "=" * 70)
     counts = {PASS: 0, FAIL: 0, WARN: 0, SKIP: 0}

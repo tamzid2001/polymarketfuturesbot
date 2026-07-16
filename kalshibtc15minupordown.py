@@ -16,11 +16,24 @@ STRATEGY  (Prophet 15-minute BTC forecast)
     4. Decides ONE trade for the window:
             current BTC close  <  p50   →  BUY YES  (UP)
             current BTC close  >  p50   →  BUY NO   (DOWN)
-    5. Records the trade and, after settlement, computes win/loss + P&L.
+    5. CONTINUOUSLY MONITORS the open position's unrealized P&L from live WS
+       quotes (position_monitor, every POSITION_POLL_S seconds). The moment
+       unrealized gains cross TP_PROFIT_USD (default: the bet amount — a $1
+       bet triggers when the position is up $1), it places the TAKE-PROFIT
+       order: a good_till_canceled reduce_only limit at the exit price that
+       locks the gain (entry + TP_PROFIT_USD/count per contract). The market
+       has already crossed that price, so the limit is marketable on arrival;
+       if the price ticks back first it rests GTC on the book.
+    6. Watches the take-profit order until it fills, books the realized P&L,
+       then waits for the NEXT contract to place a new trade.
+    7. Records the trade and, after take-profit or settlement, computes
+       win/loss + P&L (TP fills are accounted at the TP exit price; a TP that
+       only partially fills settles the remainder at the market result).
 
-  Exactly one order per 15-minute window (never re-enters the same contract).
-  Prophet also yields the 80% confidence interval (p10/p90) around p50; the
-  current BTC price's percentile position within it is logged and stored.
+  Exactly one entry per 15-minute window (never re-enters the same contract);
+  after a take-profit closes the position the bot simply waits for the next
+  contract. Prophet also yields the 80% confidence interval (p10/p90) around
+  p50; the current BTC price's percentile position within it is logged/stored.
 
 DATA SOURCES
 ────────────
@@ -48,6 +61,8 @@ CREDENTIALS / SETTINGS (env vars)
     KALSHI_DEMO            "true" for sandbox (default false)
     DRY_RUN               "true" (default) — log orders, do not submit
     BET_AMOUNT_USD        $ spent per order; fractional contracts = $/price (0.01 min)
+    TP_PROFIT_USD         take-profit target in $ (default = BET_AMOUNT_USD)
+    POSITION_POLL_S       open-position P&L monitor cadence (default 5s)
     HISTORY_MINUTES       1-min candles pulled per forecast (default 500)
     FORECAST_MINUTES      forecast horizon in minutes (default 15)
     UNCERTAINTY_SAMPLES   Prophet uncertainty samples (default 1000)
@@ -112,6 +127,15 @@ DRY_RUN           = os.getenv("DRY_RUN", "true").lower() in ("1", "true", "yes")
 # 2.50 contracts (exactly $1.00). See docs.kalshi.com fixed_point_migration.
 BET_AMOUNT_USD    = float(os.getenv("BET_AMOUNT_USD", "1"))
 
+# ── Take-profit ─────────────────────────────────────────────────────────────
+# Close the position once it is in the money by at least this many dollars
+# (default: the bet amount — a $1 bet exits when the position is up $1).
+# The position_monitor task polls the open position's unrealized P&L from
+# live WS quotes every POSITION_POLL_S; when gains cross TP_PROFIT_USD it
+# places a GTC reduce_only limit at the exit price that locks the gain.
+TP_PROFIT_USD     = float(os.getenv("TP_PROFIT_USD", str(BET_AMOUNT_USD)))
+POSITION_POLL_S   = float(os.getenv("POSITION_POLL_S", "5"))   # P&L monitor cadence
+
 # ── Prophet / data settings ───────────────────────────────────────────────────
 HISTORY_MINUTES     = int(float(os.getenv("HISTORY_MINUTES", "500")))
 FORECAST_MINUTES    = int(float(os.getenv("FORECAST_MINUTES", "15")))
@@ -130,6 +154,7 @@ TRADE_HISTORY_FILE  = os.getenv("TRADE_HISTORY_FILE", "trade_history.json")
 TRADED_TICKERS_FILE = os.getenv("TRADED_TICKERS_FILE", "traded_market_tickers.json")
 
 ORDER_TIF      = "immediate_or_cancel"   # marketable IOC == market order
+TP_ORDER_TIF   = "good_till_canceled"    # resting take-profit limit
 SERIES_TICKER  = "KXBTC15M"
 YF_SYMBOL      = os.getenv("BTC_YF_SYMBOL", "BTC-USD")
 
@@ -172,6 +197,27 @@ def contracts_for_price(price_per_contract: Optional[float]) -> float:
         return bet_count()
     raw = BET_AMOUNT_USD / price_per_contract
     return max(0.01, math.floor(raw * 100) / 100.0)
+
+
+def take_profit_exit(side: str, entry_price: float, count: float) -> tuple:
+    """Take-profit order parameters for an open position.
+
+    Exit when the position is in the money by ≥ TP_PROFIT_USD, i.e. the exit
+    price (in position-side terms) = entry + TP_PROFIT_USD/count per contract.
+    With count = BET/entry that is exactly 2× the entry price — a $1 bet exits
+    up $1. Capped to Kalshi's $0.01–$0.99 price range (an entry ≥ $0.50 can
+    never double pre-settlement, so the cap rests the order at the max $0.99).
+
+    Returns (book_side, api_price_str, exit_price):
+      YES position → ASK (sell YES) at the YES exit price.
+      NO  position → BID (buy YES back, reduce_only) at 1 − NO exit price.
+    """
+    needed = TP_PROFIT_USD / max(float(count), 0.01)     # profit per contract
+    exit_price = min(0.99, max(0.01, round(float(entry_price) + needed, 2)))
+    if side == "yes":
+        return BookSide.ASK, f"{exit_price:.2f}", exit_price
+    yes_px = min(0.99, max(0.01, round(1.0 - exit_price, 2)))
+    return BookSide.BID, f"{yes_px:.2f}", exit_price
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -664,27 +710,30 @@ async def resolve_active_market(rest: KalshiREST) -> Optional[dict]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Orders (MARKET = marketable IOC)
+# Orders (MARKET = marketable IOC; take-profit = resting GTC limit)
 # ─────────────────────────────────────────────────────────────────────────────
 async def _submit(rest: KalshiREST, *, ticker, side: BookSide, price: str,
-                  count: float, reduce_only: bool, tag: str) -> tuple:
-    """Submit a marketable IOC order (fractional count OK, 0.01 granularity).
-    Returns (resp, filled)."""
+                  count: float, reduce_only: bool, tag: str,
+                  tif: str = ORDER_TIF) -> tuple:
+    """Submit an order (fractional count OK, 0.01 granularity).
+    tif=ORDER_TIF (default) → marketable IOC; tif=TP_ORDER_TIF → resting GTC
+    limit, where success means the order is ACCEPTED (resting counts, fill
+    not required). Returns (resp, ok)."""
     global trades_placed, buys_placed, closes_placed, fills_count
     order_id = str(uuid.uuid4())
     log.info("ORDER %s  %s  side=%s price=%s count=%.2f (~$%.2f) reduce_only=%s "
-             "ticker=%s id=%s",
+             "tif=%s ticker=%s id=%s",
              "[DRY-RUN]" if DRY_RUN else "[LIVE]", tag, side.value, price, count,
-             BET_AMOUNT_USD, reduce_only, ticker, order_id)
+             float(count) * _f(price, 0.0), reduce_only, tif, ticker, order_id)
     if DRY_RUN:
         log.info("DRY_RUN active — order NOT submitted.")
-        return None, True                       # simulate a fill
+        return None, True                       # simulate a fill / resting order
     try:
         # The async create_order_v2 builds CreateOrderV2Request(**kwargs) internally,
         # so the order fields are passed DIRECTLY as kwargs (not wrapped).
         resp = await rest.orders.create_order_v2(
             ticker=ticker, side=side, count=f"{float(count):.2f}", price=price,
-            time_in_force=ORDER_TIF, client_order_id=order_id,
+            time_in_force=tif, client_order_id=order_id,
             self_trade_prevention_type=SelfTradePreventionType.TAKER_AT_CROSS,
             reduce_only=reduce_only)
         try:
@@ -703,7 +752,12 @@ async def _submit(rest: KalshiREST, *, ticker, side: BookSide, price: str,
         filled = fc > 0
         if filled:
             fills_count += 1
-        else:
+        if tif != ORDER_TIF:
+            if not filled:
+                log.info("GTC order resting on the book at %s — will fill when "
+                         "the market reaches it.", price)
+            return resp, True                   # accepted (resting or filled)
+        if not filled:
             log.warning("Order did NOT fill (IOC) — book too thin at price %s. "
                         "Kalshi min price is $0.01, so a side priced below the best "
                         "opposite quote cannot cross.", price)
@@ -769,6 +823,10 @@ class PerformanceTracker:
 
     def find_pending(self) -> list:
         return [t for t in self.trades if t.get("result") == "pending"]
+
+    def save(self) -> None:
+        """Persist in-place record mutations (e.g. tp_order_id set by monitor)."""
+        self._save_history()
 
     def settle(self, rec: dict, result: str, pnl: float) -> None:
         rec["result"] = result
@@ -946,6 +1004,8 @@ async def settlement_checker(rest: KalshiREST) -> None:
     Win/loss uses the Kalshi market `result` field ("yes"/"no"). P&L per contract:
         win  →  (1 - entry_price) * count
         loss →  -entry_price * count
+    Contracts the take-profit limit already closed realize (tp_exit − entry)
+    instead; only the unfilled remainder settles at the market result.
     """
     while True:
         await asyncio.sleep(SETTLE_CHECK_S)
@@ -976,11 +1036,175 @@ async def settlement_checker(rest: KalshiREST) -> None:
             win = (result == str(rec["side"]).lower())
             entry = _f(rec.get("entry_price"), 0.5)
             count = _f(rec.get("count"), bet_count())   # fractional contracts OK
-            pnl = (1.0 - entry) * count if win else -entry * count
-            tracker.settle(rec, "WIN" if win else "LOSS", pnl)
-            log.info("SETTLED %s  result=%s  our side=%s → %s  P&L $%+.2f",
-                     rec["ticker"], result.upper(), rec["side"],
-                     "WIN" if win else "LOSS", pnl)
+
+            # Take-profit accounting: TP-closed contracts realized early.
+            tp_filled, _ = await _tp_fill_count(rest, rec)
+            tp_filled = min(tp_filled, count)
+            tp_exit = _f(rec.get("tp_exit_price"), entry)
+            rem = max(count - tp_filled, 0.0)
+            pnl = tp_filled * (tp_exit - entry)
+            pnl += (1.0 - entry) * rem if win else -entry * rem
+            if tp_filled > 1e-9:
+                rec["tp_filled_count"] = round(tp_filled, 2)
+                rec["exit_method"] = ("take_profit" if rem <= 1e-9
+                                      else "take_profit_partial+settlement")
+            else:
+                rec["exit_method"] = "settlement"
+            if rec.get("tp_order_id") and rem > 1e-9 and not DRY_RUN:
+                try:    # tidy: an unfilled TP is dead once the market settles
+                    await rest.orders.cancel_order_v2(rec["tp_order_id"])
+                except Exception:  # noqa: BLE001
+                    pass
+            outcome = "WIN" if pnl > 0 else "LOSS"
+            tracker.settle(rec, outcome, pnl)
+            log.info("SETTLED %s  result=%s  our side=%s → %s  P&L $%+.2f%s",
+                     rec["ticker"], result.upper(), rec["side"], outcome, pnl,
+                     f"  (take-profit closed {tp_filled:.2f}/{count:.2f} early)"
+                     if tp_filled > 1e-9 else "")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Open-position P&L monitor  (take-profit trigger + fill watcher)
+# ─────────────────────────────────────────────────────────────────────────────
+def _position_mark(rec: dict) -> Optional[float]:
+    """Current position-side price (dollars/contract) from the live WS quote."""
+    q = get_kalshi_quote(rec["ticker"])
+    if not q:
+        return None
+    yes = q.get("last")
+    if yes is None:
+        b, a = q.get("yes_bid"), q.get("yes_ask")
+        if b is not None and a is not None:
+            yes = (b + a) / 2
+        else:
+            yes = a if a is not None else b
+    if yes is None:
+        return None
+    return float(yes) if str(rec["side"]).lower() == "yes" else round(1.0 - float(yes), 4)
+
+
+async def _tp_fill_count(rest: KalshiREST, rec: dict) -> tuple:
+    """(filled_contracts, status) of the trade's take-profit order, or (0, None)."""
+    oid = rec.get("tp_order_id")
+    if not oid or DRY_RUN:
+        return 0.0, None
+    try:
+        order = getattr(await rest.orders.get_order(oid), "order", None)
+        if order is None:
+            return 0.0, None
+        status = getattr(order, "status", None)
+        status = getattr(status, "value", None) or (str(status) if status else None)
+        return _f(getattr(order, "fill_count_fp", 0)), status
+    except Exception as exc:  # noqa: BLE001
+        log.warning("get_order(%s) failed: %s", oid, exc)
+        return 0.0, None
+
+
+async def _monitor_position(rest: KalshiREST, rec: dict) -> None:
+    """One monitor tick for one open position: log live unrealized P&L; place
+    the reduce-only GTC take-profit limit once gains cross the target; then
+    watch that order until it fills and book the realized P&L."""
+    ticker  = rec["ticker"]
+    side    = str(rec["side"]).lower()
+    entry   = _f(rec.get("entry_price"), 0.5)
+    count   = _f(rec.get("count"), bet_count())
+    target  = _f(rec.get("tp_target_profit_usd"), TP_PROFIT_USD)
+    tp_exit = rec.get("tp_exit_price")
+    if tp_exit is None:                       # pre-TP-schema pending record
+        _, _, tp_exit = take_profit_exit(side, entry, count)
+        rec["tp_exit_price"] = tp_exit
+
+    cur = _position_mark(rec)
+    if cur is None:
+        return                                # no live quote yet
+    unreal = (cur - entry) * count
+
+    # 1) Take-profit already on the book → watch it until it fills.
+    if rec.get("tp_order_id"):
+        filled_fp, status = await _tp_fill_count(rest, rec)
+        log.info("P&L MONITOR %s  %s  entry=$%.2f mark=$%.2f unrealized=$%+.2f "
+                 "| TP placed @ $%.2f: %s (%.2f/%.2f filled)",
+                 ticker, side.upper(), entry, cur, unreal,
+                 tp_exit, status or "?", filled_fp, count)
+        if filled_fp >= count - 1e-9:
+            pnl = (tp_exit - entry) * count
+            rec["exit_method"] = "take_profit"
+            tracker.settle(rec, "WIN", pnl)
+            log.info("🎯 TAKE-PROFIT FILLED %s — position CLOSED at $%.2f "
+                     "(entry $%.2f × %.2f contracts) → realized P&L $%+.2f. "
+                     "Waiting for the next contract to place a new trade.",
+                     ticker, tp_exit, entry, count, pnl)
+        return
+
+    log.info("P&L MONITOR %s  %s  entry=$%.2f mark=$%.2f unrealized=$%+.2f "
+             "| TP armed: trigger ≥ $%.2f gain",
+             ticker, side.upper(), entry, cur, unreal, target)
+    if unreal < target - 1e-9:
+        return                                # gains haven't crossed the target
+
+    # 2) Gains crossed the target (DRY-RUN: simulate the fill and stop).
+    if DRY_RUN:
+        pnl = (tp_exit - entry) * count
+        rec["exit_method"] = "take_profit(dry-run)"
+        tracker.settle(rec, "WIN", pnl)
+        log.info("🎯 [DRY-RUN] %s gains crossed +$%.2f — TP limit would close "
+                 "at $%.2f for P&L $%+.2f. Waiting for the next contract.",
+                 ticker, target, tp_exit, pnl)
+        return
+
+    # 3) LIVE: place the reduce-only GTC limit that locks the gain. The market
+    #    already crossed the exit price, so it is marketable on arrival; if the
+    #    price ticked back it rests GTC until touched again (or settlement).
+    tp_side, tp_api_price, tp_exit = take_profit_exit(side, entry, count)
+    log.info("💰 %s unrealized $%+.2f crossed the +$%.2f target — placing "
+             "reduce-only GTC limit to close at $%.2f/contract.",
+             ticker, unreal, target, tp_exit)
+    resp, ok = await _submit(rest, ticker=ticker, side=tp_side,
+                             price=tp_api_price, count=count, reduce_only=True,
+                             tif=TP_ORDER_TIF, tag=f"TAKE-PROFIT {side.upper()}")
+    oid = getattr(resp, "order_id", None) if ok else None
+    if not oid:
+        log.warning("Take-profit placement failed for %s — monitor retries "
+                    "next tick.", ticker)
+        return
+    rec["tp_order_id"] = oid
+    rec["tp_exit_price"] = tp_exit
+    rec["tp_api_price"] = tp_api_price
+    tracker.save()
+    fc = _f(getattr(resp, "fill_count", 0))
+    if fc >= count - 1e-9:
+        pnl = (tp_exit - entry) * count
+        rec["exit_method"] = "take_profit"
+        tracker.settle(rec, "WIN", pnl)
+        log.info("🎯 TAKE-PROFIT FILLED IMMEDIATELY %s — position CLOSED at "
+                 "$%.2f → realized P&L $%+.2f. Waiting for the next contract.",
+                 ticker, tp_exit, pnl)
+
+
+async def position_monitor(rest: KalshiREST) -> None:
+    """Continuously monitor open positions' P&L and drive the take-profit."""
+    log.info("Position P&L monitor started — poll every %.0fs, take-profit "
+             "target +$%.2f (reduce-only GTC limit placed on trigger).",
+             POSITION_POLL_S, TP_PROFIT_USD)
+    while True:
+        await asyncio.sleep(POSITION_POLL_S)
+        now = datetime.now(tz=timezone.utc)
+        for rec in tracker.find_pending():
+            # Monitor only until the window settles; after that the
+            # settlement_checker owns the record.
+            try:
+                settle = datetime.fromisoformat(rec["settle_et"])
+                if settle.tzinfo is None:
+                    settle = settle.replace(tzinfo=ET)
+                if now >= settle:
+                    continue
+            except Exception:  # noqa: BLE001
+                continue
+            try:
+                await _monitor_position(rest, rec)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("position monitor failed for %s: %s",
+                            rec.get("ticker"), exc)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1088,11 +1312,11 @@ async def execute_window_trade(rest: KalshiREST, ct: str, nt: str) -> None:
         f"@ ~${entry_price:.2f} = ~${est_cost:.2f}"
     )
 
-    # 6) Submit exactly ONE order for this window.
+    # 6) Submit exactly ONE entry order for this window.
     enum  = BookSide.BID if side == "yes" else BookSide.ASK
     price = YES_BUY_PRICE if side == "yes" else NO_BUY_PRICE
-    _, filled = await _submit(rest, ticker=ct, side=enum, price=price, count=count,
-                              reduce_only=False, tag=f"BUY {side.upper()}")
+    resp, filled = await _submit(rest, ticker=ct, side=enum, price=price, count=count,
+                                 reduce_only=False, tag=f"BUY {side.upper()}")
 
     log.info("Order Submitted   : %s", "success" if filled else "failure")
     log.info("==============================")
@@ -1103,6 +1327,29 @@ async def execute_window_trade(rest: KalshiREST, ct: str, nt: str) -> None:
         log.warning("BUY %s not filled for %s — no position, not recorded.",
                     side.upper(), ct)
         return
+
+    # Prefer the ACTUAL average fill price (YES terms in the API response) for
+    # the take-profit target and P&L accounting; fall back to the quote estimate.
+    avg_yes = _to_dollars(getattr(resp, "average_fill_price", None))
+    if avg_yes is not None and 0.01 <= avg_yes <= 0.99:
+        entry_price = avg_yes if side == "yes" else round(1.0 - avg_yes, 4)
+
+    # 8) ARM the take-profit: the position_monitor task watches this position's
+    #    unrealized P&L on live quotes and places the GTC reduce_only limit at
+    #    tp_exit the moment gains cross TP_PROFIT_USD (the bet amount).
+    _, tp_api_price, tp_exit = take_profit_exit(side, entry_price, count)
+    tp_profit = round((tp_exit - entry_price) * count, 4)
+    max_profit = round((1.0 - entry_price) * count, 4)
+    if max_profit < TP_PROFIT_USD - 1e-9:
+        log.info("NOTE: from entry $%.2f the position can gain at most $%+.2f "
+                 "before settlement — the +$%.2f take-profit cannot trigger "
+                 "pre-settlement; position rides to market result.",
+                 entry_price, max_profit, TP_PROFIT_USD)
+    log.info("TAKE-PROFIT ARMED : monitoring P&L every %.0fs — will place "
+             "reduce-only GTC limit exit=$%.2f/contract (api price %s, locks "
+             "$%+.2f on %.2f contracts) once unrealized ≥ $%.2f.",
+             POSITION_POLL_S, tp_exit, tp_api_price, tp_profit, count,
+             TP_PROFIT_USD)
 
     rec = {
         "ticker": ct,
@@ -1117,6 +1364,11 @@ async def execute_window_trade(rest: KalshiREST, ct: str, nt: str) -> None:
         "forecast_bands": {k: round(forecast[k], 2) for k, _ in _QMAP},
         "count": count,
         "order_submitted": "success" if filled else "failure",
+        "tp_order_id": None,          # set by position_monitor when triggered
+        "tp_exit_price": tp_exit,
+        "tp_api_price": tp_api_price,
+        "tp_target_profit_usd": round(TP_PROFIT_USD, 2),
+        "exit_method": "pending",
         "dry_run": DRY_RUN,
         "result": "pending",
         "profit_loss": 0.0,
@@ -1165,6 +1417,8 @@ async def main_async() -> None:
     log.info("  Demo / DRY_RUN  : %s / %s", KALSHI_DEMO, DRY_RUN)
     log.info("  Bet amount      : $%.2f/order  (fractional contracts: "
              "$%.2f / price, 0.01 granularity)", BET_AMOUNT_USD, BET_AMOUNT_USD)
+    log.info("  Take-profit     : +$%.2f — monitor P&L every %.0fs, place "
+             "reduce-only GTC limit on trigger", TP_PROFIT_USD, POSITION_POLL_S)
     log.info("  Data / horizon  : %d 1-min candles → forecast %d min",
              HISTORY_MINUTES, FORECAST_MINUTES)
     log.info("  Uncertainty     : %d samples", UNCERTAINTY_SAMPLES)
@@ -1194,10 +1448,11 @@ async def main_async() -> None:
     ws_task  = asyncio.create_task(market_ws.run(), name="kalshi-ws")
     set_task = asyncio.create_task(settlement_checker(rest), name="settlement-checker")
     rpt_task = asyncio.create_task(portfolio_reporter(rest), name="portfolio-reporter")
+    pos_task = asyncio.create_task(position_monitor(rest), name="position-monitor")
     try:
         await strategy_loop(rest, market_ws, started_at=time.time())
     finally:
-        for t in (ws_task, set_task, rpt_task):
+        for t in (ws_task, set_task, rpt_task, pos_task):
             t.cancel()
             try:
                 await t
