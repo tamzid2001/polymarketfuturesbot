@@ -439,6 +439,10 @@ def check_take_profit(bot):
             fired = (rec["result"] == "WIN"
                      and abs(rec["profit_loss"] - 1.0) < 1e-9
                      and rec["exit_method"].startswith("take_profit"))
+            s = bot.tracker.stats()
+            breakdown_ok = (s["exits"]["take_profit"] == 1
+                            and s["exits"]["settlement"] == 0
+                            and abs(s["exit_pnl"]["take_profit"] - 1.0) < 1e-9)
             del bot.kalshi_quotes["KXBTC15M-QA-TP"]
             bot.tracker, bot.DRY_RUN = saved_tracker, saved_dry
         record("monitor holds below +$1.00 unrealized", PASS if held else FAIL)
@@ -446,6 +450,9 @@ def check_take_profit(bot):
                PASS if fired else FAIL,
                f"booked {rec['result']} ${rec['profit_loss']:+.2f} "
                f"via {rec['exit_method']}")
+        record("stats() exit breakdown counts TP vs settlement",
+               PASS if breakdown_ok else FAIL,
+               f"exits={s['exits']}")
     except Exception as exc:  # noqa: BLE001
         record("take-profit checks", FAIL, str(exc))
         traceback.print_exc()

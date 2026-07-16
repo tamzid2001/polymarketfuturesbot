@@ -880,7 +880,28 @@ class PerformanceTracker:
             peak = max(peak, eq)
             max_dd = max(max_dd, peak - eq)
 
+        # exit breakdown — how each settled trade was closed:
+        #   take_profit : the take-profit limit closed the whole position
+        #   partial     : take-profit closed part, the rest settled at result
+        #   external    : closed outside the bot (manual sale in the app)
+        #   settlement  : held to settlement (also legacy pre-TP records)
+        exits    = {"take_profit": 0, "partial": 0, "external": 0, "settlement": 0}
+        exit_pnl = {k: 0.0 for k in exits}
+        for t in settled:
+            m = str(t.get("exit_method") or "settlement")
+            if m == "take_profit_partial+settlement":
+                k = "partial"
+            elif m.startswith("take_profit"):
+                k = "take_profit"
+            elif m == "closed_externally":
+                k = "external"
+            else:
+                k = "settlement"
+            exits[k] += 1
+            exit_pnl[k] += float(t.get("profit_loss", 0.0))
+
         return {
+            "exits": exits, "exit_pnl": exit_pnl,
             "total": total, "wins": wins, "losses": losses, "win_rate": win_rate,
             "total_return": total_return, "avg_return": avg_return,
             "largest_win": largest_win, "largest_loss": largest_loss,
@@ -904,6 +925,21 @@ def print_performance() -> None:
     else:
         streak_s = "none"
 
+    # Exit breakdown: take-profit vs settlement always shown; partial TP and
+    # manual/external closes only when they have occurred.
+    e, ep = s["exits"], s["exit_pnl"]
+    exit_block = (
+        f"║  Exits\n"
+        f"║    Take-Profit  : {e['take_profit']}  (P&L ${ep['take_profit']:+,.2f})\n"
+        f"║    Settlement   : {e['settlement']}  (P&L ${ep['settlement']:+,.2f})\n"
+    )
+    if e["partial"]:
+        exit_block += (f"║    Partial TP   : {e['partial']}  "
+                       f"(P&L ${ep['partial']:+,.2f})\n")
+    if e["external"]:
+        exit_block += (f"║    Manual/Ext.  : {e['external']}  "
+                       f"(P&L ${ep['external']:+,.2f})\n")
+
     last = s["last"]
     if last:
         qp = last.get("btc_quantile_position")
@@ -916,6 +952,7 @@ def print_performance() -> None:
             f"║    Kalshi Strike: ${_f(last.get('strike')):,.2f}\n"
             f"║    Prophet P50  : ${_f(last.get('p50_prediction')):,.2f}\n"
             f"║    BTC Position : {qp_s}\n"
+            f"║    Exit Via     : {last.get('exit_method') or 'settlement'}\n"
             f"║    Result       : {last.get('result')}  (P&L ${_f(last.get('profit_loss')):+,.2f})\n"
         )
     else:
@@ -936,6 +973,7 @@ def print_performance() -> None:
         f"║  Longest Win    : {s['longest_win']}\n"
         f"║  Longest Loss   : {s['longest_loss']}\n"
         f"║  Max Drawdown   : ${-s['max_drawdown']:,.2f}\n"
+        f"{exit_block}"
         f"{last_block}"
         "╚════════════════════════════════════════════════════════════"
     )

@@ -3,7 +3,7 @@
 Two independent async trading bots that run 24/7 inside GitHub Actions:
 
 1. **Polymarket Futures Bot** (`polymarket_bot.py`) — WebSocket-driven take-profit and re-entry bot for Polymarket US Futures markets (MLB World Series 2026 focus).
-2. **Kalshi BTC 15-Min Prophet Bot** (`kalshibtc15minupordown.py`) — forecasts BTC price with Facebook Prophet and trades Kalshi's 15-minute BTC up/down contracts. [Jump to docs ↓](#kalshi-btc-15-minute-prophet-bot)
+2. **Kalshi BTC 15-Min Prophet Bot** (`kalshibtc15minupordown.py`) — forecasts BTC price with Facebook Prophet, trades Kalshi's 15-minute BTC up/down contracts, and take-profits each position via a live P&L monitor once it is up by the bet amount. [Jump to docs ↓](#kalshi-btc-15-minute-prophet-bot)
 
 Both run inside GitHub Actions for up to 5 h 45 min per job before self-triggering the next run for uninterrupted 24/7 operation.
 
@@ -260,7 +260,9 @@ polymarketfuturesbot/
 
 `kalshibtc15minupordown.py` — fully async. Forecasts BTC 15 minutes ahead with
 **Facebook Prophet** and trades Kalshi's `KXBTC15M` up/down contracts, exactly
-**one order per 15-minute window**.
+**one entry per 15-minute window**, each managed by a live P&L monitor that
+**takes profit once the position is up by the bet amount** (reduce-only IOC
+limit at the locking price) or lets it ride to settlement.
 
 > The previous version of this bot used an Alpaca price feed and a momentum
 > signal (delta vs a rolling 60-second average). That strategy — and the Alpaca
@@ -294,20 +296,41 @@ At the start of every 15-minute Kalshi window:
    current BTC close > p50   →  BUY NO   (DOWN)
    ```
 
-6. **Log everything**: BTC close vs strike vs p50, the 80% CI bands, and the
+6. **Take-profit** — after the entry fills, a position monitor polls the open
+   position's unrealized P&L from live WebSocket quotes every
+   `POSITION_POLL_S` (5 s). The moment gains cross `TP_PROFIT_USD` (default:
+   the bet amount — a $1 bet exits when the position is up $1), it fires a
+   **reduce-only IOC limit** at the exit price that locks the gain
+   (`entry + target/count` per contract). Kalshi only accepts `reduce_only`
+   on IOC orders (GTC+reduce_only → `400 invalid_order`), so the exit never
+   rests on the book — the monitor is the trigger: the market has already
+   crossed the exit price when the order is sent, so it fills at
+   exit-or-better; a miss cancels harmlessly and the monitor re-fires next
+   tick. Partial fills accumulate and the remainder is re-fired. Positions
+   closed **manually in the Kalshi app** are detected (live position check
+   before every exit order) and booked at Kalshi's reported realized P&L.
+   If the target is never reached, the position rides to settlement.
+7. **Log everything**: BTC close vs strike vs p50, the 80% CI bands, the
    interpolated percentile of the current price within the forecast
-   distribution.
-7. **Settle**: a background task polls settled markets and records WIN/LOSS +
-   P&L into `trade_history.json`.
+   distribution, and a live P&L line for the open position every 5 s.
+8. **Settle**: a background task polls settled markets and records WIN/LOSS +
+   P&L into `trade_history.json`. Contracts the take-profit already closed
+   realize at their exit price; only the unfilled remainder settles at the
+   market result.
 
 ## Performance tracking
 
 Every portfolio report (every 30 s) prints the full stats block from
 `trade_history.json`: total trades, wins/losses, win rate, total/average
 return, largest win/loss, current + longest win/loss streaks, and max drawdown
-from the equity curve. Both JSON state files are **committed back to the repo
-by the workflow after every run**, so statistics accumulate across the 5 h 45 m
-restart chain.
+from the equity curve — plus an **exit breakdown** showing how many positions
+were closed by the **take-profit limit** vs held to **settlement** (and, when
+they occur, partial take-profits and manual/external closes), each with its
+cumulative P&L. Every trade records its `exit_method`
+(`take_profit` / `settlement` / `take_profit_partial+settlement` /
+`closed_externally`), and the Last Trade panel shows which path closed it.
+Both JSON state files are **committed back to the repo by the workflow after
+every run**, so statistics accumulate across the 5 h 45 m restart chain.
 
 ## Setup
 
@@ -324,21 +347,29 @@ Environment **variables** (not secrets) tune behavior:
 | Variable | Default | Description |
 |---|---|---|
 | `DRY_RUN` | `true` | **Live-money switch.** `false` → real orders |
-| `BET_AMOUNT_USD` | `1` | Whole dollars spent per order — contracts = `floor($ / contract price)`, min 1 (e.g. $1 at a $0.26 price buys 3 contracts) |
+| `BET_AMOUNT_USD` | `1` | Dollars spent per order — fractional contracts at 0.01 granularity (`count = $ / price`, e.g. $1 at a $0.40 price buys 2.50 contracts) |
+| `TP_PROFIT_USD` | `= BET_AMOUNT_USD` | **Take-profit target** in dollars — close the position once unrealized gains cross this amount (reduce-only IOC limit at the locking price) |
+| `POSITION_POLL_S` | `5` | Open-position P&L monitor cadence (seconds) |
 | `HISTORY_MINUTES` | `500` | 1-minute candles fed to Prophet |
 | `FORECAST_MINUTES` | `15` | Forecast horizon |
 | `UNCERTAINTY_SAMPLES` | `1000` | Prophet uncertainty samples (80% CI) |
+
+**One-run overrides** — the **Run workflow** dialog on `kalshi_monitor.yml`
+accepts three optional inputs that override the variables **for that dispatch
+only**: `dry_run`, `bet_amount_usd`, `tp_profit_usd`. The 5 h 45 m handoff
+re-dispatches with no inputs, so the chain reverts to the variables above.
 
 ## QA before launch
 
 Actions → **"Kalshi QA — Secrets, BTC Data, Prophet Forecast, Kalshi WS & Order
 Build"** → Run workflow.
 
-The suite runs 13 checks against live credentials — Kalshi auth/balance, a real
+The suite runs 14 checks against live credentials — Kalshi auth/balance, a real
 yfinance download + validation, a real Prophet fit with band sanity checks,
-order construction, and the tracker round-trip — and **force-overrides DRY_RUN
-in-process so it can never submit an order**. Exit code is non-zero on any
-critical failure.
+order construction, the tracker round-trip, and the take-profit exit-price
+math + P&L-monitor trigger (including the stats exit breakdown) — and
+**force-overrides DRY_RUN in-process so it can never submit an order**. Exit
+code is non-zero on any critical failure.
 
 ## Workflow continuity (Kalshi)
 
