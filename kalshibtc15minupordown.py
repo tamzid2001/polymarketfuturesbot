@@ -19,8 +19,8 @@ STRATEGY  (Prophet 15-minute BTC forecast)
     5. Records the trade and, after settlement, computes win/loss + P&L.
 
   Exactly one order per 15-minute window (never re-enters the same contract).
-  Prophet also yields p01/p10/p25/p50/p75/p90/p99 bands; the current BTC price's
-  percentile position within that forecast distribution is logged and stored.
+  Prophet also yields the 80% confidence interval (p10/p90) around p50; the
+  current BTC price's percentile position within it is logged and stored.
 
 DATA SOURCES
 ────────────
@@ -146,9 +146,8 @@ KALSHI_WS_URL = os.getenv(
     else "wss://api.elections.kalshi.com/trade-api/ws/v2",
 )
 
-# Quantile band labels ↔ fractions (0.01 … 0.99), in ascending order.
-_QMAP = [("p01", 0.01), ("p10", 0.10), ("p25", 0.25), ("p50", 0.50),
-         ("p75", 0.75), ("p90", 0.90), ("p99", 0.99)]
+# Quantile band labels ↔ fractions — the 80% confidence interval around p50.
+_QMAP = [("p10", 0.10), ("p50", 0.50), ("p90", 0.90)]
 
 
 def bet_count() -> int:
@@ -325,8 +324,9 @@ def validate_data(df: Optional[pd.DataFrame]) -> tuple:
 def run_prophet_forecast(df: pd.DataFrame) -> Optional[dict]:
     """Fit Prophet on log(close) and forecast FORECAST_MINUTES ahead.
 
-    Returns the minute-N (horizon end) quantile bands back-transformed to USD:
-      {p01, p10, p25, p50, p75, p90, p99}.  p50 == exp(yhat).
+    One fit, one predict at interval_width=0.80 — the 80% confidence interval.
+    Returns the minute-N (horizon end) bands back-transformed to USD:
+      {p10, p50, p90}.  p50 == exp(yhat); p10/p90 == exp(yhat_lower/upper).
     Blocking; call via loop.run_in_executor.
     """
     try:
@@ -338,28 +338,17 @@ def run_prophet_forecast(df: pd.DataFrame) -> Optional[dict]:
             daily_seasonality=False,
             weekly_seasonality=False,
             yearly_seasonality=False,
-            interval_width=0.80,                          # overridden per band below
+            interval_width=0.80,                          # 80% CI → p10 / p90
             uncertainty_samples=UNCERTAINTY_SAMPLES,
         )
         model.fit(d)
         future = model.make_future_dataframe(
             periods=FORECAST_MINUTES, freq="min", include_history=False)
-
-        def band(iw: float) -> tuple:
-            # Re-run predict at a given interval_width; yhat is unchanged by iw.
-            model.interval_width = iw
-            row = model.predict(future).iloc[-1]          # minute-N (horizon end)
-            return (float(row["yhat"]), float(row["yhat_lower"]),
-                    float(row["yhat_upper"]))
-
-        yhat, l80, u80 = band(0.80)   # p10 / p90
-        _,    l50, u50 = band(0.50)   # p25 / p75
-        _,    l98, u98 = band(0.98)   # p01 / p99
-        exp = np.exp
+        row = model.predict(future).iloc[-1]              # minute-N (horizon end)
         return {
-            "p01": float(exp(l98)), "p10": float(exp(l80)), "p25": float(exp(l50)),
-            "p50": float(exp(yhat)), "p75": float(exp(u50)), "p90": float(exp(u80)),
-            "p99": float(exp(u98)),
+            "p10": float(np.exp(row["yhat_lower"])),
+            "p50": float(np.exp(row["yhat"])),
+            "p90": float(np.exp(row["yhat_upper"])),
         }
     except Exception as exc:  # noqa: BLE001
         log.error("Prophet forecast failed: %s", exc)
@@ -367,7 +356,7 @@ def run_prophet_forecast(df: pd.DataFrame) -> Optional[dict]:
 
 
 def percentile_of_price(price: float, bands: dict) -> float:
-    """Interpolated percentile rank (1–99) of `price` within the forecast bands."""
+    """Interpolated percentile rank (10–90) of `price` within the 80% CI bands."""
     prices = [bands[k] for k, _ in _QMAP]
     qs     = [q for _, q in _QMAP]
     if price <= prices[0]:
@@ -1061,14 +1050,10 @@ async def execute_window_trade(rest: KalshiREST, ct: str, nt: str) -> None:
         f"BTC Current Close : ${btc_close:,.2f}\n"
         f"Kalshi Strike     : ${strike:,.2f}\n"
         f"Prophet Forecast (minute {FORECAST_MINUTES} P50): ${p50:,.2f}\n"
-        f"Forecast Bands    :\n"
-        f"    P01: ${forecast['p01']:,.2f}\n"
+        f"Forecast Bands (80% CI):\n"
         f"    P10: ${forecast['p10']:,.2f}\n"
-        f"    P25: ${forecast['p25']:,.2f}\n"
         f"    P50: ${forecast['p50']:,.2f}\n"
-        f"    P75: ${forecast['p75']:,.2f}\n"
         f"    P90: ${forecast['p90']:,.2f}\n"
-        f"    P99: ${forecast['p99']:,.2f}\n"
         f"Current BTC Quantile : {quantile:.0f} percentile\n"
         f"BTC vs Strike     : {btc_vs_strike}\n"
         f"BTC vs P50        : {btc_vs_p50}\n"

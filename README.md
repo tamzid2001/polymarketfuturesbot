@@ -1,8 +1,11 @@
-# Polymarket Futures Bot
+# Polymarket Futures Bot + Kalshi BTC Prophet Bot
 
-Async WebSocket-driven take-profit and re-entry bot for Polymarket US Futures markets (MLB World Series 2026 focus).
+Two independent async trading bots that run 24/7 inside GitHub Actions:
 
-The bot connects to Polymarket's WebSocket feeds on startup, reacts to every price update in real time, and runs inside GitHub Actions for up to 5 h 45 min before self-triggering the next run for uninterrupted 24/7 operation.
+1. **Polymarket Futures Bot** (`polymarket_bot.py`) — WebSocket-driven take-profit and re-entry bot for Polymarket US Futures markets (MLB World Series 2026 focus).
+2. **Kalshi BTC 15-Min Prophet Bot** (`kalshibtc15minupordown.py`) — forecasts BTC price with Facebook Prophet and trades Kalshi's 15-minute BTC up/down contracts. [Jump to docs ↓](#kalshi-btc-15-minute-prophet-bot)
+
+Both run inside GitHub Actions for up to 5 h 45 min per job before self-triggering the next run for uninterrupted 24/7 operation.
 
 ---
 
@@ -221,20 +224,27 @@ python test_bot.py
 
 ```
 polymarketfuturesbot/
-├── polymarket_bot.py           # Async WebSocket bot: take-profit, buyback, WS handlers, handoff
-├── test_bot.py                 # QA test: credentials, balance, positions, slug discovery
-├── markets.json                # Source of truth: which markets to track and enter
-├── state.json                  # Persisted state: pending buybacks, balance history, closed P&Ls
-├── requirements.txt            # pip dependencies
+├── polymarket_bot.py           # Polymarket bot: take-profit, buyback, WS handlers, handoff
+├── test_bot.py                 # Polymarket QA: credentials, balance, positions, slugs
+├── markets.json                # Polymarket source of truth: markets to track/enter
+├── state.json                  # Polymarket persisted state
+├── requirements.txt            # Polymarket pip dependencies
+├── kalshibtc15minupordown.py   # Kalshi bot: Prophet 15-min BTC forecast strategy
+├── test_kalshi_bot.py          # Kalshi QA: data, forecast, auth, order build (no orders)
+├── requirements_kalshi.txt     # Kalshi pip dependencies (prophet, yfinance, ...)
+├── trade_history.json          # Kalshi trade journal (committed back by the workflow)
+├── traded_market_tickers.json  # Kalshi one-order-per-window dedupe store
 └── .github/
     └── workflows/
-        ├── polymarket_monitor.yml   # Continuous bot (5h45m loop, daily cron)
-        └── qa_test.yml              # Manual QA test (workflow_dispatch only)
+        ├── polymarket_monitor.yml   # Polymarket continuous bot (5h45m loop, daily cron)
+        ├── qa_test.yml              # Polymarket manual QA
+        ├── kalshi_monitor.yml       # Kalshi continuous bot (5h45m loop, 6h cron)
+        └── kalshi_qa.yml            # Kalshi manual QA (workflow_dispatch only)
 ```
 
 ---
 
-## Environment variables reference
+## Environment variables reference (Polymarket)
 
 | Variable | Required | Description |
 |---|---|---|
@@ -242,3 +252,116 @@ polymarketfuturesbot/
 | `POLYMARKET_SECRET_KEY` | **Yes** | Polymarket US API secret key |
 | `TELEGRAM_KEY` | No | Telegram bot token — enables notifications if set |
 | `GH_PAT` | No | GitHub PAT (`workflow` scope) — enables 24/7 self-triggering |
+
+---
+---
+
+# Kalshi BTC 15-Minute Prophet Bot
+
+`kalshibtc15minupordown.py` — fully async. Forecasts BTC 15 minutes ahead with
+**Facebook Prophet** and trades Kalshi's `KXBTC15M` up/down contracts, exactly
+**one order per 15-minute window**.
+
+> The previous version of this bot used an Alpaca price feed and a momentum
+> signal (delta vs a rolling 60-second average). That strategy — and the Alpaca
+> dependency — has been fully removed.
+
+## Strategy
+
+At the start of every 15-minute Kalshi window:
+
+1. **Detect** the new active `KXBTC15M` market and its strike (`floor_strike`).
+2. **Download** the latest **500 one-minute BTC-USD candles** from Yahoo Finance
+   (BTC trades 24/7 — no weekday assumptions).
+3. **Validate** the data: ≥500 rows, clean 1-minute spacing, not stale, and all
+   `:00/:15/:30/:45` boundary candles present. Any failure → log a warning and
+   **skip the window (no order)**.
+4. **Forecast**: fit Prophet on `log(close)` (daily/weekly/yearly seasonality
+   off, uncertainty sampling on) and predict 15 minutes ahead at
+   `interval_width=0.80` — the **80% confidence interval**:
+
+   | Band | Meaning |
+   |---|---|
+   | `p10` | lower bound of the 80% CI (`exp(yhat_lower)`) |
+   | `p50` | median forecast (`exp(yhat)`) |
+   | `p90` | upper bound of the 80% CI (`exp(yhat_upper)`) |
+
+5. **Decide** (one order, never re-entered — deduped via
+   `traded_market_tickers.json`, which survives restarts):
+
+   ```
+   current BTC close < p50   →  BUY YES  (UP)
+   current BTC close > p50   →  BUY NO   (DOWN)
+   ```
+
+6. **Log everything**: BTC close vs strike vs p50, the 80% CI bands, and the
+   interpolated percentile of the current price within the forecast
+   distribution.
+7. **Settle**: a background task polls settled markets and records WIN/LOSS +
+   P&L into `trade_history.json`.
+
+## Performance tracking
+
+Every portfolio report (every 30 s) prints the full stats block from
+`trade_history.json`: total trades, wins/losses, win rate, total/average
+return, largest win/loss, current + longest win/loss streaks, and max drawdown
+from the equity curve. Both JSON state files are **committed back to the repo
+by the workflow after every run**, so statistics accumulate across the 5 h 45 m
+restart chain.
+
+## Setup
+
+Secrets live in the **`Kalshi` environment** (Settings → Environments → Kalshi):
+
+| Secret | Description |
+|---|---|
+| `KALSHI_PROD_API_KEY` | Kalshi API key ID |
+| `KALSHI_PRIVATE_KEY` | RSA private key (PEM contents) |
+| `GH_PAT` | GitHub PAT (`workflow` scope) for the 5 h 45 m self-trigger |
+
+Environment **variables** (not secrets) tune behavior:
+
+| Variable | Default | Description |
+|---|---|---|
+| `DRY_RUN` | `true` | **Live-money switch.** `false` → real orders |
+| `BET_AMOUNT_USD` | `1` | Notional per trade ($1 = 1 contract) |
+| `HISTORY_MINUTES` | `500` | 1-minute candles fed to Prophet |
+| `FORECAST_MINUTES` | `15` | Forecast horizon |
+| `UNCERTAINTY_SAMPLES` | `1000` | Prophet uncertainty samples (80% CI) |
+
+## QA before launch
+
+Actions → **"Kalshi QA — Secrets, BTC Data, Prophet Forecast, Kalshi WS & Order
+Build"** → Run workflow.
+
+The suite runs 13 checks against live credentials — Kalshi auth/balance, a real
+yfinance download + validation, a real Prophet fit with band sanity checks,
+order construction, and the tracker round-trip — and **force-overrides DRY_RUN
+in-process so it can never submit an order**. Exit code is non-zero on any
+critical failure.
+
+## Workflow continuity (Kalshi)
+
+`kalshi_monitor.yml` mirrors the Polymarket chain:
+
+1. Bot exits cleanly at **5 h 45 min** (`RUNTIME_LIMIT_MIN=345`).
+2. **Persist State** commits `trade_history.json` + `traded_market_tickers.json`
+   back to `main` (`[skip ci]`) — runs even if the bot crashed.
+3. **Re-trigger** dispatches the next run via `GH_PAT`; the fresh checkout
+   already contains the persisted state, so a restart mid-window can never
+   double-trade (the dedupe store blocks it) and pending trades are settled by
+   the next run.
+4. The `kalshi-bot-singleton` concurrency group keeps at most one run active.
+5. If a run fails, the every-6-hours cron (`11 */6 * * *`) restarts the chain.
+
+## Running locally
+
+```bash
+pip install -r requirements_kalshi.txt
+export KALSHI_API_KEY_ID="your_key_id"
+export KALSHI_PEM_PATH="kalshi_private_key.pem"
+export DRY_RUN=true            # flip to false only when you mean it
+
+python test_kalshi_bot.py      # QA first — never submits an order
+python kalshibtc15minupordown.py
+```

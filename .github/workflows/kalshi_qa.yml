@@ -1,4 +1,4 @@
-name: Kalshi QA — Secrets, Alpaca/Kalshi WS, Balance & Order Build
+name: Kalshi QA — Secrets, BTC Data, Prophet Forecast, Kalshi WS & Order Build
 
 # Manual pre-production check. Runs the full QA suite against live
 # credentials WITHOUT ever submitting a real order.
@@ -38,12 +38,11 @@ jobs:
 
       - name: Run QA Suite (no real orders)
         env:
-          ALPACA_API_KEY:    ${{ secrets.ALPACA_PUBLIC_KEY }}
-          ALPACA_API_SECRET: ${{ secrets.ALPACA_SECRETS_KEY }}
           KALSHI_API_KEY_ID: ${{ secrets.KALSHI_PROD_API_KEY }}
           KALSHI_PEM_PATH:   kalshi_private_key.pem
           KALSHI_DEMO:       "false"
           KALSHI_WS_VERBOSE: "true"
-          PRINT_NOW_PRICE:   "true"
+          # QA must NEVER trade: the suite also force-overrides DRY_RUN in-process.
+          DRY_RUN:           "true"
           BET_AMOUNT_USD:    ${{ vars.BET_AMOUNT_USD || '1' }}
         run: python test_kalshi_bot.py
