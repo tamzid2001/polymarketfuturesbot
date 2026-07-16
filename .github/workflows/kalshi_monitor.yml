@@ -15,6 +15,14 @@ on:
         description: "Override DRY_RUN for THIS run only ('true' or 'false'). Leave BLANK to use the DRY_RUN repo/env variable."
         required: false
         default: ""
+      bet_amount_usd:
+        description: "Override BET_AMOUNT_USD for THIS run only ($ spent per order, e.g. '1' or '2.50'). Leave BLANK to use the BET_AMOUNT_USD repo/env variable (default 1)."
+        required: false
+        default: ""
+      tp_profit_usd:
+        description: "Override TP_PROFIT_USD for THIS run only (take-profit $ target — close the position once it is up this much). Leave BLANK to use the TP_PROFIT_USD repo/env variable (default = bet amount)."
+        required: false
+        default: ""
 
 # At most one run at a time. A newly queued run waits; it never
 # cancels the currently running bot mid-execution.
@@ -70,10 +78,13 @@ jobs:
           #   • One-off override → dispatch with the dry_run input.
           #   • Default (nothing set) → DRY_RUN=true (safe, logs orders only).
           DRY_RUN:           ${{ github.event.inputs.dry_run || vars.DRY_RUN || 'true' }}
-          BET_AMOUNT_USD:    ${{ vars.BET_AMOUNT_USD || '1' }}
+          # One-off dispatch inputs override the repo/env variables (same
+          # pattern as DRY_RUN above); the 5h45m handoff re-dispatches with no
+          # inputs, so overrides apply to THIS run only.
+          BET_AMOUNT_USD:    ${{ github.event.inputs.bet_amount_usd || vars.BET_AMOUNT_USD || '1' }}
           # Take-profit: close the position once unrealized gains cross this
           # many dollars (default = the bet amount) via a reduce-only GTC limit.
-          TP_PROFIT_USD:     ${{ vars.TP_PROFIT_USD || vars.BET_AMOUNT_USD || '1' }}
+          TP_PROFIT_USD:     ${{ github.event.inputs.tp_profit_usd || vars.TP_PROFIT_USD || github.event.inputs.bet_amount_usd || vars.BET_AMOUNT_USD || '1' }}
           POSITION_POLL_S:   ${{ vars.POSITION_POLL_S || '5' }}
           # Prophet strategy knobs (repo/environment variables, all optional)
           HISTORY_MINUTES:     ${{ vars.HISTORY_MINUTES || '500' }}
