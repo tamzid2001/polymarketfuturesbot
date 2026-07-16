@@ -47,7 +47,7 @@ CREDENTIALS / SETTINGS (env vars)
     KALSHI_API_KEY_ID / KALSHI_PEM_PATH (or KALSHI_PRIVATE_KEY content)
     KALSHI_DEMO            "true" for sandbox (default false)
     DRY_RUN               "true" (default) — log orders, do not submit
-    BET_AMOUNT_USD        notional $ per buy (default 1 → 1 contract)
+    BET_AMOUNT_USD        whole $ spent per order; contracts = floor($/price), min 1
     HISTORY_MINUTES       1-min candles pulled per forecast (default 500)
     FORECAST_MINUTES      forecast horizon in minutes (default 15)
     UNCERTAINTY_SAMPLES   Prophet uncertainty samples (default 1000)
@@ -105,8 +105,9 @@ KALSHI_DEMO       = os.getenv("KALSHI_DEMO", "false").lower() in ("1", "true", "
 DRY_RUN           = os.getenv("DRY_RUN", "true").lower() in ("1", "true", "yes")
 
 # ── Bet sizing ──────────────────────────────────────────────────────────────
-# Initial bet amount in USD notional per buy. Each Kalshi contract settles to
-# $1, so $1 of notional == 1 contract.  Change here (or via env) to scale up.
+# Spend (up to) this many whole dollars per order. The contract count is sized
+# dynamically from the live contract price: count = floor(BET / price), min 1 —
+# e.g. $1 at a $0.26 NO price buys 3 contracts (~$0.78), not just one share.
 BET_AMOUNT_USD    = float(os.getenv("BET_AMOUNT_USD", "1"))
 
 # ── Prophet / data settings ───────────────────────────────────────────────────
@@ -151,8 +152,20 @@ _QMAP = [("p10", 0.10), ("p50", 0.50), ("p90", 0.90)]
 
 
 def bet_count() -> int:
-    """Number of contracts for one buy ($1 notional == 1 contract)."""
+    """Fallback contract count when the live price is unknown (1 per $1 bet)."""
     return max(1, int(round(BET_AMOUNT_USD)))
+
+
+def contracts_for_price(price_per_contract: Optional[float]) -> int:
+    """Contracts for one buy: spend up to BET_AMOUNT_USD whole dollars.
+
+    price_per_contract = cost of ONE contract in dollars (the YES price for a
+    YES buy; 1 − YES for a NO buy). count = floor(BET / price), min 1, so the
+    total cost stays ≤ BET_AMOUNT_USD. Unknown/invalid price → bet_count().
+    """
+    if price_per_contract is None or not (0.01 <= price_per_contract <= 0.99):
+        return bet_count()
+    return max(1, int(BET_AMOUNT_USD / price_per_contract))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1026,12 +1039,16 @@ async def execute_window_trade(rest: KalshiREST, ct: str, nt: str) -> None:
     btc_vs_p50    = "ABOVE" if btc_close > p50 else "BELOW"
     strike_direction = "P50 ABOVE strike" if strike < p50 else "P50 BELOW strike"
 
-    # Entry cost per contract (for P&L accounting).
+    # Entry cost per contract (for sizing + P&L accounting).
     yes_p = get_active_yes_price(market)
     if side == "yes":
         entry_price = yes_p if yes_p is not None else 0.5
     else:
         entry_price = (1.0 - yes_p) if yes_p is not None else 0.5
+
+    # Size the order to spend up to BET_AMOUNT_USD whole dollars.
+    count = contracts_for_price(entry_price if yes_p is not None else None)
+    est_cost = count * entry_price
 
     settle_et = market.get("settle_et")
     settle_s = settle_et.strftime("%Y-%m-%d %H:%M ET") if settle_et else "?"
@@ -1059,13 +1076,13 @@ async def execute_window_trade(rest: KalshiREST, ct: str, nt: str) -> None:
         f"BTC vs P50        : {btc_vs_p50}\n"
         f"Strike vs P50     : {strike_direction}\n"
         f"Decision          : {decision}\n"
-        f"Bet Size          : ${BET_AMOUNT_USD:.0f} ({bet_count()} contract(s))"
+        f"Bet Size          : ${BET_AMOUNT_USD:.0f} → {count} contract(s) "
+        f"@ ~${entry_price:.2f} = ~${est_cost:.2f}"
     )
 
     # 6) Submit exactly ONE order for this window.
     enum  = BookSide.BID if side == "yes" else BookSide.ASK
     price = YES_BUY_PRICE if side == "yes" else NO_BUY_PRICE
-    count = bet_count()
     _, filled = await _submit(rest, ticker=ct, side=enum, price=price, count=count,
                               reduce_only=False, tag=f"BUY {side.upper()}")
 
@@ -1138,7 +1155,8 @@ async def main_async() -> None:
     log.info("  Current window  : %s", ct)
     log.info("  Kalshi REST/WS  : %s", KALSHI_BASE_URL)
     log.info("  Demo / DRY_RUN  : %s / %s", KALSHI_DEMO, DRY_RUN)
-    log.info("  Bet amount      : $%.2f  (%d contract(s)/buy)", BET_AMOUNT_USD, bet_count())
+    log.info("  Bet amount      : $%.2f/order  (contracts sized from live price: "
+             "floor($%.2f / price), min 1)", BET_AMOUNT_USD, BET_AMOUNT_USD)
     log.info("  Data / horizon  : %d 1-min candles → forecast %d min",
              HISTORY_MINUTES, FORECAST_MINUTES)
     log.info("  Uncertainty     : %d samples", UNCERTAINTY_SAMPLES)

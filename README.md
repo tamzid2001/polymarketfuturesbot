@@ -324,7 +324,7 @@ Environment **variables** (not secrets) tune behavior:
 | Variable | Default | Description |
 |---|---|---|
 | `DRY_RUN` | `true` | **Live-money switch.** `false` → real orders |
-| `BET_AMOUNT_USD` | `1` | Notional per trade ($1 = 1 contract) |
+| `BET_AMOUNT_USD` | `1` | Whole dollars spent per order — contracts = `floor($ / contract price)`, min 1 (e.g. $1 at a $0.26 price buys 3 contracts) |
 | `HISTORY_MINUTES` | `500` | 1-minute candles fed to Prophet |
 | `FORECAST_MINUTES` | `15` | Forecast horizon |
 | `UNCERTAINTY_SAMPLES` | `1000` | Prophet uncertainty samples (80% CI) |

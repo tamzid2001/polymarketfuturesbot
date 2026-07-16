@@ -300,7 +300,17 @@ async def check_orders_async(bot, rest):
                                          SelfTradePreventionType)
         import uuid
         record("BET_AMOUNT_USD", PASS,
-               f"${bot.BET_AMOUNT_USD:.2f} → {bot.bet_count()} contract(s)")
+               f"${bot.BET_AMOUNT_USD:.2f}/order, sized from live contract price")
+        # Dynamic sizing: spend up to BET_AMOUNT_USD whole dollars per order.
+        b = bot.BET_AMOUNT_USD
+        sizing_ok = (bot.contracts_for_price(0.25) == max(1, int(b / 0.25))
+                     and bot.contracts_for_price(0.73) == max(1, int(b / 0.73))
+                     and bot.contracts_for_price(0.99) >= 1
+                     and bot.contracts_for_price(None) == bot.bet_count())
+        record("contracts_for_price (whole-$ sizing)", PASS if sizing_ok else FAIL,
+               f"$%.2f → %d @ $0.25 · %d @ $0.73 · %d @ unknown" % (
+                   b, bot.contracts_for_price(0.25), bot.contracts_for_price(0.73),
+                   bot.contracts_for_price(None)))
         cases = [("BUY YES", BookSide.BID, bot.YES_BUY_PRICE),
                  ("BUY NO",  BookSide.ASK, bot.NO_BUY_PRICE)]
         for label, side, price in cases:
