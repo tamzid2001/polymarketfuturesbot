@@ -47,7 +47,7 @@ CREDENTIALS / SETTINGS (env vars)
     KALSHI_API_KEY_ID / KALSHI_PEM_PATH (or KALSHI_PRIVATE_KEY content)
     KALSHI_DEMO            "true" for sandbox (default false)
     DRY_RUN               "true" (default) — log orders, do not submit
-    BET_AMOUNT_USD        whole $ spent per order; contracts = floor($/price), min 1
+    BET_AMOUNT_USD        $ spent per order; fractional contracts = $/price (0.01 min)
     HISTORY_MINUTES       1-min candles pulled per forecast (default 500)
     FORECAST_MINUTES      forecast horizon in minutes (default 15)
     UNCERTAINTY_SAMPLES   Prophet uncertainty samples (default 1000)
@@ -65,6 +65,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -105,9 +106,10 @@ KALSHI_DEMO       = os.getenv("KALSHI_DEMO", "false").lower() in ("1", "true", "
 DRY_RUN           = os.getenv("DRY_RUN", "true").lower() in ("1", "true", "yes")
 
 # ── Bet sizing ──────────────────────────────────────────────────────────────
-# Spend (up to) this many whole dollars per order. The contract count is sized
-# dynamically from the live contract price: count = floor(BET / price), min 1 —
-# e.g. $1 at a $0.26 NO price buys 3 contracts (~$0.78), not just one share.
+# Spend (almost) exactly this many dollars per order. Kalshi's fixed-point API
+# supports FRACTIONAL contract counts at 0.01 granularity (count_fp, sent as a
+# 0–2 decimal string), so count = BET / price — e.g. $1 at a $0.40 price buys
+# 2.50 contracts (exactly $1.00). See docs.kalshi.com fixed_point_migration.
 BET_AMOUNT_USD    = float(os.getenv("BET_AMOUNT_USD", "1"))
 
 # ── Prophet / data settings ───────────────────────────────────────────────────
@@ -151,21 +153,25 @@ KALSHI_WS_URL = os.getenv(
 _QMAP = [("p10", 0.10), ("p50", 0.50), ("p90", 0.90)]
 
 
-def bet_count() -> int:
-    """Fallback contract count when the live price is unknown (1 per $1 bet)."""
-    return max(1, int(round(BET_AMOUNT_USD)))
+def bet_count() -> float:
+    """Fallback contract count when the live price is unknown (1.00 per $1 bet)."""
+    return max(1.0, float(round(BET_AMOUNT_USD)))
 
 
-def contracts_for_price(price_per_contract: Optional[float]) -> int:
-    """Contracts for one buy: spend up to BET_AMOUNT_USD whole dollars.
+def contracts_for_price(price_per_contract: Optional[float]) -> float:
+    """Fractional contracts for one buy: spend (almost) exactly BET_AMOUNT_USD.
 
     price_per_contract = cost of ONE contract in dollars (the YES price for a
-    YES buy; 1 − YES for a NO buy). count = floor(BET / price), min 1, so the
-    total cost stays ≤ BET_AMOUNT_USD. Unknown/invalid price → bet_count().
+    YES buy; 1 − YES for a NO buy). Kalshi's fixed-point API accepts fractional
+    counts at 0.01 granularity, so count = BET / price, floored to 0.01 so the
+    cost never exceeds BET_AMOUNT_USD — e.g. $1 at $0.40 → 2.50 contracts
+    (exactly $1.00); $1 at $0.73 → 1.36 contracts ($0.99).
+    Unknown/invalid price → bet_count().
     """
     if price_per_contract is None or not (0.01 <= price_per_contract <= 0.99):
         return bet_count()
-    return max(1, int(BET_AMOUNT_USD / price_per_contract))
+    raw = BET_AMOUNT_USD / price_per_contract
+    return max(0.01, math.floor(raw * 100) / 100.0)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -661,11 +667,12 @@ async def resolve_active_market(rest: KalshiREST) -> Optional[dict]:
 # Orders (MARKET = marketable IOC)
 # ─────────────────────────────────────────────────────────────────────────────
 async def _submit(rest: KalshiREST, *, ticker, side: BookSide, price: str,
-                  count: int, reduce_only: bool, tag: str) -> tuple:
-    """Submit a marketable IOC order. Returns (resp, filled)."""
+                  count: float, reduce_only: bool, tag: str) -> tuple:
+    """Submit a marketable IOC order (fractional count OK, 0.01 granularity).
+    Returns (resp, filled)."""
     global trades_placed, buys_placed, closes_placed, fills_count
     order_id = str(uuid.uuid4())
-    log.info("ORDER %s  %s  side=%s price=%s count=%d (~$%.0f) reduce_only=%s "
+    log.info("ORDER %s  %s  side=%s price=%s count=%.2f (~$%.2f) reduce_only=%s "
              "ticker=%s id=%s",
              "[DRY-RUN]" if DRY_RUN else "[LIVE]", tag, side.value, price, count,
              BET_AMOUNT_USD, reduce_only, ticker, order_id)
@@ -968,7 +975,7 @@ async def settlement_checker(rest: KalshiREST) -> None:
 
             win = (result == str(rec["side"]).lower())
             entry = _f(rec.get("entry_price"), 0.5)
-            count = int(rec.get("count", bet_count()))
+            count = _f(rec.get("count"), bet_count())   # fractional contracts OK
             pnl = (1.0 - entry) * count if win else -entry * count
             tracker.settle(rec, "WIN" if win else "LOSS", pnl)
             log.info("SETTLED %s  result=%s  our side=%s → %s  P&L $%+.2f",
@@ -1046,7 +1053,8 @@ async def execute_window_trade(rest: KalshiREST, ct: str, nt: str) -> None:
     else:
         entry_price = (1.0 - yes_p) if yes_p is not None else 0.5
 
-    # Size the order to spend up to BET_AMOUNT_USD whole dollars.
+    # Size the order to spend (almost) exactly BET_AMOUNT_USD — fractional
+    # contracts, 0.01 granularity (Kalshi fixed-point count_fp).
     count = contracts_for_price(entry_price if yes_p is not None else None)
     est_cost = count * entry_price
 
@@ -1076,7 +1084,7 @@ async def execute_window_trade(rest: KalshiREST, ct: str, nt: str) -> None:
         f"BTC vs P50        : {btc_vs_p50}\n"
         f"Strike vs P50     : {strike_direction}\n"
         f"Decision          : {decision}\n"
-        f"Bet Size          : ${BET_AMOUNT_USD:.0f} → {count} contract(s) "
+        f"Bet Size          : ${BET_AMOUNT_USD:.2f} → {count:.2f} contract(s) "
         f"@ ~${entry_price:.2f} = ~${est_cost:.2f}"
     )
 
@@ -1155,8 +1163,8 @@ async def main_async() -> None:
     log.info("  Current window  : %s", ct)
     log.info("  Kalshi REST/WS  : %s", KALSHI_BASE_URL)
     log.info("  Demo / DRY_RUN  : %s / %s", KALSHI_DEMO, DRY_RUN)
-    log.info("  Bet amount      : $%.2f/order  (contracts sized from live price: "
-             "floor($%.2f / price), min 1)", BET_AMOUNT_USD, BET_AMOUNT_USD)
+    log.info("  Bet amount      : $%.2f/order  (fractional contracts: "
+             "$%.2f / price, 0.01 granularity)", BET_AMOUNT_USD, BET_AMOUNT_USD)
     log.info("  Data / horizon  : %d 1-min candles → forecast %d min",
              HISTORY_MINUTES, FORECAST_MINUTES)
     log.info("  Uncertainty     : %d samples", UNCERTAINTY_SAMPLES)

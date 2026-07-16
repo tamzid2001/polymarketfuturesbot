@@ -300,17 +300,25 @@ async def check_orders_async(bot, rest):
                                          SelfTradePreventionType)
         import uuid
         record("BET_AMOUNT_USD", PASS,
-               f"${bot.BET_AMOUNT_USD:.2f}/order, sized from live contract price")
-        # Dynamic sizing: spend up to BET_AMOUNT_USD whole dollars per order.
+               f"${bot.BET_AMOUNT_USD:.2f}/order, fractional contracts (count_fp)")
+        # Fractional sizing: spend (almost) exactly BET_AMOUNT_USD per order,
+        # 0.01-contract granularity, cost never exceeds the bet amount.
+        import math as _m
         b = bot.BET_AMOUNT_USD
-        sizing_ok = (bot.contracts_for_price(0.25) == max(1, int(b / 0.25))
-                     and bot.contracts_for_price(0.73) == max(1, int(b / 0.73))
-                     and bot.contracts_for_price(0.99) >= 1
+        def _exp(p):
+            return max(0.01, _m.floor(b / p * 100) / 100.0)
+        c40, c73, c99 = (bot.contracts_for_price(p) for p in (0.40, 0.73, 0.99))
+        sizing_ok = (abs(c40 - _exp(0.40)) < 1e-9        # $1 → 2.50 (= $1.00)
+                     and abs(c73 - _exp(0.73)) < 1e-9    # $1 → 1.36 (≈ $0.99)
+                     and abs(c99 - _exp(0.99)) < 1e-9
+                     and c40 * 0.40 <= b + 1e-9          # never exceeds the bet
+                     and c73 * 0.73 <= b + 1e-9
                      and bot.contracts_for_price(None) == bot.bet_count())
-        record("contracts_for_price (whole-$ sizing)", PASS if sizing_ok else FAIL,
-               f"$%.2f → %d @ $0.25 · %d @ $0.73 · %d @ unknown" % (
-                   b, bot.contracts_for_price(0.25), bot.contracts_for_price(0.73),
-                   bot.contracts_for_price(None)))
+        record("contracts_for_price (fractional ~$ sizing)",
+               PASS if sizing_ok else FAIL,
+               "$%.2f → %.2f @ $0.40 (=$%.2f) · %.2f @ $0.73 (=$%.2f) · "
+               "%.2f @ unknown" % (b, c40, c40 * 0.40, c73, c73 * 0.73,
+                                   bot.contracts_for_price(None)))
         cases = [("BUY YES", BookSide.BID, bot.YES_BUY_PRICE),
                  ("BUY NO",  BookSide.ASK, bot.NO_BUY_PRICE)]
         for label, side, price in cases:
