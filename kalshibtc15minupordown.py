@@ -66,8 +66,11 @@ CREDENTIALS / SETTINGS (env vars)
     KALSHI_API_KEY_ID / KALSHI_PEM_PATH (or KALSHI_PRIVATE_KEY content)
     KALSHI_DEMO            "true" for sandbox (default false)
     DRY_RUN               "true" (default) — log orders, do not submit
-    BET_AMOUNT_USD        $ spent per order; fractional contracts = $/price (0.01 min)
+    BET_AMOUNT_USD        base $ spent per order; fractional contracts = $/price (0.01 min)
     TP_PROFIT_USD         take-profit target in $ (default = BET_AMOUNT_USD)
+    LOSS_MULTIPLIER       martingale: multiply the next bet (and TP target) by
+                          this after every LOSS; a WIN resets to base (default 3;
+                          streak derived from trade history, survives restarts)
     POSITION_POLL_S       open-position P&L monitor cadence (default 5s)
     HISTORY_MINUTES       1-min candles pulled per forecast (default 500)
     FORECAST_MINUTES      forecast horizon in minutes (default 15)
@@ -144,6 +147,15 @@ BET_AMOUNT_USD    = float(os.getenv("BET_AMOUNT_USD", "1"))
 TP_PROFIT_USD     = float(os.getenv("TP_PROFIT_USD", str(BET_AMOUNT_USD)))
 POSITION_POLL_S   = float(os.getenv("POSITION_POLL_S", "5"))   # P&L monitor cadence
 
+# ── Loss-streak (martingale) multiplier ─────────────────────────────────────
+# After every LOSS the NEXT trade's bet — and its take-profit target — are
+# multiplied by LOSS_MULTIPLIER; a WIN resets sizing back to BET_AMOUNT_USD:
+#     bet = BET_AMOUNT_USD × LOSS_MULTIPLIER ^ consecutive-losses
+# e.g. base $1, multiplier 3 → $1, $3, $9, $27 … until a WIN resets to $1.
+# The streak is derived from the tail of trade_history.json, so it survives
+# the 5h45m restarts. Set LOSS_MULTIPLIER=1 to disable streak sizing.
+LOSS_MULTIPLIER   = float(os.getenv("LOSS_MULTIPLIER", "3"))
+
 # ── Prophet / data settings ───────────────────────────────────────────────────
 HISTORY_MINUTES     = int(float(os.getenv("HISTORY_MINUTES", "500")))
 FORECAST_MINUTES    = int(float(os.getenv("FORECAST_MINUTES", "15")))
@@ -188,25 +200,34 @@ KALSHI_WS_URL = os.getenv(
 _QMAP = [("p10", 0.10), ("p50", 0.50), ("p90", 0.90)]
 
 
-def bet_count() -> float:
+def bet_count(bet_usd: Optional[float] = None) -> float:
     """Fallback contract count when the live price is unknown (1.00 per $1 bet)."""
-    return max(1.0, float(round(BET_AMOUNT_USD)))
+    bet = BET_AMOUNT_USD if bet_usd is None else float(bet_usd)
+    return max(1.0, float(round(bet)))
 
 
-def contracts_for_price(price_per_contract: Optional[float]) -> float:
-    """Fractional contracts for one buy: spend (almost) exactly BET_AMOUNT_USD.
+def contracts_for_price(price_per_contract: Optional[float],
+                        bet_usd: Optional[float] = None) -> float:
+    """Fractional contracts for one buy: spend (almost) exactly the bet amount
+    (default BET_AMOUNT_USD; the strategy passes the streak-multiplied bet).
 
     price_per_contract = cost of ONE contract in dollars (the YES price for a
     YES buy; 1 − YES for a NO buy). Kalshi's fixed-point API accepts fractional
     counts at 0.01 granularity, so count = BET / price, floored to 0.01 so the
-    cost never exceeds BET_AMOUNT_USD — e.g. $1 at $0.40 → 2.50 contracts
+    cost never exceeds the bet — e.g. $1 at $0.40 → 2.50 contracts
     (exactly $1.00); $1 at $0.73 → 1.36 contracts ($0.99).
     Unknown/invalid price → bet_count().
     """
+    bet = BET_AMOUNT_USD if bet_usd is None else float(bet_usd)
     if price_per_contract is None or not (0.01 <= price_per_contract <= 0.99):
-        return bet_count()
-    raw = BET_AMOUNT_USD / price_per_contract
+        return bet_count(bet)
+    raw = bet / price_per_contract
     return max(0.01, math.floor(raw * 100) / 100.0)
+
+
+def streak_multiplier(streak: int) -> float:
+    """Bet/TP multiplier for the current consecutive-loss streak."""
+    return float(LOSS_MULTIPLIER) ** max(0, int(streak))
 
 
 def take_profit_exit(side: str, entry_price: float, count: float,
@@ -832,6 +853,23 @@ class PerformanceTracker:
     def find_pending(self) -> list:
         return [t for t in self.trades if t.get("result") == "pending"]
 
+    def current_loss_streak(self) -> int:
+        """Consecutive LOSSes at the tail of the settled history.
+
+        Drives the martingale bet sizing: walks the journal backwards counting
+        LOSSes until the most recent WIN (which resets the streak to 0).
+        Unsettled (pending) records are skipped — an unknown outcome neither
+        extends nor resets the streak.
+        """
+        streak = 0
+        for t in reversed(self.trades):
+            result = t.get("result")
+            if result == "LOSS":
+                streak += 1
+            elif result == "WIN":
+                break
+        return streak
+
     def save(self) -> None:
         """Persist in-place record mutations (e.g. tp_order_id set by monitor)."""
         self._save_history()
@@ -1285,9 +1323,48 @@ async def position_monitor(rest: KalshiREST) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 # Trade execution for a single 15-minute window
 # ─────────────────────────────────────────────────────────────────────────────
+async def _await_overdue_settlements(timeout_s: float = 120.0) -> None:
+    """Wait (bounded) for trades whose window already closed to settle.
+
+    The martingale bet size depends on the LAST trade's result, but Kalshi can
+    take a little while to publish a market result after the window closes —
+    so at the start of a new window the previous trade may briefly still be
+    "pending". Give the settlement_checker up to timeout_s to book it before
+    sizing the next bet; on timeout the unsettled trade simply doesn't count
+    toward the loss streak yet (sizes conservatively at the base amount).
+    """
+    deadline = time.time() + timeout_s
+    warned = False
+    while time.time() < deadline:
+        now = datetime.now(tz=timezone.utc)
+        overdue = []
+        for rec in tracker.find_pending():
+            try:
+                settle = datetime.fromisoformat(rec["settle_et"])
+            except Exception:  # noqa: BLE001
+                continue
+            if settle.tzinfo is None:
+                settle = settle.replace(tzinfo=ET)
+            if now >= settle:
+                overdue.append(rec.get("ticker", "?"))
+        if not overdue:
+            return
+        if not warned:
+            log.info("Streak sizing: waiting for %s to settle before sizing "
+                     "the next bet …", ", ".join(overdue))
+            warned = True
+        await asyncio.sleep(5)
+    log.warning("Streak sizing: settlement wait timed out — unsettled trades "
+                "do not count toward the loss streak this window.")
+
+
 async def execute_window_trade(rest: KalshiREST, ct: str, nt: str) -> None:
     """Run the Prophet forecast and place ONE order for the given window."""
     loop = asyncio.get_event_loop()
+
+    # 0) Make sure the previous window's result is booked — the loss streak
+    #    (and therefore this window's martingale bet size) depends on it.
+    await _await_overdue_settlements()
 
     # 1) Resolve the active market + strike (retry — a just-opened market can be
     #    missing floor_strike for a few seconds).
@@ -1352,9 +1429,23 @@ async def execute_window_trade(rest: KalshiREST, ct: str, nt: str) -> None:
     else:
         entry_price = (1.0 - yes_p) if yes_p is not None else 0.5
 
-    # Size the order to spend (almost) exactly BET_AMOUNT_USD — fractional
+    # Martingale sizing: multiply the base bet (and the TP target, so the win
+    # actually recovers the streak's losses) by LOSS_MULTIPLIER per consecutive
+    # loss; a WIN in the journal resets both back to base.
+    loss_streak = tracker.current_loss_streak()
+    multiplier = streak_multiplier(loss_streak)
+    bet_usd = round(BET_AMOUNT_USD * multiplier, 2)
+    tp_usd = round(TP_PROFIT_USD * multiplier, 2)
+    if loss_streak:
+        log.info("Loss streak %d → bet ×%.6g: $%.2f base → $%.2f this window "
+                 "(take-profit target $%.2f). A WIN resets to $%.2f.",
+                 loss_streak, multiplier, BET_AMOUNT_USD, bet_usd, tp_usd,
+                 BET_AMOUNT_USD)
+
+    # Size the order to spend (almost) exactly bet_usd — fractional
     # contracts, 0.01 granularity (Kalshi fixed-point count_fp).
-    count = contracts_for_price(entry_price if yes_p is not None else None)
+    count = contracts_for_price(entry_price if yes_p is not None else None,
+                                bet_usd)
     est_cost = count * entry_price
 
     settle_et = market.get("settle_et")
@@ -1383,7 +1474,9 @@ async def execute_window_trade(rest: KalshiREST, ct: str, nt: str) -> None:
         f"BTC vs P50        : {btc_vs_p50}\n"
         f"Strike vs P50     : {strike_direction}\n"
         f"Decision          : {decision}\n"
-        f"Bet Size          : ${BET_AMOUNT_USD:.2f} → {count:.2f} contract(s) "
+        f"Loss Streak       : {loss_streak} → multiplier ×{multiplier:.6g} "
+        f"(base ${BET_AMOUNT_USD:.2f})\n"
+        f"Bet Size          : ${bet_usd:.2f} → {count:.2f} contract(s) "
         f"@ ~${entry_price:.2f} = ~${est_cost:.2f}"
     )
 
@@ -1410,21 +1503,21 @@ async def execute_window_trade(rest: KalshiREST, ct: str, nt: str) -> None:
         entry_price = avg_yes if side == "yes" else round(1.0 - avg_yes, 4)
 
     # 8) ARM the take-profit: the position_monitor task watches this position's
-    #    unrealized P&L on live quotes and places the GTC reduce_only limit at
-    #    tp_exit the moment gains cross TP_PROFIT_USD (the bet amount).
-    _, tp_api_price, tp_exit = take_profit_exit(side, entry_price, count)
+    #    unrealized P&L on live quotes and places the reduce_only IOC limit at
+    #    tp_exit the moment gains cross tp_usd (the streak-scaled TP target).
+    _, tp_api_price, tp_exit = take_profit_exit(side, entry_price, count, tp_usd)
     tp_profit = round((tp_exit - entry_price) * count, 4)
     max_profit = round((1.0 - entry_price) * count, 4)
-    if max_profit < TP_PROFIT_USD - 1e-9:
+    if max_profit < tp_usd - 1e-9:
         log.info("NOTE: from entry $%.2f the position can gain at most $%+.2f "
                  "before settlement — the +$%.2f take-profit cannot trigger "
                  "pre-settlement; position rides to market result.",
-                 entry_price, max_profit, TP_PROFIT_USD)
+                 entry_price, max_profit, tp_usd)
     log.info("TAKE-PROFIT ARMED : monitoring P&L every %.0fs — will fire "
              "reduce-only IOC limit exit=$%.2f/contract (api price %s, locks "
              "$%+.2f on %.2f contracts) once unrealized ≥ $%.2f.",
              POSITION_POLL_S, tp_exit, tp_api_price, tp_profit, count,
-             TP_PROFIT_USD)
+             tp_usd)
 
     rec = {
         "ticker": ct,
@@ -1438,11 +1531,14 @@ async def execute_window_trade(rest: KalshiREST, ct: str, nt: str) -> None:
         "btc_quantile_position": round(quantile, 2),
         "forecast_bands": {k: round(forecast[k], 2) for k, _ in _QMAP},
         "count": count,
+        "bet_amount_usd": bet_usd,
+        "loss_streak": loss_streak,
+        "bet_multiplier": round(multiplier, 4),
         "order_submitted": "success" if filled else "failure",
         "tp_order_id": None,          # set by position_monitor when triggered
         "tp_exit_price": tp_exit,
         "tp_api_price": tp_api_price,
-        "tp_target_profit_usd": round(TP_PROFIT_USD, 2),
+        "tp_target_profit_usd": round(tp_usd, 2),
         "exit_method": "pending",
         "dry_run": DRY_RUN,
         "result": "pending",
@@ -1494,6 +1590,12 @@ async def main_async() -> None:
              "$%.2f / price, 0.01 granularity)", BET_AMOUNT_USD, BET_AMOUNT_USD)
     log.info("  Take-profit     : +$%.2f — monitor P&L every %.0fs, fire "
              "reduce-only IOC limit on trigger", TP_PROFIT_USD, POSITION_POLL_S)
+    _streak = tracker.current_loss_streak()
+    log.info("  Loss multiplier : ×%.6g per consecutive loss — current streak "
+             "%d → next bet $%.2f (TP $%.2f); a WIN resets to base",
+             LOSS_MULTIPLIER, _streak,
+             round(BET_AMOUNT_USD * streak_multiplier(_streak), 2),
+             round(TP_PROFIT_USD * streak_multiplier(_streak), 2))
     log.info("  Data / horizon  : %d 1-min candles → forecast %d min",
              HISTORY_MINUTES, FORECAST_MINUTES)
     log.info("  Uncertainty     : %d samples", UNCERTAINTY_SAMPLES)

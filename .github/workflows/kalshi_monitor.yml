@@ -23,6 +23,10 @@ on:
         description: "Override TP_PROFIT_USD for THIS run only (take-profit $ target — close the position once it is up this much). Leave BLANK to use the TP_PROFIT_USD repo/env variable (default = bet amount)."
         required: false
         default: ""
+      loss_multiplier:
+        description: "Override LOSS_MULTIPLIER for THIS run only (martingale: multiply the next bet by this after every LOSS; a WIN resets to the base bet). Leave BLANK to use the LOSS_MULTIPLIER repo/env variable (default 3)."
+        required: false
+        default: ""
 
 # At most one run at a time. A newly queued run waits; it never
 # cancels the currently running bot mid-execution.
@@ -86,6 +90,10 @@ jobs:
           # many dollars (default = the bet amount) via a reduce-only IOC limit
           # (Kalshi only allows reduce_only on IOC orders).
           TP_PROFIT_USD:     ${{ github.event.inputs.tp_profit_usd || vars.TP_PROFIT_USD || github.event.inputs.bet_amount_usd || vars.BET_AMOUNT_USD || '1' }}
+          # Martingale loss-streak multiplier: after every LOSS the next bet
+          # (and its TP target) are multiplied by this; a WIN resets to base.
+          # The streak persists across runs via trade_history.json.
+          LOSS_MULTIPLIER:   ${{ github.event.inputs.loss_multiplier || vars.LOSS_MULTIPLIER || '3' }}
           POSITION_POLL_S:   ${{ vars.POSITION_POLL_S || '5' }}
           # Prophet strategy knobs (repo/environment variables, all optional)
           HISTORY_MINUTES:     ${{ vars.HISTORY_MINUTES || '500' }}
