@@ -44,5 +44,5 @@ jobs:
           KALSHI_WS_VERBOSE: "true"
           # QA must NEVER trade: the suite also force-overrides DRY_RUN in-process.
           DRY_RUN:           "true"
-          BET_AMOUNT_USD:    ${{ vars.BET_AMOUNT_USD || '1' }}
+          BET_AMOUNT_SHARES: ${{ vars.BET_AMOUNT_SHARES || '0.01' }}
         run: python test_kalshi_bot.py

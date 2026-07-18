@@ -18,10 +18,10 @@ STRATEGY  (Prophet 15-minute BTC forecast)
             current BTC close  >  p50   →  BUY NO   (DOWN)
     5. CONTINUOUSLY MONITORS the open position's unrealized P&L from live WS
        quotes (position_monitor, every POSITION_POLL_S seconds). The moment
-       unrealized gains cross TP_PROFIT_USD (default: the bet amount — a $1
-       bet triggers when the position is up $1), it fires the TAKE-PROFIT:
-       a reduce_only IOC limit at the exit price that locks the gain
-       (entry + TP_PROFIT_USD/count per contract). Kalshi only allows
+       unrealized gains cross the take-profit target (TP_PROFIT_USD if set;
+       default: the position's entry cost, i.e. exit at 2× the entry price),
+       it fires the TAKE-PROFIT: a reduce_only IOC limit at the exit price
+       that locks the gain (entry + target/count per contract). Kalshi only allows
        reduce_only on IOC orders (GTC+reduce_only → 400 invalid_order), so
        the exit cannot rest on the book — the monitor IS the trigger: the
        market has already crossed the exit price when the order is sent, so
@@ -66,10 +66,12 @@ CREDENTIALS / SETTINGS (env vars)
     KALSHI_API_KEY_ID / KALSHI_PEM_PATH (or KALSHI_PRIVATE_KEY content)
     KALSHI_DEMO            "true" for sandbox (default false)
     DRY_RUN               "true" (default) — log orders, do not submit
-    BET_AMOUNT_USD        base $ spent per order; fractional contracts = $/price (0.01 min)
-    TP_PROFIT_USD         take-profit target in $ (default = BET_AMOUNT_USD)
+    BET_AMOUNT_SHARES     base contracts (shares) bought per order, fractional
+                          at 0.01 granularity (default 0.01 — the exchange minimum)
+    TP_PROFIT_USD         take-profit target in $ (default: the position's entry
+                          cost — exit at 2× the entry price)
     LOSS_MULTIPLIER       martingale: multiply the next bet (and TP target) by
-                          this after every LOSS; a WIN resets to base (default 3;
+                          this after every LOSS; a WIN resets to base (default 2;
                           streak derived from trade history, survives restarts)
     POSITION_POLL_S       open-position P&L monitor cadence (default 5s)
     HISTORY_MINUTES       1-min candles pulled per forecast (default 500)
@@ -130,31 +132,34 @@ KALSHI_DEMO       = os.getenv("KALSHI_DEMO", "false").lower() in ("1", "true", "
 DRY_RUN           = os.getenv("DRY_RUN", "true").lower() in ("1", "true", "yes")
 
 # ── Bet sizing ──────────────────────────────────────────────────────────────
-# Spend (almost) exactly this many dollars per order. Kalshi's fixed-point API
-# supports FRACTIONAL contract counts at 0.01 granularity (count_fp, sent as a
-# 0–2 decimal string), so count = BET / price — e.g. $1 at a $0.40 price buys
-# 2.50 contracts (exactly $1.00). See docs.kalshi.com fixed_point_migration.
-BET_AMOUNT_USD    = float(os.getenv("BET_AMOUNT_USD", "1"))
+# Buy exactly this many contracts (shares) per order, independent of price.
+# Kalshi's fixed-point API supports FRACTIONAL contract counts at 0.01
+# granularity (count_fp, sent as a 0–2 decimal string), so 0.01 — the exchange
+# minimum — is a valid order. See docs.kalshi.com fixed_point_migration.
+BET_AMOUNT_SHARES = float(os.getenv("BET_AMOUNT_SHARES", "0.01"))
 
 # ── Take-profit ─────────────────────────────────────────────────────────────
-# Close the position once it is in the money by at least this many dollars
-# (default: the bet amount — a $1 bet exits when the position is up $1).
-# The position_monitor task polls the open position's unrealized P&L from
-# live WS quotes every POSITION_POLL_S; when gains cross TP_PROFIT_USD it
-# fires a reduce_only IOC limit at the exit price that locks the gain
-# (Kalshi rejects reduce_only on anything but IOC, so the exit can't rest
-# GTC — the monitor itself is the trigger and re-fires until closed).
-TP_PROFIT_USD     = float(os.getenv("TP_PROFIT_USD", str(BET_AMOUNT_USD)))
+# Close the position once it is in the money by at least this many dollars.
+# Unset/blank (the default) → the position's entry cost (entry × count), which
+# exits at 2× the entry price — the share-sized equivalent of the old
+# "a $1 bet exits when up $1". The position_monitor task polls the open
+# position's unrealized P&L from live WS quotes every POSITION_POLL_S; when
+# gains cross the target it fires a reduce_only IOC limit at the exit price
+# that locks the gain (Kalshi rejects reduce_only on anything but IOC, so the
+# exit can't rest GTC — the monitor itself is the trigger and re-fires until
+# closed).
+_TP_ENV           = os.getenv("TP_PROFIT_USD", "").strip()
+TP_PROFIT_USD     = float(_TP_ENV) if _TP_ENV else None   # None → entry cost
 POSITION_POLL_S   = float(os.getenv("POSITION_POLL_S", "5"))   # P&L monitor cadence
 
 # ── Loss-streak (martingale) multiplier ─────────────────────────────────────
 # After every LOSS the NEXT trade's bet — and its take-profit target — are
-# multiplied by LOSS_MULTIPLIER; a WIN resets sizing back to BET_AMOUNT_USD:
-#     bet = BET_AMOUNT_USD × LOSS_MULTIPLIER ^ consecutive-losses
-# e.g. base $1, multiplier 3 → $1, $3, $9, $27 … until a WIN resets to $1.
-# The streak is derived from the tail of trade_history.json, so it survives
-# the 5h45m restarts. Set LOSS_MULTIPLIER=1 to disable streak sizing.
-LOSS_MULTIPLIER   = float(os.getenv("LOSS_MULTIPLIER", "3"))
+# multiplied by LOSS_MULTIPLIER; a WIN resets sizing back to BET_AMOUNT_SHARES:
+#     bet = BET_AMOUNT_SHARES × LOSS_MULTIPLIER ^ consecutive-losses
+# e.g. base 0.01, multiplier 2 → 0.01, 0.02, 0.04, 0.08 … until a WIN resets
+# to 0.01. The streak is derived from the tail of trade_history.json, so it
+# survives the 5h45m restarts. Set LOSS_MULTIPLIER=1 to disable streak sizing.
+LOSS_MULTIPLIER   = float(os.getenv("LOSS_MULTIPLIER", "2"))
 
 # ── Prophet / data settings ───────────────────────────────────────────────────
 HISTORY_MINUTES     = int(float(os.getenv("HISTORY_MINUTES", "500")))
@@ -200,29 +205,14 @@ KALSHI_WS_URL = os.getenv(
 _QMAP = [("p10", 0.10), ("p50", 0.50), ("p90", 0.90)]
 
 
-def bet_count(bet_usd: Optional[float] = None) -> float:
-    """Fallback contract count when the live price is unknown (1.00 per $1 bet)."""
-    bet = BET_AMOUNT_USD if bet_usd is None else float(bet_usd)
-    return max(1.0, float(round(bet)))
-
-
-def contracts_for_price(price_per_contract: Optional[float],
-                        bet_usd: Optional[float] = None) -> float:
-    """Fractional contracts for one buy: spend (almost) exactly the bet amount
-    (default BET_AMOUNT_USD; the strategy passes the streak-multiplied bet).
-
-    price_per_contract = cost of ONE contract in dollars (the YES price for a
-    YES buy; 1 − YES for a NO buy). Kalshi's fixed-point API accepts fractional
-    counts at 0.01 granularity, so count = BET / price, floored to 0.01 so the
-    cost never exceeds the bet — e.g. $1 at $0.40 → 2.50 contracts
-    (exactly $1.00); $1 at $0.73 → 1.36 contracts ($0.99).
-    Unknown/invalid price → bet_count().
-    """
-    bet = BET_AMOUNT_USD if bet_usd is None else float(bet_usd)
-    if price_per_contract is None or not (0.01 <= price_per_contract <= 0.99):
-        return bet_count(bet)
-    raw = bet / price_per_contract
-    return max(0.01, math.floor(raw * 100) / 100.0)
+def bet_count(bet_shares: Optional[float] = None) -> float:
+    """Contract count for one buy: the share amount itself, independent of
+    price (default BET_AMOUNT_SHARES; the strategy passes the
+    streak-multiplied bet). Kalshi's fixed-point API accepts fractional
+    counts at 0.01 granularity, so the count is floored to 0.01 steps and
+    clamped to the 0.01 exchange minimum."""
+    bet = BET_AMOUNT_SHARES if bet_shares is None else float(bet_shares)
+    return max(0.01, math.floor(bet * 100 + 1e-6) / 100.0)
 
 
 def streak_multiplier(streak: int) -> float:
@@ -234,17 +224,23 @@ def take_profit_exit(side: str, entry_price: float, count: float,
                      target: Optional[float] = None) -> tuple:
     """Take-profit order parameters for an open position.
 
-    Exit when the position is in the money by ≥ TP_PROFIT_USD, i.e. the exit
-    price (in position-side terms) = entry + TP_PROFIT_USD/count per contract.
-    With count = BET/entry that is exactly 2× the entry price — a $1 bet exits
-    up $1. Capped to Kalshi's $0.01–$0.99 price range (an entry ≥ $0.50 can
+    Exit when the position is in the money by ≥ the target, i.e. the exit
+    price (in position-side terms) = entry + target/count per contract.
+    The default target (TP_PROFIT_USD unset) is the entry cost (entry ×
+    count), which is exactly 2× the entry price — double or nothing.
+    Capped to Kalshi's $0.01–$0.99 price range (an entry ≥ $0.50 can
     never double pre-settlement, so the cap rests the order at the max $0.99).
 
     Returns (book_side, api_price_str, exit_price):
       YES position → ASK (sell YES) at the YES exit price.
       NO  position → BID (buy YES back, reduce_only) at 1 − NO exit price.
     """
-    tgt = TP_PROFIT_USD if target is None else float(target)
+    if target is not None:
+        tgt = float(target)
+    elif TP_PROFIT_USD is not None:
+        tgt = TP_PROFIT_USD
+    else:
+        tgt = float(entry_price) * float(count)   # entry cost → 2× entry exit
     needed = tgt / max(float(count), 0.01)               # profit per contract
     exit_price = min(0.99, max(0.01, round(float(entry_price) + needed, 2)))
     if side == "yes":
@@ -1134,7 +1130,7 @@ async def settlement_checker(rest: KalshiREST) -> None:
                 rec["exit_method"] = "settlement"
             outcome = "WIN" if pnl > 0 else "LOSS"
             tracker.settle(rec, outcome, pnl)
-            log.info("SETTLED %s  result=%s  our side=%s → %s  P&L $%+.2f%s",
+            log.info("SETTLED %s  result=%s  our side=%s → %s  P&L $%+.4f%s",
                      rec["ticker"], result.upper(), rec["side"], outcome, pnl,
                      f"  (take-profit closed {tp_filled:.2f}/{count:.2f} early)"
                      if tp_filled > 1e-9 else "")
@@ -1182,7 +1178,7 @@ def _settle_external(rec: dict, realized: float, extra: str = "") -> None:
     rec["exit_method"] = "closed_externally"
     tracker.settle(rec, "WIN" if realized > 0 else "LOSS", realized)
     log.info("🤝 %s position was closed OUTSIDE the bot (manual sale?)%s — "
-             "booked Kalshi realized P&L $%+.2f. Waiting for the next contract.",
+             "booked Kalshi realized P&L $%+.4f. Waiting for the next contract.",
              rec["ticker"], extra, realized)
 
 
@@ -1195,7 +1191,10 @@ async def _monitor_position(rest: KalshiREST, rec: dict) -> None:
     side    = str(rec["side"]).lower()
     entry   = _f(rec.get("entry_price"), 0.5)
     count   = _f(rec.get("count"), bet_count())
-    target  = _f(rec.get("tp_target_profit_usd"), TP_PROFIT_USD)
+    # Legacy records without a stored target fall back to the env target or,
+    # when unset, the position's entry cost (2× entry exit).
+    target  = _f(rec.get("tp_target_profit_usd"),
+                 TP_PROFIT_USD if TP_PROFIT_USD is not None else entry * count)
     tp_filled = _f(rec.get("tp_filled_fp"), 0.0)   # contracts our TPs closed
     # Exit params derive from the record's own target so the fire price always
     # matches the trigger threshold, even across restarts with a changed env.
@@ -1206,8 +1205,8 @@ async def _monitor_position(rest: KalshiREST, rec: dict) -> None:
         return                                # no live quote yet
     unreal = (cur - entry) * count
 
-    log.info("P&L MONITOR %s  %s  entry=$%.2f mark=$%.2f unrealized=$%+.2f "
-             "| TP armed: trigger ≥ $%.2f gain%s",
+    log.info("P&L MONITOR %s  %s  entry=$%.2f mark=$%.2f unrealized=$%+.4f "
+             "| TP armed: trigger ≥ $%.4f gain%s",
              ticker, side.upper(), entry, cur, unreal, target,
              f" (TP closed {tp_filled:.2f}/{count:.2f} so far)"
              if tp_filled > 1e-9 else "")
@@ -1219,8 +1218,8 @@ async def _monitor_position(rest: KalshiREST, rec: dict) -> None:
         pnl = (tp_exit - entry) * count
         rec["exit_method"] = "take_profit(dry-run)"
         tracker.settle(rec, "WIN", pnl)
-        log.info("🎯 [DRY-RUN] %s gains crossed +$%.2f — TP limit would close "
-                 "at $%.2f for P&L $%+.2f. Waiting for the next contract.",
+        log.info("🎯 [DRY-RUN] %s gains crossed +$%.4f — TP limit would close "
+                 "at $%.2f for P&L $%+.4f. Waiting for the next contract.",
                  ticker, target, tp_exit, pnl)
         return
 
@@ -1238,7 +1237,7 @@ async def _monitor_position(rest: KalshiREST, rec: dict) -> None:
             rec["exit_method"] = "take_profit"
             tracker.settle(rec, "WIN" if realized > 0 else "LOSS", realized)
             log.info("🎯 TAKE-PROFIT COMPLETE %s — position CLOSED "
-                     "(TP filled %.2f contracts) → Kalshi realized P&L $%+.2f. "
+                     "(TP filled %.2f contracts) → Kalshi realized P&L $%+.4f. "
                      "Waiting for the next contract to place a new trade.",
                      ticker, tp_filled, realized)
         else:
@@ -1252,7 +1251,7 @@ async def _monitor_position(rest: KalshiREST, rec: dict) -> None:
     # 3) Fire the reduce-only IOC limit at the exit price. The market already
     #    crossed it, so the order fills at exit-or-better (profit ≥ target);
     #    if the book moved back it cancels and the monitor re-fires next tick.
-    log.info("💰 %s unrealized $%+.2f crossed the +$%.2f target — firing "
+    log.info("💰 %s unrealized $%+.4f crossed the +$%.4f target — firing "
              "reduce-only IOC limit to close at $%.2f/contract or better.",
              ticker, unreal, target, tp_exit)
     resp, filled = await _submit(rest, ticker=ticker, side=tp_side,
@@ -1284,21 +1283,23 @@ async def _monitor_position(rest: KalshiREST, rec: dict) -> None:
         rec["exit_method"] = "take_profit"
         tracker.settle(rec, "WIN", rec["tp_pnl"])
         log.info("🎯 TAKE-PROFIT FILLED %s — position CLOSED at $%.2f "
-                 "(entry $%.2f × %.2f contracts) → realized P&L $%+.2f. "
+                 "(entry $%.2f × %.2f contracts) → realized P&L $%+.4f. "
                  "Waiting for the next contract to place a new trade.",
                  ticker, exit_px, entry, rec["tp_filled_fp"], rec["tp_pnl"])
     else:
         tracker.save()
         log.info("%s take-profit PARTIAL fill %.2f/%.2f at $%.2f (P&L so far "
-                 "$%+.2f) — monitor closes the remainder next tick.",
+                 "$%+.4f) — monitor closes the remainder next tick.",
                  ticker, rec["tp_filled_fp"], count, exit_px, rec["tp_pnl"])
 
 
 async def position_monitor(rest: KalshiREST) -> None:
     """Continuously monitor open positions' P&L and drive the take-profit."""
     log.info("Position P&L monitor started — poll every %.0fs, take-profit "
-             "target +$%.2f (reduce-only IOC limit fired on trigger).",
-             POSITION_POLL_S, TP_PROFIT_USD)
+             "target %s (reduce-only IOC limit fired on trigger).",
+             POSITION_POLL_S,
+             f"+${TP_PROFIT_USD:.4f}" if TP_PROFIT_USD is not None
+             else "+entry cost (exit at 2× entry)")
     while True:
         await asyncio.sleep(POSITION_POLL_S)
         now = datetime.now(tz=timezone.utc)
@@ -1434,18 +1435,19 @@ async def execute_window_trade(rest: KalshiREST, ct: str, nt: str) -> None:
     # loss; a WIN in the journal resets both back to base.
     loss_streak = tracker.current_loss_streak()
     multiplier = streak_multiplier(loss_streak)
-    bet_usd = round(BET_AMOUNT_USD * multiplier, 2)
-    tp_usd = round(TP_PROFIT_USD * multiplier, 2)
-    if loss_streak:
-        log.info("Loss streak %d → bet ×%.6g: $%.2f base → $%.2f this window "
-                 "(take-profit target $%.2f). A WIN resets to $%.2f.",
-                 loss_streak, multiplier, BET_AMOUNT_USD, bet_usd, tp_usd,
-                 BET_AMOUNT_USD)
+    # tp_usd None → resolved to the position's entry cost once the entry fills.
+    tp_usd = (round(TP_PROFIT_USD * multiplier, 4)
+              if TP_PROFIT_USD is not None else None)
 
-    # Size the order to spend (almost) exactly bet_usd — fractional
-    # contracts, 0.01 granularity (Kalshi fixed-point count_fp).
-    count = contracts_for_price(entry_price if yes_p is not None else None,
-                                bet_usd)
+    # Size the order in shares: fractional contracts, 0.01 granularity
+    # (Kalshi fixed-point count_fp), independent of price.
+    count = bet_count(BET_AMOUNT_SHARES * multiplier)
+    if loss_streak:
+        log.info("Loss streak %d → bet ×%.6g: %.2f base → %.2f contracts this "
+                 "window%s. A WIN resets to %.2f.",
+                 loss_streak, multiplier, BET_AMOUNT_SHARES, count,
+                 f" (take-profit target ${tp_usd:.4f})" if tp_usd is not None
+                 else "", BET_AMOUNT_SHARES)
     est_cost = count * entry_price
 
     settle_et = market.get("settle_et")
@@ -1475,9 +1477,9 @@ async def execute_window_trade(rest: KalshiREST, ct: str, nt: str) -> None:
         f"Strike vs P50     : {strike_direction}\n"
         f"Decision          : {decision}\n"
         f"Loss Streak       : {loss_streak} → multiplier ×{multiplier:.6g} "
-        f"(base ${BET_AMOUNT_USD:.2f})\n"
-        f"Bet Size          : ${bet_usd:.2f} → {count:.2f} contract(s) "
-        f"@ ~${entry_price:.2f} = ~${est_cost:.2f}"
+        f"(base {BET_AMOUNT_SHARES:.2f} contracts)\n"
+        f"Bet Size          : {count:.2f} contract(s) "
+        f"@ ~${entry_price:.2f} = ~${est_cost:.4f}"
     )
 
     # 6) Submit exactly ONE entry order for this window.
@@ -1505,17 +1507,20 @@ async def execute_window_trade(rest: KalshiREST, ct: str, nt: str) -> None:
     # 8) ARM the take-profit: the position_monitor task watches this position's
     #    unrealized P&L on live quotes and places the reduce_only IOC limit at
     #    tp_exit the moment gains cross tp_usd (the streak-scaled TP target).
+    if tp_usd is None:
+        # Default target: the position's entry cost → exit at 2× the entry.
+        tp_usd = round(entry_price * count, 4)
     _, tp_api_price, tp_exit = take_profit_exit(side, entry_price, count, tp_usd)
     tp_profit = round((tp_exit - entry_price) * count, 4)
     max_profit = round((1.0 - entry_price) * count, 4)
     if max_profit < tp_usd - 1e-9:
-        log.info("NOTE: from entry $%.2f the position can gain at most $%+.2f "
-                 "before settlement — the +$%.2f take-profit cannot trigger "
+        log.info("NOTE: from entry $%.2f the position can gain at most $%+.4f "
+                 "before settlement — the +$%.4f take-profit cannot trigger "
                  "pre-settlement; position rides to market result.",
                  entry_price, max_profit, tp_usd)
     log.info("TAKE-PROFIT ARMED : monitoring P&L every %.0fs — will fire "
              "reduce-only IOC limit exit=$%.2f/contract (api price %s, locks "
-             "$%+.2f on %.2f contracts) once unrealized ≥ $%.2f.",
+             "$%+.4f on %.2f contracts) once unrealized ≥ $%.4f.",
              POSITION_POLL_S, tp_exit, tp_api_price, tp_profit, count,
              tp_usd)
 
@@ -1531,14 +1536,14 @@ async def execute_window_trade(rest: KalshiREST, ct: str, nt: str) -> None:
         "btc_quantile_position": round(quantile, 2),
         "forecast_bands": {k: round(forecast[k], 2) for k, _ in _QMAP},
         "count": count,
-        "bet_amount_usd": bet_usd,
+        "bet_amount_shares": count,
         "loss_streak": loss_streak,
         "bet_multiplier": round(multiplier, 4),
         "order_submitted": "success" if filled else "failure",
         "tp_order_id": None,          # set by position_monitor when triggered
         "tp_exit_price": tp_exit,
         "tp_api_price": tp_api_price,
-        "tp_target_profit_usd": round(tp_usd, 2),
+        "tp_target_profit_usd": round(tp_usd, 4),
         "exit_method": "pending",
         "dry_run": DRY_RUN,
         "result": "pending",
@@ -1586,16 +1591,19 @@ async def main_async() -> None:
     log.info("  Current window  : %s", ct)
     log.info("  Kalshi REST/WS  : %s", KALSHI_BASE_URL)
     log.info("  Demo / DRY_RUN  : %s / %s", KALSHI_DEMO, DRY_RUN)
-    log.info("  Bet amount      : $%.2f/order  (fractional contracts: "
-             "$%.2f / price, 0.01 granularity)", BET_AMOUNT_USD, BET_AMOUNT_USD)
-    log.info("  Take-profit     : +$%.2f — monitor P&L every %.0fs, fire "
-             "reduce-only IOC limit on trigger", TP_PROFIT_USD, POSITION_POLL_S)
+    log.info("  Bet amount      : %.2f contracts/order  (shares, fractional "
+             "at 0.01 granularity — NOT dollars)", BET_AMOUNT_SHARES)
+    log.info("  Take-profit     : %s — monitor P&L every %.0fs, fire "
+             "reduce-only IOC limit on trigger",
+             f"+${TP_PROFIT_USD:.4f}" if TP_PROFIT_USD is not None
+             else "+entry cost (exit at 2× entry)", POSITION_POLL_S)
     _streak = tracker.current_loss_streak()
     log.info("  Loss multiplier : ×%.6g per consecutive loss — current streak "
-             "%d → next bet $%.2f (TP $%.2f); a WIN resets to base",
+             "%d → next bet %.2f contracts%s; a WIN resets to base",
              LOSS_MULTIPLIER, _streak,
-             round(BET_AMOUNT_USD * streak_multiplier(_streak), 2),
-             round(TP_PROFIT_USD * streak_multiplier(_streak), 2))
+             bet_count(BET_AMOUNT_SHARES * streak_multiplier(_streak)),
+             "" if TP_PROFIT_USD is None else
+             f" (TP ${round(TP_PROFIT_USD * streak_multiplier(_streak), 4):.4f})")
     log.info("  Data / horizon  : %d 1-min candles → forecast %d min",
              HISTORY_MINUTES, FORECAST_MINUTES)
     log.info("  Uncertainty     : %d samples", UNCERTAINTY_SAMPLES)

@@ -300,26 +300,25 @@ async def check_orders_async(bot, rest):
         from kalshi_python_async import (CreateOrderV2Request, BookSide,
                                          SelfTradePreventionType)
         import uuid
-        record("BET_AMOUNT_USD", PASS,
-               f"${bot.BET_AMOUNT_USD:.2f}/order, fractional contracts (count_fp)")
-        # Fractional sizing: spend (almost) exactly BET_AMOUNT_USD per order,
-        # 0.01-contract granularity, cost never exceeds the bet amount.
+        record("BET_AMOUNT_SHARES", PASS,
+               f"{bot.BET_AMOUNT_SHARES:.2f} contracts/order (shares — NOT "
+               f"dollars — fractional count_fp)")
+        # Share sizing: buy exactly the share amount regardless of price,
+        # floored to 0.01-contract granularity, clamped to the 0.01 minimum.
         import math as _m
-        b = bot.BET_AMOUNT_USD
-        def _exp(p):
-            return max(0.01, _m.floor(b / p * 100) / 100.0)
-        c40, c73, c99 = (bot.contracts_for_price(p) for p in (0.40, 0.73, 0.99))
-        sizing_ok = (abs(c40 - _exp(0.40)) < 1e-9        # $1 → 2.50 (= $1.00)
-                     and abs(c73 - _exp(0.73)) < 1e-9    # $1 → 1.36 (≈ $0.99)
-                     and abs(c99 - _exp(0.99)) < 1e-9
-                     and c40 * 0.40 <= b + 1e-9          # never exceeds the bet
-                     and c73 * 0.73 <= b + 1e-9
-                     and bot.contracts_for_price(None) == bot.bet_count())
-        record("contracts_for_price (fractional ~$ sizing)",
+        b = bot.BET_AMOUNT_SHARES
+        base_ok = abs(bot.bet_count()
+                      - max(0.01, _m.floor(b * 100 + 1e-6) / 100.0)) < 1e-9
+        sizing_ok = (base_ok
+                     and abs(bot.bet_count(0.056) - 0.05) < 1e-9  # floored to 0.01 steps
+                     and abs(bot.bet_count(0.004) - 0.01) < 1e-9  # clamped to the minimum
+                     and abs(bot.bet_count(0.01 * 2 ** 3) - 0.08) < 1e-9)  # ×2 martingale, streak 3
+        record("bet_count (fixed share sizing, price-independent)",
                PASS if sizing_ok else FAIL,
-               "$%.2f → %.2f @ $0.40 (=$%.2f) · %.2f @ $0.73 (=$%.2f) · "
-               "%.2f @ unknown" % (b, c40, c40 * 0.40, c73, c73 * 0.73,
-                                   bot.contracts_for_price(None)))
+               "base %.2f → %.2f · 0.056 → %.2f · 0.004 → %.2f · "
+               "0.01×2³ → %.2f" % (b, bot.bet_count(), bot.bet_count(0.056),
+                                   bot.bet_count(0.004),
+                                   bot.bet_count(0.01 * 2 ** 3)))
         cases = [("BUY YES", BookSide.BID, bot.YES_BUY_PRICE),
                  ("BUY NO",  BookSide.ASK, bot.NO_BUY_PRICE)]
         for label, side, price in cases:
