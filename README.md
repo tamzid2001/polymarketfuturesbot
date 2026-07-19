@@ -457,3 +457,27 @@ The final summary also ranks directional win/loss rate by Eastern-Time hour,
 weekday, weekday-hour, and 15-minute market-open slot. It excludes groups with
 fewer than 100 observations by default; use `time_group_min_samples` to set a
 different threshold.
+
+### Ledger Statistical Analysis
+
+`kalshi_ledger_analysis.py` analyzes either a real ledger with the columns
+`trade_number`, date/time, market, side, entry/exit price, `profit_loss`, and
+WIN/LOSS result, or a downloaded Kalshi backtest artifact. It produces separate
+reports for Prophet and ML signals, including chronological ML tests, rolling
+time series, streak conditional tests, Prophet cutoff tests, Monte Carlo, and
+per-market/per-side summaries.
+
+```bash
+pip install -r requirements_kalshi_ledger_analysis.txt
+python test_ledger_analysis.py
+python kalshi_ledger_analysis.py \
+  --input ~/Desktop/kalshi-btc15m-backtest-29698207476 \
+  --signal all \
+  --output-dir ledger_analysis_output
+```
+
+The **Kalshi Ledger Statistical Analysis** GitHub Action downloads a specified
+backtest artifact and uploads the full analysis as an artifact. It treats a
+backtest outcome-only artifact as directional research: monetary P&L, Kelly,
+and dollar Monte Carlo remain unavailable until a ledger includes actual fills
+and realized `profit_loss`.
