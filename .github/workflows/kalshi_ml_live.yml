@@ -34,12 +34,12 @@ on:
         default: "29698207476"
 
 concurrency:
-  group: kalshi-ml-live-singleton
+  group: kalshi-ml-ledger-singleton
   cancel-in-progress: false
 
 permissions:
   actions: read
-  contents: read
+  contents: write
 
 jobs:
   ml-inference:
@@ -104,20 +104,33 @@ jobs:
             python kalshi_ml_inference_live.py \
               --training-csv training_data/prophet_ml_backtest_rows.csv \
               --model-path stored_model/kxbtc15m_ml_model.joblib \
+              --state-file ml_inference_ledger.json \
               --windows "${{ inputs.windows }}" \
               --submit --allow-live
           else
             python kalshi_ml_inference_live.py \
               --training-csv training_data/prophet_ml_backtest_rows.csv \
               --model-path stored_model/kxbtc15m_ml_model.joblib \
+              --state-file ml_inference_ledger.json \
               --windows "${{ inputs.windows }}"
           fi
+
+      - name: Persist ML Signal Ledger
+        if: always()
+        run: |
+          test -f ml_inference_ledger.json || exit 0
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add ml_inference_ledger.json
+          git diff-index --quiet HEAD || \
+            (git commit -m "chore: record ML signal ledger [skip ci]" && \
+             git pull --rebase --autostash origin main && git push)
 
       - name: Upload ML Inference State
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: kalshi-ml-inference-state-${{ github.run_id }}
-          path: ml_inference_live_state.json
+          path: ml_inference_ledger.json
           if-no-files-found: ignore
           retention-days: 90
