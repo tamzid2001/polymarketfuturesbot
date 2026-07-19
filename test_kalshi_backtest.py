@@ -51,6 +51,9 @@ def test_metrics_and_feature_vector_are_stable() -> None:
     assert metrics["correct"] == 3
     assert metrics["predictions"] == 4
     assert 0.0 <= metrics["brier_score"] <= 1.0
+    assert metrics["streaks"] == {
+        "current": "WIN", "current_length": 1, "longest_win": 2, "longest_loss": 1,
+    }
 
     end = pd.Timestamp("2026-01-01T12:00:00Z")
     window = pd.DataFrame({

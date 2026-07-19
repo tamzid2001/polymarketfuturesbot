@@ -449,5 +449,6 @@ same test and full replay, then uploads these artifacts:
 - `summary.json` and `summary.md`
 
 It also prints running Prophet and walk-forward ML metrics to the Actions log
-every 100 predictions by default. Set the workflow's `metrics_every` input to
+every 100 predictions by default, including the current win/loss streak and
+the longest win/loss streak. Set the workflow's `metrics_every` input to
 change that cadence.

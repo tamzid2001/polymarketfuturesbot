@@ -477,14 +477,17 @@ def run_prophet_backtest(markets: list[dict[str, Any]], candles: pd.DataFrame,
             if (len(rows) - last_reported_rows >= metrics_every
                     or index == len(valid)):
                 metrics = prophet_summary(rows)
+                streaks = metrics["streaks"]
                 LOG.info(
                     "PROPHET RUNNING METRICS | processed %d/%d | forecasts %d | "
                     "correct %d | accuracy %.2f%% | actual YES %.2f%% | predicted YES %.2f%% | "
-                    "P50 MAE $%.2f | skipped %d",
+                    "P50 MAE $%.2f | streak %s %d | longest W %d / L %d | skipped %d",
                     index, len(valid), metrics["predictions"], metrics["correct"],
                     100.0 * metrics["accuracy"], 100.0 * metrics["actual_yes_rate"],
                     100.0 * metrics["predicted_yes_rate"],
-                    float(metrics.get("p50_mae_usd") or 0.0), len(skipped),
+                    float(metrics.get("p50_mae_usd") or 0.0), streaks["current"],
+                    streaks["current_length"], streaks["longest_win"],
+                    streaks["longest_loss"], len(skipped),
                 )
                 last_reported_rows = len(rows)
     finally:
@@ -505,6 +508,26 @@ def binary_metrics(actual: list[int], predicted: list[int],
     yes_precision = true_positive / (true_positive + false_positive) if true_positive + false_positive else None
     yes_recall = true_positive / (true_positive + false_negative) if true_positive + false_negative else None
     no_recall = true_negative / (true_negative + false_positive) if true_negative + false_positive else None
+    correctness = [observed == called for observed, called in zip(actual, predicted)]
+    current_won = correctness[-1]
+    current_length = 0
+    for won in reversed(correctness):
+        if won != current_won:
+            break
+        current_length += 1
+    longest_win = 0
+    longest_loss = 0
+    running_win = 0
+    running_loss = 0
+    for won in correctness:
+        if won:
+            running_win += 1
+            running_loss = 0
+            longest_win = max(longest_win, running_win)
+        else:
+            running_loss += 1
+            running_win = 0
+            longest_loss = max(longest_loss, running_loss)
     summary: dict[str, Any] = {
         "predictions": total,
         "correct": true_positive + true_negative,
@@ -524,6 +547,12 @@ def binary_metrics(actual: list[int], predicted: list[int],
             "true_negative": true_negative,
             "false_positive": false_positive,
             "false_negative": false_negative,
+        },
+        "streaks": {
+            "current": "WIN" if current_won else "LOSS",
+            "current_length": current_length,
+            "longest_win": longest_win,
+            "longest_loss": longest_loss,
         },
     }
     if probabilities is not None:
@@ -596,12 +625,15 @@ def add_walk_forward_ml(rows: list[dict[str, Any]], min_train_rows: int,
         evaluated_probabilities.append(probability_yes)
         if len(evaluated_actual) % metrics_every == 0:
             metrics = binary_metrics(evaluated_actual, evaluated_predicted, evaluated_probabilities)
+            streaks = metrics["streaks"]
             LOG.info(
                 "ML RUNNING METRICS | row %d/%d | predictions %d | correct %d | "
-                "accuracy %.2f%% | Brier %.4f | log loss %.4f | train rows %d",
+                "accuracy %.2f%% | Brier %.4f | log loss %.4f | streak %s %d | "
+                "longest W %d / L %d | train rows %d",
                 index + 1, len(rows), metrics["predictions"], metrics["correct"],
                 100.0 * metrics["accuracy"], float(metrics["brier_score"]),
-                float(metrics["log_loss"]), len(training_indices),
+                float(metrics["log_loss"]), streaks["current"], streaks["current_length"],
+                streaks["longest_win"], streaks["longest_loss"], len(training_indices),
             )
 
     summary = binary_metrics(evaluated_actual, evaluated_predicted, evaluated_probabilities)
@@ -613,11 +645,13 @@ def add_walk_forward_ml(rows: list[dict[str, Any]], min_train_rows: int,
         "lookahead_guard": "Each fit includes only markets whose settlement timestamp was no later than the current forecast timestamp.",
     })
     if summary["predictions"] and summary["predictions"] % metrics_every:
+        streaks = summary["streaks"]
         LOG.info(
             "ML RUNNING METRICS | complete | predictions %d | correct %d | "
-            "accuracy %.2f%% | Brier %.4f | log loss %.4f",
+            "accuracy %.2f%% | Brier %.4f | log loss %.4f | streak %s %d | longest W %d / L %d",
             summary["predictions"], summary["correct"], 100.0 * summary["accuracy"],
-            float(summary["brier_score"]), float(summary["log_loss"]),
+            float(summary["brier_score"]), float(summary["log_loss"]), streaks["current"],
+            streaks["current_length"], streaks["longest_win"], streaks["longest_loss"],
         )
     return summary
 
@@ -671,11 +705,19 @@ def summary_markdown(summary: dict[str, Any]) -> str:
         "",
         f"- {score(prophet)}",
         f"- P50 settlement-price MAE: {prophet.get('p50_mae_usd', 'n/a')}",
+        f"- Streaks: current {prophet.get('streaks', {}).get('current', 'n/a')} "
+        f"{prophet.get('streaks', {}).get('current_length', 'n/a')}; longest W "
+        f"{prophet.get('streaks', {}).get('longest_win', 'n/a')} / L "
+        f"{prophet.get('streaks', {}).get('longest_loss', 'n/a')}",
         "",
         "## Walk-Forward ML",
         "",
         f"- {score(ml)}",
         f"- Brier score: {ml.get('brier_score', 'n/a')}",
+        f"- Streaks: current {ml.get('streaks', {}).get('current', 'n/a')} "
+        f"{ml.get('streaks', {}).get('current_length', 'n/a')}; longest W "
+        f"{ml.get('streaks', {}).get('longest_win', 'n/a')} / L "
+        f"{ml.get('streaks', {}).get('longest_loss', 'n/a')}",
         f"- Training policy: {ml['lookahead_guard']}",
         "",
         "## Important Limits",
