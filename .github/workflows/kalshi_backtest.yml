@@ -15,6 +15,10 @@ on:
         description: "Refit the expanding-window ML model after this many new markets."
         required: false
         default: "16"
+      metrics_every:
+        description: "Print running Prophet and ML metrics after this many predictions."
+        required: false
+        default: "100"
       prophet_uncertainty_samples:
         description: "Prophet uncertainty samples. Does not change the p50 side signal."
         required: false
@@ -54,6 +58,7 @@ jobs:
             --market-limit "${{ inputs.market_limit }}" \
             --min-train-rows "${{ inputs.min_train_rows }}" \
             --retrain-every "${{ inputs.retrain_every }}" \
+            --metrics-every "${{ inputs.metrics_every }}" \
             --prophet-uncertainty-samples "${{ inputs.prophet_uncertainty_samples }}"
 
       - name: Upload Backtest Report

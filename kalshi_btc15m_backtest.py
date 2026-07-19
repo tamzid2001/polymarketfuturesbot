@@ -399,7 +399,8 @@ def feature_values(window: pd.DataFrame, strike: float, forecast: dict[str, floa
 def run_prophet_backtest(markets: list[dict[str, Any]], candles: pd.DataFrame,
                          history_minutes: int, forecast_minutes: int,
                          preopen_lead_seconds: float,
-                         uncertainty_samples: int) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+                         uncertainty_samples: int,
+                         metrics_every: int) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Recreate the live Prophet side decision for each eligible market."""
     previous_uncertainty = live_bot.UNCERTAINTY_SAMPLES
     live_bot.UNCERTAINTY_SAMPLES = uncertainty_samples
@@ -409,6 +410,7 @@ def run_prophet_backtest(markets: list[dict[str, Any]], candles: pd.DataFrame,
     settlement_stream = settled_outcome_stream(markets)
     known_outcomes: list[int] = []
     settlement_cursor = 0
+    last_reported_rows = 0
     try:
         for index, market in enumerate(valid, start=1):
             market_open = parse_timestamp(market["open_time"])
@@ -472,9 +474,19 @@ def run_prophet_backtest(markets: list[dict[str, Any]], candles: pd.DataFrame,
             }
             row.update(feature_values(window, float(market["floor_strike"]), forecast, known, market_open))
             rows.append(row)
-            if index % 25 == 0 or index == len(valid):
-                LOG.info("Prophet replay: %d/%d eligible markets; %d valid, %d skipped",
-                         index, len(valid), len(rows), len(skipped))
+            if (len(rows) - last_reported_rows >= metrics_every
+                    or index == len(valid)):
+                metrics = prophet_summary(rows)
+                LOG.info(
+                    "PROPHET RUNNING METRICS | processed %d/%d | forecasts %d | "
+                    "correct %d | accuracy %.2f%% | actual YES %.2f%% | predicted YES %.2f%% | "
+                    "P50 MAE $%.2f | skipped %d",
+                    index, len(valid), metrics["predictions"], metrics["correct"],
+                    100.0 * metrics["accuracy"], 100.0 * metrics["actual_yes_rate"],
+                    100.0 * metrics["predicted_yes_rate"],
+                    float(metrics.get("p50_mae_usd") or 0.0), len(skipped),
+                )
+                last_reported_rows = len(rows)
     finally:
         live_bot.UNCERTAINTY_SAMPLES = previous_uncertainty
     return rows, skipped
@@ -525,7 +537,7 @@ def binary_metrics(actual: list[int], predicted: list[int],
 
 
 def add_walk_forward_ml(rows: list[dict[str, Any]], min_train_rows: int,
-                        retrain_every: int) -> dict[str, Any]:
+                        retrain_every: int, metrics_every: int) -> dict[str, Any]:
     """Add chronologically out-of-sample ML predictions to already-built rows."""
     model = None
     last_fit_index = -retrain_every
@@ -582,6 +594,15 @@ def add_walk_forward_ml(rows: list[dict[str, Any]], min_train_rows: int,
         evaluated_actual.append(actual_yes)
         evaluated_predicted.append(predicted_yes)
         evaluated_probabilities.append(probability_yes)
+        if len(evaluated_actual) % metrics_every == 0:
+            metrics = binary_metrics(evaluated_actual, evaluated_predicted, evaluated_probabilities)
+            LOG.info(
+                "ML RUNNING METRICS | row %d/%d | predictions %d | correct %d | "
+                "accuracy %.2f%% | Brier %.4f | log loss %.4f | train rows %d",
+                index + 1, len(rows), metrics["predictions"], metrics["correct"],
+                100.0 * metrics["accuracy"], float(metrics["brier_score"]),
+                float(metrics["log_loss"]), len(training_indices),
+            )
 
     summary = binary_metrics(evaluated_actual, evaluated_predicted, evaluated_probabilities)
     summary.update({
@@ -591,6 +612,13 @@ def add_walk_forward_ml(rows: list[dict[str, Any]], min_train_rows: int,
         "retrain_every_markets": retrain_every,
         "lookahead_guard": "Each fit includes only markets whose settlement timestamp was no later than the current forecast timestamp.",
     })
+    if summary["predictions"] and summary["predictions"] % metrics_every:
+        LOG.info(
+            "ML RUNNING METRICS | complete | predictions %d | correct %d | "
+            "accuracy %.2f%% | Brier %.4f | log loss %.4f",
+            summary["predictions"], summary["correct"], 100.0 * summary["accuracy"],
+            float(summary["brier_score"]), float(summary["log_loss"]),
+        )
     return summary
 
 
@@ -673,6 +701,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prophet-uncertainty-samples", type=int, default=1000)
     parser.add_argument("--min-train-rows", type=int, default=200)
     parser.add_argument("--retrain-every", type=int, default=16)
+    parser.add_argument("--metrics-every", type=int, default=100,
+                        help="Print running Prophet and ML metrics after this many predictions.")
     parser.add_argument("--request-pause-seconds", type=float, default=0.08)
     parser.add_argument("--markets-only", action="store_true",
                         help="Only export the complete closed-market ledger; do not fetch candles or fit models.")
@@ -685,8 +715,9 @@ def main() -> int:
     configure_logging(args.verbose)
     if args.market_limit < 0 or args.history_minutes < 61 or args.forecast_minutes < 1:
         raise SystemExit("market-limit must be >= 0, history-minutes >= 61, and forecast-minutes >= 1")
-    if args.min_train_rows < 1 or args.retrain_every < 1 or args.request_pause_seconds < 0:
-        raise SystemExit("min-train-rows/retrain-every must be positive and request pause cannot be negative")
+    if (args.min_train_rows < 1 or args.retrain_every < 1 or args.metrics_every < 1
+            or args.request_pause_seconds < 0):
+        raise SystemExit("min-train-rows/retrain-every/metrics-every must be positive and request pause cannot be negative")
 
     all_markets = fetch_all_closed_markets()
     output_dir: Path = args.output_dir
@@ -735,7 +766,7 @@ def main() -> int:
         candle_start, candle_end, args.request_pause_seconds)
     rows, skipped = run_prophet_backtest(
         all_markets, candles, args.history_minutes, args.forecast_minutes,
-        args.preopen_lead_seconds, args.prophet_uncertainty_samples)
+        args.preopen_lead_seconds, args.prophet_uncertainty_samples, args.metrics_every)
     # The full ledger remains exported, but a requested test limit only evaluates
     # the latest N rows.  This lets CI smoke-test a small period without changing
     # the historical archive output.
@@ -743,7 +774,8 @@ def main() -> int:
         selected = {market["ticker"] for market in replay_markets}
         rows = [row for row in rows if row["ticker"] in selected]
         skipped = [row for row in skipped if row["ticker"] in selected]
-    ml_summary = add_walk_forward_ml(rows, args.min_train_rows, args.retrain_every)
+    ml_summary = add_walk_forward_ml(
+        rows, args.min_train_rows, args.retrain_every, args.metrics_every)
     prophet_metrics = prophet_summary(rows)
     base_summary["coverage"].update({
         "prophet_rows": len(rows),

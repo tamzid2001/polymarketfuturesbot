@@ -447,3 +447,7 @@ same test and full replay, then uploads these artifacts:
 - `prophet_ml_backtest_rows.csv`
 - `skipped_markets.csv`
 - `summary.json` and `summary.md`
+
+It also prints running Prophet and walk-forward ML metrics to the Actions log
+every 100 predictions by default. Set the workflow's `metrics_every` input to
+change that cadence.
