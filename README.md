@@ -484,3 +484,14 @@ backtest artifact and uploads the full analysis as an artifact. It treats a
 backtest outcome-only artifact as directional research: monetary P&L, Kelly,
 and dollar Monte Carlo remain unavailable until a ledger includes actual fills
 and realized `profit_loss`.
+
+### Streak ML Backtest
+
+`kalshi_streak_ml_backtest.py` evaluates whether pre-trade features can predict
+the current trade result, an all-win next-three-trade run, or an all-loss
+next-three-trade run. It uses expanding chronological test blocks and reports
+accuracy, precision, recall, F1, ROC-AUC, PR-AUC, Brier score, log loss, and
+top-decile precision for Logistic Regression, KNN, Decision Tree, Random
+Forest, Extra Trees, XGBoost when available, and an equal-weight soft-voting
+probability ensemble. The **Kalshi Streak ML Backtest** GitHub Action runs this
+against a specified historical artifact and uploads its predictions and metrics.
