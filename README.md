@@ -329,8 +329,9 @@ For every 15-minute Kalshi window:
 Every portfolio report (every 30 s) prints the full stats block from
 `trade_history.json`: total trades, wins/losses, win rate, total/average
 return, largest win/loss, current + longest win/loss streaks, and max drawdown
-from the equity curve — plus a **leg breakdown** showing BTC-primary vs
-ETH-hedge settled records and cumulative P&L. Every trade records its
+from the equity curve. It also prints a separate **BTC-primary** win/loss and
+streak block, so ETH hedge outcomes cannot obscure the BTC sequence controlling
+the next pair size, plus a leg breakdown with BTC-primary vs ETH-hedge P&L. Every trade records its
 `trade_kind` (`BTC_PRIMARY` / `ETH_HEDGE`) and settlement result.
 Both JSON state files are **committed back to the repo by the workflow after
 every run**, so statistics accumulate across the 5 h 45 m restart chain.

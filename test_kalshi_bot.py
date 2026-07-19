@@ -395,6 +395,9 @@ def check_tracker(bot):
                   and abs(s["total_return"] - 0.05) < 1e-9
                   and s["current_kind"] == "LOSS" and s["current_streak"] == 1
                   and s["longest_win"] == 1 and s["longest_loss"] == 1
+                  and s["btc_total"] == 2 and s["btc_wins"] == 1
+                  and s["btc_losses"] == 1 and s["btc_current_kind"] == "LOSS"
+                  and s["btc_current_streak"] == 1
                   and abs(s["max_drawdown"] - 0.55) < 1e-9)
             record("stats: win-rate/streaks/equity/max-drawdown",
                    PASS if ok else FAIL,

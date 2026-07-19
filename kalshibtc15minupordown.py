@@ -1051,6 +1051,38 @@ class PerformanceTracker:
         rec["profit_loss"] = round(float(pnl), 4)
         self._save_history()
 
+    @staticmethod
+    def _streak_metrics(records: list) -> dict:
+        """Return current and longest win/loss streaks for settled records."""
+        longest_win = longest_loss = 0
+        current_win = current_loss = 0
+        for rec in records:
+            if rec["result"] == "WIN":
+                current_win += 1
+                current_loss = 0
+                longest_win = max(longest_win, current_win)
+            else:
+                current_loss += 1
+                current_win = 0
+                longest_loss = max(longest_loss, current_loss)
+
+        current_streak = 0
+        current_kind = None
+        for rec in reversed(records):
+            if current_kind is None:
+                current_kind = rec["result"]
+                current_streak = 1
+            elif rec["result"] == current_kind:
+                current_streak += 1
+            else:
+                break
+        return {
+            "current_streak": current_streak,
+            "current_kind": current_kind,
+            "longest_win": longest_win,
+            "longest_loss": longest_loss,
+        }
+
     def stats(self) -> dict:
         settled = [t for t in self.trades if t.get("result") in ("WIN", "LOSS")]
         total = len(settled)
@@ -1065,23 +1097,20 @@ class PerformanceTracker:
         largest_win = max(wins_pnl) if wins_pnl else 0.0
         largest_loss = min(loss_pnl) if loss_pnl else 0.0
 
-        # streaks (chronological order = append order)
-        longest_win = longest_loss = 0
-        cw = cl = 0
-        for t in settled:
-            if t["result"] == "WIN":
-                cw += 1; cl = 0; longest_win = max(longest_win, cw)
-            else:
-                cl += 1; cw = 0; longest_loss = max(longest_loss, cl)
-        current_streak = 0
-        current_kind = None
-        for t in reversed(settled):
-            if current_kind is None:
-                current_kind = t["result"]; current_streak = 1
-            elif t["result"] == current_kind:
-                current_streak += 1
-            else:
-                break
+        streaks = self._streak_metrics(settled)
+
+        # BTC-primary streaks are the trading sequence. ETH outcomes remain in
+        # aggregate figures, but never hide the BTC loss/win run used by sizing.
+        btc_settled = [
+            t for t in settled
+            if t.get("trade_kind", "BTC_PRIMARY") == "BTC_PRIMARY"
+            and str(t.get("ticker", "")).startswith(SERIES_TICKER)
+        ]
+        btc_total = len(btc_settled)
+        btc_wins = sum(1 for t in btc_settled if t["result"] == "WIN")
+        btc_losses = btc_total - btc_wins
+        btc_win_rate = (btc_wins / btc_total * 100.0) if btc_total else 0.0
+        btc_streaks = self._streak_metrics(btc_settled)
 
         # equity curve + max drawdown (starting balance 0)
         eq = peak = max_dd = 0.0
@@ -1104,8 +1133,13 @@ class PerformanceTracker:
             "total": total, "wins": wins, "losses": losses, "win_rate": win_rate,
             "total_return": total_return, "avg_return": avg_return,
             "largest_win": largest_win, "largest_loss": largest_loss,
-            "current_streak": current_streak, "current_kind": current_kind,
-            "longest_win": longest_win, "longest_loss": longest_loss,
+            **streaks,
+            "btc_total": btc_total, "btc_wins": btc_wins,
+            "btc_losses": btc_losses, "btc_win_rate": btc_win_rate,
+            "btc_current_streak": btc_streaks["current_streak"],
+            "btc_current_kind": btc_streaks["current_kind"],
+            "btc_longest_win": btc_streaks["longest_win"],
+            "btc_longest_loss": btc_streaks["longest_loss"],
             "max_drawdown": max_dd,
             "last": settled[-1] if settled else None,
         }
@@ -1124,10 +1158,20 @@ def print_performance() -> None:
     else:
         streak_s = "none"
 
+    if s["btc_current_kind"] == "WIN":
+        btc_streak_s = f"{s['btc_current_streak']} wins"
+    elif s["btc_current_kind"] == "LOSS":
+        btc_streak_s = f"{s['btc_current_streak']} losses"
+    else:
+        btc_streak_s = "none"
+
     k, kp = s["kinds"], s["kind_pnl"]
     leg_block = (
         f"║  Legs\n"
-        f"║    BTC Primary  : {k['BTC_PRIMARY']}  (P&L ${kp['BTC_PRIMARY']:+,.2f})\n"
+        f"║    BTC Primary  : {k['BTC_PRIMARY']}  (W {s['btc_wins']} / L {s['btc_losses']}, "
+        f"{s['btc_win_rate']:.1f}%, P&L ${kp['BTC_PRIMARY']:+,.2f})\n"
+        f"║    BTC Streak   : {btc_streak_s}  "
+        f"(longest W {s['btc_longest_win']} / L {s['btc_longest_loss']})\n"
         f"║    ETH Hedge    : {k['ETH_HEDGE']}  (P&L ${kp['ETH_HEDGE']:+,.2f})\n"
     )
     if k["OTHER"]:
