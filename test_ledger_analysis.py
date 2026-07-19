@@ -58,8 +58,29 @@ def test_prophet_series_keeps_original_trade_numbers_after_rolling_windows() -> 
     assert rolling["trade_number"].iloc[-1] == 55
 
 
+def test_conclusion_rejects_accuracy_gain_with_worse_probability_quality() -> None:
+    performance = {
+        "win_rate_vs_50pct_pvalue": 0.9,
+        "win_rate": 0.5,
+        "monetary_performance": {"available": False},
+    }
+    models = {
+        "available": True,
+        "models": {
+            "random_forest": {
+                "accuracy_improvement": 0.01,
+                "brier_improvement": -0.001,
+                "mcnemar_exact_pvalue": 0.01,
+            },
+        },
+    }
+    result = analysis.conclusion(performance, pd.DataFrame(), models)
+    assert result["streak_predictive_value"].startswith("No ML model")
+
+
 if __name__ == "__main__":
     test_artifact_normalization_and_streaks()
     test_real_pnl_performance_and_streak_conditionals()
     test_prophet_series_keeps_original_trade_numbers_after_rolling_windows()
+    test_conclusion_rejects_accuracy_gain_with_worse_probability_quality()
     print("PASS: ledger analysis tests")

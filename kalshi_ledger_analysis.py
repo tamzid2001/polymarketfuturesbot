@@ -722,7 +722,10 @@ def conclusion(performance: dict[str, Any], streak_frame: pd.DataFrame,
     model_significant = False
     if ml_report.get("available"):
         model_significant = any(
-            report.get("accuracy_improvement", 0) > 0 and (report.get("mcnemar_exact_pvalue") or 1) < 0.05
+            report.get("available", True)
+            and report.get("accuracy_improvement", 0) > 0
+            and report.get("brier_improvement", 0) > 0
+            and (report.get("mcnemar_exact_pvalue") or 1) < 0.05
             for report in ml_report.get("models", {}).values() if isinstance(report, dict)
         )
     if not monetary.get("available"):
@@ -741,8 +744,8 @@ def conclusion(performance: dict[str, Any], streak_frame: pd.DataFrame,
                                else "No statistically significant directional edge versus 50% at the 5% level."),
         "hot_cold_periods": ("At least one streak condition differs after Bonferroni correction; inspect its sample size before acting."
                               if hot_cold else "No streak condition survives the multiple-test correction."),
-        "streak_predictive_value": ("At least one ML model improves on the chronological baseline significantly."
-                                     if model_significant else "No ML model shows statistically significant improvement over the chronological baseline."),
+        "streak_predictive_value": ("At least one ML model improves on the chronological baseline with both significant directional accuracy and better probability calibration."
+                                     if model_significant else "No ML model shows both statistically significant directional improvement and better probability calibration versus the chronological baseline."),
         "position_sizing": sizing,
     }
 
