@@ -28,7 +28,7 @@ Checks
   11 Kalshi market WebSocket live stream              (async, non-critical)
   12 Bet sizing + V2 MARKET order build + DRY-RUN submit (nothing sent)
   13 PerformanceTracker round-trip (record → dedupe → settle → stats → reload)
-  14 BTC/ETH hedge: target-price math + fill monitor + settlement gate (DRY-RUN)
+  14 BTC/ETH hedge: target-price math + fill monitor + immediate reconciliation (DRY-RUN)
 """
 
 from __future__ import annotations
@@ -584,59 +584,68 @@ def check_eth_hedge(bot):
         traceback.print_exc()
 
 
-def check_pre_entry_settlement_gate(bot):
-    """A just-published loss must arm 10+10; unresolved means no base order."""
-    section("15. Pre-entry BTC settlement gate")
+def check_deferred_loss_reconciliation(bot):
+    """A late BTC loss must top an already-live 2-share entry up to 10+10."""
+    section("15. Immediate BTC-loss reconciliation")
     try:
         from types import SimpleNamespace
 
         with tempfile.TemporaryDirectory() as tmp:
-            saved_tracker = bot.tracker
+            saved_tracker, saved_dry = bot.tracker, bot.DRY_RUN
             bot.tracker = bot.PerformanceTracker(
                 os.path.join(tmp, "h.json"), os.path.join(tmp, "t.json"))
-            overdue = {
-                "ticker": "KXBTC15M-QA-PREENTRY-LOSS",
+            bot.DRY_RUN = True
+            prior = {
+                "ticker": "KXBTC15M-QA-PRIOR-LOSS",
                 "timestamp": "qa",
                 "settle_et": (datetime.now(tz=timezone.utc) - timedelta(seconds=1)).isoformat(),
                 "side": "NO", "entry_price": 0.50, "count": 2.0,
                 "trade_kind": "BTC_PRIMARY", "arbitrage_active": False,
-                "eth_hedge": None, "result": "pending", "profit_loss": 0.0,
+                "eth_hedge": None, "loss_streak": 0,
+                "result": "pending", "profit_loss": 0.0,
             }
-            bot.tracker.record_open(overdue)
+            current = {
+                "ticker": "KXBTC15M-QA-CURRENT", "timestamp": "qa",
+                "settle_et": (datetime.now(tz=timezone.utc) + timedelta(minutes=10)).isoformat(),
+                "side": "NO", "entry_price": 0.50, "count": 2.0,
+                "bet_amount_shares": 2.0, "trade_kind": "BTC_PRIMARY",
+                "arbitrage_active": False, "eth_hedge": None,
+                "deferred_hedge": {
+                    "status": "awaiting_btc_result",
+                    "prior_btc_ticker": prior["ticker"], "base_count": 2.0,
+                },
+                "result": "pending", "profit_loss": 0.0,
+                "btc_entry": 0.0, "p50_prediction": 0.0,
+            }
+            bot.tracker.record_open(prior)
+            bot.tracker.record_open(current)
 
-            class _SettledRest:
+            class _ReconcileRest:
                 async def get_market(self, ticker):
-                    assert ticker == overdue["ticker"]
-                    return SimpleNamespace(result="yes")
+                    if ticker == prior["ticker"]:
+                        return SimpleNamespace(result="yes")
+                    assert ticker == current["ticker"]
+                    return SimpleNamespace(status="active")
 
-            resolved = asyncio.run(bot.resolve_closed_btc_before_entry(
-                _SettledRest(), max_wait_s=0.01, poll_s=0.001))
-            armed = bot.tracker.next_eth_hedge_state()
-            armed_ok = (resolved and overdue["result"] == "LOSS"
-                        and armed["active"] and armed["multiplier"] == 1.0
-                        and bot.bet_count(bot.ARBITRAGE_SHARES) == 10.0)
+            settled = asyncio.run(bot._settle_record_if_ready(_ReconcileRest(), prior))
+            eth_records = [t for t in bot.tracker.trades
+                           if t.get("trade_kind") == "ETH_HEDGE"]
+            reconciled = (settled and prior["result"] == "LOSS"
+                          and current["count"] == 10.0
+                          and current["arbitrage_active"]
+                          and current["deferred_hedge"]["status"] == "reconciled"
+                          and isinstance(current["eth_hedge"], dict)
+                          and current["eth_hedge"]["count"] == 10.0
+                          and len(eth_records) == 1
+                          and eth_records[0]["count"] == 10.0)
+            bot.tracker, bot.DRY_RUN = saved_tracker, saved_dry
 
-            unresolved = dict(overdue, ticker="KXBTC15M-QA-PREENTRY-UNKNOWN",
-                              result="pending", profit_loss=0.0)
-            bot.tracker = bot.PerformanceTracker(
-                os.path.join(tmp, "h2.json"), os.path.join(tmp, "t2.json"))
-            bot.tracker.record_open(unresolved)
-
-            class _UnsettledRest:
-                async def get_market(self, ticker):
-                    return SimpleNamespace(result=None)
-
-            skip_base = not asyncio.run(bot.resolve_closed_btc_before_entry(
-                _UnsettledRest(), max_wait_s=0.01, poll_s=0.001))
-            bot.tracker = saved_tracker
-
-        record("published BTC loss arms 10 BTC + 10 ETH before entry",
-               PASS if armed_ok else FAIL,
-               f"result={overdue['result']} active={armed['active']} multiplier={armed['multiplier']}")
-        record("unresolved BTC result skips opening instead of 2-share base",
-               PASS if skip_base else FAIL)
+        record("late BTC loss tops live base entry to 10 BTC + 10 ETH",
+               PASS if reconciled else FAIL,
+               f"prior={prior['result']} BTC={current['count']:.2f} "
+               f"deferred={current['deferred_hedge']['status']}")
     except Exception as exc:  # noqa: BLE001
-        record("pre-entry settlement gate", FAIL, str(exc))
+        record("immediate BTC-loss reconciliation", FAIL, str(exc))
         traceback.print_exc()
 
 
@@ -689,7 +698,7 @@ def main():
             traceback.print_exc()
         check_tracker(bot)
         check_eth_hedge(bot)
-        check_pre_entry_settlement_gate(bot)
+        check_deferred_loss_reconciliation(bot)
 
     print("\n" + "=" * 70)
     counts = {PASS: 0, FAIL: 0, WARN: 0, SKIP: 0}

@@ -310,10 +310,10 @@ For every 15-minute Kalshi window:
    forecast p50 < live strike   →  BUY NO   (DOWN)
    ```
 
-   If the preceding BTC market has closed but its outcome is not yet recorded,
-   the bot resolves it for at most two seconds before sizing. It skips the
-   opening rather than submit the 2-share base when a loss may require the
-   10-share BTC + 10-share ETH pair.
+   If the preceding BTC market's result arrives just after the opening, the
+   bot does not delay or skip the live entry. It reconciles that same BTC
+   record as soon as the loss is published, topping it up to the required pair
+   size and then submitting the matched ETH limit.
 
 6. **ETH hedge after a settled BTC loss** — the next BTC entry uses the
    `ARBITRAGE_SHARES` base of 10 contracts. It multiplies that paired amount
@@ -368,7 +368,6 @@ Environment **variables** (not secrets) tune behavior:
 | `PREOPEN_FORECAST_LEAD_S` | `120` | Seconds before the next market opens to pre-compute its 17-step forecast |
 | `OPEN_TRADE_GRACE_S` | `15` | Max seconds after a market opens to place the entry. Every manual, scheduled, and handoff run skips an older market and waits for the next live opening. |
 | `SETTLE_CHECK_S` | `2` | Settlement polling cadence (seconds), independent of the opening order path |
-| `PRE_ENTRY_SETTLEMENT_WAIT_S` | `2` | Maximum seconds to resolve a just-closed BTC result before sizing; unresolved results skip the window |
 | `UNCERTAINTY_SAMPLES` | `1000` | Prophet uncertainty samples (80% CI) |
 
 **One-run overrides** — the **Run workflow** dialog on `kalshi_monitor.yml`

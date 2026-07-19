@@ -74,9 +74,6 @@ CREDENTIALS / SETTINGS (env vars)
     PREOPEN_FORECAST_LEAD_S
                           seconds before the next window opens to pre-compute
                           its settlement forecast (default 120)
-    PRE_ENTRY_SETTLEMENT_WAIT_S
-                          maximum seconds to resolve a just-closed BTC market
-                          before sizing the next entry (default 2)
     OPEN_TRADE_GRACE_S    max seconds after a window opens to submit its entry
                           (default 15; only enter a newly-live market)
     UNCERTAINTY_SAMPLES   Prophet uncertainty samples (default 1000)
@@ -168,8 +165,6 @@ RUNTIME_LIMIT_MIN = float(os.getenv("RUNTIME_LIMIT_MIN", "345"))
 REPORT_INTERVAL_S = float(os.getenv("REPORT_INTERVAL_S", "30"))    # report cadence
 POLL_INTERVAL_S   = float(os.getenv("POLL_INTERVAL_S", "5"))       # window-watch cadence
 SETTLE_CHECK_S    = float(os.getenv("SETTLE_CHECK_S", "2"))        # settlement poll cadence
-PRE_ENTRY_SETTLEMENT_WAIT_S = float(os.getenv("PRE_ENTRY_SETTLEMENT_WAIT_S", "2"))
-PRE_ENTRY_SETTLEMENT_POLL_S = float(os.getenv("PRE_ENTRY_SETTLEMENT_POLL_S", "0.25"))
 STRIKE_RETRIES    = int(float(os.getenv("STRIKE_RETRIES", "8")))   # strike-resolution retries
 KALSHI_WS_VERBOSE = os.getenv("KALSHI_WS_VERBOSE", "false").lower() in ("1", "true", "yes")
 
@@ -1298,6 +1293,24 @@ async def portfolio_reporter(rest: KalshiREST) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 # Settlement checker  (resolve pending trades → win/loss + P&L)
 # ─────────────────────────────────────────────────────────────────────────────
+def latest_closed_pending_btc() -> Optional[dict]:
+    """Return the immediately prior BTC trade if its market has just closed."""
+    now = datetime.now(tz=timezone.utc)
+    for rec in reversed(tracker.trades):
+        if rec.get("trade_kind", "BTC_PRIMARY") != "BTC_PRIMARY":
+            continue
+        if rec.get("result") != "pending":
+            return None
+        try:
+            settle = datetime.fromisoformat(rec["settle_et"])
+        except Exception:  # noqa: BLE001
+            return None
+        if settle.tzinfo is None:
+            settle = settle.replace(tzinfo=ET)
+        return rec if settle.astimezone(timezone.utc) <= now else None
+    return None
+
+
 async def _settle_record_if_ready(rest: KalshiREST, rec: dict) -> bool:
     """Settle one closed record if Kalshi has published its result yet."""
     if rec.get("result") != "pending":
@@ -1346,50 +1359,9 @@ async def _settle_record_if_ready(rest: KalshiREST, rec: dict) -> bool:
     tracker.settle(rec, outcome, pnl)
     log.info("SETTLED %s  result=%s  our side=%s → %s  P&L $%+.4f",
              rec["ticker"], result.upper(), rec["side"], outcome, pnl)
+    if rec.get("trade_kind", "BTC_PRIMARY") == "BTC_PRIMARY":
+        await _reconcile_entries_waiting_on_btc_result(rest, rec)
     return True
-
-
-async def resolve_closed_btc_before_entry(rest: KalshiREST,
-                                           max_wait_s: Optional[float] = None,
-                                           poll_s: Optional[float] = None) -> bool:
-    """Resolve overdue BTC results before sizing, never defaulting their entry.
-
-    Kalshi can publish a 15-minute result fractions of a second after the next
-    market opens. Wait only the small configured bound. If the result remains
-    unavailable, the caller skips the window instead of placing the BTC base
-    size while a loss might require the 10+10 hedge pair.
-    """
-    wait_s = PRE_ENTRY_SETTLEMENT_WAIT_S if max_wait_s is None else max_wait_s
-    retry_s = PRE_ENTRY_SETTLEMENT_POLL_S if poll_s is None else poll_s
-    deadline = time.monotonic() + max(0.0, wait_s)
-    while True:
-        now = datetime.now(tz=timezone.utc)
-        overdue = []
-        for rec in tracker.find_pending():
-            if rec.get("trade_kind", "BTC_PRIMARY") != "BTC_PRIMARY":
-                continue
-            try:
-                settle = datetime.fromisoformat(rec["settle_et"])
-            except Exception:  # noqa: BLE001
-                continue
-            if settle.tzinfo is None:
-                settle = settle.replace(tzinfo=ET)
-            if settle.astimezone(timezone.utc) <= now:
-                overdue.append(rec)
-        if not overdue:
-            return True
-
-        for rec in overdue:
-            await _settle_record_if_ready(rest, rec)
-        if not any(rec.get("result") == "pending" for rec in overdue):
-            return True
-        if time.monotonic() >= deadline:
-            log.warning("Prior BTC result still unavailable after %.2fs: %s. "
-                        "Skip this opening rather than use BTC base sizing.",
-                        wait_s, ", ".join(rec["ticker"] for rec in overdue
-                                            if rec.get("result") == "pending"))
-            return False
-        await asyncio.sleep(min(max(0.01, retry_s), max(0.01, deadline - time.monotonic())))
 
 
 async def settlement_checker(rest: KalshiREST) -> None:
@@ -1567,6 +1539,148 @@ async def eth_hedge_monitor(rest: KalshiREST) -> None:
                             rec.get("ticker"), exc)
 
 
+def _build_eth_hedge(rec: dict) -> dict:
+    """Build the opposite ETH limit that keeps the full paired cost <= $0.90."""
+    entry_price = _f(rec.get("entry_price"), 0.0)
+    count = _f(rec.get("count"), ARBITRAGE_SHARES)
+    target_price = eth_hedge_target_price(entry_price)
+    if target_price is None:
+        log.info("ETH hedge skipped: BTC %s entry=$%.2f leaves no ETH price >= $0.01 "
+                 "while keeping paired cost <= $%.2f.",
+                 rec["side"], entry_price, ARBITRAGE_MAX_PAIR_COST)
+        return {
+            "status": "skipped",
+            "reason": "btc_entry_too_high_for_pair_cost_cap",
+            "btc_entry_price": round(entry_price, 4),
+            "max_pair_cost": ARBITRAGE_MAX_PAIR_COST,
+        }
+
+    try:
+        settle = datetime.fromisoformat(rec["settle_et"])
+        if settle.tzinfo is None:
+            settle = settle.replace(tzinfo=ET)
+        eth_ticker = build_ticker(ETH_SERIES_TICKER, settle)
+    except Exception:  # noqa: BLE001
+        eth_ticker = rec["ticker"].replace(SERIES_TICKER, ETH_SERIES_TICKER, 1)
+    eth_side, _, eth_api_price = eth_hedge_order(rec["side"], target_price)
+    hedge = {
+        "status": "pending_submission",
+        "ticker": eth_ticker,
+        "side": eth_side.upper(),
+        "target_entry_price": round(target_price, 2),
+        "api_price": eth_api_price,
+        "count": count,
+        "btc_side": rec["side"],
+        "btc_entry_price": round(entry_price, 4),
+        "discount_usd": ARBITRAGE_DISCOUNT_USD,
+        "max_pair_cost": ARBITRAGE_MAX_PAIR_COST,
+    }
+    log.info("ETH HEDGE READY : BTC %s entry=$%.2f → submit %s %s limit <= $%.2f "
+             "(api price %s), count %.2f; paired max cost $%.2f.",
+             rec["side"], entry_price, eth_ticker, eth_side.upper(), target_price,
+             eth_api_price, count, ARBITRAGE_MAX_PAIR_COST)
+    return hedge
+
+
+async def _reconcile_deferred_entry(rest: KalshiREST, rec: dict) -> None:
+    """Top up an immediate base entry once its preceding BTC loss is published."""
+    deferred = rec.get("deferred_hedge")
+    if not isinstance(deferred, dict) or deferred.get("status") != "awaiting_btc_result":
+        return
+    prior_ticker = deferred.get("prior_btc_ticker")
+    prior = next((t for t in tracker.trades if t.get("ticker") == prior_ticker), None)
+    if not prior or prior.get("result") == "pending":
+        return
+    if prior.get("result") != "LOSS":
+        deferred["status"] = "not_needed"
+        deferred["prior_result"] = prior.get("result")
+        tracker.save()
+        return
+
+    # Reproduce next_eth_hedge_state() for the known prior loss without being
+    # obscured by this newer, still-pending base entry.
+    prior_hedge = prior.get("eth_hedge")
+    prior_fills = (_f(prior_hedge.get("recorded_fill_count"), 0.0)
+                   if isinstance(prior_hedge, dict) else 0.0)
+    multiplier = 1.0
+    if bool(prior.get("arbitrage_active")) and prior_fills < 0.005:
+        multiplier = max(1.0, _f(prior.get("bet_multiplier"), 1.0)) * LOSS_MULTIPLIER
+    desired_count = bet_count(ARBITRAGE_SHARES * multiplier)
+    base_count = _f(rec.get("count"), BET_AMOUNT_SHARES)
+    top_up_count = bet_count(desired_count - base_count) if desired_count > base_count else 0.0
+    deferred["prior_result"] = "LOSS"
+    deferred["desired_count"] = desired_count
+    deferred["multiplier"] = multiplier
+    if top_up_count <= 0.0:
+        deferred["status"] = "already_sized"
+        tracker.save()
+        return
+
+    deferred["status"] = "reconciling"
+    tracker.save()
+    market = await rest.get_market(rec["ticker"])
+    if market is None or not is_market_live(market):
+        deferred["status"] = "top_up_unavailable"
+        tracker.save()
+        log.error("Deferred BTC loss for %s arrived after %s was no longer active; "
+                  "the original %.2f-share entry remains open.",
+                  prior_ticker, rec["ticker"], base_count)
+        return
+
+    side = str(rec["side"]).lower()
+    book_side = BookSide.BID if side == "yes" else BookSide.ASK
+    price = YES_BUY_PRICE if side == "yes" else NO_BUY_PRICE
+    log.info("BTC LOSS RECONCILE : %s lost → top up %s %s by %.2f shares "
+             "(%.2f → %.2f) and place matched ETH limit.",
+             prior_ticker, rec["ticker"], side.upper(), top_up_count,
+             base_count, desired_count)
+    resp, filled = await _submit(
+        rest, ticker=rec["ticker"], side=book_side, price=price, count=top_up_count,
+        reduce_only=False, tag=f"BTC LOSS TOP-UP {side.upper()}")
+    if not filled:
+        deferred["status"] = "top_up_unfilled"
+        tracker.save()
+        return
+
+    added_count = top_up_count if DRY_RUN else _f(getattr(resp, "fill_count"), 0.0)
+    if added_count < 0.005:
+        deferred["status"] = "top_up_unfilled"
+        tracker.save()
+        return
+    avg_yes = _to_dollars(getattr(resp, "average_fill_price", None)) if resp else None
+    added_entry = (_f(rec.get("entry_price"), 0.5) if avg_yes is None
+                   else position_price_from_yes(side, avg_yes))
+    total_count = round(base_count + added_count, 2)
+    blended_entry = ((base_count * _f(rec.get("entry_price"), 0.5)
+                      + added_count * added_entry) / total_count)
+    rec["count"] = total_count
+    rec["bet_amount_shares"] = total_count
+    rec["entry_price"] = round(blended_entry, 4)
+    rec["loss_streak"] = max(1, int(_f(prior.get("loss_streak"), 0)) + 1)
+    rec["bet_multiplier"] = round(multiplier, 4)
+    rec["hedge_trigger_reason"] = "deferred_btc_loss_reconciled"
+    rec["arbitrage_active"] = True
+    rec["btc_top_up"] = {
+        "count": round(added_count, 2), "entry_price": round(added_entry, 4),
+        "order_id": getattr(resp, "order_id", None) if resp is not None else None,
+        "at": datetime.now(tz=timezone.utc).isoformat(),
+    }
+    deferred["status"] = "reconciled" if total_count >= desired_count - 0.005 else "partially_reconciled"
+    rec["eth_hedge"] = _build_eth_hedge(rec)
+    tracker.save()
+    if rec["eth_hedge"].get("status") == "pending_submission":
+        await _submit_eth_hedge_limit(rest, rec)
+
+
+async def _reconcile_entries_waiting_on_btc_result(rest: KalshiREST, settled_btc: dict) -> None:
+    """Reconcile each immediate entry that was waiting on this BTC result."""
+    for rec in list(tracker.find_pending()):
+        deferred = rec.get("deferred_hedge")
+        if (isinstance(deferred, dict)
+                and deferred.get("prior_btc_ticker") == settled_btc.get("ticker")):
+            await _reconcile_deferred_entry(rest, rec)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Trade execution for a single 15-minute window
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1612,13 +1726,6 @@ async def execute_window_trade(rest: KalshiREST, ct: str, nt: str) -> None:
         handled_windows.add(ct)
         return
 
-    # A just-closed BTC market can publish its result fractions of a second
-    # after the next market opens. Resolve it before choosing 2-share base vs.
-    # the loss-triggered 10+10 pair; skip rather than use a wrong base size.
-    if not await resolve_closed_btc_before_entry(rest):
-        handled_windows.add(ct)
-        return
-
     forecast = forecast_rec["forecast"]
     p50 = forecast["p50"]
     btc_close = float(forecast_rec["btc_close"])
@@ -1653,6 +1760,7 @@ async def execute_window_trade(rest: KalshiREST, ct: str, nt: str) -> None:
     # The normal BTC-only path is always BET_AMOUNT_SHARES. Settlement runs in
     # the background and this snapshot never waits for it; only results already
     # booked before the open can affect this immediate order's hedge sizing.
+    deferred_prior = latest_closed_pending_btc()
     loss_streak = tracker.current_loss_streak()
     hedge_state = tracker.next_eth_hedge_state()
     hedge_active = bool(hedge_state["active"])
@@ -1664,6 +1772,10 @@ async def execute_window_trade(rest: KalshiREST, ct: str, nt: str) -> None:
                  "= %.2f per leg / %.2f paired shares (%s).",
                  hedge_state.get("previous_ticker"), ARBITRAGE_SHARES,
                  multiplier, count, count * 2, hedge_state["reason"])
+    elif deferred_prior is not None:
+        log.info("Prior BTC %s is closed but unresolved: submit the live %.2f-share "
+                 "base now; reconcile this same record to the loss pair if needed.",
+                 deferred_prior["ticker"], count)
     est_cost = count * entry_price
 
     settle_et = market.get("settle_et")
@@ -1730,39 +1842,14 @@ async def execute_window_trade(rest: KalshiREST, ct: str, nt: str) -> None:
     if avg_yes is not None and 0.01 <= avg_yes <= 0.99:
         entry_price = avg_yes if side == "yes" else round(1.0 - avg_yes, 4)
 
-    eth_hedge = None
-    if hedge_active:
-        eth_ticker = build_ticker(ETH_SERIES_TICKER, settle_et) if settle_et else (
-            ct.replace(SERIES_TICKER, ETH_SERIES_TICKER, 1))
-        target_price = eth_hedge_target_price(entry_price)
-        if target_price is None:
-            eth_hedge = {
-                "status": "skipped",
-                "reason": "btc_entry_too_high_for_pair_cost_cap",
-                "btc_entry_price": round(entry_price, 4),
-                "max_pair_cost": ARBITRAGE_MAX_PAIR_COST,
-            }
-            log.info("ETH hedge skipped: BTC %s entry=$%.2f leaves no ETH "
-                     "price >= $0.01 while keeping paired cost <= $%.2f.",
-                     side.upper(), entry_price, ARBITRAGE_MAX_PAIR_COST)
-        else:
-            eth_side, _, eth_api_price = eth_hedge_order(side, target_price)
-            eth_hedge = {
-                "status": "pending_submission",
-                "ticker": eth_ticker,
-                "side": eth_side.upper(),
-                "target_entry_price": round(target_price, 2),
-                "api_price": eth_api_price,
-                "count": count,
-                "btc_side": side.upper(),
-                "btc_entry_price": round(entry_price, 4),
-                "discount_usd": ARBITRAGE_DISCOUNT_USD,
-                "max_pair_cost": ARBITRAGE_MAX_PAIR_COST,
-            }
-            log.info("ETH HEDGE READY : BTC %s entry=$%.2f → submit %s %s "
-                     "limit <= $%.2f (api price %s), count %.2f; paired max cost $%.2f.",
-                     side.upper(), entry_price, eth_ticker, eth_side.upper(),
-                     target_price, eth_api_price, count, ARBITRAGE_MAX_PAIR_COST)
+    deferred_hedge = None
+    if not hedge_active and deferred_prior is not None:
+        deferred_hedge = {
+            "status": "awaiting_btc_result",
+            "prior_btc_ticker": deferred_prior["ticker"],
+            "base_count": count,
+            "created_at": datetime.now(tz=timezone.utc).isoformat(),
+        }
 
     rec = {
         "ticker": ct,
@@ -1787,16 +1874,21 @@ async def execute_window_trade(rest: KalshiREST, ct: str, nt: str) -> None:
         "hedge_trigger_reason": hedge_state["reason"],
         "trade_kind": "BTC_PRIMARY",
         "arbitrage_active": hedge_active,
-        "eth_hedge": eth_hedge,
+        "eth_hedge": None,
+        "deferred_hedge": deferred_hedge,
         "order_submitted": "success" if filled else "failure",
         "exit_method": "pending",
         "dry_run": DRY_RUN,
         "result": "pending",
         "profit_loss": 0.0,
     }
+    if hedge_active:
+        rec["eth_hedge"] = _build_eth_hedge(rec)
     tracker.record_open(rec)
-    if isinstance(eth_hedge, dict) and eth_hedge.get("status") == "pending_submission":
+    if isinstance(rec["eth_hedge"], dict) and rec["eth_hedge"].get("status") == "pending_submission":
         await _submit_eth_hedge_limit(rest, rec)
+    if isinstance(deferred_hedge, dict):
+        await _reconcile_deferred_entry(rest, rec)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
