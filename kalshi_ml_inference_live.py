@@ -54,6 +54,7 @@ MODEL_TYPE = os.getenv("ML_MODEL_TYPE", "hist_gradient_boosting")
 MAX_ENTRY_PRICE = float(os.getenv("ML_MAX_ENTRY_PRICE", "0.50"))
 MIN_EDGE = float(os.getenv("ML_MIN_EDGE", "0.03"))
 PREOPEN_LEAD_S = float(os.getenv("ML_PREOPEN_LEAD_S", "120"))
+LEDGER_FORMAT_VERSION = 1
 
 
 def configure_logging() -> None:
@@ -173,18 +174,110 @@ def order_fields(side: str, position_price: float) -> tuple[Any, str]:
 
 
 def load_state(path: Path) -> dict[str, Any]:
+    default = {
+        "format_version": LEDGER_FORMAT_VERSION,
+        "signals": {},
+        "submitted_tickers": {},
+    }
     if not path.exists():
-        return {"submitted_tickers": {}}
+        return default
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         LOG.warning("Cannot read %s; using a new ML inference state.", path)
-        return {"submitted_tickers": {}}
-    return payload if isinstance(payload, dict) else {"submitted_tickers": {}}
+        return default
+    if not isinstance(payload, dict):
+        return default
+    payload.setdefault("format_version", LEDGER_FORMAT_VERSION)
+    payload.setdefault("signals", {})
+    payload.setdefault("submitted_tickers", {})
+    return payload
 
 
 def save_state(path: Path, state: dict[str, Any]) -> None:
     path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def settled_outcome(raw_market: Any) -> str | None:
+    """Return Kalshi's final YES/NO result, if this market has settled."""
+    value = getattr(raw_market, "result", None)
+    text = str(getattr(value, "value", value) or "").strip().lower()
+    if text in {"yes", "no"}:
+        return text
+    return None
+
+
+async def reconcile_pending_signals(rest: kalshi.KalshiREST, state_path: Path) -> int:
+    """Settle prior submitted and skipped signals without creating an order.
+
+    A skip is evaluated as a counterfactual at its observed executable price:
+    it records whether that specific contract would have won or lost before
+    fees. This is observational evidence about the gate, not an estimate of
+    executable P&L or proof that every skipped trade should have been taken.
+    """
+    state = load_state(state_path)
+    signals = state.setdefault("signals", {})
+    changed = 0
+    for ticker, signal in signals.items():
+        if not isinstance(signal, dict) or signal.get("settled_at"):
+            continue
+        market = await rest.get_market(str(ticker))
+        if market is None:
+            continue
+        outcome = settled_outcome(market)
+        if outcome is None:
+            continue
+        side = str(signal.get("side") or "").lower()
+        price = signal.get("position_price")
+        count = signal.get("count")
+        signal["settled_at"] = datetime.now(tz=timezone.utc).isoformat()
+        signal["actual_outcome"] = outcome
+        if side in {"yes", "no"} and isinstance(price, (int, float)):
+            correct = side == outcome
+            gross_per_contract = (1.0 - float(price)) if correct else -float(price)
+            signal["counterfactual_correct"] = correct
+            signal["counterfactual_gross_per_contract"] = round(gross_per_contract, 6)
+            if isinstance(count, (int, float)):
+                signal["counterfactual_gross_total"] = round(gross_per_contract * float(count), 6)
+            if str(signal.get("decision") or "").startswith("skipped"):
+                signal["skip_observation"] = "avoided_realized_loss" if not correct else "foregone_realized_profit"
+        changed += 1
+        LOG.info(
+            "ML LEDGER SETTLED | ticker=%s decision=%s outcome=%s counterfactual_correct=%s",
+            ticker, signal.get("decision"), outcome, signal.get("counterfactual_correct"),
+        )
+    if changed:
+        save_state(state_path, state)
+    return changed
+
+
+def record_signal(
+    state: dict[str, Any],
+    *,
+    ticker: str,
+    side: str,
+    probability_yes: float,
+    confidence: float,
+    price: float | None,
+    max_allowed: float | None,
+    count: float,
+    decision: str,
+    reason: str,
+) -> None:
+    """Persist both submitted and skipped decisions for later settlement scoring."""
+    signals = state.setdefault("signals", {})
+    signals[ticker] = {
+        "recorded_at": datetime.now(tz=timezone.utc).isoformat(),
+        "side": side,
+        "probability_yes": round(probability_yes, 6),
+        "confidence": round(confidence, 6),
+        "position_price": round(price, 4) if price is not None else None,
+        "max_allowed_price": round(max_allowed, 4) if max_allowed is not None else None,
+        "count": count,
+        "decision": decision,
+        "reason": reason,
+        "dry_run": kalshi.DRY_RUN,
+    }
 
 
 async def wait_for_preopen() -> tuple[str, str]:
@@ -271,33 +364,70 @@ async def score_and_maybe_submit(
     side = "yes" if probability_yes >= 0.5 else "no"
     confidence = probability_yes if side == "yes" else 1.0 - probability_yes
     price = executable_position_price(market["raw_market"], side)
+    count = kalshi.bet_count()
 
     LOG.info(
         "ML SIGNAL | ticker=%s side=%s p_yes=%.4f confidence=%.4f train_rows=%d strike=%.2f",
         target_ticker, side.upper(), probability_yes, confidence, len(cached["rows"]), float(market["target"]),
     )
     if confidence < MIN_CONFIDENCE:
+        state = load_state(state_path)
+        record_signal(
+            state, ticker=target_ticker, side=side, probability_yes=probability_yes,
+            confidence=confidence, price=price, max_allowed=None, count=count,
+            decision="skipped_confidence", reason="score_below_minimum",
+        )
+        save_state(state_path, state)
         LOG.info("Confidence %.4f < %.4f — SKIP.", confidence, MIN_CONFIDENCE)
         return
     if price is None:
+        state = load_state(state_path)
+        record_signal(
+            state, ticker=target_ticker, side=side, probability_yes=probability_yes,
+            confidence=confidence, price=None, max_allowed=None, count=count,
+            decision="skipped_price_unavailable", reason="no_executable_position_price",
+        )
+        save_state(state_path, state)
         LOG.warning("No executable %s ask price for %s — SKIP.", side.upper(), target_ticker)
         return
     max_allowed = min(MAX_ENTRY_PRICE, confidence - MIN_EDGE)
     if price > max_allowed:
+        state = load_state(state_path)
+        record_signal(
+            state, ticker=target_ticker, side=side, probability_yes=probability_yes,
+            confidence=confidence, price=price, max_allowed=max_allowed, count=count,
+            decision="skipped_price", reason="executable_price_exceeds_model_edge_gate",
+        )
+        save_state(state_path, state)
         LOG.info("Price $%.4f exceeds $%.4f confidence/price gate — SKIP.", price, max_allowed)
         return
 
     state = load_state(state_path)
     submitted = state.setdefault("submitted_tickers", {})
     if target_ticker in submitted:
+        signal = state.setdefault("signals", {}).setdefault(target_ticker, {})
+        signal.setdefault("duplicate_attempts", []).append({
+            "at": datetime.now(tz=timezone.utc).isoformat(),
+            "side": side,
+            "probability_yes": round(probability_yes, 6),
+            "confidence": round(confidence, 6),
+            "position_price": round(price, 4),
+            "reason": "ticker_already_submitted_in_ledger",
+        })
+        save_state(state_path, state)
         LOG.info("Already submitted ML inference for %s — SKIP duplicate.", target_ticker)
         return
     if not submit:
+        record_signal(
+            state, ticker=target_ticker, side=side, probability_yes=probability_yes,
+            confidence=confidence, price=price, max_allowed=max_allowed, count=count,
+            decision="qualified_inference_only", reason="submission_not_requested",
+        )
+        save_state(state_path, state)
         LOG.info("ML signal passed all gates; inference-only mode, no order submitted.")
         return
 
     book_side, order_price = order_fields(side, price)
-    count = kalshi.bet_count()
     response, filled = await kalshi._submit(
         rest,
         ticker=target_ticker,
@@ -318,6 +448,12 @@ async def score_and_maybe_submit(
         "dry_run": kalshi.DRY_RUN,
         "order_id": getattr(response, "order_id", None) if response is not None else None,
     }
+    record_signal(
+        state, ticker=target_ticker, side=side, probability_yes=probability_yes,
+        confidence=confidence, price=price, max_allowed=max_allowed, count=count,
+        decision="submitted" if response is not None else "submission_failed",
+        reason="order_submitted" if response is not None else "order_not_accepted",
+    )
     save_state(state_path, state)
     LOG.info("ML order %s for %s.", "filled" if filled else "not filled", target_ticker)
 
@@ -327,6 +463,11 @@ async def run(args: argparse.Namespace) -> None:
         raise SystemExit("Refusing a real order: add --allow-live with --submit.")
     rest = kalshi.KalshiREST()
     try:
+        reconciled = await reconcile_pending_signals(rest, args.state_file.expanduser())
+        if reconciled:
+            LOG.info("Reconciled %d prior ML ledger signal(s).", reconciled)
+        if args.reconcile_only:
+            return
         for _ in range(args.windows):
             _, target_ticker = await wait_for_preopen()
             model_path = args.model_path.expanduser() if args.model_path is not None else None
@@ -350,6 +491,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--state-file", type=Path, default=Path(DEFAULT_STATE_FILE))
     parser.add_argument("--windows", type=int, default=1)
+    parser.add_argument(
+        "--reconcile-only",
+        action="store_true",
+        help="Settle prior signal-ledger entries without evaluating or submitting a new market.",
+    )
     parser.add_argument("--submit", action="store_true", help="Submit a gated order; default is infer only.")
     parser.add_argument("--allow-live", action="store_true", help="Required with --submit when DRY_RUN=false.")
     args = parser.parse_args()
