@@ -452,3 +452,8 @@ It also prints running Prophet and walk-forward ML metrics to the Actions log
 every 100 predictions by default, including the current win/loss streak and
 the longest win/loss streak. Set the workflow's `metrics_every` input to
 change that cadence.
+
+The final summary also ranks directional win/loss rate by Eastern-Time hour,
+weekday, weekday-hour, and 15-minute market-open slot. It excludes groups with
+fewer than 100 observations by default; use `time_group_min_samples` to set a
+different threshold.

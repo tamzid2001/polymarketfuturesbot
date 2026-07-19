@@ -54,6 +54,13 @@ def test_metrics_and_feature_vector_are_stable() -> None:
     assert metrics["streaks"] == {
         "current": "WIN", "current_length": 1, "longest_win": 2, "longest_loss": 1,
     }
+    grouped = backtest.time_group_metrics([
+        {"market_open": "2026-01-05T14:00:00Z", "actual_yes": 1, "prophet_side": "yes"},
+        {"market_open": "2026-01-05T14:15:00Z", "actual_yes": 0, "prophet_side": "yes"},
+        {"market_open": "2026-01-05T15:00:00Z", "actual_yes": 0, "prophet_side": "no"},
+    ], "prophet_side", min_samples=1)
+    assert grouped["hour_et"]["best_win_rate"]["win_rate"] == 1.0
+    assert grouped["hour_et"]["lowest_win_rate"]["win_rate"] == 0.5
 
     end = pd.Timestamp("2026-01-01T12:00:00Z")
     window = pd.DataFrame({

@@ -34,6 +34,7 @@ from typing import Any, Iterable, Optional
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -54,6 +55,8 @@ MINUTE = pd.Timedelta(minutes=1)
 OUTCOME_YES = "yes"
 OUTCOME_NO = "no"
 OUTCOME_VALUES = {OUTCOME_YES: 1, OUTCOME_NO: 0}
+EASTERN = ZoneInfo("America/New_York")
+WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 
 FEATURE_COLUMNS = [
     "spot_vs_strike_bps",
@@ -674,6 +677,63 @@ def prophet_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
     return summary
 
 
+def time_group_metrics(rows: list[dict[str, Any]], side_key: str,
+                       min_samples: int) -> dict[str, Any]:
+    """Summarize directional win/loss rates by market-open time in Eastern Time."""
+    grouped: dict[str, dict[str, tuple[list[int], list[int]]]] = {
+        "hour_et": {},
+        "weekday_et": {},
+        "weekday_hour_et": {},
+        "quarter_hour_et": {},
+    }
+    for row in rows:
+        side = str(row.get(side_key) or "").lower()
+        opened_at = parse_timestamp(row.get("market_open"))
+        if side not in OUTCOME_VALUES or opened_at is None:
+            continue
+        actual = int(row["actual_yes"])
+        predicted = OUTCOME_VALUES[side]
+        local = opened_at.tz_convert(EASTERN)
+        labels = {
+            "hour_et": f"{local.hour:02d}:00 ET",
+            "weekday_et": WEEKDAYS[local.weekday()],
+            "weekday_hour_et": f"{WEEKDAYS[local.weekday()]} {local.hour:02d}:00 ET",
+            "quarter_hour_et": f":{local.minute:02d} ET",
+        }
+        for group_name, label in labels.items():
+            actuals, predicteds = grouped[group_name].setdefault(label, ([], []))
+            actuals.append(actual)
+            predicteds.append(predicted)
+
+    result: dict[str, Any] = {
+        "timezone": "America/New_York",
+        "minimum_samples": min_samples,
+    }
+    for group_name, buckets in grouped.items():
+        records: list[dict[str, Any]] = []
+        for label, (actuals, predicteds) in buckets.items():
+            metrics = binary_metrics(actuals, predicteds)
+            records.append({
+                "group": label,
+                "samples": metrics["predictions"],
+                "wins": metrics["correct"],
+                "losses": metrics["incorrect"],
+                "win_rate": metrics["accuracy"],
+                "loss_rate": 1.0 - metrics["accuracy"],
+            })
+        records.sort(key=lambda record: record["group"])
+        eligible = [record for record in records if record["samples"] >= min_samples]
+        best = max(eligible, key=lambda record: (record["win_rate"], record["samples"]), default=None)
+        worst = min(eligible, key=lambda record: (record["win_rate"], -record["samples"]), default=None)
+        result[group_name] = {
+            "groups": records,
+            "eligible_group_count": len(eligible),
+            "best_win_rate": best,
+            "lowest_win_rate": worst,
+        }
+    return result
+
+
 def summary_markdown(summary: dict[str, Any]) -> str:
     prophet = summary["prophet"]
     ml = summary["machine_learning"]
@@ -688,6 +748,22 @@ def summary_markdown(summary: dict[str, Any]) -> str:
         return (f"{block['correct']}/{block['predictions']} correct "
                 f"({pct(block['accuracy'])}); actual YES {pct(block['actual_yes_rate'])}, "
                 f"predicted YES {pct(block['predicted_yes_rate'])}.")
+
+    def time_window_lines(name: str, block: dict[str, Any]) -> list[str]:
+        groups = block.get("time_groups", {})
+        hour = groups.get("hour_et", {})
+        weekday_hour = groups.get("weekday_hour_et", {})
+        lines: list[str] = []
+        for label, group in (("hour", hour), ("weekday-hour", weekday_hour)):
+            best = group.get("best_win_rate")
+            worst = group.get("lowest_win_rate")
+            if best and worst:
+                lines.append(
+                    f"- {name} {label} (ET, n>={groups.get('minimum_samples', 'n/a')}): "
+                    f"best {best['group']} {pct(best['win_rate'])} ({best['wins']}W/{best['losses']}L); "
+                    f"worst {worst['group']} {pct(worst['win_rate'])} "
+                    f"({worst['wins']}W/{worst['losses']}L).")
+        return lines
 
     lines = [
         "# KXBTC15M Historical Backtest",
@@ -720,6 +796,11 @@ def summary_markdown(summary: dict[str, Any]) -> str:
         f"{ml.get('streaks', {}).get('longest_loss', 'n/a')}",
         f"- Training policy: {ml['lookahead_guard']}",
         "",
+        "## Time Windows (Directional Accuracy)",
+        "",
+        *time_window_lines("Prophet", prophet),
+        *time_window_lines("ML", ml),
+        "",
         "## Important Limits",
         "",
         "- This is a directional-outcome backtest, not a P&L backtest. It does not invent fills, spread, slippage, or exchange fees.",
@@ -745,6 +826,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--retrain-every", type=int, default=16)
     parser.add_argument("--metrics-every", type=int, default=100,
                         help="Print running Prophet and ML metrics after this many predictions.")
+    parser.add_argument("--time-group-min-samples", type=int, default=100,
+                        help="Minimum observations required before ranking a time group.")
     parser.add_argument("--request-pause-seconds", type=float, default=0.08)
     parser.add_argument("--markets-only", action="store_true",
                         help="Only export the complete closed-market ledger; do not fetch candles or fit models.")
@@ -758,6 +841,7 @@ def main() -> int:
     if args.market_limit < 0 or args.history_minutes < 61 or args.forecast_minutes < 1:
         raise SystemExit("market-limit must be >= 0, history-minutes >= 61, and forecast-minutes >= 1")
     if (args.min_train_rows < 1 or args.retrain_every < 1 or args.metrics_every < 1
+            or args.time_group_min_samples < 1
             or args.request_pause_seconds < 0):
         raise SystemExit("min-train-rows/retrain-every/metrics-every must be positive and request pause cannot be negative")
 
@@ -819,6 +903,10 @@ def main() -> int:
     ml_summary = add_walk_forward_ml(
         rows, args.min_train_rows, args.retrain_every, args.metrics_every)
     prophet_metrics = prophet_summary(rows)
+    prophet_metrics["time_groups"] = time_group_metrics(
+        rows, "prophet_side", args.time_group_min_samples)
+    ml_summary["time_groups"] = time_group_metrics(
+        rows, "ml_side", args.time_group_min_samples)
     base_summary["coverage"].update({
         "prophet_rows": len(rows),
         "skipped_windows": len(skipped),
