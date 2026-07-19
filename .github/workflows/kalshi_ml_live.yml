@@ -1,0 +1,123 @@
+name: Kalshi ML Inference — One Window
+
+# A deliberately bounded live workflow for the standalone ML strategy. It is
+# manual-only and defaults to inference. Real orders require an explicit true
+# live_trading input, and each invocation covers only the requested number of
+# upcoming 15-minute markets (default one).
+on:
+  workflow_dispatch:
+    inputs:
+      live_trading:
+        description: "Submit real orders. false = inference only."
+        required: true
+        type: boolean
+        default: false
+      bet_amount_shares:
+        description: "Fractional Kalshi contracts per qualifying order. Default 0.01."
+        required: true
+        type: string
+        default: "0.01"
+      windows:
+        description: "Upcoming KXBTC15M windows to evaluate; default one."
+        required: true
+        type: string
+        default: "1"
+      model_run_id:
+        description: "Successful Kalshi ML model-training run that produced the stored model."
+        required: true
+        type: string
+        default: "29706847167"
+      training_run_id:
+        description: "Historical backtest run containing prophet_ml_backtest_rows.csv."
+        required: true
+        type: string
+        default: "29698207476"
+
+concurrency:
+  group: kalshi-ml-live-singleton
+  cancel-in-progress: false
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  ml-inference:
+    runs-on: ubuntu-latest
+    environment: "Kalshi"
+    timeout-minutes: 30
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+
+      - name: Setup Python 3.13
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements_kalshi.txt
+
+      - name: Verify ML Runner
+        run: python -m py_compile kalshi_ml_inference_live.py
+
+      - name: Download Stored Gradient Model
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MODEL_RUN_ID: ${{ inputs.model_run_id }}
+        run: |
+          gh run download "$MODEL_RUN_ID" -R "${{ github.repository }}" \
+            -n "kalshi-kxbtc15m-ml-model-$MODEL_RUN_ID" -D stored_model
+          test -s stored_model/kxbtc15m_ml_model.joblib
+
+      - name: Download Historical Feature Ledger
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TRAINING_RUN_ID: ${{ inputs.training_run_id }}
+        run: |
+          gh run download "$TRAINING_RUN_ID" -R "${{ github.repository }}" \
+            -n "kalshi-btc15m-backtest-$TRAINING_RUN_ID" -D training_data
+          test -s training_data/prophet_ml_backtest_rows.csv
+
+      - name: Write Kalshi RSA Private Key
+        env:
+          KALSHI_PRIVATE_KEY: ${{ secrets.KALSHI_PRIVATE_KEY }}
+        run: |
+          printf '%s\n' "$KALSHI_PRIVATE_KEY" > kalshi_private_key.pem
+          chmod 600 kalshi_private_key.pem
+          head -1 kalshi_private_key.pem
+
+      - name: Run Bounded ML Inference
+        env:
+          KALSHI_API_KEY_ID: ${{ secrets.KALSHI_PROD_API_KEY }}
+          KALSHI_PEM_PATH: kalshi_private_key.pem
+          KALSHI_DEMO: "false"
+          DRY_RUN: ${{ inputs.live_trading == true && 'false' || 'true' }}
+          BET_AMOUNT_SHARES: ${{ inputs.bet_amount_shares }}
+          ML_MIN_CONFIDENCE: "0.52"
+          ML_MAX_ENTRY_PRICE: "0.50"
+          ML_MIN_EDGE: "0.03"
+        run: |
+          if [ "${{ inputs.live_trading }}" = "true" ]; then
+            python kalshi_ml_inference_live.py \
+              --training-csv training_data/prophet_ml_backtest_rows.csv \
+              --model-path stored_model/kxbtc15m_ml_model.joblib \
+              --windows "${{ inputs.windows }}" \
+              --submit --allow-live
+          else
+            python kalshi_ml_inference_live.py \
+              --training-csv training_data/prophet_ml_backtest_rows.csv \
+              --model-path stored_model/kxbtc15m_ml_model.joblib \
+              --windows "${{ inputs.windows }}"
+          fi
+
+      - name: Upload ML Inference State
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kalshi-ml-inference-state-${{ github.run_id }}
+          path: ml_inference_live_state.json
+          if-no-files-found: ignore
+          retention-days: 90

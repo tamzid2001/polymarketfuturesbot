@@ -33,6 +33,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import joblib
+from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
@@ -46,7 +47,10 @@ DEFAULT_TRAINING_CSV = os.getenv("ML_TRAINING_CSV", "prophet_ml_backtest_rows.cs
 DEFAULT_MODEL_PATH = os.getenv("ML_MODEL_PATH", "")
 DEFAULT_STATE_FILE = os.getenv("ML_INFERENCE_STATE_FILE", "ml_inference_live_state.json")
 MIN_TRAIN_ROWS = int(os.getenv("ML_MIN_TRAIN_ROWS", "1000"))
-MIN_CONFIDENCE = float(os.getenv("ML_MIN_CONFIDENCE", "0.55"))
+# This is a score gate selected by the robust historical test. It is not a
+# substitute for the executable-price gate below, which remains mandatory.
+MIN_CONFIDENCE = float(os.getenv("ML_MIN_CONFIDENCE", "0.52"))
+MODEL_TYPE = os.getenv("ML_MODEL_TYPE", "hist_gradient_boosting")
 MAX_ENTRY_PRICE = float(os.getenv("ML_MAX_ENTRY_PRICE", "0.50"))
 MIN_EDGE = float(os.getenv("ML_MIN_EDGE", "0.03"))
 PREOPEN_LEAD_S = float(os.getenv("ML_PREOPEN_LEAD_S", "120"))
@@ -96,10 +100,24 @@ def load_training_rows(path: Path, as_of: pd.Timestamp) -> pd.DataFrame:
 
 
 def train_model(rows: pd.DataFrame):
-    model = make_pipeline(
-        StandardScaler(),
-        LogisticRegression(C=0.25, max_iter=1000, class_weight="balanced", random_state=0),
-    )
+    if MODEL_TYPE == "hist_gradient_boosting":
+        model = HistGradientBoostingClassifier(
+            max_iter=150,
+            learning_rate=0.05,
+            max_leaf_nodes=8,
+            min_samples_leaf=100,
+            l2_regularization=10.0,
+            random_state=0,
+        )
+    elif MODEL_TYPE == "logistic_regression":
+        model = make_pipeline(
+            StandardScaler(),
+            LogisticRegression(C=0.25, max_iter=1000, class_weight="balanced", random_state=0),
+        )
+    else:
+        raise ValueError(
+            "ML_MODEL_TYPE must be 'hist_gradient_boosting' or 'logistic_regression'"
+        )
     model.fit(rows[FEATURE_COLUMNS].to_numpy(dtype=float), rows["actual_yes"].to_numpy(dtype=int))
     return model
 

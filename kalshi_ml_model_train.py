@@ -16,6 +16,7 @@ from typing import Any
 
 import joblib
 import pandas as pd
+from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
@@ -24,6 +25,7 @@ from kalshi_btc15m_backtest import FEATURE_COLUMNS
 
 
 MODEL_FORMAT_VERSION = 1
+MODEL_TYPES = ("hist_gradient_boosting", "logistic_regression")
 
 
 def read_training_rows(path: Path, as_of: pd.Timestamp | None) -> pd.DataFrame:
@@ -60,11 +62,23 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def train(rows: pd.DataFrame) -> Any:
-    model = make_pipeline(
-        StandardScaler(),
-        LogisticRegression(C=0.25, max_iter=2_000, class_weight="balanced", random_state=0),
-    )
+def train(rows: pd.DataFrame, model_type: str) -> Any:
+    if model_type == "hist_gradient_boosting":
+        model = HistGradientBoostingClassifier(
+            max_iter=150,
+            learning_rate=0.05,
+            max_leaf_nodes=8,
+            min_samples_leaf=100,
+            l2_regularization=10.0,
+            random_state=0,
+        )
+    elif model_type == "logistic_regression":
+        model = make_pipeline(
+            StandardScaler(),
+            LogisticRegression(C=0.25, max_iter=2_000, class_weight="balanced", random_state=0),
+        )
+    else:
+        raise ValueError(f"Unsupported model type: {model_type}")
     model.fit(rows[FEATURE_COLUMNS].to_numpy(dtype=float), rows["actual_yes"].to_numpy(dtype=int))
     return model
 
@@ -74,13 +88,14 @@ def serialize(
     rows: pd.DataFrame,
     model_path: Path,
     metadata_path: Path,
+    model_type: str,
 ) -> dict[str, Any]:
     model_path.parent.mkdir(parents=True, exist_ok=True)
     metadata_path.parent.mkdir(parents=True, exist_ok=True)
     trained_at = datetime.now(tz=timezone.utc).isoformat()
     metadata: dict[str, Any] = {
         "format_version": MODEL_FORMAT_VERSION,
-        "model_type": "standard_scaler_logistic_regression",
+        "model_type": model_type,
         "feature_columns": FEATURE_COLUMNS,
         "trained_at": trained_at,
         "training_rows": int(len(rows)),
@@ -92,7 +107,7 @@ def serialize(
     payload = {
         "format_version": MODEL_FORMAT_VERSION,
         "feature_columns": FEATURE_COLUMNS,
-        "model": train(rows),
+        "model": train(rows, model_type),
         "metadata": metadata,
     }
     joblib.dump(payload, model_path, compress=3)
@@ -111,6 +126,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-output", type=Path, required=True)
     parser.add_argument("--metadata-output", type=Path, required=True)
     parser.add_argument(
+        "--model-type",
+        choices=MODEL_TYPES,
+        default="hist_gradient_boosting",
+        help="Classifier to serialize; default is the robust-backtest winner.",
+    )
+    parser.add_argument(
         "--as-of",
         type=parse_as_of,
         help="Strict settlement cutoff in ISO-8601 UTC; omit to use every settled row in the input.",
@@ -121,7 +142,9 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     rows = read_training_rows(args.input, args.as_of)
-    metadata = serialize(args.input, rows, args.model_output, args.metadata_output)
+    metadata = serialize(
+        args.input, rows, args.model_output, args.metadata_output, args.model_type
+    )
     print(json.dumps(metadata, indent=2, sort_keys=True))
     return 0
 

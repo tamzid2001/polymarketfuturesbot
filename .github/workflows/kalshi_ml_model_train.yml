@@ -32,7 +32,7 @@ jobs:
 
       - name: Verify ML Programs Compile
         run: |
-          python -m py_compile kalshi_ml_inference_live.py kalshi_ml_model_train.py kalshi_ml_runner_backtest.py
+          python -m py_compile kalshi_ml_inference_live.py kalshi_ml_model_train.py kalshi_ml_runner_backtest.py kalshi_ml_robust_backtest.py
 
       - name: Download Historical Backtest Artifact
         env:
@@ -49,12 +49,20 @@ jobs:
             --output model_output/holdout_backtest.json \
             --minimum-coverage 0.05
 
+      - name: Run Robust Model and Gate Backtest
+        run: |
+          python kalshi_ml_robust_backtest.py \
+            --input model_input/prophet_ml_backtest_rows.csv \
+            --output model_output/robust_backtest.json \
+            --minimum-coverage 0.05
+
       - name: Train and Store ML Model
         run: |
           python kalshi_ml_model_train.py \
             --input model_input/prophet_ml_backtest_rows.csv \
             --model-output model_output/kxbtc15m_ml_model.joblib \
-            --metadata-output model_output/kxbtc15m_ml_model_metadata.json
+            --metadata-output model_output/kxbtc15m_ml_model_metadata.json \
+            --model-type hist_gradient_boosting
 
       - name: Upload Model and Validation Report
         uses: actions/upload-artifact@v4
