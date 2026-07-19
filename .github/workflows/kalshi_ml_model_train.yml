@@ -1,0 +1,63 @@
+name: Kalshi Train Stored ML Model
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: "Historical backtest run whose artifact contains prophet_ml_backtest_rows.csv."
+        required: true
+        default: "29698207476"
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  train-model:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+
+      - name: Setup Python 3.13
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements_kalshi.txt
+
+      - name: Verify ML Programs Compile
+        run: |
+          python -m py_compile kalshi_ml_inference_live.py kalshi_ml_model_train.py kalshi_ml_runner_backtest.py
+
+      - name: Download Historical Backtest Artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+        run: |
+          gh run download "$SOURCE_RUN_ID" -R "${{ github.repository }}" \
+            -n "kalshi-btc15m-backtest-$SOURCE_RUN_ID" -D model_input
+
+      - name: Run Chronological ML Holdout Backtest
+        run: |
+          python kalshi_ml_runner_backtest.py \
+            --input model_input/prophet_ml_backtest_rows.csv \
+            --output model_output/holdout_backtest.json
+
+      - name: Train and Store ML Model
+        run: |
+          python kalshi_ml_model_train.py \
+            --input model_input/prophet_ml_backtest_rows.csv \
+            --model-output model_output/kxbtc15m_ml_model.joblib \
+            --metadata-output model_output/kxbtc15m_ml_model_metadata.json
+
+      - name: Upload Model and Validation Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: kalshi-kxbtc15m-ml-model-${{ github.run_id }}
+          path: model_output/
+          retention-days: 90
