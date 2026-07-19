@@ -79,10 +79,11 @@ jobs:
             echo "LOSS_MULTIPLIER=${{ github.event.inputs.loss_multiplier || vars.LOSS_MULTIPLIER || '2' }}"
             echo "ETH_HEDGE_POLL_S=${{ vars.ETH_HEDGE_POLL_S || '5' }}"
             echo "HISTORY_MINUTES=${{ vars.HISTORY_MINUTES || '500' }}"
-            echo "FORECAST_MINUTES=${{ vars.FORECAST_MINUTES || '16' }}"
+            echo "FORECAST_MINUTES=${{ vars.FORECAST_MINUTES || '17' }}"
             echo "UNCERTAINTY_SAMPLES=${{ vars.UNCERTAINTY_SAMPLES || '1000' }}"
-            echo "PREOPEN_FORECAST_LEAD_S=${{ vars.PREOPEN_FORECAST_LEAD_S || '60' }}"
+            echo "PREOPEN_FORECAST_LEAD_S=${{ vars.PREOPEN_FORECAST_LEAD_S || '120' }}"
             echo "OPEN_TRADE_GRACE_S=${{ vars.OPEN_TRADE_GRACE_S || '15' }}"
+            echo "SETTLE_CHECK_S=${{ vars.SETTLE_CHECK_S || '2' }}"
             echo "RUNTIME_LIMIT_MIN=345"
           } >> "$GITHUB_ENV"
 

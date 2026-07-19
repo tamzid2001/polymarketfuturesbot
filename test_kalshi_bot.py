@@ -128,10 +128,13 @@ def check_tickers(bot):
             and bot.is_within_open_trade_grace(0.0)
             and bot.is_within_open_trade_grace(bot.OPEN_TRADE_GRACE_S)
             and not bot.is_within_open_trade_grace(bot.OPEN_TRADE_GRACE_S + 0.01)
+            and bot.PREOPEN_FORECAST_LEAD_S == 120
+            and bot.FORECAST_MINUTES == 17
         )
-        record("entry gate requires active market within opening grace",
+        record("entry gate requires active market + 2-min pre-open 17-step cache",
                PASS if opening_gate_ok else FAIL,
-               f"active + first {bot.OPEN_TRADE_GRACE_S:.0f}s only")
+               f"active + first {bot.OPEN_TRADE_GRACE_S:.0f}s; "
+               f"cache {bot.PREOPEN_FORECAST_LEAD_S:.0f}s / {bot.FORECAST_MINUTES} steps")
     except Exception as exc:  # noqa: BLE001
         record("ticker helpers", FAIL, str(exc))
 
@@ -478,6 +481,10 @@ def check_eth_hedge(bot):
             primary("KXBTC15M-QA-UNFILLED", "LOSS", arbitrage_active=True,
                     bet_multiplier=1.0, hedge_status="expired"),
         ])
+        partial_loss = next_state_for([
+            primary("KXBTC15M-QA-PARTIAL", "LOSS", arbitrage_active=True,
+                    bet_multiplier=1.0, hedge_status="partially_filled"),
+        ])
         filled_loss = next_state_for([
             primary("KXBTC15M-QA-FILLED", "LOSS", arbitrage_active=True,
                     bet_multiplier=bot.LOSS_MULTIPLIER, hedge_status="filled"),
@@ -495,18 +502,21 @@ def check_eth_hedge(bot):
             and abs(first_pair - 10.0) < 1e-9
             and unfilled_loss["active"]
             and abs(unfilled_loss["multiplier"] - bot.LOSS_MULTIPLIER) < 1e-9
+            and abs(partial_loss["multiplier"] - bot.LOSS_MULTIPLIER) < 1e-9
             and abs(multiplied_pair - 20.0) < 1e-9
             and filled_loss["active"]
             and filled_loss["multiplier"] == 1.0
             and not win_reset["active"]
             and win_reset["multiplier"] == 1.0
         )
-        record("hedge sizing: BTC loss → 10 BTC + 10 ETH; unfilled loss → 20 + 20",
+        record("hedge sizing: only BTC loss + unfilled ETH limit → 20 + 20",
                PASS if lifecycle_ok else FAIL,
                "first pair=%.2f+%.2f, escalated pair=%.2f+%.2f, filled hedge resets to base"
                % (first_pair, first_pair, multiplied_pair, multiplied_pair))
 
         with tempfile.TemporaryDirectory() as tmp:
+            from types import SimpleNamespace
+
             saved_tracker, saved_dry = bot.tracker, bot.DRY_RUN
             bot.tracker = bot.PerformanceTracker(
                 os.path.join(tmp, "h.json"), os.path.join(tmp, "t.json"))
@@ -514,7 +524,7 @@ def check_eth_hedge(bot):
             rec = {"ticker": "KXBTC15M-QA-HEDGE", "side": "YES", "entry_price": 0.60,
                    "count": 10.0, "trade_kind": "BTC_PRIMARY",
                    "eth_hedge": {
-                       "status": "watching", "ticker": "KXETH15M-QA-HEDGE",
+                       "status": "pending_submission", "ticker": "KXETH15M-QA-HEDGE",
                        "side": "NO", "target_entry_price": 0.30,
                        "api_price": "0.70", "count": 10.0,
                    },
@@ -522,21 +532,48 @@ def check_eth_hedge(bot):
                    "settle_et": "2099-01-01T00:00:00+00:00",
                    "timestamp": "qa", "btc_entry": 0.0, "p50_prediction": 0.0}
             bot.tracker.trades.append(rec)
-            bot.kalshi_quotes["KXETH15M-QA-HEDGE"] = {"last": 0.71}   # NO mark $0.29
-            asyncio.run(bot._monitor_eth_hedge(None, rec))
+            asyncio.run(bot._submit_eth_hedge_limit(None, rec))
             hedge_records = [t for t in bot.tracker.trades
                              if t.get("trade_kind") == "ETH_HEDGE"]
-            fired = (rec["eth_hedge"]["status"] == "filled"
-                     and len(hedge_records) == 1
-                     and hedge_records[0]["side"] == "NO"
-                     and abs(hedge_records[0]["entry_price"] - 0.30) < 1e-9)
+            submitted = (rec["eth_hedge"]["status"] == "filled"
+                         and rec["eth_hedge"]["time_in_force"] == "good_till_canceled"
+                         and len(hedge_records) == 1
+                         and hedge_records[0]["side"] == "NO"
+                         and abs(hedge_records[0]["entry_price"] - 0.30) < 1e-9)
+
+            bot.DRY_RUN = False
+            monitor_rec = {"ticker": "KXBTC15M-QA-HEDGE-MONITOR", "side": "YES",
+                           "entry_price": 0.60, "count": 10.0,
+                           "trade_kind": "BTC_PRIMARY",
+                           "eth_hedge": {
+                               "status": "open", "order_id": "qa-order",
+                               "ticker": "KXETH15M-QA-HEDGE-MONITOR", "side": "NO",
+                               "target_entry_price": 0.30, "api_price": "0.70",
+                               "count": 10.0, "recorded_fill_count": 0.0,
+                           },
+                           "exit_method": "pending", "result": "pending",
+                           "settle_et": "2099-01-01T00:00:00+00:00",
+                           "timestamp": "qa", "btc_entry": 0.0,
+                           "p50_prediction": 0.0}
+
+            class _FakeOrders:
+                async def get_order(self, order_id):
+                    assert order_id == "qa-order"
+                    return SimpleNamespace(order=SimpleNamespace(fill_count_fp="10.00"))
+
+            asyncio.run(bot._monitor_eth_hedge(SimpleNamespace(orders=_FakeOrders()), monitor_rec))
+            monitored = (monitor_rec["eth_hedge"]["status"] == "filled"
+                         and len([t for t in bot.tracker.trades
+                                  if t.get("linked_btc_ticker") == monitor_rec["ticker"]]) == 1)
             s = bot.tracker.stats()
             leg_ok = s["kinds"]["ETH_HEDGE"] == 0   # hedge is pending until settlement
-            del bot.kalshi_quotes["KXETH15M-QA-HEDGE"]
             bot.tracker, bot.DRY_RUN = saved_tracker, saved_dry
-        record("ETH hedge monitor fires when opposite mark <= target",
-               PASS if fired else FAIL,
+        record("ETH limit submits immediately after BTC fill (DRY-RUN)",
+               PASS if submitted else FAIL,
                f"hedge_status={rec['eth_hedge']['status']}")
+        record("ETH limit monitor records a later full fill",
+               PASS if monitored else FAIL,
+               f"hedge_status={monitor_rec['eth_hedge']['status']}")
         record("stats() keeps un-settled hedge out of settled leg counts",
                PASS if leg_ok else FAIL,
                f"kinds={s['kinds']}")
