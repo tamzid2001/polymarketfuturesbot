@@ -358,7 +358,7 @@ Environment **variables** (not secrets) tune behavior:
 | `HISTORY_MINUTES` | `500` | 1-minute candles fed to Prophet |
 | `FORECAST_MINUTES` | `16` | Fallback one-minute forecast horizon; the normal pre-open path dynamically forecasts from the newest candle to settlement |
 | `PREOPEN_FORECAST_LEAD_S` | `60` | Seconds before the next market opens to pre-compute its settlement forecast |
-| `OPEN_TRADE_GRACE_S` | `90` | Max seconds after a market opens to place the entry; prevents late mid-window entries |
+| `OPEN_TRADE_GRACE_S` | `15` | Max seconds after a market opens to place the entry. Every manual, scheduled, and handoff run skips an older market and waits for the next live opening. |
 | `UNCERTAINTY_SAMPLES` | `1000` | Prophet uncertainty samples (80% CI) |
 
 **One-run overrides** — the **Run workflow** dialog on `kalshi_monitor.yml`
@@ -391,6 +391,9 @@ Exit code is non-zero on any critical failure.
    the next run.
 4. The `kalshi-bot-singleton` concurrency group keeps at most one run active.
 5. If a run fails, the every-6-hours cron (`11 */6 * * *`) restarts the chain.
+   A restart may begin mid-window, but the bot only enters a market with Kalshi
+   status `active` during its first `OPEN_TRADE_GRACE_S` seconds; otherwise it
+   pre-forecasts and waits for the next opening.
 
 ## Running locally
 

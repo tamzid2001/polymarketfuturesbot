@@ -75,7 +75,7 @@ CREDENTIALS / SETTINGS (env vars)
                           seconds before the next window opens to pre-compute
                           its settlement forecast (default 60)
     OPEN_TRADE_GRACE_S    max seconds after a window opens to submit its entry
-                          (default 90; prevents late mid-window entries)
+                          (default 15; only enter a newly-live market)
     UNCERTAINTY_SAMPLES   Prophet uncertainty samples (default 1000)
     DATA_MAX_STALE_S      max age of newest candle before SKIP (default 600)
     YF_PERIOD             yfinance download period (default "2d")
@@ -158,7 +158,7 @@ UNCERTAINTY_SAMPLES = int(float(os.getenv("UNCERTAINTY_SAMPLES", "1000")))
 DATA_MAX_STALE_S    = float(os.getenv("DATA_MAX_STALE_S", "600"))   # newest candle age
 YF_PERIOD           = os.getenv("YF_PERIOD", "2d")
 PREOPEN_FORECAST_LEAD_S = float(os.getenv("PREOPEN_FORECAST_LEAD_S", "60"))
-OPEN_TRADE_GRACE_S      = float(os.getenv("OPEN_TRADE_GRACE_S", "90"))
+OPEN_TRADE_GRACE_S      = float(os.getenv("OPEN_TRADE_GRACE_S", "15"))
 
 RUNTIME_LIMIT_MIN = float(os.getenv("RUNTIME_LIMIT_MIN", "345"))
 REPORT_INTERVAL_S = float(os.getenv("REPORT_INTERVAL_S", "30"))    # report cadence
@@ -301,6 +301,12 @@ def seconds_since_ticker_open(ticker: str) -> Optional[float]:
         return None
     open_et = p["settle_et"] - timedelta(minutes=15)
     return (datetime.now(tz=ET) - open_et).total_seconds()
+
+
+def is_within_open_trade_grace(seconds_since_open: Optional[float]) -> bool:
+    """True only during the configured first seconds of a live window."""
+    return (seconds_since_open is not None
+            and 0.0 <= seconds_since_open <= OPEN_TRADE_GRACE_S)
 
 
 def log_next_ticker_prediction() -> str:
@@ -809,6 +815,11 @@ def _field(obj, *names):
     return None
 
 
+def is_market_live(market) -> bool:
+    """Kalshi only accepts new orders while a market status is ``active``."""
+    return str(_field(market, "status") or "").strip().lower() == "active"
+
+
 def _extract_target(market) -> Optional[float]:
     """Target/strike price = floor_strike (min value for YES); fall back to subtitle."""
     val = _field(market, "floor_strike", "cap_strike", "functional_strike")
@@ -841,6 +852,10 @@ async def resolve_active_market(rest: KalshiREST,
             parsed = parse_ticker(ct) or parsed
     if market is None:
         log.info("No open %s market found", series)
+        return None
+    if not is_market_live(market):
+        log.info("Market %s is not live yet (status=%s); waiting for active.",
+                 ct, _field(market, "status"))
         return None
     return {"ticker": ct, "next_ticker": nt,
             "market_type": parsed.get("market_type", "?"),
@@ -1494,12 +1509,19 @@ async def execute_window_trade(rest: KalshiREST, ct: str, nt: str) -> None:
             break
         await asyncio.sleep(2)
     if market is None or market.get("target") is None:
-        log.warning("No open market / strike for %s — SKIP window (no order).", ct)
-        handled_windows.add(ct)
+        log.warning("No live market / strike for %s yet — retrying while the "
+                    "new-market entry window remains open.", ct)
         return
 
     ct = market["ticker"]                       # authoritative ticker from Kalshi
     strike = float(market["target"])
+    seconds_since_open = seconds_since_ticker_open(ct)
+    if not is_within_open_trade_grace(seconds_since_open):
+        log.info("Market %s is %.1fs old after strike resolution; skip late "
+                 "entry and wait for the next opening.",
+                 ct, seconds_since_open if seconds_since_open is not None else -1)
+        handled_windows.add(ct)
+        return
     if tracker.already_traded(ct):
         log.info("Window %s already traded — skip (one order per window).", ct)
         handled_windows.add(ct)
@@ -1716,11 +1738,11 @@ async def strategy_loop(rest: KalshiREST, market_ws: KalshiMarketWS,
         # traded in a prior run / restart).
         if ct not in handled_windows and not tracker.already_traded(ct):
             seconds_since_open = seconds_since_ticker_open(ct)
-            if (seconds_since_open is not None
-                    and seconds_since_open > OPEN_TRADE_GRACE_S):
+            if not is_within_open_trade_grace(seconds_since_open):
                 log.info("Window %s opened %.0fs ago (> %.0fs grace) — skip late "
                          "entry and wait to pre-forecast the next market.",
-                         ct, seconds_since_open, OPEN_TRADE_GRACE_S)
+                         ct, seconds_since_open if seconds_since_open is not None else -1,
+                         OPEN_TRADE_GRACE_S)
                 handled_windows.add(ct)
                 await asyncio.sleep(POLL_INTERVAL_S)
                 continue

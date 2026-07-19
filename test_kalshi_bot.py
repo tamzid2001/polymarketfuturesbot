@@ -117,6 +117,21 @@ def check_tickers(bot):
         print(f"      NEXT market                       : {nt}", flush=True)
         record("current ticker matches ET clock",
                PASS if ct == exp else FAIL, f"{ct} (expected {exp})")
+
+        class _Market:
+            def __init__(self, status):
+                self.status = status
+
+        opening_gate_ok = (
+            bot.is_market_live(_Market("active"))
+            and not bot.is_market_live(_Market("initialized"))
+            and bot.is_within_open_trade_grace(0.0)
+            and bot.is_within_open_trade_grace(bot.OPEN_TRADE_GRACE_S)
+            and not bot.is_within_open_trade_grace(bot.OPEN_TRADE_GRACE_S + 0.01)
+        )
+        record("entry gate requires active market within opening grace",
+               PASS if opening_gate_ok else FAIL,
+               f"active + first {bot.OPEN_TRADE_GRACE_S:.0f}s only")
     except Exception as exc:  # noqa: BLE001
         record("ticker helpers", FAIL, str(exc))
 
