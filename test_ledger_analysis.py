@@ -58,6 +58,21 @@ def test_prophet_series_keeps_original_trade_numbers_after_rolling_windows() -> 
     assert rolling["trade_number"].iloc[-1] == 55
 
 
+def test_rolling_regime_uses_the_pretrade_balance() -> None:
+    raw = pd.DataFrame({
+        "date/time": pd.date_range("2026-01-01", periods=51, freq="15min", tz="UTC"),
+        "market": ["BTC"] * 51,
+        "side": ["YES"] * 51,
+        "result": ["WIN"] * 26 + ["LOSS"] * 25,
+    })
+    ledger, _ = analysis.normalize_ledger(raw, analysis.Path("fixture.csv"))
+    series = analysis.add_time_series(ledger, 1000)
+    # Before trade 51, the preceding 50 trades have a +2 balance.  Trade 51
+    # itself is a loss and brings its own rolling window to zero.
+    assert series.loc[50, "rolling_50_balance"] == 0
+    assert series.loc[50, "rolling_50_regime"] == "hot"
+
+
 def test_conclusion_rejects_accuracy_gain_with_worse_probability_quality() -> None:
     performance = {
         "win_rate_vs_50pct_pvalue": 0.9,
@@ -82,5 +97,6 @@ if __name__ == "__main__":
     test_artifact_normalization_and_streaks()
     test_real_pnl_performance_and_streak_conditionals()
     test_prophet_series_keeps_original_trade_numbers_after_rolling_windows()
+    test_rolling_regime_uses_the_pretrade_balance()
     test_conclusion_rejects_accuracy_gain_with_worse_probability_quality()
     print("PASS: ledger analysis tests")

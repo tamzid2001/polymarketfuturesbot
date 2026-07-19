@@ -285,8 +285,11 @@ def add_time_series(data: pd.DataFrame, starting_balance: float) -> pd.DataFrame
     frame["hour_et"] = local.dt.hour
     frame["weekday_et"] = local.dt.day_name().str.slice(0, 3)
     frame["month_et"] = local.dt.strftime("%Y-%m")
+    # The regime must be known before the row's trade resolves.  The raw
+    # rolling value includes the current outcome, so shift it by one trade.
+    prior_rolling_50_balance = frame["rolling_50_balance"].shift(1)
     frame["rolling_50_regime"] = np.select(
-        [frame["rolling_50_balance"] > 0, frame["rolling_50_balance"] < 0],
+        [prior_rolling_50_balance > 0, prior_rolling_50_balance < 0],
         ["hot", "cold"],
         default="neutral_or_unavailable",
     )
