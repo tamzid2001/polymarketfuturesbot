@@ -263,7 +263,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--calibration-fraction", type=float, default=0.15)
     parser.add_argument("--test-fraction", type=float, default=0.15)
     parser.add_argument("--thresholds", type=parse_thresholds, default=parse_thresholds("0.50,0.55,0.60,0.65"))
-    parser.add_argument("--minimum-coverage", type=float, default=0.20)
+    parser.add_argument("--minimum-coverage", type=float, default=0.05)
     args = parser.parse_args()
     if not (0.05 <= args.calibration_fraction < 0.4 and 0.05 <= args.test_fraction < 0.4):
         parser.error("calibration/test fractions must each be from 0.05 through 0.4")
