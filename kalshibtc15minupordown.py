@@ -74,6 +74,9 @@ CREDENTIALS / SETTINGS (env vars)
     PREOPEN_FORECAST_LEAD_S
                           seconds before the next window opens to pre-compute
                           its settlement forecast (default 120)
+    PRE_ENTRY_SETTLEMENT_WAIT_S
+                          maximum seconds to resolve a just-closed BTC market
+                          before sizing the next entry (default 2)
     OPEN_TRADE_GRACE_S    max seconds after a window opens to submit its entry
                           (default 15; only enter a newly-live market)
     UNCERTAINTY_SAMPLES   Prophet uncertainty samples (default 1000)
@@ -165,6 +168,8 @@ RUNTIME_LIMIT_MIN = float(os.getenv("RUNTIME_LIMIT_MIN", "345"))
 REPORT_INTERVAL_S = float(os.getenv("REPORT_INTERVAL_S", "30"))    # report cadence
 POLL_INTERVAL_S   = float(os.getenv("POLL_INTERVAL_S", "5"))       # window-watch cadence
 SETTLE_CHECK_S    = float(os.getenv("SETTLE_CHECK_S", "2"))        # settlement poll cadence
+PRE_ENTRY_SETTLEMENT_WAIT_S = float(os.getenv("PRE_ENTRY_SETTLEMENT_WAIT_S", "2"))
+PRE_ENTRY_SETTLEMENT_POLL_S = float(os.getenv("PRE_ENTRY_SETTLEMENT_POLL_S", "0.25"))
 STRIKE_RETRIES    = int(float(os.getenv("STRIKE_RETRIES", "8")))   # strike-resolution retries
 KALSHI_WS_VERBOSE = os.getenv("KALSHI_WS_VERBOSE", "false").lower() in ("1", "true", "yes")
 
@@ -1017,6 +1022,7 @@ class PerformanceTracker:
             "previous_ticker": None,
             "previous_result": None,
             "previous_hedge_status": None,
+            "previous_hedge_filled_count": 0.0,
         }
         if latest is None:
             return state
@@ -1292,6 +1298,100 @@ async def portfolio_reporter(rest: KalshiREST) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 # Settlement checker  (resolve pending trades → win/loss + P&L)
 # ─────────────────────────────────────────────────────────────────────────────
+async def _settle_record_if_ready(rest: KalshiREST, rec: dict) -> bool:
+    """Settle one closed record if Kalshi has published its result yet."""
+    if rec.get("result") != "pending":
+        return True
+    try:
+        settle = datetime.fromisoformat(rec["settle_et"])
+    except Exception:  # noqa: BLE001
+        return False
+    if settle.tzinfo is None:
+        settle = settle.replace(tzinfo=ET)
+    if datetime.now(tz=timezone.utc) < settle.astimezone(timezone.utc):
+        return False
+
+    market = await rest.get_market(rec["ticker"])
+    if market is None:
+        return False
+    result = _field(market, "result")
+    if not result:
+        return False
+    result = str(result).lower()
+    if result not in ("yes", "no"):
+        return False
+
+    # Another task can settle while this coroutine awaits get_market.
+    if rec.get("result") != "pending":
+        return True
+    win = (result == str(rec["side"]).lower())
+    entry = _f(rec.get("entry_price"), 0.5)
+    count = _f(rec.get("count"), bet_count())
+    pnl = (1.0 - entry) * count if win else -entry * count
+    rec["exit_method"] = "settlement"
+
+    hedge = rec.get("eth_hedge")
+    if isinstance(hedge, dict) and hedge.get("status") in ("open", "partially_filled"):
+        try:
+            await _monitor_eth_hedge(rest, rec)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Final ETH hedge fill check failed for %s: %s", rec["ticker"], exc)
+        hedge = rec.get("eth_hedge")
+    if (isinstance(hedge, dict)
+            and hedge.get("status") in ("pending_submission", "open", "partially_filled")):
+        hedge["status"] = "expired"
+        hedge["expired_at"] = datetime.now(tz=timezone.utc).isoformat()
+
+    outcome = "WIN" if pnl > 0 else "LOSS"
+    tracker.settle(rec, outcome, pnl)
+    log.info("SETTLED %s  result=%s  our side=%s → %s  P&L $%+.4f",
+             rec["ticker"], result.upper(), rec["side"], outcome, pnl)
+    return True
+
+
+async def resolve_closed_btc_before_entry(rest: KalshiREST,
+                                           max_wait_s: Optional[float] = None,
+                                           poll_s: Optional[float] = None) -> bool:
+    """Resolve overdue BTC results before sizing, never defaulting their entry.
+
+    Kalshi can publish a 15-minute result fractions of a second after the next
+    market opens. Wait only the small configured bound. If the result remains
+    unavailable, the caller skips the window instead of placing the BTC base
+    size while a loss might require the 10+10 hedge pair.
+    """
+    wait_s = PRE_ENTRY_SETTLEMENT_WAIT_S if max_wait_s is None else max_wait_s
+    retry_s = PRE_ENTRY_SETTLEMENT_POLL_S if poll_s is None else poll_s
+    deadline = time.monotonic() + max(0.0, wait_s)
+    while True:
+        now = datetime.now(tz=timezone.utc)
+        overdue = []
+        for rec in tracker.find_pending():
+            if rec.get("trade_kind", "BTC_PRIMARY") != "BTC_PRIMARY":
+                continue
+            try:
+                settle = datetime.fromisoformat(rec["settle_et"])
+            except Exception:  # noqa: BLE001
+                continue
+            if settle.tzinfo is None:
+                settle = settle.replace(tzinfo=ET)
+            if settle.astimezone(timezone.utc) <= now:
+                overdue.append(rec)
+        if not overdue:
+            return True
+
+        for rec in overdue:
+            await _settle_record_if_ready(rest, rec)
+        if not any(rec.get("result") == "pending" for rec in overdue):
+            return True
+        if time.monotonic() >= deadline:
+            log.warning("Prior BTC result still unavailable after %.2fs: %s. "
+                        "Skip this opening rather than use BTC base sizing.",
+                        wait_s, ", ".join(rec["ticker"] for rec in overdue
+                                            if rec.get("result") == "pending"))
+            return False
+        await asyncio.sleep(min(max(0.01, retry_s), max(0.01, deadline - time.monotonic())))
+
+
 async def settlement_checker(rest: KalshiREST) -> None:
     """Poll pending trades whose window has settled and finalize their result.
 
@@ -1306,42 +1406,11 @@ async def settlement_checker(rest: KalshiREST) -> None:
         pending = tracker.find_pending()
         if not pending:
             continue
-        now = datetime.now(tz=timezone.utc)
         for rec in pending:
             try:
-                settle = datetime.fromisoformat(rec["settle_et"])
-            except Exception:  # noqa: BLE001
-                continue
-            if settle.tzinfo is None:
-                settle = settle.replace(tzinfo=ET)
-            if (now - settle).total_seconds() < 5:
-                continue   # window not yet closed
-
-            market = await rest.get_market(rec["ticker"])
-            if market is None:
-                continue
-            result = _field(market, "result")
-            if not result:
-                continue   # not settled yet (Kalshi can lag a few seconds)
-            result = str(result).lower()
-            if result not in ("yes", "no"):
-                continue
-
-            win = (result == str(rec["side"]).lower())
-            entry = _f(rec.get("entry_price"), 0.5)
-            count = _f(rec.get("count"), bet_count())   # fractional contracts OK
-
-            pnl = (1.0 - entry) * count if win else -entry * count
-            rec["exit_method"] = "settlement"
-            hedge = rec.get("eth_hedge")
-            if (isinstance(hedge, dict)
-                    and hedge.get("status") in ("pending_submission", "open", "partially_filled")):
-                hedge["status"] = "expired"
-                hedge["expired_at"] = datetime.now(tz=timezone.utc).isoformat()
-            outcome = "WIN" if pnl > 0 else "LOSS"
-            tracker.settle(rec, outcome, pnl)
-            log.info("SETTLED %s  result=%s  our side=%s → %s  P&L $%+.4f",
-                     rec["ticker"], result.upper(), rec["side"], outcome, pnl)
+                await _settle_record_if_ready(rest, rec)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Settlement check failed for %s: %s", rec.get("ticker"), exc)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1540,6 +1609,13 @@ async def execute_window_trade(rest: KalshiREST, ct: str, nt: str) -> None:
     else:
         log.warning("No pre-open forecast cached for %s — SKIP window rather "
                     "than delay the opening order with a live forecast.", ct)
+        handled_windows.add(ct)
+        return
+
+    # A just-closed BTC market can publish its result fractions of a second
+    # after the next market opens. Resolve it before choosing 2-share base vs.
+    # the loss-triggered 10+10 pair; skip rather than use a wrong base size.
+    if not await resolve_closed_btc_before_entry(rest):
         handled_windows.add(ct)
         return
 

@@ -28,7 +28,7 @@ Checks
   11 Kalshi market WebSocket live stream              (async, non-critical)
   12 Bet sizing + V2 MARKET order build + DRY-RUN submit (nothing sent)
   13 PerformanceTracker round-trip (record → dedupe → settle → stats → reload)
-  14 BTC/ETH hedge: target-price math + monitor trigger (DRY-RUN)
+  14 BTC/ETH hedge: target-price math + fill monitor + settlement gate (DRY-RUN)
 """
 
 from __future__ import annotations
@@ -584,6 +584,62 @@ def check_eth_hedge(bot):
         traceback.print_exc()
 
 
+def check_pre_entry_settlement_gate(bot):
+    """A just-published loss must arm 10+10; unresolved means no base order."""
+    section("15. Pre-entry BTC settlement gate")
+    try:
+        from types import SimpleNamespace
+
+        with tempfile.TemporaryDirectory() as tmp:
+            saved_tracker = bot.tracker
+            bot.tracker = bot.PerformanceTracker(
+                os.path.join(tmp, "h.json"), os.path.join(tmp, "t.json"))
+            overdue = {
+                "ticker": "KXBTC15M-QA-PREENTRY-LOSS",
+                "timestamp": "qa",
+                "settle_et": (datetime.now(tz=timezone.utc) - timedelta(seconds=1)).isoformat(),
+                "side": "NO", "entry_price": 0.50, "count": 2.0,
+                "trade_kind": "BTC_PRIMARY", "arbitrage_active": False,
+                "eth_hedge": None, "result": "pending", "profit_loss": 0.0,
+            }
+            bot.tracker.record_open(overdue)
+
+            class _SettledRest:
+                async def get_market(self, ticker):
+                    assert ticker == overdue["ticker"]
+                    return SimpleNamespace(result="yes")
+
+            resolved = asyncio.run(bot.resolve_closed_btc_before_entry(
+                _SettledRest(), max_wait_s=0.01, poll_s=0.001))
+            armed = bot.tracker.next_eth_hedge_state()
+            armed_ok = (resolved and overdue["result"] == "LOSS"
+                        and armed["active"] and armed["multiplier"] == 1.0
+                        and bot.bet_count(bot.ARBITRAGE_SHARES) == 10.0)
+
+            unresolved = dict(overdue, ticker="KXBTC15M-QA-PREENTRY-UNKNOWN",
+                              result="pending", profit_loss=0.0)
+            bot.tracker = bot.PerformanceTracker(
+                os.path.join(tmp, "h2.json"), os.path.join(tmp, "t2.json"))
+            bot.tracker.record_open(unresolved)
+
+            class _UnsettledRest:
+                async def get_market(self, ticker):
+                    return SimpleNamespace(result=None)
+
+            skip_base = not asyncio.run(bot.resolve_closed_btc_before_entry(
+                _UnsettledRest(), max_wait_s=0.01, poll_s=0.001))
+            bot.tracker = saved_tracker
+
+        record("published BTC loss arms 10 BTC + 10 ETH before entry",
+               PASS if armed_ok else FAIL,
+               f"result={overdue['result']} active={armed['active']} multiplier={armed['multiplier']}")
+        record("unresolved BTC result skips opening instead of 2-share base",
+               PASS if skip_base else FAIL)
+    except Exception as exc:  # noqa: BLE001
+        record("pre-entry settlement gate", FAIL, str(exc))
+        traceback.print_exc()
+
+
 async def _run_async(bot):
     rest = await check_kalshi_async(bot)
     if rest is not None:
@@ -633,6 +689,7 @@ def main():
             traceback.print_exc()
         check_tracker(bot)
         check_eth_hedge(bot)
+        check_pre_entry_settlement_gate(bot)
 
     print("\n" + "=" * 70)
     counts = {PASS: 0, FAIL: 0, WARN: 0, SKIP: 0}
