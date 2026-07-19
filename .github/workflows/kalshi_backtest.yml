@@ -1,0 +1,66 @@
+name: Kalshi BTC 15-min Historical Backtest
+
+on:
+  workflow_dispatch:
+    inputs:
+      market_limit:
+        description: "Latest eligible markets to replay. 0 exports and replays every available market."
+        required: false
+        default: "0"
+      min_train_rows:
+        description: "Minimum settled historical rows before ML starts predicting."
+        required: false
+        default: "200"
+      retrain_every:
+        description: "Refit the expanding-window ML model after this many new markets."
+        required: false
+        default: "16"
+      prophet_uncertainty_samples:
+        description: "Prophet uncertainty samples. Does not change the p50 side signal."
+        required: false
+        default: "1000"
+
+permissions:
+  contents: read
+
+jobs:
+  historical-backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+
+      - name: Setup Python 3.13
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements_kalshi.txt
+
+      - name: Run Offline Backtest Tests
+        run: python test_kalshi_backtest.py
+
+      - name: Export Closed Markets and Run Historical Replay
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: |
+          python kalshi_btc15m_backtest.py \
+            --output-dir backtest_output \
+            --market-limit "${{ inputs.market_limit }}" \
+            --min-train-rows "${{ inputs.min_train_rows }}" \
+            --retrain-every "${{ inputs.retrain_every }}" \
+            --prophet-uncertainty-samples "${{ inputs.prophet_uncertainty_samples }}"
+
+      - name: Upload Backtest Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kalshi-btc15m-backtest-${{ github.run_id }}
+          path: backtest_output/
+          if-no-files-found: warn
+          retention-days: 30

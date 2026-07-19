@@ -231,6 +231,8 @@ polymarketfuturesbot/
 ├── requirements.txt            # Polymarket pip dependencies
 ├── kalshibtc15minupordown.py   # Kalshi bot: Prophet 15-min BTC forecast strategy
 ├── test_kalshi_bot.py          # Kalshi QA: data, forecast, auth, order build (no orders)
+├── kalshi_btc15m_backtest.py   # Read-only historical KXBTC15M Prophet + ML backtest
+├── test_kalshi_backtest.py     # Offline tests for the historical backtest helpers
 ├── requirements_kalshi.txt     # Kalshi pip dependencies (prophet, yfinance, ...)
 ├── trade_history.json          # Kalshi trade journal (committed back by the workflow)
 ├── traded_market_tickers.json  # Kalshi one-order-per-window dedupe store
@@ -415,3 +417,33 @@ export DRY_RUN=true            # flip to false only when you mean it
 python test_kalshi_bot.py      # QA first — never submits an order
 python kalshibtc15minupordown.py
 ```
+
+### Historical KXBTC15M Backtest
+
+`kalshi_btc15m_backtest.py` is separate from the live bot and never creates
+orders. It paginates Kalshi's current and archived settled `KXBTC15M` markets,
+writes every closed market and its outcome to
+`backtest_output/closed_kxbtc15m_markets.csv`, then replays the live
+two-minute-pre-open / 500-candle / 17-minute Prophet decision.
+
+It also evaluates an expanding-window logistic-regression classifier using
+only data that existed at each forecast time: BTC one-minute price features,
+the Prophet output, and earlier *settled* Kalshi outcomes. The previous market
+is excluded until its settlement timestamp, which prevents future-outcome
+leakage. The report is directional accuracy and calibration only; it does not
+claim dollar P&L because historical result records do not provide executable
+opening fills, spreads, or fees.
+
+```bash
+pip install -r requirements_kalshi.txt
+python test_kalshi_backtest.py
+python kalshi_btc15m_backtest.py --output-dir backtest_output
+```
+
+The manual **Kalshi BTC 15-min Historical Backtest** GitHub Action runs the
+same test and full replay, then uploads these artifacts:
+
+- `closed_kxbtc15m_markets.csv`
+- `prophet_ml_backtest_rows.csv`
+- `skipped_markets.csv`
+- `summary.json` and `summary.md`
