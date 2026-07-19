@@ -9,7 +9,7 @@ Exits non-zero if any CRITICAL check fails.
 
 Prints LIVE INFO with substantial logging:
   • latest 1-minute BTC-USD candles from Yahoo Finance + validation verdict
-  • a real Prophet fit + 15-minute forecast with the 80% CI (p10/p50/p90)
+  • a real Prophet fit + settlement forecast with the 80% CI (p10/p50/p90)
   • the current & next 15-min ET tickers + full live Kalshi market snapshot
   • a live sample of Kalshi market WebSocket messages
 
@@ -28,7 +28,7 @@ Checks
   11 Kalshi market WebSocket live stream              (async, non-critical)
   12 Bet sizing + V2 MARKET order build + DRY-RUN submit (nothing sent)
   13 PerformanceTracker round-trip (record → dedupe → settle → stats → reload)
-  14 Take-profit: exit-price math (YES/NO/cap) + P&L monitor trigger (DRY-RUN)
+  14 BTC/ETH hedge: target-price math + monitor trigger (DRY-RUN)
 """
 
 from __future__ import annotations
@@ -152,7 +152,7 @@ def check_btc_history(bot):
 # 7 ────────────────────────────────────────────────────────────────────────────
 def check_prophet(bot, df):
     """Fit Prophet on the real data. Returns the 80% CI bands or None."""
-    section("7. Prophet 15-minute forecast (80% confidence interval)")
+    section("7. Prophet settlement forecast (80% confidence interval)")
     if df is None:
         record("Prophet forecast", SKIP, "no validated BTC data")
         return None
@@ -204,7 +204,7 @@ def check_quantile(bot, df, bands):
             spot = float(df["close"].iloc[-1])
             print(f"      LIVE: BTC ${spot:,.2f} is at the "
                   f"{bot.percentile_of_price(spot, bands):.0f}th percentile "
-                  f"of the 15-min forecast", flush=True)
+                  f"of the settlement forecast", flush=True)
     except Exception as exc:  # noqa: BLE001
         record("quantile interpolation", FAIL, str(exc))
 
@@ -312,7 +312,7 @@ async def check_orders_async(bot, rest):
         sizing_ok = (base_ok
                      and abs(bot.bet_count(0.056) - 0.05) < 1e-9  # floored to 0.01 steps
                      and abs(bot.bet_count(0.004) - 0.01) < 1e-9  # clamped to the minimum
-                     and abs(bot.bet_count(0.01 * 2 ** 3) - 0.08) < 1e-9)  # ×2 martingale, streak 3
+                     and abs(bot.bet_count(0.01 * 2 ** 3) - 0.08) < 1e-9)  # generic share math
         record("bet_count (fixed share sizing, price-independent)",
                PASS if sizing_ok else FAIL,
                "base %.2f → %.2f · 0.056 → %.2f · 0.004 → %.2f · "
@@ -331,6 +331,19 @@ async def check_orders_async(bot, rest):
             ok = (req.side == side and req.price == price)
             record(f"build {label}", PASS if ok else FAIL,
                    f"side={req.side.value} price={req.price} count={req.count}")
+
+        side_yes, decision_yes = bot.decide_side_from_forecast(
+            100000.0, {"p50": 100010.0})
+        side_no, decision_no = bot.decide_side_from_forecast(
+            100000.0, {"p50": 99990.0})
+        side_skip, decision_skip = bot.decide_side_from_forecast(
+            100000.0, {"p50": 100000.0})
+        side_ok = (side_yes == "yes" and decision_yes == "BUY YES"
+                   and side_no == "no" and decision_no == "BUY NO"
+                   and side_skip is None and decision_skip == "SKIP")
+        record("side decision uses forecast p50 vs live strike",
+               PASS if side_ok else FAIL,
+               f"above→{decision_yes}, below→{decision_no}, equal→{decision_skip}")
 
         # DRY-RUN submit through the bot's real order path — must not hit the API.
         class _FakeOrders:
@@ -398,62 +411,65 @@ def check_tracker(bot):
 
 
 # 14 ────────────────────────────────────────────────────────────────────────────
-def check_take_profit(bot):
-    section("14. Take-profit: exit math + P&L monitor trigger (DRY-RUN)")
+def check_eth_hedge(bot):
+    section("14. BTC/ETH hedge: price math + monitor trigger (DRY-RUN)")
     try:
         from kalshi_python_async import BookSide
-        # $1 bet @ $0.40 → 2.50 contracts; +$1 target → exit $0.80 (2× entry)
-        s, px, ex = bot.take_profit_exit("yes", 0.40, 2.50)
-        record("YES exit = entry + target/count (sell YES)",
-               PASS if (s, px, ex) == (BookSide.ASK, "0.80", 0.80) else FAIL,
-               f"ASK @ {px} (exit ${ex:.2f}/contract)")
-        # NO position closes by BUYING YES back at 1 − NO-exit
-        s, px, ex = bot.take_profit_exit("no", 0.40, 2.50)
-        record("NO exit → BID YES at 1 − NO-exit (reduce-only)",
-               PASS if (s, px, ex) == (BookSide.BID, "0.20", 0.80) else FAIL,
-               f"BID @ {px} (NO exit ${ex:.2f}/contract)")
-        # entry ≥ $0.50 can't double pre-settlement → capped at $0.99
-        s, px, ex = bot.take_profit_exit("yes", 0.73, 1.36)
-        record("exit price capped at $0.99 exchange max",
-               PASS if px == "0.99" else FAIL, f"entry $0.73 → {px}")
+        target = bot.eth_hedge_target_price(0.60)
+        record("BTC $0.60 entry → ETH opposite target $0.30",
+               PASS if abs(target - 0.30) < 1e-9 else FAIL,
+               f"target={target}")
 
-        # Monitor trigger: below target holds; crossing +$1 books the TP win.
+        side, book_side, api_price = bot.eth_hedge_order("yes", target)
+        record("BTC YES → ETH NO ASK at YES price $0.70",
+               PASS if (side, book_side, api_price) == ("no", BookSide.ASK, "0.70") else FAIL,
+               f"side={side} book={book_side.value} api={api_price}")
+
+        side2, book_side2, api_price2 = bot.eth_hedge_order("no", target)
+        record("BTC NO → ETH YES BID at $0.30",
+               PASS if (side2, book_side2, api_price2) == ("yes", BookSide.BID, "0.30") else FAIL,
+               f"side={side2} book={book_side2.value} api={api_price2}")
+
+        skip = bot.eth_hedge_target_price(0.90)
+        record("hedge skips when BTC entry leaves no <=$0.90 pair room",
+               PASS if skip is None else FAIL, f"target={skip}")
+
         with tempfile.TemporaryDirectory() as tmp:
             saved_tracker, saved_dry = bot.tracker, bot.DRY_RUN
             bot.tracker = bot.PerformanceTracker(
                 os.path.join(tmp, "h.json"), os.path.join(tmp, "t.json"))
             bot.DRY_RUN = True
-            rec = {"ticker": "KXBTC15M-QA-TP", "side": "YES", "entry_price": 0.40,
-                   "count": 2.50, "tp_exit_price": 0.80, "tp_api_price": "0.80",
-                   "tp_target_profit_usd": 1.0, "tp_order_id": None,
+            rec = {"ticker": "KXBTC15M-QA-HEDGE", "side": "YES", "entry_price": 0.60,
+                   "count": 10.0, "trade_kind": "BTC_PRIMARY",
+                   "eth_hedge": {
+                       "status": "watching", "ticker": "KXETH15M-QA-HEDGE",
+                       "side": "NO", "target_entry_price": 0.30,
+                       "api_price": "0.70", "count": 10.0,
+                   },
                    "exit_method": "pending", "result": "pending",
                    "settle_et": "2099-01-01T00:00:00+00:00",
                    "timestamp": "qa", "btc_entry": 0.0, "p50_prediction": 0.0}
             bot.tracker.trades.append(rec)
-            bot.kalshi_quotes["KXBTC15M-QA-TP"] = {"last": 0.75}   # +$0.875
-            asyncio.run(bot._monitor_position(None, rec))
-            held = rec["result"] == "pending"
-            bot.kalshi_quotes["KXBTC15M-QA-TP"] = {"last": 0.81}   # +$1.025
-            asyncio.run(bot._monitor_position(None, rec))
-            fired = (rec["result"] == "WIN"
-                     and abs(rec["profit_loss"] - 1.0) < 1e-9
-                     and rec["exit_method"].startswith("take_profit"))
+            bot.kalshi_quotes["KXETH15M-QA-HEDGE"] = {"last": 0.71}   # NO mark $0.29
+            asyncio.run(bot._monitor_eth_hedge(None, rec))
+            hedge_records = [t for t in bot.tracker.trades
+                             if t.get("trade_kind") == "ETH_HEDGE"]
+            fired = (rec["eth_hedge"]["status"] == "filled"
+                     and len(hedge_records) == 1
+                     and hedge_records[0]["side"] == "NO"
+                     and abs(hedge_records[0]["entry_price"] - 0.30) < 1e-9)
             s = bot.tracker.stats()
-            breakdown_ok = (s["exits"]["take_profit"] == 1
-                            and s["exits"]["settlement"] == 0
-                            and abs(s["exit_pnl"]["take_profit"] - 1.0) < 1e-9)
-            del bot.kalshi_quotes["KXBTC15M-QA-TP"]
+            leg_ok = s["kinds"]["ETH_HEDGE"] == 0   # hedge is pending until settlement
+            del bot.kalshi_quotes["KXETH15M-QA-HEDGE"]
             bot.tracker, bot.DRY_RUN = saved_tracker, saved_dry
-        record("monitor holds below +$1.00 unrealized", PASS if held else FAIL)
-        record("monitor fires TP when gains cross +$1.00",
+        record("ETH hedge monitor fires when opposite mark <= target",
                PASS if fired else FAIL,
-               f"booked {rec['result']} ${rec['profit_loss']:+.2f} "
-               f"via {rec['exit_method']}")
-        record("stats() exit breakdown counts TP vs settlement",
-               PASS if breakdown_ok else FAIL,
-               f"exits={s['exits']}")
+               f"hedge_status={rec['eth_hedge']['status']}")
+        record("stats() keeps un-settled hedge out of settled leg counts",
+               PASS if leg_ok else FAIL,
+               f"kinds={s['kinds']}")
     except Exception as exc:  # noqa: BLE001
-        record("take-profit checks", FAIL, str(exc))
+        record("ETH hedge checks", FAIL, str(exc))
         traceback.print_exc()
 
 
@@ -505,7 +521,7 @@ def main():
             record("async checks", FAIL, str(exc))
             traceback.print_exc()
         check_tracker(bot)
-        check_take_profit(bot)
+        check_eth_hedge(bot)
 
     print("\n" + "=" * 70)
     counts = {PASS: 0, FAIL: 0, WARN: 0, SKIP: 0}

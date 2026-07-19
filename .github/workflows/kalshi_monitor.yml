@@ -19,12 +19,12 @@ on:
         description: "Override BET_AMOUNT_SHARES for THIS run only (contracts/SHARES bought per order — NOT dollars — fractional at 0.01 granularity, e.g. '0.01' or '1'). Leave BLANK to use the BET_AMOUNT_SHARES repo/env variable (default 0.01)."
         required: false
         default: ""
-      tp_profit_usd:
-        description: "Override TP_PROFIT_USD for THIS run only (take-profit $ target — close the position once it is up this much). Leave BLANK to use the TP_PROFIT_USD repo/env variable (default = the position's entry cost, i.e. exit at 2× entry)."
+      arbitrage_shares:
+        description: "Override ARBITRAGE_SHARES for THIS run and handoffs (paired BTC/ETH hedge shares when BTC loss streak > 0; default 10)."
         required: false
         default: ""
       loss_multiplier:
-        description: "Override LOSS_MULTIPLIER for THIS run only (martingale: multiply the next bet by this after every LOSS; a WIN resets to the base bet). Leave BLANK to use the LOSS_MULTIPLIER repo/env variable (default 2)."
+        description: "Override LOSS_MULTIPLIER for THIS run and handoffs (applies only to ARBITRAGE_SHARES during BTC/ETH hedge mode; default 2)."
         required: false
         default: ""
 
@@ -70,39 +70,27 @@ jobs:
           # sanity: confirm it is a PEM (does not print the key body)
           head -1 kalshi_private_key.pem
 
+      - name: Resolve runtime inputs
+        run: |
+          {
+            echo "DRY_RUN=${{ github.event.inputs.dry_run || vars.DRY_RUN || 'true' }}"
+            echo "BET_AMOUNT_SHARES=${{ github.event.inputs.bet_amount_shares || vars.BET_AMOUNT_SHARES || '0.01' }}"
+            echo "ARBITRAGE_SHARES=${{ github.event.inputs.arbitrage_shares || vars.ARBITRAGE_SHARES || '10' }}"
+            echo "LOSS_MULTIPLIER=${{ github.event.inputs.loss_multiplier || vars.LOSS_MULTIPLIER || '2' }}"
+            echo "ETH_HEDGE_POLL_S=${{ vars.ETH_HEDGE_POLL_S || '5' }}"
+            echo "HISTORY_MINUTES=${{ vars.HISTORY_MINUTES || '500' }}"
+            echo "FORECAST_MINUTES=${{ vars.FORECAST_MINUTES || '16' }}"
+            echo "UNCERTAINTY_SAMPLES=${{ vars.UNCERTAINTY_SAMPLES || '1000' }}"
+            echo "PREOPEN_FORECAST_LEAD_S=${{ vars.PREOPEN_FORECAST_LEAD_S || '60' }}"
+            echo "OPEN_TRADE_GRACE_S=${{ vars.OPEN_TRADE_GRACE_S || '90' }}"
+            echo "RUNTIME_LIMIT_MIN=345"
+          } >> "$GITHUB_ENV"
+
       - name: Run Bot (continuous 5 h 45 min loop)
         env:
           KALSHI_API_KEY_ID: ${{ secrets.KALSHI_PROD_API_KEY }}
           KALSHI_PEM_PATH:   kalshi_private_key.pem
           KALSHI_DEMO:       "false"
-          # LIVE TRADING SWITCH (real money):
-          #   • Continuous live  → set the repo/environment variable DRY_RUN=false
-          #     (gh variable set DRY_RUN --env Kalshi --body false). Then every run
-          #     in the chain (dispatch + 5h45m handoff + cron) trades live.
-          #   • One-off override → dispatch with the dry_run input.
-          #   • Default (nothing set) → DRY_RUN=true (safe, logs orders only).
-          DRY_RUN:           ${{ github.event.inputs.dry_run || vars.DRY_RUN || 'true' }}
-          # One-off dispatch inputs override the repo/env variables (same
-          # pattern as DRY_RUN above); the 5h45m handoff re-dispatches with no
-          # inputs, so overrides apply to THIS run only.
-          # BET_AMOUNT_SHARES is contracts (shares) per order — NOT dollars —
-          # fractional at 0.01 granularity (0.01 = the exchange minimum).
-          BET_AMOUNT_SHARES: ${{ github.event.inputs.bet_amount_shares || vars.BET_AMOUNT_SHARES || '0.01' }}
-          # Take-profit: close the position once unrealized gains cross this
-          # many dollars via a reduce-only IOC limit (Kalshi only allows
-          # reduce_only on IOC orders). BLANK → default = the position's entry
-          # cost, i.e. exit at 2× the entry price.
-          TP_PROFIT_USD:     ${{ github.event.inputs.tp_profit_usd || vars.TP_PROFIT_USD || '' }}
-          # Martingale loss-streak multiplier: after every LOSS the next bet
-          # (and its TP target) are multiplied by this; a WIN resets to base.
-          # The streak persists across runs via trade_history.json.
-          LOSS_MULTIPLIER:   ${{ github.event.inputs.loss_multiplier || vars.LOSS_MULTIPLIER || '2' }}
-          POSITION_POLL_S:   ${{ vars.POSITION_POLL_S || '5' }}
-          # Prophet strategy knobs (repo/environment variables, all optional)
-          HISTORY_MINUTES:     ${{ vars.HISTORY_MINUTES || '500' }}
-          FORECAST_MINUTES:    ${{ vars.FORECAST_MINUTES || '15' }}
-          UNCERTAINTY_SAMPLES: ${{ vars.UNCERTAINTY_SAMPLES || '1000' }}
-          RUNTIME_LIMIT_MIN: "345"
         run: python kalshibtc15minupordown.py
 
       - name: Persist State (trade history + traded windows)
@@ -122,7 +110,11 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
-          # Re-dispatch with no inputs so the next run honours the DRY_RUN
-          # variable — a live chain stays live, a default chain stays dry.
+          # Re-dispatch with the effective inputs so manual overrides persist
+          # across the 5h45m handoff chain. Scheduled runs still use env vars.
           gh workflow run kalshi_monitor.yml -R "${{ github.repository }}" \
+            -f dry_run="$DRY_RUN" \
+            -f bet_amount_shares="$BET_AMOUNT_SHARES" \
+            -f arbitrage_shares="$ARBITRAGE_SHARES" \
+            -f loss_multiplier="$LOSS_MULTIPLIER" \
             && echo "Handoff: next run queued." || echo "Handoff skipped (no GH_PAT?)."
