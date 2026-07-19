@@ -465,7 +465,9 @@ different threshold.
 WIN/LOSS result, or a downloaded Kalshi backtest artifact. It produces separate
 reports for Prophet and ML signals, including chronological ML tests, rolling
 time series, streak conditional tests, Prophet cutoff tests, Monte Carlo, and
-per-market/per-side summaries.
+per-market/per-side summaries. It also writes P90/P99 prior-loss-streak
+walk-forward tests: each 100-trade training prefix selects the high-loss state
+and scores the following non-overlapping 100 trades.
 
 ```bash
 pip install -r requirements_kalshi_ledger_analysis.txt

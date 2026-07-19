@@ -73,6 +73,22 @@ def test_rolling_regime_uses_the_pretrade_balance() -> None:
     assert series.loc[50, "rolling_50_regime"] == "hot"
 
 
+def test_high_loss_streak_walkforward_uses_future_blocks_only() -> None:
+    raw = pd.DataFrame({
+        "date/time": pd.date_range("2026-01-01", periods=400, freq="15min", tz="UTC"),
+        "market": ["BTC"] * 400,
+        "side": ["YES"] * 400,
+        "result": (["WIN"] * 5 + ["LOSS"] * 5) * 40,
+    })
+    ledger, _ = analysis.normalize_ledger(raw, analysis.Path("fixture.csv"))
+    details, summary = analysis.loss_streak_percentile_walkforward(ledger, block_size=100)
+    assert len(details) == 6  # Three non-overlapping future blocks for P90 and P99.
+    assert set(details["percentile"]) == {"P90", "P99"}
+    assert set(summary["percentile"]) == {"P90", "P99"}
+    assert details["train_trades"].tolist() == [100, 100, 200, 200, 300, 300]
+    assert details["selected_trades"].gt(0).all()
+
+
 def test_conclusion_rejects_accuracy_gain_with_worse_probability_quality() -> None:
     performance = {
         "win_rate_vs_50pct_pvalue": 0.9,
@@ -98,5 +114,6 @@ if __name__ == "__main__":
     test_real_pnl_performance_and_streak_conditionals()
     test_prophet_series_keeps_original_trade_numbers_after_rolling_windows()
     test_rolling_regime_uses_the_pretrade_balance()
+    test_high_loss_streak_walkforward_uses_future_blocks_only()
     test_conclusion_rejects_accuracy_gain_with_worse_probability_quality()
     print("PASS: ledger analysis tests")

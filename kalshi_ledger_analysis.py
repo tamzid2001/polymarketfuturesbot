@@ -41,7 +41,7 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 from prophet import Prophet
-from scipy.stats import binomtest, ttest_1samp
+from scipy.stats import binomtest, fisher_exact, ttest_1samp
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.impute import SimpleImputer
@@ -63,6 +63,8 @@ EASTERN = ZoneInfo("America/New_York")
 WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 WINDOWS = (50, 100, 500)
 STREAK_LEVELS = (3, 5, 7, 10)
+LOSS_STREAK_PERCENTILES = (0.90, 0.99)
+LOSS_STREAK_WALKFORWARD_BLOCK = 100
 STARTING_BALANCE = 1000.0
 
 
@@ -410,6 +412,109 @@ def streak_conditionals(frame: pd.DataFrame) -> pd.DataFrame:
             "win_rate_95pct_ci": wilson_interval(successes, count),
         })
     return pd.DataFrame(records)
+
+
+def prior_loss_streaks(wins: pd.Series) -> pd.Series:
+    """Return the consecutive-loss count known immediately before each trade."""
+    values: list[int] = []
+    running = 0
+    for won in wins.astype(bool):
+        values.append(running)
+        running = 0 if won else running + 1
+    return pd.Series(values, index=wins.index, dtype="int64")
+
+
+def loss_streak_percentile_walkforward(
+        frame: pd.DataFrame, block_size: int = LOSS_STREAK_WALKFORWARD_BLOCK,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Test P90/P99 prior-loss states on non-overlapping future trade blocks.
+
+    For each 100/200/300/... trade cutoff, percentile thresholds are learned
+    from the already observed prefix and evaluated only on the following
+    block.  A P90/P99 signal means the current pre-trade loss streak is at or
+    above that threshold.
+    """
+    if block_size < 10:
+        raise ValueError("loss-streak walk-forward block size must be at least 10")
+    data = frame.sort_values("timestamp", kind="stable").reset_index(drop=True).copy()
+    data["prior_loss_streak"] = prior_loss_streaks(data["win"])
+    details: list[dict[str, Any]] = []
+    selected_wins: dict[float, list[int]] = {percentile: [] for percentile in LOSS_STREAK_PERCENTILES}
+    for train_trades in range(block_size, len(data), block_size):
+        train = data.iloc[:train_trades]
+        test = data.iloc[train_trades:min(train_trades + block_size, len(data))]
+        for percentile in LOSS_STREAK_PERCENTILES:
+            threshold = float(train["prior_loss_streak"].quantile(percentile))
+            selected = test[test["prior_loss_streak"] >= threshold]
+            other = test[test["prior_loss_streak"] < threshold]
+            selected_count = len(selected)
+            other_count = len(other)
+            selected_win_count = int(selected["win"].sum())
+            other_win_count = int(other["win"].sum())
+            comparison = None
+            if selected_count and other_count:
+                comparison = fisher_exact([
+                    [selected_win_count, selected_count - selected_win_count],
+                    [other_win_count, other_count - other_win_count],
+                ], alternative="two-sided")
+            selected_wins[percentile].extend(selected["win"].astype(int).tolist())
+            details.append({
+                "percentile": f"P{int(percentile * 100)}",
+                "percentile_value": percentile,
+                "train_trades": train_trades,
+                "test_trades": len(test),
+                "loss_streak_threshold": threshold,
+                "selected_trades": selected_count,
+                "selected_wins": selected_win_count,
+                "selected_losses": selected_count - selected_win_count,
+                "selected_win_rate": selected_win_count / selected_count if selected_count else None,
+                "other_trades": other_count,
+                "other_wins": other_win_count,
+                "other_losses": other_count - other_win_count,
+                "other_win_rate": other_win_count / other_count if other_count else None,
+                "win_rate_difference": (selected_win_count / selected_count - other_win_count / other_count)
+                if selected_count and other_count else None,
+                "fisher_p_value_vs_other": float(comparison.pvalue) if comparison else None,
+            })
+    detail_frame = pd.DataFrame(details)
+    summary_records: list[dict[str, Any]] = []
+    for percentile in LOSS_STREAK_PERCENTILES:
+        subset = detail_frame[detail_frame["percentile_value"].eq(percentile)]
+        selected_count = int(subset["selected_trades"].sum()) if not subset.empty else 0
+        selected_win_count = int(subset["selected_wins"].sum()) if not subset.empty else 0
+        other_count = int(subset["other_trades"].sum()) if not subset.empty else 0
+        other_win_count = int(subset["other_wins"].sum()) if not subset.empty else 0
+        valid = subset.dropna(subset=["win_rate_difference"])
+        better_blocks = int((valid["win_rate_difference"] > 0).sum())
+        worse_blocks = int((valid["win_rate_difference"] < 0).sum())
+        sign_test = binomtest(better_blocks, better_blocks + worse_blocks, p=0.5) if better_blocks + worse_blocks else None
+        comparison = None
+        if selected_count and other_count:
+            comparison = fisher_exact([
+                [selected_win_count, selected_count - selected_win_count],
+                [other_win_count, other_count - other_win_count],
+            ], alternative="two-sided")
+        selected_streaks = streaks(pd.Series(selected_wins[percentile], dtype="int64"))
+        summary_records.append({
+            "percentile": f"P{int(percentile * 100)}",
+            "test_blocks": len(subset),
+            "threshold_min": float(subset["loss_streak_threshold"].min()) if not subset.empty else None,
+            "threshold_max": float(subset["loss_streak_threshold"].max()) if not subset.empty else None,
+            "selected_trades": selected_count,
+            "selected_wins": selected_win_count,
+            "selected_losses": selected_count - selected_win_count,
+            "selected_win_rate": selected_win_count / selected_count if selected_count else None,
+            "other_trades": other_count,
+            "other_win_rate": other_win_count / other_count if other_count else None,
+            "aggregate_fisher_p_value_vs_other": float(comparison.pvalue) if comparison else None,
+            "mean_block_win_rate_difference": float(valid["win_rate_difference"].mean()) if not valid.empty else None,
+            "blocks_better_than_other": better_blocks,
+            "blocks_worse_than_other": worse_blocks,
+            "block_sign_test_p_value": float(sign_test.pvalue) if sign_test else None,
+            "selected_longest_win_streak": selected_streaks["longest_win"],
+            "selected_longest_loss_streak": selected_streaks["longest_loss"],
+        })
+    return detail_frame, pd.DataFrame(summary_records)
 
 
 def prophet_model() -> Prophet:
@@ -777,6 +882,13 @@ def markdown_report(report: dict[str, Any]) -> str:
         ])
     else:
         lines.append(f"- Not available: {monetary['reason']}")
+    lines.extend(["", "## Walk-Forward High Loss-Streak Filters", ""])
+    for item in report.get("loss_streak_percentile_summary", []):
+        lines.append(
+            f"- {item['percentile']}: {item['selected_trades']} selected trades, "
+            f"{item['selected_win_rate']:.2%} win rate versus {item['other_win_rate']:.2%} other states; "
+            f"block sign-test p={item['block_sign_test_p_value']:.4g}."
+        )
     lines.extend(["", "## Conclusion", ""])
     for key, value in report["conclusion"].items():
         lines.append(f"- {key.replace('_', ' ').title()}: {value}")
@@ -811,6 +923,10 @@ def run_one(frame: pd.DataFrame, info: InputInfo, args: argparse.Namespace, outp
     write_csv(output_dir / "performance_by_rolling_50_regime.csv", by_regime)
     streak_frame = streak_conditionals(series)
     write_csv(output_dir / "streak_conditionals.csv", streak_frame)
+    loss_streak_details, loss_streak_summary = loss_streak_percentile_walkforward(
+        series, args.loss_streak_walkforward_block)
+    write_csv(output_dir / "loss_streak_percentile_walkforward.csv", loss_streak_details)
+    write_csv(output_dir / "loss_streak_percentile_summary.csv", loss_streak_summary)
     forecast_inputs = prophet_series(series)
     LOG.info("%s: Prophet final forecasts and historical cutoff tests", info.signal)
     forecasts = prophet_forecasts(forecast_inputs, (100, 500), args.prophet_max_history)
@@ -838,6 +954,7 @@ def run_one(frame: pd.DataFrame, info: InputInfo, args: argparse.Namespace, outp
             "signal": info.signal,
         },
         "performance": performance,
+        "loss_streak_percentile_summary": loss_streak_summary.to_dict(orient="records"),
         "prophet_policy_summary": policies.to_dict(orient="records"),
         "machine_learning": ml_report,
         "monte_carlo": monte_carlo_report,
@@ -858,6 +975,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prophet-train-window", type=int, default=1000)
     parser.add_argument("--prophet-max-history", type=int, default=5000)
     parser.add_argument("--prophet-origins", type=int, default=25)
+    parser.add_argument("--loss-streak-walkforward-block", type=int, default=LOSS_STREAK_WALKFORWARD_BLOCK)
     parser.add_argument("--monte-carlo-simulations", type=int, default=10_000)
     parser.add_argument("--monte-carlo-trades", type=int, default=500)
     parser.add_argument("--random-seed", type=int, default=0)
@@ -867,8 +985,9 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     configure_logging()
-    if args.starting_balance <= 0 or args.prophet_min_history < 30 or args.prophet_origins < 1:
-        raise SystemExit("starting balance must be positive; Prophet minimum history must be >= 30; origins must be positive")
+    if (args.starting_balance <= 0 or args.prophet_min_history < 30 or args.prophet_origins < 1
+            or args.loss_streak_walkforward_block < 10):
+        raise SystemExit("starting balance must be positive; Prophet minimum history must be >= 30; origins must be positive; loss-streak block must be >= 10")
     raw, source_path = read_input(args.input.expanduser())
     is_artifact = {"market_open", "actual_outcome", "prophet_side", "ml_side"}.issubset(raw.columns)
     if args.signal == "all":
