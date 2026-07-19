@@ -434,6 +434,60 @@ def check_eth_hedge(bot):
         record("hedge skips when BTC entry leaves no <=$0.90 pair room",
                PASS if skip is None else FAIL, f"target={skip}")
 
+        def primary(ticker, result, *, arbitrage_active=False,
+                    bet_multiplier=1.0, hedge_status=None):
+            hedge = None if hedge_status is None else {"status": hedge_status}
+            return {
+                "ticker": ticker,
+                "trade_kind": "BTC_PRIMARY",
+                "result": result,
+                "arbitrage_active": arbitrage_active,
+                "bet_multiplier": bet_multiplier,
+                "eth_hedge": hedge,
+            }
+
+        def next_state_for(records):
+            with tempfile.TemporaryDirectory() as tmp:
+                tr = bot.PerformanceTracker(
+                    os.path.join(tmp, "h.json"), os.path.join(tmp, "t.json"))
+                tr.trades.extend(records)
+                return tr.next_eth_hedge_state()
+
+        first_loss = next_state_for([
+            primary("KXBTC15M-QA-FIRST-LOSS", "LOSS"),
+        ])
+        unfilled_loss = next_state_for([
+            primary("KXBTC15M-QA-UNFILLED", "LOSS", arbitrage_active=True,
+                    bet_multiplier=1.0, hedge_status="expired"),
+        ])
+        filled_loss = next_state_for([
+            primary("KXBTC15M-QA-FILLED", "LOSS", arbitrage_active=True,
+                    bet_multiplier=bot.LOSS_MULTIPLIER, hedge_status="filled"),
+        ])
+        win_reset = next_state_for([
+            primary("KXBTC15M-QA-WIN", "WIN", arbitrage_active=True,
+                    bet_multiplier=bot.LOSS_MULTIPLIER, hedge_status="expired"),
+        ])
+        first_pair = bot.bet_count(bot.ARBITRAGE_SHARES * first_loss["multiplier"])
+        multiplied_pair = bot.bet_count(
+            bot.ARBITRAGE_SHARES * unfilled_loss["multiplier"])
+        lifecycle_ok = (
+            first_loss["active"]
+            and first_loss["multiplier"] == 1.0
+            and abs(first_pair - 10.0) < 1e-9
+            and unfilled_loss["active"]
+            and abs(unfilled_loss["multiplier"] - bot.LOSS_MULTIPLIER) < 1e-9
+            and abs(multiplied_pair - 20.0) < 1e-9
+            and filled_loss["active"]
+            and filled_loss["multiplier"] == 1.0
+            and not win_reset["active"]
+            and win_reset["multiplier"] == 1.0
+        )
+        record("hedge sizing: BTC loss → 10 BTC + 10 ETH; unfilled loss → 20 + 20",
+               PASS if lifecycle_ok else FAIL,
+               "first pair=%.2f+%.2f, escalated pair=%.2f+%.2f, filled hedge resets to base"
+               % (first_pair, first_pair, multiplied_pair, multiplied_pair))
+
         with tempfile.TemporaryDirectory() as tmp:
             saved_tracker, saved_dry = bot.tracker, bot.DRY_RUN
             bot.tracker = bot.PerformanceTracker(

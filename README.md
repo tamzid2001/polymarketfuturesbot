@@ -3,7 +3,7 @@
 Two independent async trading bots that run 24/7 inside GitHub Actions:
 
 1. **Polymarket Futures Bot** (`polymarket_bot.py`) — WebSocket-driven take-profit and re-entry bot for Polymarket US Futures markets (MLB World Series 2026 focus).
-2. **Kalshi BTC 15-Min Prophet Bot** (`kalshibtc15minupordown.py`) — pre-forecasts BTC one minute before each new Kalshi market opens, compares the forecast p50 with the live strike as soon as the market opens, trades the 15-minute BTC up/down contract, and after a BTC loss streak can pair it with an opposite `KXETH15M` hedge when the paired cost is 90 cents or less. [Jump to docs ↓](#kalshi-btc-15-minute-prophet-bot)
+2. **Kalshi BTC 15-Min Prophet Bot** (`kalshibtc15minupordown.py`) — pre-forecasts BTC one minute before each new Kalshi market opens, compares the forecast p50 with the live strike as soon as the market opens, trades the 15-minute BTC up/down contract, and after a settled BTC loss can pair the next trade with an opposite `KXETH15M` hedge when the paired cost is 90 cents or less. [Jump to docs ↓](#kalshi-btc-15-minute-prophet-bot)
 
 Both run inside GitHub Actions for up to 5 h 45 min per job before self-triggering the next run for uninterrupted 24/7 operation.
 
@@ -263,11 +263,11 @@ polymarketfuturesbot/
 forecasts BTC to that market's settlement with **Facebook Prophet**. As soon as
 the market opens, it compares the forecast p50 with the live Kalshi strike and
 places exactly **one BTC entry per 15-minute window**, sized in **shares**
-(`BET_AMOUNT_SHARES`, default 0.01 contracts — NOT dollars). After at least one
-consecutive BTC-primary loss, the next BTC entry uses the BTC/ETH hedge protocol:
-paired shares start at `ARBITRAGE_SHARES` (default 10) on the first BTC loss,
-scale by `LOSS_MULTIPLIER` on additional consecutive BTC losses, and the bot
-watches the matching `KXETH15M` ticker for an
+(`BET_AMOUNT_SHARES`, default 2 contracts — NOT dollars). A settled BTC-primary
+loss activates the next BTC entry's BTC/ETH hedge protocol: paired shares start
+at `ARBITRAGE_SHARES` (default 10). They scale by `LOSS_MULTIPLIER` only when
+the preceding paired BTC trade also lost **and** its ETH hedge did not fill; a
+BTC win resets the escalation. The bot watches the matching `KXETH15M` ticker for an
 opposite-side IOC limit fill that keeps BTC entry + ETH hedge at 90 cents or
 less. Positions ride to settlement; there is no take-profit monitor.
 
@@ -307,11 +307,13 @@ For every 15-minute Kalshi window:
    forecast p50 < live strike   →  BUY NO   (DOWN)
    ```
 
-6. **ETH hedge after BTC losses** — if the BTC-primary loss streak is greater
-   than zero, the BTC entry uses
-   `ARBITRAGE_SHARES × LOSS_MULTIPLIER^(loss_streak - 1)` contracts. Once BTC
-   fills, the bot watches the matching `KXETH15M` ticker and buys the opposite
-   ETH side only if the watched limit can keep paired cost at or below `$0.90`.
+6. **ETH hedge after a settled BTC loss** — the next BTC entry uses the
+   `ARBITRAGE_SHARES` base of 10 contracts. It multiplies that paired amount
+   only when the prior paired BTC bet lost and its ETH hedge did not fill. A BTC
+   profit clears escalation, and normal BTC-only bets always stay at
+   `BET_AMOUNT_SHARES`. Once BTC fills, the bot watches the matching
+   `KXETH15M` ticker and buys the opposite ETH side only if the watched limit
+   can keep paired cost at or below `$0.90`.
    Example: BTC YES fills at `$0.60`; ETH NO target is
    `1 - 0.60 - 0.10 = $0.30`. For BTC NO, the bot watches ETH YES the same way.
 7. **Log everything**: forecast-time BTC close vs strike vs p50, p50 vs the
@@ -348,9 +350,9 @@ Environment **variables** (not secrets) tune behavior:
 | Variable | Default | Description |
 |---|---|---|
 | `DRY_RUN` | `true` | **Live-money switch.** `false` → real orders |
-| `BET_AMOUNT_SHARES` | `0.01` | Contracts (**shares — NOT dollars**) bought per order, fractional at 0.01 granularity (0.01 is the exchange minimum; price does not affect the count) |
-| `ARBITRAGE_SHARES` | `10` | Base paired BTC/ETH hedge contracts used only when BTC loss streak > 0 |
-| `LOSS_MULTIPLIER` | `2` | Multiplies `ARBITRAGE_SHARES` only during BTC/ETH hedge mode after additional consecutive BTC-primary losses |
+| `BET_AMOUNT_SHARES` | `2` | BTC-only contracts (**shares — NOT dollars**) bought per order; this base is never multiplied |
+| `ARBITRAGE_SHARES` | `10` | Base paired BTC/ETH hedge contracts used after a settled BTC loss |
+| `LOSS_MULTIPLIER` | `2` | Multiplies `ARBITRAGE_SHARES` only after a paired BTC loss where that market's ETH hedge did not fill |
 | `ETH_HEDGE_POLL_S` | `5` | ETH hedge watch cadence (seconds) |
 | `HISTORY_MINUTES` | `500` | 1-minute candles fed to Prophet |
 | `FORECAST_MINUTES` | `16` | Fallback one-minute forecast horizon; the normal pre-open path dynamically forecasts from the newest candle to settlement |

@@ -21,13 +21,14 @@ STRATEGY  (Prophet 15-minute BTC forecast)
        (floor_strike) and decides ONE trade for the window:
             p50 forecast  >  live strike   →  BUY YES  (UP)
             p50 forecast  <  live strike   →  BUY NO   (DOWN)
-    5. If the BTC-only streak already has at least one consecutive loss, the
-       bot activates the BTC/ETH hedge protocol: size the BTC entry with
-       ARBITRAGE_SHARES × LOSS_MULTIPLIER^(loss_streak - 1), monitor the
-       matching KXETH15M market, and submit the opposite ETH IOC limit when the ETH
-       leg can be bought cheaply enough that BTC entry + ETH hedge <= $0.90
-       per paired contract. Example: BTC YES fills at $0.60, so ETH NO is
-       targeted at $0.30 (1 - 0.60 - 0.10).
+    5. A settled BTC loss activates the next BTC/ETH hedge protocol at
+       ARBITRAGE_SHARES. It scales that paired size only after a BTC/ETH
+       protocol trade itself settles as a BTC loss and its ETH hedge did not
+       fill. A BTC win resets this escalation. The bot monitors the matching
+       KXETH15M market and submits the opposite ETH IOC limit when the ETH leg
+       can be bought cheaply enough that BTC entry + ETH hedge <= $0.90 per
+       paired contract. Example: BTC YES fills at $0.60, so ETH NO is targeted
+       at $0.30 (1 - 0.60 - 0.10).
     6. Records filled BTC entries and filled ETH hedges, then lets positions
        ride to settlement. There is no take-profit monitor.
 
@@ -61,12 +62,12 @@ CREDENTIALS / SETTINGS (env vars)
     KALSHI_API_KEY_ID / KALSHI_PEM_PATH (or KALSHI_PRIVATE_KEY content)
     KALSHI_DEMO            "true" for sandbox (default false)
     DRY_RUN               "true" (default) — log orders, do not submit
-    BET_AMOUNT_SHARES     base contracts (shares) bought per order, fractional
-                          at 0.01 granularity (default 0.01 — the exchange minimum)
-    ARBITRAGE_SHARES     base paired BTC/ETH hedge contracts when BTC loss
-                          streak > 0 (default 10)
-    LOSS_MULTIPLIER       multiplies ARBITRAGE_SHARES only during the BTC/ETH
-                          hedge protocol after consecutive BTC losses (default 2)
+    BET_AMOUNT_SHARES     BTC-only contracts (shares) bought per order, fractional
+                          at 0.01 granularity (default 2)
+    ARBITRAGE_SHARES     base paired BTC/ETH hedge contracts after a settled
+                          BTC loss (default 10)
+    LOSS_MULTIPLIER       multiplies ARBITRAGE_SHARES only after an unfilled
+                          ETH hedge and BTC loss in the BTC/ETH protocol (default 2)
     ETH_HEDGE_POLL_S      ETH hedge monitor cadence (default 5s)
     HISTORY_MINUTES       1-min candles pulled per forecast (default 500)
     FORECAST_MINUTES      fallback forecast horizon in minutes (default 16)
@@ -135,15 +136,15 @@ DRY_RUN           = os.getenv("DRY_RUN", "true").lower() in ("1", "true", "yes")
 # Kalshi's fixed-point API supports FRACTIONAL contract counts at 0.01
 # granularity (count_fp, sent as a 0–2 decimal string), so 0.01 — the exchange
 # minimum — is a valid order. See docs.kalshi.com fixed_point_migration.
-BET_AMOUNT_SHARES = float(os.getenv("BET_AMOUNT_SHARES", "0.01"))
+BET_AMOUNT_SHARES = float(os.getenv("BET_AMOUNT_SHARES", "2"))
 
 # ── BTC/ETH hedge protocol ──────────────────────────────────────────────────
-# Only after the BTC result streak has at least one consecutive loss, the next
-# BTC trade enters the paired hedge path. The first BTC loss uses
-# ARBITRAGE_SHARES, and additional consecutive losses multiply that base by
-# LOSS_MULTIPLIER. The bot watches the matching KXETH15M contract for an
-# opposite-side IOC limit fill that keeps BTC entry + ETH hedge <=
-# ARBITRAGE_MAX_PAIR_COST.
+# Only after a settled BTC loss does the next BTC trade enter the paired hedge
+# path. That first paired trade uses ARBITRAGE_SHARES. The size escalates only
+# when a prior paired BTC trade loses and its ETH hedge did not fill; a BTC win
+# clears the escalation. The normal BTC-only BET_AMOUNT_SHARES is never
+# multiplied. The bot watches KXETH15M for an opposite-side IOC limit fill that
+# keeps BTC entry + ETH hedge <= ARBITRAGE_MAX_PAIR_COST.
 ARBITRAGE_SHARES      = float(os.getenv("ARBITRAGE_SHARES", "10"))
 LOSS_MULTIPLIER   = float(os.getenv("LOSS_MULTIPLIER", "2"))
 ARBITRAGE_DISCOUNT_USD = float(os.getenv("ARBITRAGE_DISCOUNT_USD", "0.10"))
@@ -197,17 +198,12 @@ _QMAP = [("p10", 0.10), ("p50", 0.50), ("p90", 0.90)]
 
 def bet_count(bet_shares: Optional[float] = None) -> float:
     """Contract count for one buy: the share amount itself, independent of
-    price (default BET_AMOUNT_SHARES; the strategy passes the
-    streak-multiplied bet). Kalshi's fixed-point API accepts fractional
+    price (default BET_AMOUNT_SHARES; the strategy may pass a paired
+    arbitrage size). Kalshi's fixed-point API accepts fractional
     counts at 0.01 granularity, so the count is floored to 0.01 steps and
     clamped to the 0.01 exchange minimum."""
     bet = BET_AMOUNT_SHARES if bet_shares is None else float(bet_shares)
     return max(0.01, math.floor(bet * 100 + 1e-6) / 100.0)
-
-
-def streak_multiplier(streak: int) -> float:
-    """Arbitrage share multiplier for the current consecutive BTC-loss streak."""
-    return float(LOSS_MULTIPLIER) ** max(0, int(streak))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -984,7 +980,67 @@ class PerformanceTracker:
                 streak += 1
             elif result == "WIN":
                 break
+            else:
+                # An unbooked prior BTC result must not activate a hedge based
+                # on older history while the settlement checker is still polling.
+                break
         return streak
+
+    def next_eth_hedge_state(self, series: str = SERIES_TICKER) -> dict:
+        """Return sizing state for the next BTC entry's optional ETH hedge.
+
+        A settled BTC loss arms the next BTC/ETH trade at ARBITRAGE_SHARES.
+        Escalation is deliberately narrower than a BTC loss streak: it occurs
+        only when the immediately preceding BTC/ETH trade lost and its ETH
+        hedge never filled. A BTC win (or no settled BTC result) leaves the
+        next entry as the normal BTC-only base order.
+        """
+        latest = None
+        for rec in reversed(self.trades):
+            if not str(rec.get("ticker", "")).startswith(series):
+                continue
+            if rec.get("trade_kind", "BTC_PRIMARY") != "BTC_PRIMARY":
+                continue
+            latest = rec
+            break
+
+        state = {
+            "active": False,
+            "multiplier": 1.0,
+            "reason": "no_settled_btc_loss",
+            "previous_ticker": None,
+            "previous_result": None,
+            "previous_hedge_status": None,
+        }
+        if latest is None:
+            return state
+
+        state["previous_ticker"] = latest.get("ticker")
+        result = str(latest.get("result", "pending")).upper()
+        state["previous_result"] = result
+        if result != "LOSS":
+            state["reason"] = (
+                "btc_win_resets_hedge_escalation" if result == "WIN"
+                else "previous_btc_not_settled"
+            )
+            return state
+
+        hedge = latest.get("eth_hedge")
+        hedge_status = hedge.get("status") if isinstance(hedge, dict) else None
+        state["previous_hedge_status"] = hedge_status
+        state["active"] = True
+        state["reason"] = "settled_btc_loss_starts_eth_hedge"
+
+        # The first loss only starts the protocol. Subsequent multiplication
+        # needs both a BTC/ETH-protocol loss and proof that its ETH leg missed.
+        if bool(latest.get("arbitrage_active")) and hedge_status != "filled":
+            prior_multiplier = max(1.0, _f(latest.get("bet_multiplier"), 1.0))
+            state["multiplier"] = prior_multiplier * LOSS_MULTIPLIER
+            state["reason"] = "btc_loss_with_unfilled_eth_hedge_escalates"
+        elif bool(latest.get("arbitrage_active")):
+            state["reason"] = "btc_loss_with_filled_eth_hedge_uses_arb_base"
+
+        return state
 
     def save(self) -> None:
         """Persist in-place record mutations from monitor tasks."""
@@ -1381,8 +1437,8 @@ async def _await_overdue_settlements(timeout_s: float = 120.0) -> None:
 async def execute_window_trade(rest: KalshiREST, ct: str, nt: str) -> None:
     """Use the pre-open Prophet forecast and place ONE order for this window."""
 
-    # 0) Make sure the previous BTC window's result is booked — the loss streak
-    #    controls whether this entry arms the BTC/ETH hedge protocol.
+    # 0) Make sure the previous BTC result is booked. Its BTC result and ETH
+    #    fill status control whether this entry arms or escalates the protocol.
     await _await_overdue_settlements()
 
     # 1) Resolve the active market + strike (retry — a just-opened market can be
@@ -1453,18 +1509,20 @@ async def execute_window_trade(rest: KalshiREST, ct: str, nt: str) -> None:
     else:
         entry_price = (1.0 - yes_p) if yes_p is not None else 0.5
 
-    # Loss-streak hedge sizing: the normal BTC-only path stays at
-    # BET_AMOUNT_SHARES. Only after a BTC loss streak do we enter the paired
-    # BTC/ETH hedge protocol and apply the multiplier to ARBITRAGE_SHARES.
+    # The normal BTC-only path is always BET_AMOUNT_SHARES. A settled BTC loss
+    # arms the paired BTC/ETH path at ARBITRAGE_SHARES; it only doubles (or
+    # otherwise multiplies) when the preceding paired BTC loss had no ETH fill.
     loss_streak = tracker.current_loss_streak()
-    hedge_active = loss_streak > 0
-    multiplier = streak_multiplier(loss_streak - 1) if hedge_active else 1.0
+    hedge_state = tracker.next_eth_hedge_state()
+    hedge_active = bool(hedge_state["active"])
+    multiplier = float(hedge_state["multiplier"])
     count = bet_count(
         ARBITRAGE_SHARES * multiplier if hedge_active else BET_AMOUNT_SHARES)
     if hedge_active:
-        log.info("BTC loss streak %d → ETH hedge protocol active: %.2f base "
-                 "arb shares × %.6g = %.2f paired contracts.",
-                 loss_streak, ARBITRAGE_SHARES, multiplier, count)
+        log.info("ETH hedge protocol active after %s: %.2f arb shares × %.6g "
+                 "= %.2f per leg / %.2f paired shares (%s).",
+                 hedge_state.get("previous_ticker"), ARBITRAGE_SHARES,
+                 multiplier, count, count * 2, hedge_state["reason"])
     est_cost = count * entry_price
 
     settle_et = market.get("settle_et")
@@ -1497,7 +1555,8 @@ async def execute_window_trade(rest: KalshiREST, ct: str, nt: str) -> None:
         f"Decision          : {decision}\n"
         f"BTC Loss Streak   : {loss_streak}\n"
         f"ETH Hedge         : {'armed after BTC fill' if hedge_active else 'inactive'} "
-        f"(arb base {ARBITRAGE_SHARES:.2f}, multiplier ×{multiplier:.6g})\n"
+        f"(arb base {ARBITRAGE_SHARES:.2f}, multiplier ×{multiplier:.6g}; "
+        f"{hedge_state['reason']})\n"
         f"Bet Size          : {count:.2f} contract(s) "
         f"@ ~${entry_price:.2f} = ~${est_cost:.4f}"
     )
@@ -1578,6 +1637,7 @@ async def execute_window_trade(rest: KalshiREST, ct: str, nt: str) -> None:
         "bet_amount_shares": count,
         "loss_streak": loss_streak,
         "bet_multiplier": round(multiplier, 4),
+        "hedge_trigger_reason": hedge_state["reason"],
         "trade_kind": "BTC_PRIMARY",
         "arbitrage_active": hedge_active,
         "eth_hedge": eth_hedge,
@@ -1644,17 +1704,20 @@ async def main_async() -> None:
     log.info("  BTC base bet    : %.2f contracts/order  (shares, fractional "
              "at 0.01 granularity — NOT dollars)", BET_AMOUNT_SHARES)
     _streak = tracker.current_loss_streak()
-    _arb_next = bet_count(ARBITRAGE_SHARES * streak_multiplier(_streak - 1)) if _streak else 0.0
-    log.info("  ETH hedge       : current BTC loss streak %d → %s; arb shares %.2f, "
-             "multiplier ×%.6g, next paired count %.2f",
-             _streak, "ACTIVE" if _streak else "inactive",
-             ARBITRAGE_SHARES, LOSS_MULTIPLIER, _arb_next)
+    _hedge_state = tracker.next_eth_hedge_state()
+    _arb_next = (bet_count(ARBITRAGE_SHARES * _hedge_state["multiplier"])
+                 if _hedge_state["active"] else 0.0)
+    log.info("  ETH hedge       : BTC loss streak %d → %s; arb shares %.2f, "
+             "next multiplier ×%.6g, paired count %.2f (%s)",
+             _streak, "ACTIVE" if _hedge_state["active"] else "inactive",
+             ARBITRAGE_SHARES, _hedge_state["multiplier"], _arb_next,
+             _hedge_state["reason"])
     log.info("  Hedge pricing   : opposite ETH target = 1 - BTC entry - $%.2f; "
              "paired cost cap $%.2f; poll %.0fs",
              ARBITRAGE_DISCOUNT_USD, ARBITRAGE_MAX_PAIR_COST, ETH_HEDGE_POLL_S)
-    log.info("  Loss multiplier : applies only to BTC/ETH hedge protocol; "
-             "current streak %d → multiplier ×%.6g",
-             _streak, streak_multiplier(_streak - 1) if _streak else 1.0)
+    log.info("  Loss multiplier : applies only after a BTC/ETH loss whose ETH "
+             "hedge did not fill; standalone BTC base remains %.2f shares.",
+             BET_AMOUNT_SHARES)
     log.info("  Data / horizon  : %d 1-min candles → forecast to settlement "
              "(fallback %d min)", HISTORY_MINUTES, FORECAST_MINUTES)
     log.info("  Pre-open timing : forecast %.0fs before next open; entry grace %.0fs",

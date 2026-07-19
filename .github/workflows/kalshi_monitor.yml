@@ -16,15 +16,15 @@ on:
         required: false
         default: ""
       bet_amount_shares:
-        description: "Override BET_AMOUNT_SHARES for THIS run only (contracts/SHARES bought per order — NOT dollars — fractional at 0.01 granularity, e.g. '0.01' or '1'). Leave BLANK to use the BET_AMOUNT_SHARES repo/env variable (default 0.01)."
+        description: "Override BET_AMOUNT_SHARES for THIS run only (BTC-only contracts/SHARES bought per order — NOT dollars). Leave BLANK to use the BET_AMOUNT_SHARES repo/env variable (default 2)."
         required: false
         default: ""
       arbitrage_shares:
-        description: "Override ARBITRAGE_SHARES for THIS run and handoffs (paired BTC/ETH hedge shares when BTC loss streak > 0; default 10)."
+        description: "Override ARBITRAGE_SHARES for THIS run and handoffs (base paired BTC/ETH hedge shares after a settled BTC loss; default 10)."
         required: false
         default: ""
       loss_multiplier:
-        description: "Override LOSS_MULTIPLIER for THIS run and handoffs (applies only to ARBITRAGE_SHARES during BTC/ETH hedge mode; default 2)."
+        description: "Override LOSS_MULTIPLIER for THIS run and handoffs (applies only after a BTC/ETH loss where the ETH hedge did not fill; default 2)."
         required: false
         default: ""
 
@@ -74,7 +74,7 @@ jobs:
         run: |
           {
             echo "DRY_RUN=${{ github.event.inputs.dry_run || vars.DRY_RUN || 'true' }}"
-            echo "BET_AMOUNT_SHARES=${{ github.event.inputs.bet_amount_shares || vars.BET_AMOUNT_SHARES || '0.01' }}"
+            echo "BET_AMOUNT_SHARES=${{ github.event.inputs.bet_amount_shares || vars.BET_AMOUNT_SHARES || '2' }}"
             echo "ARBITRAGE_SHARES=${{ github.event.inputs.arbitrage_shares || vars.ARBITRAGE_SHARES || '10' }}"
             echo "LOSS_MULTIPLIER=${{ github.event.inputs.loss_multiplier || vars.LOSS_MULTIPLIER || '2' }}"
             echo "ETH_HEDGE_POLL_S=${{ vars.ETH_HEDGE_POLL_S || '5' }}"
