@@ -81,12 +81,16 @@ def test_high_loss_streak_walkforward_uses_future_blocks_only() -> None:
         "result": (["WIN"] * 5 + ["LOSS"] * 5) * 40,
     })
     ledger, _ = analysis.normalize_ledger(raw, analysis.Path("fixture.csv"))
-    details, summary = analysis.loss_streak_percentile_walkforward(ledger, block_size=100)
+    details, summary, events, buckets = analysis.loss_streak_percentile_walkforward(ledger, block_size=100)
     assert len(details) == 6  # Three non-overlapping future blocks for P90 and P99.
     assert set(details["percentile"]) == {"P90", "P99"}
     assert set(summary["percentile"]) == {"P90", "P99"}
     assert details["train_trades"].tolist() == [100, 100, 200, 200, 300, 300]
     assert details["selected_trades"].gt(0).all()
+    assert not events.empty
+    assert not buckets.empty
+    assert set(events["percentile"]).issubset({"P90", "P99"})
+    assert "P90" in set(events["percentile"])
 
 
 def test_conclusion_rejects_accuracy_gain_with_worse_probability_quality() -> None:

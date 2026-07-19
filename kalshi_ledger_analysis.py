@@ -424,9 +424,114 @@ def prior_loss_streaks(wins: pd.Series) -> pd.Series:
     return pd.Series(values, index=wins.index, dtype="int64")
 
 
+def loss_streak_trade_bucket(trades: int) -> str:
+    if trades == 1:
+        return "1"
+    if trades == 2:
+        return "2"
+    if trades == 3:
+        return "3"
+    if trades <= 5:
+        return "4-5"
+    if trades <= 9:
+        return "6-9"
+    return "10+"
+
+
+def loss_streak_duration_bucket(elapsed_minutes: float) -> str:
+    if elapsed_minutes <= 15:
+        return "<=15m"
+    if elapsed_minutes <= 60:
+        return "16-60m"
+    if elapsed_minutes <= 240:
+        return "1-4h"
+    if elapsed_minutes <= 720:
+        return "4-12h"
+    if elapsed_minutes <= 1440:
+        return "12-24h"
+    return ">24h"
+
+
+def loss_streak_event_frames(selected_trades: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Return every loss run in a filtered trade stream and its duration buckets."""
+    event_columns = [
+        "percentile", "start_trade_number", "end_trade_number", "start_timestamp", "end_timestamp",
+        "start_et", "end_et", "selected_trade_count", "elapsed_minutes", "trade_count_bucket",
+        "elapsed_duration_bucket",
+    ]
+    if selected_trades.empty:
+        return pd.DataFrame(columns=event_columns), pd.DataFrame()
+    records: list[dict[str, Any]] = []
+    for percentile, subset in selected_trades.groupby("percentile", sort=False):
+        subset = subset.sort_values("timestamp", kind="stable").reset_index(drop=True)
+        current: list[pd.Series] = []
+        for _, row in subset.iterrows():
+            if int(row["win"]) == 0:
+                current.append(row)
+                continue
+            if current:
+                first, last = current[0], current[-1]
+                start = pd.Timestamp(first["timestamp"])
+                end = pd.Timestamp(last["timestamp"])
+                elapsed_minutes = (end - start).total_seconds() / 60.0
+                records.append({
+                    "percentile": percentile,
+                    "start_trade_number": int(first["trade_number"]),
+                    "end_trade_number": int(last["trade_number"]),
+                    "start_timestamp": start,
+                    "end_timestamp": end,
+                    "start_et": start.tz_convert(EASTERN).isoformat(),
+                    "end_et": end.tz_convert(EASTERN).isoformat(),
+                    "selected_trade_count": len(current),
+                    "elapsed_minutes": elapsed_minutes,
+                    "trade_count_bucket": loss_streak_trade_bucket(len(current)),
+                    "elapsed_duration_bucket": loss_streak_duration_bucket(elapsed_minutes),
+                })
+                current = []
+        if current:
+            first, last = current[0], current[-1]
+            start = pd.Timestamp(first["timestamp"])
+            end = pd.Timestamp(last["timestamp"])
+            elapsed_minutes = (end - start).total_seconds() / 60.0
+            records.append({
+                "percentile": percentile,
+                "start_trade_number": int(first["trade_number"]),
+                "end_trade_number": int(last["trade_number"]),
+                "start_timestamp": start,
+                "end_timestamp": end,
+                "start_et": start.tz_convert(EASTERN).isoformat(),
+                "end_et": end.tz_convert(EASTERN).isoformat(),
+                "selected_trade_count": len(current),
+                "elapsed_minutes": elapsed_minutes,
+                "trade_count_bucket": loss_streak_trade_bucket(len(current)),
+                "elapsed_duration_bucket": loss_streak_duration_bucket(elapsed_minutes),
+            })
+    events = pd.DataFrame(records, columns=event_columns)
+    if events.empty:
+        return events, pd.DataFrame()
+    buckets = events.groupby(
+        ["percentile", "trade_count_bucket", "elapsed_duration_bucket"], as_index=False, sort=False,
+    ).agg(
+        loss_streak_events=("selected_trade_count", "size"),
+        total_selected_loss_trades=("selected_trade_count", "sum"),
+        average_selected_trade_count=("selected_trade_count", "mean"),
+        average_elapsed_minutes=("elapsed_minutes", "mean"),
+        maximum_elapsed_minutes=("elapsed_minutes", "max"),
+    )
+    trade_order = {"1": 1, "2": 2, "3": 3, "4-5": 4, "6-9": 5, "10+": 6}
+    duration_order = {"<=15m": 1, "16-60m": 2, "1-4h": 3, "4-12h": 4, "12-24h": 5, ">24h": 6}
+    buckets = buckets.assign(
+        _trade_order=buckets["trade_count_bucket"].map(trade_order),
+        _duration_order=buckets["elapsed_duration_bucket"].map(duration_order),
+    ).sort_values(["percentile", "_trade_order", "_duration_order"], kind="stable").drop(
+        columns=["_trade_order", "_duration_order"],
+    )
+    return events, buckets
+
+
 def loss_streak_percentile_walkforward(
         frame: pd.DataFrame, block_size: int = LOSS_STREAK_WALKFORWARD_BLOCK,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Test P90/P99 prior-loss states on non-overlapping future trade blocks.
 
     For each 100/200/300/... trade cutoff, percentile thresholds are learned
@@ -439,6 +544,7 @@ def loss_streak_percentile_walkforward(
     data = frame.sort_values("timestamp", kind="stable").reset_index(drop=True).copy()
     data["prior_loss_streak"] = prior_loss_streaks(data["win"])
     details: list[dict[str, Any]] = []
+    selected_records: list[pd.DataFrame] = []
     selected_wins: dict[float, list[int]] = {percentile: [] for percentile in LOSS_STREAK_PERCENTILES}
     for train_trades in range(block_size, len(data), block_size):
         train = data.iloc[:train_trades]
@@ -457,6 +563,12 @@ def loss_streak_percentile_walkforward(
                     [selected_win_count, selected_count - selected_win_count],
                     [other_win_count, other_count - other_win_count],
                 ], alternative="two-sided")
+            if selected_count:
+                selected_record = selected[["trade_number", "timestamp", "win", "prior_loss_streak"]].copy()
+                selected_record["percentile"] = f"P{int(percentile * 100)}"
+                selected_record["train_trades"] = train_trades
+                selected_record["loss_streak_threshold"] = threshold
+                selected_records.append(selected_record)
             selected_wins[percentile].extend(selected["win"].astype(int).tolist())
             details.append({
                 "percentile": f"P{int(percentile * 100)}",
@@ -514,7 +626,9 @@ def loss_streak_percentile_walkforward(
             "selected_longest_win_streak": selected_streaks["longest_win"],
             "selected_longest_loss_streak": selected_streaks["longest_loss"],
         })
-    return detail_frame, pd.DataFrame(summary_records)
+    selected_frame = pd.concat(selected_records, ignore_index=True) if selected_records else pd.DataFrame()
+    events, buckets = loss_streak_event_frames(selected_frame)
+    return detail_frame, pd.DataFrame(summary_records), events, buckets
 
 
 def prophet_model() -> Prophet:
@@ -923,10 +1037,12 @@ def run_one(frame: pd.DataFrame, info: InputInfo, args: argparse.Namespace, outp
     write_csv(output_dir / "performance_by_rolling_50_regime.csv", by_regime)
     streak_frame = streak_conditionals(series)
     write_csv(output_dir / "streak_conditionals.csv", streak_frame)
-    loss_streak_details, loss_streak_summary = loss_streak_percentile_walkforward(
+    loss_streak_details, loss_streak_summary, loss_streak_events, loss_streak_buckets = loss_streak_percentile_walkforward(
         series, args.loss_streak_walkforward_block)
     write_csv(output_dir / "loss_streak_percentile_walkforward.csv", loss_streak_details)
     write_csv(output_dir / "loss_streak_percentile_summary.csv", loss_streak_summary)
+    write_csv(output_dir / "loss_streak_events.csv", loss_streak_events)
+    write_csv(output_dir / "loss_streak_duration_buckets.csv", loss_streak_buckets)
     forecast_inputs = prophet_series(series)
     LOG.info("%s: Prophet final forecasts and historical cutoff tests", info.signal)
     forecasts = prophet_forecasts(forecast_inputs, (100, 500), args.prophet_max_history)
@@ -955,6 +1071,7 @@ def run_one(frame: pd.DataFrame, info: InputInfo, args: argparse.Namespace, outp
         },
         "performance": performance,
         "loss_streak_percentile_summary": loss_streak_summary.to_dict(orient="records"),
+        "loss_streak_duration_buckets": loss_streak_buckets.to_dict(orient="records"),
         "prophet_policy_summary": policies.to_dict(orient="records"),
         "machine_learning": ml_report,
         "monte_carlo": monte_carlo_report,
