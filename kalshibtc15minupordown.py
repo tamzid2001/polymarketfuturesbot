@@ -23,8 +23,8 @@ STRATEGY  (Prophet 15-minute BTC forecast)
             p50 forecast  <  live strike   →  BUY NO   (DOWN)
     5. A settled BTC loss activates the next BTC/ETH hedge protocol at
        ARBITRAGE_SHARES. It scales that paired size only after a BTC/ETH
-       protocol trade itself settles as a BTC loss and its ETH hedge did not
-       fill. A BTC win resets this escalation. Immediately after the BTC fill,
+       protocol trade itself settles as a BTC loss and zero ETH shares filled.
+       A BTC win resets this escalation. Immediately after the BTC fill,
        the bot submits a resting opposite-side KXETH15M limit that expires at
        that market's settlement and keeps BTC entry + ETH hedge <= $0.90 per
        paired contract. Example: BTC YES fills at $0.60, so ETH NO is targeted
@@ -141,7 +141,7 @@ BET_AMOUNT_SHARES = float(os.getenv("BET_AMOUNT_SHARES", "2"))
 # ── BTC/ETH hedge protocol ──────────────────────────────────────────────────
 # Only after a settled BTC loss does the next BTC trade enter the paired hedge
 # path. That first paired trade uses ARBITRAGE_SHARES. The size escalates only
-# when a prior paired BTC trade loses and its ETH hedge did not fill; a BTC win
+# when a prior paired BTC trade loses and zero ETH shares filled; a BTC win
 # clears the escalation. The normal BTC-only BET_AMOUNT_SHARES is never
 # multiplied. Immediately after the BTC fill, it submits a resting opposite-side
 # KXETH15M limit through that market's settlement. The target keeps BTC entry +
@@ -997,8 +997,8 @@ class PerformanceTracker:
 
         A settled BTC loss arms the next BTC/ETH trade at ARBITRAGE_SHARES.
         Escalation is deliberately narrower than a BTC loss streak: it occurs
-        only when the immediately preceding BTC/ETH trade lost and its ETH
-        hedge never filled. A BTC win (or no settled BTC result) leaves the
+        only when the immediately preceding BTC/ETH trade lost and zero ETH
+        shares filled. A BTC win (or no settled BTC result) leaves the
         next entry as the normal BTC-only base order.
         """
         latest = None
@@ -1033,18 +1033,23 @@ class PerformanceTracker:
 
         hedge = latest.get("eth_hedge")
         hedge_status = hedge.get("status") if isinstance(hedge, dict) else None
+        hedge_filled_count = (_f(hedge.get("recorded_fill_count"), 0.0)
+                              if isinstance(hedge, dict) else 0.0)
         state["previous_hedge_status"] = hedge_status
+        state["previous_hedge_filled_count"] = hedge_filled_count
         state["active"] = True
         state["reason"] = "settled_btc_loss_starts_eth_hedge"
 
         # The first loss only starts the protocol. Subsequent multiplication
-        # needs both a BTC/ETH-protocol loss and proof that its ETH leg missed.
-        if bool(latest.get("arbitrage_active")) and hedge_status != "filled":
+        # needs a BTC/ETH-protocol loss and a completely unfilled ETH order.
+        # A partial ETH fill counts as a fill and therefore does not multiply.
+        eth_has_zero_fills = (hedge_status != "filled" and hedge_filled_count < 0.005)
+        if bool(latest.get("arbitrage_active")) and eth_has_zero_fills:
             prior_multiplier = max(1.0, _f(latest.get("bet_multiplier"), 1.0))
             state["multiplier"] = prior_multiplier * LOSS_MULTIPLIER
-            state["reason"] = "btc_loss_with_unfilled_eth_hedge_escalates"
+            state["reason"] = "btc_loss_with_zero_fill_eth_hedge_escalates"
         elif bool(latest.get("arbitrage_active")):
-            state["reason"] = "btc_loss_with_filled_eth_hedge_uses_arb_base"
+            state["reason"] = "btc_loss_with_eth_fill_uses_arb_base"
 
         return state
 
@@ -1783,8 +1788,8 @@ async def main_async() -> None:
     log.info("  Hedge pricing   : opposite ETH target = 1 - BTC entry - $%.2f; "
              "paired cost cap $%.2f; poll %.0fs",
              ARBITRAGE_DISCOUNT_USD, ARBITRAGE_MAX_PAIR_COST, ETH_HEDGE_POLL_S)
-    log.info("  Loss multiplier : applies only after a BTC/ETH loss whose ETH "
-             "hedge did not fill; standalone BTC base remains %.2f shares.",
+    log.info("  Loss multiplier : applies only after a BTC/ETH loss with zero "
+             "ETH shares filled; standalone BTC base remains %.2f shares.",
              BET_AMOUNT_SHARES)
     log.info("  Data / horizon  : %d 1-min candles → fixed %d-min forecast",
              HISTORY_MINUTES, FORECAST_MINUTES)

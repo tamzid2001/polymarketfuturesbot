@@ -456,8 +456,9 @@ def check_eth_hedge(bot):
                PASS if skip is None else FAIL, f"target={skip}")
 
         def primary(ticker, result, *, arbitrage_active=False,
-                    bet_multiplier=1.0, hedge_status=None):
-            hedge = None if hedge_status is None else {"status": hedge_status}
+                    bet_multiplier=1.0, hedge_status=None, hedge_filled_count=0.0):
+            hedge = (None if hedge_status is None else {
+                "status": hedge_status, "recorded_fill_count": hedge_filled_count})
             return {
                 "ticker": ticker,
                 "trade_kind": "BTC_PRIMARY",
@@ -483,7 +484,8 @@ def check_eth_hedge(bot):
         ])
         partial_loss = next_state_for([
             primary("KXBTC15M-QA-PARTIAL", "LOSS", arbitrage_active=True,
-                    bet_multiplier=1.0, hedge_status="partially_filled"),
+                    bet_multiplier=1.0, hedge_status="partially_filled",
+                    hedge_filled_count=1.0),
         ])
         filled_loss = next_state_for([
             primary("KXBTC15M-QA-FILLED", "LOSS", arbitrage_active=True,
@@ -502,16 +504,16 @@ def check_eth_hedge(bot):
             and abs(first_pair - 10.0) < 1e-9
             and unfilled_loss["active"]
             and abs(unfilled_loss["multiplier"] - bot.LOSS_MULTIPLIER) < 1e-9
-            and abs(partial_loss["multiplier"] - bot.LOSS_MULTIPLIER) < 1e-9
+            and partial_loss["multiplier"] == 1.0
             and abs(multiplied_pair - 20.0) < 1e-9
             and filled_loss["active"]
             and filled_loss["multiplier"] == 1.0
             and not win_reset["active"]
             and win_reset["multiplier"] == 1.0
         )
-        record("hedge sizing: only BTC loss + unfilled ETH limit → 20 + 20",
+        record("hedge sizing: only BTC loss + zero ETH fill → 20 + 20",
                PASS if lifecycle_ok else FAIL,
-               "first pair=%.2f+%.2f, escalated pair=%.2f+%.2f, filled hedge resets to base"
+               "first pair=%.2f+%.2f, escalated pair=%.2f+%.2f; partial/full ETH fill resets to base"
                % (first_pair, first_pair, multiplied_pair, multiplied_pair))
 
         with tempfile.TemporaryDirectory() as tmp:

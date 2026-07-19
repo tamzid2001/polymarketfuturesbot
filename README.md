@@ -266,8 +266,8 @@ places exactly **one BTC entry per 15-minute window**, sized in **shares**
 (`BET_AMOUNT_SHARES`, default 2 contracts — NOT dollars). A settled BTC-primary
 loss activates the next BTC entry's BTC/ETH hedge protocol: paired shares start
 at `ARBITRAGE_SHARES` (default 10). They scale by `LOSS_MULTIPLIER` only when
-the preceding paired BTC trade also lost **and** its ETH hedge did not fully
-fill; a BTC win resets the escalation. Immediately after the BTC fill, the bot
+the preceding paired BTC trade also lost **and** zero ETH shares filled; a BTC
+win resets the escalation. Immediately after the BTC fill, the bot
 submits a resting opposite-side limit in the matching `KXETH15M` market, with
 an expiry at settlement, that keeps BTC entry + ETH hedge at 90 cents or less.
 Positions ride to settlement; there is no take-profit monitor.
@@ -312,7 +312,7 @@ For every 15-minute Kalshi window:
 
 6. **ETH hedge after a settled BTC loss** — the next BTC entry uses the
    `ARBITRAGE_SHARES` base of 10 contracts. It multiplies that paired amount
-   only when the prior paired BTC bet lost and its ETH hedge did not fully fill. A BTC
+   only when the prior paired BTC bet lost and zero ETH shares filled. A BTC
    profit clears escalation, and normal BTC-only bets always stay at
    `BET_AMOUNT_SHARES`. Immediately after BTC fills, the bot submits a
    settlement-expiring limit in the matching `KXETH15M` ticker for the
@@ -356,7 +356,7 @@ Environment **variables** (not secrets) tune behavior:
 | `DRY_RUN` | `true` | **Live-money switch.** `false` → real orders |
 | `BET_AMOUNT_SHARES` | `2` | BTC-only contracts (**shares — NOT dollars**) bought per order; this base is never multiplied |
 | `ARBITRAGE_SHARES` | `10` | Base paired BTC/ETH hedge contracts used after a settled BTC loss |
-| `LOSS_MULTIPLIER` | `2` | Multiplies `ARBITRAGE_SHARES` only after a paired BTC loss where that market's ETH hedge did not fully fill |
+| `LOSS_MULTIPLIER` | `2` | Multiplies `ARBITRAGE_SHARES` only after a paired BTC loss where zero ETH shares filled |
 | `ETH_HEDGE_POLL_S` | `5` | ETH order-fill reconciliation cadence (seconds) |
 | `HISTORY_MINUTES` | `500` | 1-minute candles fed to Prophet |
 | `FORECAST_MINUTES` | `17` | Fixed Prophet horizon in one-minute timesteps for every cached forecast |
