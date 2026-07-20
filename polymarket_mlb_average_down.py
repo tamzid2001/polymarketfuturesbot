@@ -43,7 +43,7 @@ LOG = logging.getLogger("polymarket_mlb_average_down")
 GATEWAY_BASE_URL = "https://gateway.polymarket.us"
 LEAGUE = "mlb"
 ET = ZoneInfo("America/New_York")
-CONFIG_VERSION = 1
+CONFIG_VERSION = 2
 STATE_VERSION = 1
 
 DEFAULT_CONFIG: dict[str, Any] = {
@@ -56,6 +56,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "max_total_capital": 50.00,
     "poll_seconds": 20.0,
     "status_log_seconds": 60.0,
+    # The historical ML pipeline is opt-in. Existing monitoring remains the
+    # original price-only mechanical strategy unless this is explicitly set.
+    "strategy_mode": "mechanical",
+    "ml_model_path": "",
+    "ml_min_confidence": 0.50,
 }
 
 
@@ -164,11 +169,13 @@ def lower_levels(first_fill: float, step: float, tick_size: float, max_orders: i
 
 
 def choose_first_trigger(
-    outcomes: dict[str, dict[str, Any]], asks: dict[str, float | None], step: float,
+    outcomes: dict[str, dict[str, Any]], asks: dict[str, float | None], step: float, permitted_outcome: str | None = None,
 ) -> tuple[str, float, float] | None:
     """Select a triggered home/away outcome.  Exact simultaneous ties prefer home."""
     candidates: list[tuple[float, int, str, float, float]] = []
     for outcome, metadata in outcomes.items():
+        if permitted_outcome is not None and outcome != permitted_outcome:
+            continue
         baseline = as_float(metadata.get("initial_ask"))
         target = as_float(metadata.get("entry_target"))
         ask = asks.get(outcome)
@@ -294,6 +301,14 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("price_step must be less than $1")
     if merged["max_contracts_per_game"] < merged["initial_position_size"]:
         raise ValueError("max_contracts_per_game must fund the initial contract quantity")
+    merged["strategy_mode"] = str(merged.get("strategy_mode") or "mechanical")
+    if merged["strategy_mode"] not in {"mechanical", "ml_side_average_down"}:
+        raise ValueError("strategy_mode must be mechanical or ml_side_average_down")
+    merged["ml_model_path"] = str(merged.get("ml_model_path") or "")
+    confidence = as_float(merged.get("ml_min_confidence"))
+    if confidence is None or not .5 <= confidence <= 1:
+        raise ValueError("ml_min_confidence must be between 0.50 and 1.00")
+    merged["ml_min_confidence"] = confidence
     return merged
 
 
@@ -303,6 +318,7 @@ def apply_config_overrides(config: dict[str, Any], args: argparse.Namespace) -> 
     for key in (
         "initial_position_size", "max_active_games", "max_contracts_per_game",
         "max_total_capital", "price_step", "poll_seconds", "status_log_seconds",
+        "strategy_mode", "ml_model_path", "ml_min_confidence",
     ):
         value = getattr(args, key, None)
         if value is not None:
@@ -577,7 +593,7 @@ async def snapshot_baseline(client: Any, record: dict[str, Any], game: GameMarke
         outcomes[outcome] = {**side, "initial_ask": baseline, "entry_target": target}
     record.update({
         "outcomes": outcomes, "status": "watching_trigger", "baseline_observed_at": now_iso(),
-        "quantity": max(config["initial_position_size"], game.minimum_trade_qty),
+        "quantity": max(config["initial_position_size"], game.minimum_trade_qty), "baseline_asks": asks,
     })
     LOG.info(
         "BASELINE | %s home=%s $%.4f -> buy <= $%.4f | away=%s $%.4f -> buy <= $%.4f",
@@ -588,6 +604,41 @@ async def snapshot_baseline(client: Any, record: dict[str, Any], game: GameMarke
         next(side["team"] for side in outcomes.values() if side["role"] == "away"),
         next(side["initial_ask"] for side in outcomes.values() if side["role"] == "away"),
         next(side["entry_target"] for side in outcomes.values() if side["role"] == "away"),
+    )
+    return True
+
+
+async def resolve_ml_side(game: GameMarket, record: dict[str, Any], config: dict[str, Any]) -> bool:
+    """Freeze one ML-selected team before the mechanical discount watcher runs."""
+    if config["strategy_mode"] != "ml_side_average_down":
+        return True
+    if record.get("ml_selected_outcome") in {"long", "short"}:
+        return True
+    try:
+        from polymarket_mlb_ml_inference import choose_ml_side
+    except ImportError as exc:
+        record.update({"status": "ml_inference_unavailable", "ml_error": f"ml_module_import_failed:{exc}"})
+        LOG.error("ML SIDE FAILED | %s %s", game.market_slug, record["ml_error"])
+        return False
+    result = await asyncio.to_thread(
+        choose_ml_side, model_path=Path(config["ml_model_path"]), game_start=game.game_start,
+        outcomes=record.get("outcomes") or {}, asks=record.get("baseline_asks") or {},
+        min_confidence=float(config["ml_min_confidence"]), root=Path("."),
+    )
+    outcome = result.get("outcome") if isinstance(result, dict) else None
+    if outcome not in {"long", "short"}:
+        error = result.get("error", "unknown_ml_inference_failure") if isinstance(result, dict) else "unknown_ml_inference_failure"
+        record.update({"status": "ml_inference_unavailable", "ml_error": error, "ml_result": result})
+        LOG.warning("ML SIDE FAILED | %s %s; no mechanical side will be substituted.", game.market_slug, error)
+        return False
+    record.update({
+        "ml_selected_outcome": outcome, "ml_selected_at": now_iso(), "ml_p_home": result.get("p_home"),
+        "ml_confidence": result.get("confidence"), "ml_model": result.get("model"), "ml_result": result,
+    })
+    side = record["outcomes"][outcome]
+    LOG.info(
+        "ML SIDE FROZEN | %s %s %s p_home=%.4f confidence=%.4f model=%s; only this team can trigger the 10c ladder.",
+        game.market_slug, side["role"].upper(), side["team"], float(result["p_home"]), float(result["confidence"]), result.get("model"),
     )
     return True
 
@@ -604,7 +655,10 @@ async def consider_entry(
     if set(outcomes) != {"long", "short"}:
         return
     asks = await bbo(client, record["market_slug"])
-    trigger = choose_first_trigger(outcomes, asks, config["price_step"])
+    selected = record.get("ml_selected_outcome") if config["strategy_mode"] == "ml_side_average_down" else None
+    if config["strategy_mode"] == "ml_side_average_down" and selected not in {"long", "short"}:
+        return
+    trigger = choose_first_trigger(outcomes, asks, config["price_step"], selected)
     if trigger is None:
         return
     outcome, ask, target = trigger
@@ -694,6 +748,8 @@ async def run(args: argparse.Namespace) -> int:
     LOG.info("STARTUP | mode=%s contracts_per_rung=%d step=$%.2f max_game_contracts=%d",
              "DRY_RUN" if dry_run else "LIVE", config["initial_position_size"], config["price_step"],
              config["max_contracts_per_game"])
+    LOG.info("STRATEGY | mode=%s%s", config["strategy_mode"],
+             f" model={config['ml_model_path']} confidence_gate={config['ml_min_confidence']:.2f}" if config["strategy_mode"] == "ml_side_average_down" else "")
     async with AsyncPolymarketUS(key_id=api_key, secret_key=secret_key) as client:
         try:
             while True:
@@ -708,6 +764,7 @@ async def run(args: argparse.Namespace) -> int:
                     await reconcile_game(client, record, dry_run)
                     if record.get("status") == "watching_baseline":
                         if await snapshot_baseline(client, record, game, config):
+                            await resolve_ml_side(game, record, config)
                             save_json(args.state_file, state)
                     await consider_entry(client, record, config, dry_run, args.state_file, state, now)
                     await reconcile_game(client, record, dry_run)
@@ -743,6 +800,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--price-step", type=float)
     parser.add_argument("--poll-seconds", type=float)
     parser.add_argument("--status-log-seconds", type=float)
+    parser.add_argument("--strategy-mode", choices=("mechanical", "ml_side_average_down"))
+    parser.add_argument("--ml-model-path")
+    parser.add_argument("--ml-min-confidence", type=float)
     return parser
 
 

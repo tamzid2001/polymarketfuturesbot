@@ -1,0 +1,71 @@
+name: Polymarket US MLB Historical ML Backtest
+
+# Read-only historical research. This workflow never imports the live runner,
+# never calls an order endpoint, and never persists a trading configuration.
+on:
+  workflow_dispatch:
+    inputs:
+      max_games:
+        description: "Optional small schema smoke-test limit; leave blank for all completed MLB moneylines."
+        required: false
+        type: string
+        default: ""
+      refresh:
+        description: "Refresh cached API responses for this run."
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  research:
+    runs-on: ubuntu-latest
+    environment: "Polymarket US Futures"
+    timeout-minutes: 360
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install isolated research dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements_mlb_ml_backtest.txt
+
+      - name: Verify leakage and execution safeguards
+        run: |
+          python -m py_compile polymarket_mlb_ml_backtest.py polymarket_mlb_ml_inference.py polymarket_mlb_average_down.py
+          python -m unittest -v test_polymarket_mlb_ml_backtest.py test_polymarket_mlb_average_down.py
+
+      - name: Collect, validate, and evaluate historical MLB data
+        env:
+          # These credentials sign read-only reporting/reference calls. The
+          # script has no order client and no live-trading flag.
+          POLYMARKET_PUBLIC_KEY: ${{ secrets.POLYMARKET_PUBLIC_KEY }}
+          POLYMARKET_SECRET_KEY: ${{ secrets.POLYMARKET_SECRET_KEY }}
+        run: |
+          set -euo pipefail
+          args=(run-all --root .)
+          if [ "${{ inputs.refresh }}" = "true" ]; then args+=(--refresh); fi
+          if [ -n "${{ inputs.max_games }}" ]; then args+=(--max-games "${{ inputs.max_games }}"); fi
+          python polymarket_mlb_ml_backtest.py "${args[@]}"
+
+      - name: Upload raw data, exclusions, predictions, and report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: polymarket-mlb-ml-backtest-${{ github.run_id }}
+          path: |
+            data/raw/polymarket_mlb/
+            data/processed/polymarket_mlb/
+            data/features/polymarket_mlb/
+            models/trained/polymarket_mlb/
+            reports/polymarket_mlb/
+          if-no-files-found: warn
+          retention-days: 90

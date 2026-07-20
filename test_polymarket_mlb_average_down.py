@@ -77,6 +77,17 @@ class MechanicalMlbAverageDownTests(unittest.TestCase):
             ("long", 0.10, 0.10),
         )
 
+    def test_ml_selected_outcome_blocks_an_opposite_team_trigger(self):
+        outcomes = {
+            "long": {"role": "away", "team": "Away", "initial_ask": 0.30, "entry_target": 0.20},
+            "short": {"role": "home", "team": "Home", "initial_ask": 0.80, "entry_target": 0.70},
+        }
+        # Away crosses first, but an ML choice of home means no away order is
+        # permitted; when home later reaches its own discount it is the only
+        # side that can start the ladder.
+        self.assertIsNone(choose_first_trigger(outcomes, {"long": 0.10, "short": 0.80}, 0.10, "short"))
+        self.assertEqual(choose_first_trigger(outcomes, {"long": 0.10, "short": 0.70}, 0.10, "short"), ("short", 0.70, 0.70))
+
     def test_lower_ladder_is_strictly_below_actual_fill(self):
         self.assertEqual(lower_levels(0.67, 0.10, 0.01, 10), [0.57, 0.47, 0.37, 0.27, 0.17, 0.07])
 
@@ -92,11 +103,12 @@ class MechanicalMlbAverageDownTests(unittest.TestCase):
         }}
         self.assertEqual(reserved_capital(state, self.now), 0.69)
 
-    def test_defaults_are_one_contract_and_no_ml_fields(self):
+    def test_defaults_are_one_contract_and_ml_is_explicitly_disabled(self):
         config = validate_config(DEFAULT_CONFIG)
         self.assertEqual(config["initial_position_size"], 1)
         self.assertEqual(config["price_step"], 0.10)
-        self.assertNotIn("model", config)
+        self.assertEqual(config["strategy_mode"], "mechanical")
+        self.assertEqual(config["ml_model_path"], "")
 
 
 if __name__ == "__main__":

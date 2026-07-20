@@ -5,7 +5,7 @@ The repository contains the original futures and Prophet runners, plus two separ
 1. **Polymarket Futures Bot** (`polymarket_bot.py`) — WebSocket-driven take-profit and re-entry bot for Polymarket US Futures markets (MLB World Series 2026 focus).
 2. **Kalshi BTC 15-Min Prophet Bot** (`kalshibtc15minupordown.py`) — pre-forecasts BTC two minutes before each new Kalshi market opens with a fixed 17-minute horizon, then compares the cached p50 with the live strike immediately at the open. [Jump to docs ↓](#kalshi-btc-15-minute-prophet-bot)
 3. **Kalshi BTC 15-Min ML-Side Mechanical Average-Down Bot** (`kalshi_btc15m_average_down.py`) — continuous KXBTC15M-only runner. A stored ML inference selects YES or NO before opening; when the market opens, it immediately posts that side's 40¢/30¢/20¢/10¢ economic GTC ladder through settlement. [Jump to docs ↓](#kalshi-btc-15-minute-mechanical-average-down-runner)
-4. **Polymarket US MLB Mechanical Average-Down Bot** (`polymarket_mlb_average_down.py`) — continuous dry-monitoring runner for same-day MLB full-game moneylines. It takes no baseball prediction: it snapshots both team costs, waits for the first team to trade 10¢ below its own snapshot, and records the resulting mechanical ladder audit. Scheduled runs cannot place orders; a separate manual switch permits a one-off live run.
+4. **Polymarket US MLB Average-Down Bot** (`polymarket_mlb_average_down.py`) — continuous dry-monitoring runner for same-day MLB full-game moneylines. Its default `mechanical` mode takes no baseball prediction: it snapshots both team costs, waits for the first team to trade 10¢ below its own snapshot, and records the resulting mechanical ladder audit. An explicitly configured `ml_side_average_down` mode is available only after the separate leakage-safe research pipeline produces a versioned model artifact; it freezes one ML-selected team and never substitutes or reverses to the other team. Scheduled runs cannot place orders; a separate manual switch permits a one-off live run.
 
 The continuous runners use GitHub Actions for up to 5 h 45 min per job before self-triggering the next run. The Polymarket MLB mechanical runner is now a 24/7 **dry-monitoring** chain: scheduled and handoff jobs are explicitly dry, while live trading remains a separate manual choice.
 
@@ -100,6 +100,37 @@ For every eligible MLB full-game moneyline starting that day in New York time, t
 Example: home 80¢ / away 20¢ at baseline gives home `≤70¢` and away `≤10¢` triggers. If home reaches 70¢ first and fills, only home can receive lower 60¢/50¢/... rungs; away receives no order.
 
 Polymarket's API price is always the LONG/YES price, so buying the short/NO team at a 10¢ outcome cost is correctly submitted as a 90¢ API price. The runner stores both prices in its state and logs them on every submission.
+
+### Historical MLB ML backtest and optional ML-side mode
+
+`polymarket_mlb_ml_backtest.py` is a distinct, read-only research pipeline. It uses the official Polymarket US public gateway for completed MLB events/settlements, the authenticated Polymarket reporting endpoint for historical trade statistics, and the MLB Stats API for final game records and strictly prior team features. It does not use the 15 observed dry-run games as an ML sample.
+
+Run it locally after installing its isolated dependencies:
+
+```bash
+pip install -r requirements_mlb_ml_backtest.txt
+python polymarket_mlb_ml_backtest.py run-all --root . --refresh
+```
+
+Or use **Actions → “Polymarket US MLB Historical ML Backtest”**. That workflow is read-only: it has no order call, no live-trading input, and uploads raw API responses, exclusions, feature rows, predictions, and reports as a 90-day artifact.
+
+The backtest separately evaluates the 24-hour, 6-hour, and 1-hour pre-game cutoffs. It accepts only full-game two-team moneylines, checks Polymarket settlement against an MLB final, records every exclusion, and only uses a candle whose timestamp is at or before the cutoff. Its chronological expanding folds and latest 20% untouched holdout never use a random split. Training preprocessing and calibration are fitted only on their preceding chronological data.
+
+It compares market implied probability, market favorite, always-home, historical home rate, price-only logistic regression, market-feature logistic regression, gradient boosting, and a market-plus-prior-team model. Reported prediction metrics include accuracy, confidence interval, log loss, Brier score, ROC-AUC, calibration error, and confusion matrix. A higher accuracy alone is **not** a market edge: the report compares every model to the market baseline on the same untouched games.
+
+Historical trade candles are not executable bid/ask quotes. The trading simulator therefore never converts a candle close or midpoint into a fill. It reports a no-trade result unless historical ask price, liquidity, fee assumption, and position-capacity information are present. This means a directional result may be valid while P&L remains unavailable; it is not evidence of profitability.
+
+The optional `ml_side_average_down` runner mode remains disabled by default:
+
+```json
+{
+  "strategy_mode": "mechanical",
+  "ml_model_path": "",
+  "ml_min_confidence": 0.5
+}
+```
+
+To use a successfully validated artifact in a future **dry run**, set `strategy_mode` to `ml_side_average_down` and point `ml_model_path` at that artifact. The runner loads no Prophet model and has no fallback side: once it stores the ML-selected home or away outcome, only that outcome can trigger the initial 10¢ discount order and all later rungs stay on that same team through settlement. Missing/unreadable artifacts, unavailable features, or failed inference place no order.
 
 ---
 
