@@ -71,14 +71,15 @@ jobs:
         run: |
           set -euo pipefail
           if [ -n "$MANUAL_MODEL_RUN_ID" ]; then
-            # A manual override preserves the former artifact convention for
-            # emergency rollback only. The runner still validates the saved
-            # model's exact ML-only feature schema before it can trade.
+            # Manual rollback is restricted to the current ML-only bundle
+            # convention.  It cannot select the retired Prophet-era ledger.
+            # The runner also validates the saved model's exact ML-only schema
+            # before it can trade.
             MODEL_RUN_ID="$MANUAL_MODEL_RUN_ID"
             MODEL_ARTIFACT="kalshi-kxbtc15m-ml-model-$MODEL_RUN_ID"
-            TRAINING_RUN_ID="${MANUAL_TRAINING_RUN_ID:-29698207476}"
-            LEDGER_ARTIFACT="kalshi-btc15m-backtest-$TRAINING_RUN_ID"
-            LEDGER_PATH="prophet_ml_backtest_rows.csv"
+            TRAINING_RUN_ID="${MANUAL_TRAINING_RUN_ID:-$MODEL_RUN_ID}"
+            LEDGER_ARTIFACT="kalshi-kxbtc15m-ml-model-$TRAINING_RUN_ID"
+            LEDGER_PATH="training_data/kxbtc15m_ml_only_feature_ledger.csv"
             MODEL_SOURCE="manual_override"
           else
             test -s kalshi_ml_model_registry.json
