@@ -4,7 +4,7 @@ The repository contains the original futures and Prophet runners, plus two separ
 
 1. **Polymarket Futures Bot** (`polymarket_bot.py`) — WebSocket-driven take-profit and re-entry bot for Polymarket US Futures markets (MLB World Series 2026 focus).
 2. **Kalshi BTC 15-Min Prophet Bot** (`kalshibtc15minupordown.py`) — pre-forecasts BTC two minutes before each new Kalshi market opens with a fixed 17-minute horizon, then compares the cached p50 with the live strike immediately at the open. [Jump to docs ↓](#kalshi-btc-15-minute-prophet-bot)
-3. **Kalshi BTC 15-Min ML-Side Mechanical Average-Down Bot** (`kalshi_btc15m_average_down.py`) — continuous KXBTC15M-only runner. A stored ML inference selects YES or NO before opening; the execution layer then watches only that side for a 40¢/30¢/20¢/10¢ economic ladder to settlement. [Jump to docs ↓](#kalshi-btc-15-minute-mechanical-average-down-runner)
+3. **Kalshi BTC 15-Min ML-Side Mechanical Average-Down Bot** (`kalshi_btc15m_average_down.py`) — continuous KXBTC15M-only runner. A stored ML inference selects YES or NO before opening; when the market opens, it immediately posts that side's 40¢/30¢/20¢/10¢ economic GTC ladder through settlement. [Jump to docs ↓](#kalshi-btc-15-minute-mechanical-average-down-runner)
 4. **Polymarket US MLB Mechanical Average-Down Bot** (`polymarket_mlb_average_down.py`) — continuous dry-monitoring runner for same-day MLB full-game moneylines. It takes no baseball prediction: it snapshots both team costs, waits for the first team to trade 10¢ below its own snapshot, and records the resulting mechanical ladder audit. Scheduled runs cannot place orders; a separate manual switch permits a one-off live run.
 
 The continuous runners use GitHub Actions for up to 5 h 45 min per job before self-triggering the next run. The Polymarket MLB mechanical runner is now a 24/7 **dry-monitoring** chain: scheduled and handoff jobs are explicitly dry, while live trading remains a separate manual choice.
@@ -17,31 +17,65 @@ Use **Actions → “Kalshi BTC 15m ML-Side Average Down” → Run workflow**. 
 
 ### Deployed model, coverage, and evidence
 
-The live runner resolves its artifact from [`kalshi_ml_model_registry.json`](kalshi_ml_model_registry.json) at every 5h45m handoff. The bootstrap artifact is **Actions run `29776048495`**: regularized logistic regression with isotonic probability calibration. Its schema lock prevents a model with any non-ML-only feature from being substituted. The runner records the artifact ID, training cutoff, model `p_yes`, confidence, and selected side with every ML-backed market record.
+The live runner resolves its artifact from [`kalshi_ml_model_registry.json`](kalshi_ml_model_registry.json) at every 5h45m handoff. The active model is a regularized logistic regression with isotonic probability calibration, trained and published by the ML-only daily retraining workflow. Its schema lock prevents a model with any non-ML-only feature from being substituted. The runner records the artifact ID, training cutoff, model `p_yes`, confidence, and selected side with every ML-backed market record.
 
-The `confidence >= 0.50` gate has **100% valid-model-direction coverage**: every valid binary-model score has a YES or NO direction at that threshold. This is not 100% order coverage. An actual position still requires the ML-selected side's executable Kalshi ask to reach `<= $0.40`; it may then fill zero to four same-side rungs depending on market prices and liquidity.
+The `confidence >= 0.50` gate has **100% valid-model-direction coverage**: every valid binary-model score has a YES or NO direction at that threshold. For a freshly discovered, active market with sufficient capital, the runner immediately attempts all four GTC limits on that one ML-selected side. This is still not 100% fill coverage: each rung may remain unfilled, partially fill, be rejected, or be canceled at market close.
 
-The earlier 52.42% / 18,986-score result used a Prophet-feature schema and is **not evidence for this ML-only model**. On the ML-only logistic model's final untouched 2,879-market test, the 50% gate scored 51.27% (full coverage; p=0.18) and its 55% subset scored 60.27% on 146 scores (p=0.016). These are directional-only measurements, not executable P&L. The live gate must be selected deliberately; fees, fills, spread, rung depth, and settlement determine actual P&L.
+The earlier 52.42% / 18,986-score result used a Prophet-feature schema and is **not evidence for this ML-only model**. In an earlier ML-only final untouched 2,879-market test, the 50% gate scored 51.27% (full coverage; p=0.18): this was not statistically significant. The newest daily-retrain artifact uses a separate chronological test (2,895 markets): its pre-selected 55% confidence subset was 234/423 = 55.32% (p=0.032). That is statistically significant at the conventional 5% level for that one directional test, but it is not an executable-P&L result and is not the live 50% coverage policy. The production runner deliberately uses `confidence >= 0.50` so every valid score produces a side; its live P&L and 50%-gate directional performance must be measured prospectively with fills and fees.
+
+### Exact ML-only features
+
+The classifier receives exactly these 16 values, all fixed using information available before the market opens:
+
+| Group | Features | Meaning |
+| --- | --- | --- |
+| Strike and momentum | `spot_vs_strike_bps`, `return_1m_bps`, `return_5m_bps`, `return_15m_bps`, `return_60m_bps` | Latest BTC spot relative to Kalshi's strike, plus BTC returns over 1, 5, 15, and 60 minutes, in basis points. |
+| Volatility and range | `vol_15m_bps`, `vol_60m_bps`, `range_15m_bps` | Standard deviation of one-minute log returns over 15/60 minutes and the 15-minute high-to-low range. |
+| Settled-outcome history | `lag_outcome_1`, `lag_outcome_2`, `lag_outcome_4`, `lag_outcome_8`, `known_yes_rate_8`, `known_outcome_count` | Only earlier **settled** KXBTC15M YES/NO outcomes: four lags, the last-eight YES rate, and the number of known settled rows. Missing early lags use a neutral 0.5 value. |
+| Time of day | `hour_sin`, `hour_cos` | UTC market-open time encoded cyclically, so times near midnight remain close together. |
+
+The feature builder requires at least 61 continuous one-minute BTC candles. It uses no Kalshi quote or order-book, Prophet output, future candle, un-settled outcome, or price forecast as a model input.
 
 ### What the Action logs
 
-At startup the runner prints `ML MODEL`, `ML VALIDATION`, and `ML EXECUTION POLICY` lines with the exact artifact, calibration method, training rows/cutoff, schema, and active gate. Before each market it prints `ML INPUT READY` to confirm no forecast input was used, then `ML SIDE READY` (`p_yes`, confidence, selected side). A candle fetch is capped at 45 seconds and an unfinished pre-open task logs `ML SIDE FAILED` at the open; neither condition can fall back to Prophet, stale inference, or price-side selection. The runner also logs selected-side-only quote triggers, entry/ladder IDs and fills, exchange-position guards, settlement, rung P&L, and `ML LIVE PERFORMANCE`.
+At startup the runner prints `ML MODEL`, `ML VALIDATION`, and `ML EXECUTION POLICY` lines with the exact artifact, calibration method, training rows/cutoff, schema, and active gate. Before each market it prints `ML INPUT READY` to confirm no forecast input was used, then `ML SIDE READY` (`p_yes`, confidence, selected side). A candle fetch is capped at 45 seconds and an unfinished pre-open task logs `ML SIDE FAILED` at the open; neither condition can fall back to Prophet, stale inference, or price-side selection. The runner then logs `SIDE LOCKED`, four `GTC LADDER LIMIT` submissions, `GTC LADDER POSTED`, order IDs/fills, exchange-position guards, settlement, rung P&L, and `ML LIVE PERFORMANCE`.
 
 ### ML-only retraining
 
 **“Kalshi BTC 15m ML-Only Daily Retrain”** runs daily at 00:32 UTC and can also be started manually. It downloads the active ledger, appends only newly settled, feature-complete BTC 15-minute rows, reruns chronological validation, and stores the ledger, trained logistic/isotonic model, cadence audit, and validation reports in one 90-day artifact. Scheduled runs publish the validated artifact to the registry; a manual run stores a candidate unless `publish_model` is selected. A live runner never changes model mid-market: it adopts the newly published artifact only when its next 5h45m job starts.
 
-Daily is the operational cadence, not six-hour retraining. The ML-only expanding-window cadence audit compared static, 6-hour, 12-hour, daily, 3-day, weekly, and 14-day refits with each fit restricted to outcomes settled before its prediction boundary. In the final untouched 3,860 markets, 12-hour retraining was 51.61% (1,992/3,860) and daily was 51.53% (1,989/3,860); the three-call difference was not significant (paired p=0.784). Six-hour retraining was worse at 51.32%. Daily therefore keeps the model current without paying for unsupported extra churn. These are directional metrics only, not executable P&L.
+Daily is the operational cadence, not six-hour retraining. The ML-only expanding-window cadence audit compared static, 6-hour, 12-hour, daily, 3-day, weekly, and 14-day refits with each fit restricted to outcomes settled before its prediction boundary. The final untouched 3,860-market, 50%-gate results were:
+
+| Refit cadence | Correct calls | Directional rate | Exact binomial p vs. 50% |
+| --- | ---: | ---: | ---: |
+| Every 6 hours | 1,981 / 3,860 | 51.32% | 0.104 |
+| Every 12 hours | 1,992 / 3,860 | 51.61% | 0.0477* |
+| **Daily** | **1,989 / 3,860** | **51.53%** | **0.0597** |
+| Weekly | 1,976 / 3,860 | 51.19% | 0.143 |
+| Static | 1,927 / 3,860 | 49.92% | not significant |
+
+The 12-hour run made only three more correct calls than daily. Its paired comparison with daily has p=0.784, so there is no evidence that its slight lead is a real cadence advantage rather than ordinary sampling noise. Six-hour retraining also adds cost and operational churn without an observed improvement. Daily is therefore the conservative operational default.
+
+### What “statistically significant” means here
+
+For a directional result, the null hypothesis is that a model has a 50% chance of choosing the correct YES/NO side. The exact binomial p-value is the chance of seeing a result at least this far from 50% if that null hypothesis were true. The conventional `p < 0.05` threshold is called *statistically significant*; it is a screening convention, not a guarantee of a trading edge.
+
+The 12-hour result is nominally below 0.05 when compared with a coin flip alone (`p=0.0477`, marked `*`), but it was one of several cadence/gate experiments and did **not** significantly outperform daily (`paired p=0.784`). It is therefore not sound evidence to replace daily with 12-hour retraining. Daily's 51.53% is just above the threshold (`p=0.0597`), so it is **not** statistically significant by that convention. “Not significant” does not prove that daily is useless or exactly 50%; it means this test does not provide strong enough evidence to rule out random variation. Conversely, a significant directional result does not prove profitability: executable entry price, depth, partial fills, fees, slippage, correlated losses, and the 40/30/20/10 averaging rule are outside these directional tests.
 
 ### Exact Kalshi lifecycle
 
 1. **Freeze one ML side before opening.** During the two-minute pre-open window, the runner obtains a bounded BTC candle snapshot and builds only raw-candle, strike, clock, and prior-settled-outcome features. It evaluates the schema-locked calibrated model and records `p_yes`, confidence, selected YES/NO side, exact model run, and training cutoff. The inclusive `≥50%` gate gives every valid binary-model direction coverage; if inference is late or unavailable, it submits no order. There is no mechanical, Prophet, forecast, stale-score, or price-side fallback.
-2. **Start one watcher at a fresh opening.** When that KXBTC15M market opens, the runner persists a `watching` record. A short start grace absorbs normal discovery/handoff delay, but it is not an entry deadline. If a runner first discovers an already-old market, it skips that market rather than starting a late watcher. A saved watcher continues through the next Actions handoff.
-3. **Watch only the ML-selected executable ask.** The watcher ignores the opposite side completely and waits as long as needed for the selected side to reach `≤ $0.40`. If it never does, it submits no order and records a no-signal market.
-4. **Lock the ML side with a GTC limit.** The first selected-side qualifying quote posts a same-side GTC limit at that observed price (never above 40¢), expiring at market close. It does **not** submit, switch to, or cancel an opposite-side entry.
-5. **The ML side remains selected.** A transient quote cannot cause the initial GTC limit to disappear: it remains resting until it fills, is explicitly canceled at close, or the exchange rejects it. Before it fills, the bot still cannot submit or switch to the other side. Once the initial order fills, that side is locked and the lower ladder is submitted.
-6. **Place the lower same-side ladder.** After the initial fill, it posts only strictly lower limits on the locked ML side. A 40¢ fill produces 30¢, 20¢, and 10¢ rungs; a 39¢ fill produces 30¢, 20¢, and 10¢; a 10¢ fill creates no lower rung. It never averages up, reverses, or hedges. The default cap is four contracts per market: one contract at each rung.
-7. **Hold to settlement.** Unfilled lower limits have the market close as their expiry and are explicitly canceled when the market closes. Filled contracts remain through settlement; then the runner records payout, fees, net P&L, streaks, drawdown, and per-rung results. A closed prior market cannot block the next fresh watcher.
+2. **Start only at a fresh opening.** When that KXBTC15M market opens, the runner persists a `watching` record. A 45-second start grace absorbs normal discovery/handoff delay; it is not a price-entry window. If a runner first discovers an already-old market, it skips that market rather than sending a late ladder. A saved watcher continues through the next Actions handoff.
+3. **Lock the frozen ML side before sending any order.** Once a valid ML YES/NO side is ready, the other side is never considered. The exchange-position guard must confirm a compatible, within-cap position and the account must cover the complete ladder principal plus configured fee reserve.
+4. **Immediately pre-post four GTC limits.** For that one locked side, the runner sends exactly one GTC buy at each fixed economic price: **40¢, 30¢, 20¢, and 10¢**. Every order has the market's explicit close timestamp as its expiry. It sends no opposite-side order, does not reverse, and has no quote-trigger wait.
+5. **Fill behavior is intentional.** If the selected side is already cheap enough that one or more limits cross the book, those GTCs may fill immediately at their limit or a better available price. Otherwise they provide liquidity and rest in Kalshi's book. A partial fill remains attached to that same rung; an unfilled rung remains resting until close, rejection, or explicit cancellation.
+6. **Hold to settlement and clear the ladder.** At market close the runner stops new orders and explicitly cancels all remaining GTC rungs. Filled contracts remain through settlement; then the runner records payout, fees, net P&L, streaks, drawdown, and per-rung results. A closed prior market cannot block the next fresh watcher.
+
+### Pre-posted GTC ladder semantics
+
+The runner uses Kalshi `good_till_canceled` with an **explicit market-close expiry**. It therefore does not rely on a GTC order surviving into the next 15-minute market: the bot also cancels any remaining owned orders after the market closes.
+
+Pre-posting is intentional. If the frozen ML side opens around 20¢, the 40¢, 30¢, and 20¢ GTC buys can all be marketable and may fill immediately; that is the specified fixed 40/30/20/10 ladder, not a reversal or an accidental duplicate. The complete four-rung principal is reserved before any order is submitted, and the exchange-position guard rejects a ticker with an incompatible side, unexpected position, or position above the configured four-rung cap.
 
 Key persisted settings in `kalshi_btc15m_average_down_config.json` are `initial_position_size` (contracts per rung), `max_total_capital`, `max_active_markets`, and `watch_start_grace_seconds` (default 45; only for starting a watcher at a fresh open). When you change only `initial_position_size` in **Run workflow**, the full ladder scales automatically: `10` shares per rung becomes a `40`-contract per-market ceiling and a `$10` principal cap (before fees). Those values persist into later handoffs. You can still supply explicit caps in the same form if you intentionally want a stricter limit.
 

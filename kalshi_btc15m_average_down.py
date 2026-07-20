@@ -1,9 +1,10 @@
 """ML-side-selected KXBTC15M mechanical average-down trader.
 
-The stored ML inference chooses one side before the market opens.  The
-execution rule is then mechanical: it watches *only* that side's executable
-ask and uses the fixed 40c -> 30c -> 20c -> 10c ladder.  There is no Prophet,
-forecast, or mechanical-side fallback if ML inference is unavailable.
+The stored ML inference chooses one side before the market opens.  As soon as
+that market is active, the execution rule mechanically posts one same-side,
+market-close-expiring GTC limit at each fixed 40c -> 30c -> 20c -> 10c rung.
+There is no Prophet, forecast, or mechanical-side fallback if ML inference is
+unavailable.
 
 Live submission is deliberately opt-in: ``DRY_RUN`` must be false and both
 ``--submit`` and ``--allow-live`` are required.  The GitHub workflow persists
@@ -54,8 +55,8 @@ except ImportError:  # pragma: no cover - exercised only in minimal local enviro
 LOG = logging.getLogger("kalshi_btc15m_average_down")
 SERIES_TICKER = "KXBTC15M"
 LADDER_LEVELS = (0.40, 0.30, 0.20, 0.10)
-CONFIG_VERSION = 5
-STATE_VERSION = 3
+CONFIG_VERSION = 6
+STATE_VERSION = 4
 ORDER_NAMESPACE = uuid.UUID("4d85857e-4dc6-43ec-960f-0b342523bdb7")
 KALSHI_WS_URL = os.getenv(
     "KALSHI_WS_URL",
@@ -83,16 +84,15 @@ DEFAULT_CONFIG = {
     "market_refresh_seconds": 15.0,
     "order_reconcile_seconds": 5.0,
     # This is *not* an entry window.  It is only the short allowance for
-    # observing a brand-new market and starting its watcher.  Once started,
-    # the watcher runs until the market closes or one side reaches 40c.
+    # observing a brand-new market and starting its watcher. Once started,
+    # a frozen ML side immediately receives its four-rung GTC ladder.
     "watch_start_grace_seconds": 45.0,
     # ML is computed before the next market opens from raw candles and settled
     # outcomes only. A watcher never chooses a side from prices; it only acts
     # after this frozen model side is ready.
     "ml_preopen_lead_seconds": 120.0,
-    # Inclusive 50% confidence: every valid binary-model direction is eligible
-    # for the price ladder. This is model coverage, not order coverage: the
-    # selected side must still reach the mechanical 40c entry level.
+    # Inclusive 50% confidence: every valid binary-model direction receives
+    # the fixed GTC ladder once its market is active.
     "ml_min_confidence": 0.50,
     "status_log_seconds": 30.0,
 }
@@ -181,9 +181,9 @@ def market_is_tradeable(market: Any) -> bool:
 def market_can_start_watcher(market: Any, start_grace_seconds: float) -> bool:
     """Start a market watcher only at the market's opening, never late.
 
-    The watcher is allowed to continue for the whole market after it starts.
-    The small grace period absorbs normal market-discovery and handoff delay;
-    it does not limit how long the watcher may wait for a 40c trigger.
+    The watcher is allowed to finish its ML-side setup after it starts. The
+    small grace period absorbs normal market-discovery and handoff delay; it
+    is not a price-entry deadline.
     """
     open_time = timestamp_epoch(field(market, "open_time"))
     if open_time is None or not market_is_tradeable(market):
@@ -284,9 +284,9 @@ def save_json(path: Path, payload: dict[str, Any]) -> None:
 
 def validate_config(config: dict[str, Any]) -> dict[str, Any]:
     merged = {**DEFAULT_CONFIG, **config, "format_version": CONFIG_VERSION}
-    # Version 3 used a 15-second *entry* window.  Version 4 uses a persisted
-    # whole-market watcher instead, so remove the retired setting when an old
-    # state/configuration is handed forward.
+    # Earlier versions used a short price-entry window. The persisted watcher
+    # now exists only to attach the frozen ML direction and post the full GTC
+    # ladder, so remove the retired setting when an old config is handed on.
     merged.pop("initial_entry_window_seconds", None)
     for name in (
         "initial_position_size", "max_contracts_per_market", "max_total_capital",
@@ -764,7 +764,7 @@ class MLDirectionSelector:
         self._log_once(
             record, "ready",
             "ML SIDE READY | %s model=%s run=%s side=%s p_yes=%.4f confidence=%.4f "
-            "gate=%.4f; watching only this side for <= $0.40.",
+            "gate=%.4f; full same-side GTC ladder will post when the market is active.",
             ticker, self.model_metadata.get("model_type", "unknown"), self.model_run_id or "unknown",
             side.upper(), probability_yes, confidence, self.min_confidence,
         )
@@ -1059,7 +1059,7 @@ def market_record(state: dict[str, Any], ticker: str) -> dict[str, Any]:
         markets[ticker] = {
             "ticker": ticker,
             "created_at": now_iso(),
-            "strategy": "mechanical_price_average_down_v1",
+            "strategy": "ml_side_preposted_gtc_ladder_v2",
             "orders": {},
             "locked_side": None,
             "status": "watching",
@@ -1093,7 +1093,7 @@ def start_market_watcher(state: dict[str, Any], market: Any, config: dict[str, A
         "watch_started_at": now_iso(),
     })
     LOG.info(
-        "WATCH STARTED | %s awaiting its frozen ML side, then watching only that side until its executable ask reaches $0.40 or lower.",
+        "WATCH STARTED | %s awaiting its frozen ML side; once ready, it will immediately post that side's 40c/30c/20c/10c GTC ladder.",
         ticker,
     )
     return record
@@ -1181,7 +1181,7 @@ def reserved_principal(state: dict[str, Any]) -> float:
 
 
 async def reconcile_orders(rest: KalshiREST, record: dict[str, Any], dry_run: bool) -> bool:
-    """Refresh fills.  The first non-zero initial fill locks the market side."""
+    """Refresh fills and retain the frozen/pre-posted single market side."""
     changed = False
     for order in orders_for_market(record):
         before = (order.get("fill_count"), order.get("status"), order.get("fees_paid"))
@@ -1223,6 +1223,11 @@ async def reconcile_orders(rest: KalshiREST, record: dict[str, Any], dry_run: bo
 async def submit_ladder(
     rest: KalshiREST, record: dict[str, Any], market: Any, config: dict[str, Any], dry_run: bool,
 ) -> None:
+    # Version 2 posts the complete 40/30/20/10 GTC ladder atomically from the
+    # strategy's point of view. Retain this function only to reconcile a
+    # partially completed record from the older fill-then-ladder version.
+    if record.get("ladder_mode") == "preposted_gtc_v2":
+        return
     if not record.get("locked_side"):
         return
     if not await exchange_position_guard(rest, record, config):
@@ -1277,7 +1282,7 @@ async def settle_or_cancel(rest: KalshiREST, record: dict[str, Any], market: Any
             "gross_payout": 0.0, "gross_profit_loss": 0.0, "kalshi_fees": 0.0,
             "net_profit_loss": 0.0, "return_percentage": None,
         })
-        LOG.info("WATCH COMPLETE | %s settled %s with no 40c trigger; no order submitted.",
+        LOG.info("WATCH COMPLETE | %s settled %s with no valid frozen ML side; no GTC ladder submitted.",
                  record["ticker"], result.upper())
         return
     for order in orders_for_market(record):
@@ -1322,6 +1327,14 @@ async def consider_initial_entry(
     rest: KalshiREST, state: dict[str, Any], market: Any, config: dict[str, Any], dry_run: bool,
     live_asks: dict[str, float | None] | None = None, ml_side: str | None = None,
 ) -> bool:
+    """Post the complete fixed GTC ladder for one frozen ML side.
+
+    The ML decision—not a transient quote—chooses the economic outcome.  The
+    four limits are deliberately created only after the market is tradeable,
+    with its explicit close timestamp as their expiry.  This makes the order
+    set one side / four fixed rungs / one market, and prevents a later quote
+    from choosing or reversing the side.
+    """
     ticker = str(field(market, "ticker") or "")
     if not ticker or not market_is_tradeable(market):
         return False
@@ -1335,52 +1348,110 @@ async def consider_initial_entry(
         return False
     if ml_side not in {"yes", "no"}:
         return False
-    asks = market_asks(market, live_asks)
-    ask = asks[ml_side]
-    if ask is None or ask > LADDER_LEVELS[0] + 1e-9:
-        return False
+    # Quotes remain useful for heartbeat/audit output, but they do not gate
+    # this mode.  Once the frozen ML side is available, every fixed rung is a
+    # market-close-expiring GTC limit on that side.
+    _ = live_asks
     side = ml_side
     quantity = config["initial_position_size"]
     reserve = ladder_principal(quantity)
-    if reserved_principal(state) + reserve > config["max_total_capital"] + 1e-9:
-        LOG.warning("SKIP CAPITAL | %s reserve=$%.2f cap=$%.2f", ticker, reserve, config["max_total_capital"])
+    # A retried, partially submitted ladder is already included in the active
+    # reserve. Replace that record's reserve rather than adding it twice.
+    existing_quantity = as_float(record.get("quantity")) if record.get("candidate_side") else None
+    existing_reserve = ladder_principal(existing_quantity) if existing_quantity is not None else 0.0
+    total_after_reserve = reserved_principal(state) - existing_reserve + reserve
+    if total_after_reserve > config["max_total_capital"] + 1e-9:
+        LOG.warning(
+            "SKIP CAPITAL | %s reserve=$%.2f total_after=$%.2f cap=$%.2f",
+            ticker, reserve, total_after_reserve, config["max_total_capital"],
+        )
         return False
     balance = await rest.balance_dollars()
     if balance is None or balance + 1e-9 < reserve + config["fee_reserve"]:
         LOG.warning("SKIP BALANCE | %s need >= $%.2f including fee reserve; available=%s", ticker, reserve + config["fee_reserve"], balance)
         return False
     record.update({
-        "candidate_side": side, "quantity": quantity, "status": "initial_submitted",
-        "initial_ask": round(ask, 4), "initial_reason": f"ML selected {side.upper()}; its ask reached <= $0.40",
-        "reserved_principal": reserve, "market_close_time": field(market, "close_time"),
+        "candidate_side": side,
+        "locked_side": side,
+        "locked_at": now_iso(),
+        "quantity": quantity,
+        "status": "ladder_active",
+        "ladder_mode": "preposted_gtc_v2",
+        "reserved_principal": reserve,
+        "market_close_time": field(market, "close_time", "expected_expiration_time"),
     })
     if not await exchange_position_guard(rest, record, config):
         record["status"] = "initial_blocked_exchange_position"
-        LOG.critical("INITIAL ENTRY BLOCKED | %s no order submitted because the live exchange position is unsafe.", ticker)
+        LOG.critical("GTC LADDER BLOCKED | %s no order submitted because the live exchange position is unsafe.", ticker)
         return False
-    # Lock the first qualifying side with a resting, market-close-expiring
-    # limit.  An IOC can miss a transient quote and abandon the entire market;
-    # an unbounded market order could buy above the mechanical 40c ceiling.
-    # This GTC order preserves both requirements: the selected side cannot
-    # switch, and its executable cost can never exceed the observed <=40c ask.
-    price = min(ask, LADDER_LEVELS[0])
-    record["orders"]["0.4000"] = await rest.create_order(
-        ticker=ticker, side=side, position_price=price, quantity=quantity, tif="good_till_canceled",
-        expiration_time=expiration_epoch(market), dry_run=dry_run,
-        order_key="initial",
+    expiry = expiration_epoch(market)
+    if expiry is None:
+        record["status"] = "initial_blocked_no_expiry"
+        LOG.critical("GTC LADDER BLOCKED | %s has no market-close expiry; no GTC orders submitted.", ticker)
+        return False
+    LOG.info(
+        "SIDE LOCKED | %s %s from frozen ML decision; immediately posting GTC ladder $0.40/$0.30/$0.20/$0.10 through close_epoch=%d.",
+        ticker, side.upper(), expiry,
     )
-    record["orders"]["0.4000"]["ladder_level"] = 0.40
-    record["orders"]["0.4000"]["reason"] = (
-        "First qualifying executable ask; resting same-side limit through market close."
+    for level in LADDER_LEVELS:
+        key = f"{level:.4f}"
+        prior_order = record["orders"].get(key)
+        if isinstance(prior_order, dict):
+            # A transport/API rejection has no accepted exchange order. Remove
+            # only that local failure so the frozen, same-side watcher can
+            # retry this exact deterministic client ID on the next loop.
+            if prior_order.get("status") == "submit_failed" and not prior_order.get("order_id"):
+                record["orders"].pop(key, None)
+            else:
+                continue
+        submitted_contracts = sum(float(order.get("quantity") or 0.0) for order in orders_for_market(record))
+        if submitted_contracts + quantity > config["max_contracts_per_market"] + 1e-9:
+            record["ladder_prepost_error"] = "contract cap"
+            LOG.critical(
+                "GTC LADDER BLOCKED | %s cannot post $%.2f: requested=%.2f cap=%.2f.",
+                ticker, level, submitted_contracts + quantity, config["max_contracts_per_market"],
+            )
+            break
+        LOG.info("GTC LADDER LIMIT | %s %s @ $%.2f x %.2f expires_at=%d", ticker, side.upper(), level, quantity, expiry)
+        order = await rest.create_order(
+            ticker=ticker, side=side, position_price=level, quantity=quantity,
+            tif="good_till_canceled", expiration_time=expiry, dry_run=dry_run,
+            order_key="initial" if level == LADDER_LEVELS[0] else key,
+        )
+        order["ladder_level"] = level
+        order["reason"] = "Frozen ML side; pre-posted fixed GTC ladder through market close."
+        record["orders"][key] = order
+        if order.get("direction_verified") is False:
+            record["status"] = "direction_mismatch"
+            LOG.critical(
+                "GTC LADDER STOPPED | %s $%.2f direction mismatch; no further rungs submitted.", ticker, level,
+            )
+            break
+    record["ladder_preposted_at"] = now_iso()
+    accepted_rungs = sum(
+        isinstance(record["orders"].get(f"{level:.4f}"), dict)
+        and record["orders"][f"{level:.4f}"].get("status") != "submit_failed"
+        for level in LADDER_LEVELS
     )
+    record["ladder_preposted_rungs"] = accepted_rungs
+    record["ladder_preposted_complete"] = accepted_rungs == len(LADDER_LEVELS)
+    if not record["ladder_preposted_complete"] and record.get("status") != "direction_mismatch":
+        # Preserve the frozen ML side and any accepted rungs, then retry only
+        # missing/rejected submissions. This never changes or hedges the side.
+        record["status"] = "watching"
+        LOG.warning(
+            "GTC LADDER INCOMPLETE | %s %s accepted=%d/%d; will retry only missing same-side rungs.",
+            ticker, side.upper(), accepted_rungs, len(LADDER_LEVELS),
+        )
     ml_signal = record.get("ml_inference") if isinstance(record.get("ml_inference"), dict) else {}
     LOG.info(
-        "WATCH TRIGGERED | %s %s selected p_yes=%s confidence=%s; stopped watching the other side.",
+        "GTC LADDER POSTED | %s %s p_yes=%s confidence=%s rungs=%d/%d; no opposite-side order exists.",
         ticker, side.upper(),
         "unknown" if ml_signal.get("probability_yes") is None else f"{float(ml_signal['probability_yes']):.4f}",
         "unknown" if ml_signal.get("confidence") is None else f"{float(ml_signal['confidence']):.4f}",
+        accepted_rungs, len(LADDER_LEVELS),
     )
-    return True
+    return accepted_rungs > 0
 
 
 def streak(values: list[float], winning: bool) -> int:
@@ -1568,16 +1639,30 @@ def performance_report(state: dict[str, Any], config: dict[str, Any]) -> dict[st
         starts_below = 0
         fills = []
         for record in settled:
-            initial = (record.get("orders") or {}).get("0.4000") or {}
-            if float(initial.get("position_price") or 0.40) < 0.40:
+            orders = record.get("orders") or {}
+            forty = orders.get("0.4000") or {}
+            forty_filled = float(forty.get("fill_count") or 0.0) > 0.004
+            if record.get("ladder_mode") == "preposted_gtc_v2":
+                # In the pre-posted-GTC strategy the stored limit is always
+                # 40c. A market "starts below 40c" operationally means a
+                # lower rung filled while the 40c rung never did.
+                lower_filled = any(
+                    float((orders.get(f"{level:.4f}") or {}).get("fill_count") or 0.0) > 0.004
+                    for level in LADDER_LEVELS[1:]
+                )
+                if lower_filled and not forty_filled:
+                    starts_below += 1
+            elif float(forty.get("position_price") or 0.40) < 0.40:
+                # Preserve the historical fill-then-ladder measurement for
+                # records created before the pre-posted-GTC strategy.
                 starts_below += 1
             fills.append(sum(float(order.get("fill_count") or 0.0) > 0.004 for order in orders_for_market(record)))
             for level in LADDER_LEVELS:
-                order = (record.get("orders") or {}).get(f"{level:.4f}") or {}
+                order = orders.get(f"{level:.4f}") or {}
                 if float(order.get("fill_count") or 0.0) > 0.004:
                     levels[level] += 1
         report.update({
-            "percentage_entering_at_40c": round(100 * (len(settled) - starts_below) / len(settled), 4),
+            "percentage_entering_at_40c": round(100 * levels[0.40] / len(settled), 4),
             "percentage_starting_below_40c": round(100 * starts_below / len(settled), 4),
             "percentage_reaching_30c": round(100 * levels[0.30] / len(settled), 4),
             "percentage_reaching_20c": round(100 * levels[0.20] / len(settled), 4),
@@ -1660,7 +1745,7 @@ def log_ml_deployment(
     )
     LOG.info(
         "ML EXECUTION POLICY | model gate >= %.2f (100%% valid-model direction coverage at 0.50); "
-        "actual orders still require the selected side's executable ask <= $0.40 and then use only lower same-side rungs.",
+        "at a fresh active market, immediately post the selected side's close-expiring GTC rungs at $0.40/$0.30/$0.20/$0.10.",
         execution_gate,
     )
 
@@ -1720,11 +1805,12 @@ async def log_heartbeat(
         watch_state = str(record.get("status")) if isinstance(record, dict) else "not_started"
         ml_signal = record.get("ml_inference") if isinstance(record, dict) and isinstance(record.get("ml_inference"), dict) else {}
         ml_side = str(ml_signal.get("side") or "").lower()
-        selected_ask = asks.get(ml_side) if ml_side in {"yes", "no"} else None
+        preposted = isinstance(record, dict) and record.get("ladder_mode") == "preposted_gtc_v2"
         trigger = (
-            f"ML_{ml_side.upper()} @ ${selected_ask:.4f}"
-            if selected_ask is not None and selected_ask <= LADDER_LEVELS[0] else
-            ("awaiting_ml" if watch_state == "watching" and not ml_side else "none")
+            "GTC_LADDER_POSTED"
+            if preposted else
+            ("ML_READY_POSTING_GTC" if watch_state == "watching" and ml_side else
+             ("awaiting_ml" if watch_state == "watching" else "none"))
         )
         LOG.info(
             "QUOTE | %s source=%s yes_ask=%s no_ask=%s watcher=%s ml_side=%s trigger=%s close=%s",
@@ -1743,7 +1829,7 @@ async def log_heartbeat(
             LOG.info(
                 "WATCH | %s active; %s.", record.get("ticker", "?"),
                 (f"ML selected {ml_side} p_yes={float(ml_signal.get('probability_yes')):.4f} "
-                 f"confidence={float(ml_signal.get('confidence')):.4f}; only its ask can trigger at <= $0.40" if ml_side
+                 f"confidence={float(ml_signal.get('confidence')):.4f}; full GTC ladder will post immediately" if ml_side
                  else "awaiting frozen ML direction; no order can be placed"),
             )
             continue

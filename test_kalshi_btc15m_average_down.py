@@ -284,7 +284,7 @@ class MechanicalAverageDownTests(unittest.TestCase):
         self.assertEqual(activity["0.30"]["resting_orders"], 1)
         self.assertEqual(activity["0.20"]["canceled_unfilled_orders"], 1)
 
-    def test_below_40_entry_locks_one_side_then_places_only_30_20_10_limits(self):
+    def test_ml_selected_side_preposts_all_four_gtc_rungs_at_open(self):
         class FakeRest:
             def __init__(self):
                 self.requests = []
@@ -325,12 +325,14 @@ class MechanicalAverageDownTests(unittest.TestCase):
         entered, requests, record = asyncio.run(scenario())
         self.assertTrue(entered)
         self.assertEqual(record["locked_side"], "yes")
-        self.assertEqual([request["position_price"] for request in requests], [0.35, 0.30, 0.20, 0.10])
-        self.assertEqual(requests[0]["tif"], "good_till_canceled")
-        self.assertIsNotNone(requests[0]["expiration_time"])
+        self.assertEqual(record["ladder_mode"], "preposted_gtc_v2")
+        self.assertEqual([request["position_price"] for request in requests], list(LADDER_LEVELS))
+        self.assertTrue(all(request["tif"] == "good_till_canceled" for request in requests))
+        self.assertTrue(all(request["expiration_time"] is not None for request in requests))
+        self.assertEqual(len({request["expiration_time"] for request in requests}), 1)
         self.assertTrue(all(request["side"] == "yes" for request in requests))
 
-    def test_first_below_40_trigger_remains_a_resting_limit_and_never_switches_sides(self):
+    def test_preposted_ladder_never_switches_sides_after_a_later_opposite_quote(self):
         class FakeRest:
             def __init__(self):
                 self.requests = []
@@ -364,18 +366,69 @@ class MechanicalAverageDownTests(unittest.TestCase):
             return record, rest.requests
 
         record, requests = asyncio.run(scenario())
-        self.assertEqual(record["status"], "initial_submitted")
-        self.assertEqual(len(requests), 1)
-        self.assertEqual(requests[0]["side"], "yes")
-        self.assertEqual(requests[0]["position_price"], 0.34)
-        self.assertEqual(requests[0]["tif"], "good_till_canceled")
+        self.assertEqual(record["status"], "ladder_active")
+        self.assertEqual(len(requests), 4)
+        self.assertTrue(all(request["side"] == "yes" for request in requests))
+        self.assertEqual([request["position_price"] for request in requests], list(LADDER_LEVELS))
+        self.assertTrue(all(request["tif"] == "good_till_canceled" for request in requests))
 
-    def test_ml_side_not_cheapest_side_selects_the_initial_limit(self):
+    def test_preposted_ladder_retries_only_a_rejected_same_side_rung(self):
         class FakeRest:
+            def __init__(self):
+                self.requests = []
+                self.fail_once = True
+
             async def balance_dollars(self):
                 return 10.0
 
             async def create_order(self, **kwargs):
+                self.requests.append(kwargs)
+                if kwargs["position_price"] == 0.30 and self.fail_once:
+                    self.fail_once = False
+                    return {
+                        "side": kwargs["side"], "position_price": kwargs["position_price"],
+                        "quantity": kwargs["quantity"], "fill_count": 0.0,
+                        "remaining_count": 0.0, "fees_paid": 0.0, "status": "submit_failed",
+                    }
+                return {
+                    "order_id": f"order-{len(self.requests)}", "side": kwargs["side"],
+                    "position_price": kwargs["position_price"], "quantity": kwargs["quantity"],
+                    "fill_count": 0.0, "remaining_count": kwargs["quantity"],
+                    "fees_paid": 0.0, "status": "resting",
+                }
+
+        async def scenario():
+            state = default_state()
+            market = SimpleNamespace(
+                ticker="KXBTC15M-TEST-RETRY", status="active", yes_ask_dollars="0.75",
+                no_ask_dollars="0.25", open_time=time.time() - 5, close_time=time.time() + 895,
+            )
+            rest = FakeRest()
+            record = market_record(state, market.ticker)
+            record.update({"status": "watching", "market_open_time": market.open_time})
+            first = await consider_initial_entry(rest, state, market, validate_config(DEFAULT_CONFIG), dry_run=False, ml_side="yes")
+            second = await consider_initial_entry(rest, state, market, validate_config(DEFAULT_CONFIG), dry_run=False, ml_side="yes")
+            return first, second, record, rest.requests
+
+        first, second, record, requests = asyncio.run(scenario())
+        self.assertTrue(first)
+        self.assertTrue(second)
+        self.assertTrue(record["ladder_preposted_complete"])
+        self.assertEqual(record["status"], "ladder_active")
+        self.assertEqual(list(record["orders"]), ["0.4000", "0.2000", "0.1000", "0.3000"])
+        self.assertEqual([request["position_price"] for request in requests], [0.40, 0.30, 0.20, 0.10, 0.30])
+        self.assertTrue(all(request["side"] == "yes" for request in requests))
+
+    def test_ml_side_not_cheapest_side_receives_its_full_ladder_without_a_price_gate(self):
+        class FakeRest:
+            def __init__(self):
+                self.requests = []
+
+            async def balance_dollars(self):
+                return 10.0
+
+            async def create_order(self, **kwargs):
+                self.requests.append(kwargs)
                 return {
                     "order_id": "ml-side", "side": kwargs["side"],
                     "position_price": kwargs["position_price"], "quantity": kwargs["quantity"],
@@ -386,19 +439,19 @@ class MechanicalAverageDownTests(unittest.TestCase):
         async def scenario():
             state = default_state()
             market = SimpleNamespace(
-                ticker="KXBTC15M-TEST-ML-SIDE", status="active", yes_ask_dollars="0.3500",
+                ticker="KXBTC15M-TEST-ML-SIDE", status="active", yes_ask_dollars="0.7500",
                 no_ask_dollars="0.2000", open_time=time.time() - 5, close_time=time.time() + 895,
             )
             rest = FakeRest()
             record = market_record(state, market.ticker)
             record.update({"status": "watching", "market_open_time": market.open_time})
             await consider_initial_entry(rest, state, market, validate_config(DEFAULT_CONFIG), dry_run=False, ml_side="yes")
-            return record
+            return record, rest.requests
 
-        record = asyncio.run(scenario())
-        initial = record["orders"]["0.4000"]
-        self.assertEqual(initial["side"], "yes")
-        self.assertEqual(initial["position_price"], 0.35)
+        record, requests = asyncio.run(scenario())
+        self.assertEqual(record["locked_side"], "yes")
+        self.assertEqual([request["position_price"] for request in requests], list(LADDER_LEVELS))
+        self.assertTrue(all(request["side"] == "yes" for request in requests))
 
     def test_missing_ml_side_cannot_fall_back_to_a_price_selected_entry(self):
         class FakeRest:
@@ -420,12 +473,16 @@ class MechanicalAverageDownTests(unittest.TestCase):
 
         self.assertFalse(asyncio.run(scenario()))
 
-    def test_10_cent_initial_entry_never_averages_up(self):
+    def test_selected_side_at_10_cents_still_gets_the_fixed_preposted_ladder(self):
         class FakeRest:
             async def balance_dollars(self):
                 return 10.0
 
+            def __init__(self):
+                self.requests = []
+
             async def create_order(self, **kwargs):
+                self.requests.append(kwargs)
                 return {
                     "order_id": "initial", "side": kwargs["side"],
                     "position_price": kwargs["position_price"], "quantity": kwargs["quantity"],
@@ -448,10 +505,12 @@ class MechanicalAverageDownTests(unittest.TestCase):
             record = state["markets"]["KXBTC15M-TEST-10"]
             await reconcile_orders(rest, record, dry_run=False)
             await submit_ladder(rest, record, market, config, dry_run=False)
-            return record
+            return record, rest.requests
 
-        record = asyncio.run(scenario())
-        self.assertEqual(list(record["orders"]), ["0.4000"])
+        record, requests = asyncio.run(scenario())
+        self.assertEqual(list(record["orders"]), ["0.4000", "0.3000", "0.2000", "0.1000"])
+        self.assertEqual([request["position_price"] for request in requests], list(LADDER_LEVELS))
+        self.assertTrue(all(request["side"] == "no" for request in requests))
 
     def test_closed_prior_market_does_not_block_a_fresh_new_market(self):
         state = {"markets": {"old": {"status": "closed_waiting_finalization", "quantity": 1.0}}}
@@ -459,7 +518,7 @@ class MechanicalAverageDownTests(unittest.TestCase):
         expired = SimpleNamespace(status="active", close_time="2020-01-01T00:00:00Z")
         self.assertFalse(market_is_tradeable(expired))
 
-    def test_watcher_without_a_40_cent_signal_is_not_counted_as_an_unfilled_order(self):
+    def test_watcher_without_an_ml_side_is_not_counted_as_an_unfilled_order(self):
         class FakeRest:
             async def cancel_order(self, _order, _dry_run):
                 raise AssertionError("A watcher with no order must not cancel anything")
