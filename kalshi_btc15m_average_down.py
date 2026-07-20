@@ -44,7 +44,7 @@ except ImportError:  # pragma: no cover - exercised only in minimal local enviro
 LOG = logging.getLogger("kalshi_btc15m_average_down")
 SERIES_TICKER = "KXBTC15M"
 LADDER_LEVELS = (0.40, 0.30, 0.20, 0.10)
-CONFIG_VERSION = 1
+CONFIG_VERSION = 2
 STATE_VERSION = 1
 ORDER_NAMESPACE = uuid.UUID("4d85857e-4dc6-43ec-960f-0b342523bdb7")
 
@@ -59,6 +59,8 @@ DEFAULT_CONFIG = {
     "max_total_capital": 1.00,
     "fee_reserve": 0.05,
     "poll_seconds": 2.0,
+    # The loop still polls at poll_seconds; this only limits diagnostic logs.
+    "status_log_seconds": 30.0,
 }
 
 
@@ -185,7 +187,10 @@ def save_json(path: Path, payload: dict[str, Any]) -> None:
 
 def validate_config(config: dict[str, Any]) -> dict[str, Any]:
     merged = {**DEFAULT_CONFIG, **config, "format_version": CONFIG_VERSION}
-    for name in ("initial_position_size", "max_contracts_per_market", "max_total_capital", "fee_reserve", "poll_seconds"):
+    for name in (
+        "initial_position_size", "max_contracts_per_market", "max_total_capital",
+        "fee_reserve", "poll_seconds", "status_log_seconds",
+    ):
         value = as_float(merged.get(name))
         if value is None or value <= 0:
             raise ValueError(f"{name} must be positive")
@@ -205,7 +210,7 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
 def apply_config_overrides(config: dict[str, Any], args: argparse.Namespace) -> tuple[dict[str, Any], bool]:
     names = (
         "initial_position_size", "max_active_markets", "max_contracts_per_market",
-        "max_total_capital", "fee_reserve", "poll_seconds",
+        "max_total_capital", "fee_reserve", "poll_seconds", "status_log_seconds",
     )
     changed = False
     updated = dict(config)
@@ -251,6 +256,18 @@ def client_order_id(ticker: str, side: str, order_key: str) -> str:
     not collide with the separately requested averaging rung at that price.
     """
     return str(uuid.uuid5(ORDER_NAMESPACE, f"average-down-v1:{ticker}:{side}:{order_key}"))
+
+
+def classify_submission(fill_count: float, remaining_count: float, quantity: float, tif: str) -> str:
+    """Classify a create-order response without mistaking canceled IOC for fill."""
+    tolerance = 0.004
+    if fill_count >= quantity - tolerance and fill_count > tolerance:
+        return "filled"
+    if fill_count > tolerance:
+        return "resting_partial" if tif == "good_till_canceled" else "partially_filled_canceled"
+    if tif == "good_till_canceled" and remaining_count > tolerance:
+        return "resting"
+    return "canceled_unfilled"
 
 
 @dataclass
@@ -360,7 +377,13 @@ class KalshiREST:
         record["remaining_count"] = round(order_remaining_count(response) if order_remaining_count(response) is not None else quantity - record["fill_count"], 2)
         record["average_fill_price"] = order_average_position_price(response, side, position_price)
         record["fees_paid"] = order_fee_total(response)
-        record["status"] = "filled" if record["remaining_count"] <= 0.004 else ("resting" if tif == "good_till_canceled" else "canceled_unfilled")
+        # An IOC that gets no execution is returned with zero remaining
+        # quantity because the exchange cancelled the remainder.  Zero
+        # remaining is therefore *not* evidence of a fill.  Only call an
+        # order filled when the reported fill quantity covers the request.
+        record["status"] = classify_submission(
+            record["fill_count"], record["remaining_count"], quantity, tif,
+        )
         LOG.info("ORDER %s | %s %s @ $%.2f x %.2f | fill=%.2f remaining=%.2f id=%s",
                  record["status"].upper(), ticker, side.upper(), position_price, quantity,
                  record["fill_count"], record["remaining_count"], record["order_id"] or "?")
@@ -460,6 +483,14 @@ async def reconcile_orders(rest: KalshiREST, record: dict[str, Any], dry_run: bo
         before = (order.get("fill_count"), order.get("status"), order.get("fees_paid"))
         await rest.refresh_order(order)
         if before != (order.get("fill_count"), order.get("status"), order.get("fees_paid")):
+            LOG.info(
+                "ORDER UPDATE | %s %s status=%s->%s fill=%.2f->%.2f remaining=%.2f fees=$%.4f id=%s",
+                record.get("ticker", "?"), str(order.get("side", "?")).upper(),
+                before[1], order.get("status"), float(before[0] or 0.0),
+                float(order.get("fill_count") or 0.0), float(order.get("remaining_count") or 0.0),
+                float(order.get("fees_paid") or 0.0),
+                order.get("order_id") or order.get("client_order_id") or "?",
+            )
             changed = True
     initial = (record.get("orders") or {}).get("0.4000")
     if isinstance(initial, dict) and float(initial.get("fill_count") or 0.0) > 0.004 and not record.get("locked_side"):
@@ -661,6 +692,55 @@ def performance_report(state: dict[str, Any], config: dict[str, Any]) -> dict[st
     return report
 
 
+async def log_heartbeat(
+    rest: KalshiREST,
+    state: dict[str, Any],
+    active_markets: list[Any],
+    config: dict[str, Any],
+    dry_run: bool,
+    elapsed_seconds: float,
+) -> None:
+    """Emit enough live context to audit decisions without 2-second log spam."""
+    balance = await rest.balance_dollars()
+    LOG.info(
+        "HEARTBEAT | mode=%s elapsed=%.0fs quotes=%d tracked=%d active_positions=%d "
+        "reserved=$%.4f cap=$%.4f balance=%s poll=%.1fs",
+        "DRY_RUN" if dry_run else "LIVE", elapsed_seconds, len(active_markets),
+        len(state.get("markets", {})), len(active_strategy_records(state)),
+        reserved_principal(state), config["max_total_capital"],
+        "unknown" if balance is None else f"${balance:.4f}", config["poll_seconds"],
+    )
+    for market in active_markets:
+        asks = market_asks(market)
+        choice = choose_entry_side(asks)
+        LOG.info(
+            "QUOTE | %s yes_ask=%s no_ask=%s entry_signal=%s close=%s",
+            field(market, "ticker") or "?",
+            "none" if asks["yes"] is None else f"${asks['yes']:.4f}",
+            "none" if asks["no"] is None else f"${asks['no']:.4f}",
+            "none" if choice is None else f"{choice[0].upper()} @ ${choice[1]:.4f}",
+            field(market, "close_time", "expected_expiration_time") or "unknown",
+        )
+    for record in state.get("markets", {}).values():
+        if not isinstance(record, dict) or record.get("status") == "finalized":
+            continue
+        LOG.info(
+            "POSITION | %s status=%s side=%s filled=%.2f submitted=%.2f",
+            record.get("ticker", "?"), record.get("status", "?"),
+            str(record.get("locked_side") or record.get("candidate_side") or "none").upper(),
+            filled_contracts(record),
+            sum(float(order.get("quantity") or 0.0) for order in orders_for_market(record)),
+        )
+        for order in orders_for_market(record):
+            LOG.info(
+                "ORDER | %s side=%s price=$%.4f qty=%.2f fill=%.2f remaining=%.2f status=%s id=%s",
+                record.get("ticker", "?"), str(order.get("side", "?")).upper(),
+                float(order.get("position_price") or 0.0), float(order.get("quantity") or 0.0),
+                float(order.get("fill_count") or 0.0), float(order.get("remaining_count") or 0.0),
+                order.get("status", "?"), order.get("order_id") or order.get("client_order_id") or "?",
+            )
+
+
 async def run(args: argparse.Namespace) -> int:
     config_path = args.config.expanduser()
     config = validate_config(load_json(config_path, DEFAULT_CONFIG))
@@ -680,7 +760,14 @@ async def run(args: argparse.Namespace) -> int:
     if not api_key or not pem_path.exists():
         raise SystemExit("KALSHI_API_KEY_ID and KALSHI_PEM_PATH are required")
     rest = KalshiREST(api_key, pem_path, os.getenv("KALSHI_DEMO", "false").lower() in {"1", "true", "yes"})
-    deadline = asyncio.get_running_loop().time() + args.run_seconds
+    started_at = asyncio.get_running_loop().time()
+    deadline = started_at + args.run_seconds
+    last_heartbeat_at = float("-inf")
+    LOG.info(
+        "STARTUP | mode=%s run_seconds=%.0f quantity_per_rung=%.2f ladder=%s capital_cap=$%.4f",
+        "DRY_RUN" if dry_run else "LIVE", args.run_seconds, config["initial_position_size"],
+        "/".join(f"${level:.2f}" for level in LADDER_LEVELS), config["max_total_capital"],
+    )
     try:
         while True:
             # Reconcile every known market before considering fresh entries.
@@ -694,11 +781,16 @@ async def run(args: argparse.Namespace) -> int:
                 await settle_or_cancel(rest, record, market, dry_run)
                 if market_is_tradeable(market):
                     await submit_ladder(rest, record, market, config, dry_run)
-            for market in await rest.active_markets():
+            active_markets = await rest.active_markets()
+            for market in active_markets:
                 await consider_initial_entry(rest, state, market, config, dry_run)
+            monotonic_now = asyncio.get_running_loop().time()
+            if monotonic_now - last_heartbeat_at >= config["status_log_seconds"]:
+                await log_heartbeat(rest, state, active_markets, config, dry_run, monotonic_now - started_at)
+                last_heartbeat_at = monotonic_now
             save_json(state_path, state)
             save_json(args.report.expanduser(), performance_report(state, config))
-            if asyncio.get_running_loop().time() >= deadline:
+            if monotonic_now >= deadline:
                 break
             await asyncio.sleep(config["poll_seconds"])
     finally:
@@ -724,6 +816,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-total-capital", type=float)
     parser.add_argument("--fee-reserve", type=float)
     parser.add_argument("--poll-seconds", type=float)
+    parser.add_argument("--status-log-seconds", type=float)
     return parser
 
 

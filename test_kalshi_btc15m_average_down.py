@@ -6,6 +6,7 @@ from kalshi_btc15m_average_down import (
     DEFAULT_CONFIG,
     LADDER_LEVELS,
     active_strategy_records,
+    classify_submission,
     choose_entry_side,
     consider_initial_entry,
     default_state,
@@ -34,6 +35,16 @@ class MechanicalAverageDownTests(unittest.TestCase):
     def test_no_orders_use_complementary_yes_book_price(self):
         self.assertEqual(side_api_price("yes", 0.30), "0.3000")
         self.assertEqual(side_api_price("no", 0.30), "0.7000")
+
+    def test_unfilled_ioc_is_never_reported_as_filled(self):
+        self.assertEqual(
+            classify_submission(0.0, 0.0, 1.0, "immediate_or_cancel"),
+            "canceled_unfilled",
+        )
+        self.assertEqual(
+            classify_submission(1.0, 0.0, 1.0, "immediate_or_cancel"),
+            "filled",
+        )
 
     def test_config_rejects_an_unfunded_ladder(self):
         invalid = {**DEFAULT_CONFIG, "max_total_capital": 0.99}
