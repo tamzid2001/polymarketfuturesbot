@@ -1,4 +1,6 @@
 import asyncio
+import importlib
+import sys
 import time
 import unittest
 from types import SimpleNamespace
@@ -61,6 +63,16 @@ class MechanicalAverageDownTests(unittest.TestCase):
         self.assertEqual(set(values), set(ML_ONLY_FEATURE_COLUMNS))
         self.assertEqual(FEATURE_SCHEMA, "ml_only_raw_candles_settled_outcomes_v1")
         self.assertFalse(any("prophet" in name for name in ML_ONLY_FEATURE_COLUMNS))
+
+    def test_live_ml_inference_import_does_not_load_legacy_forecast_runner(self):
+        # The deployed average-down runner imports this module to prepare its
+        # frozen ML side.  Keep the legacy forecasting runner out of that
+        # import path so it cannot be a hidden live-inference dependency.
+        sys.modules.pop("kalshi_ml_inference_live", None)
+        sys.modules.pop("kalshibtc15minupordown", None)
+        inference = importlib.import_module("kalshi_ml_inference_live")
+        self.assertFalse("kalshibtc15minupordown" in sys.modules)
+        self.assertEqual(inference.market_data.SERIES_TICKER, "KXBTC15M")
 
     def test_unfinished_ml_task_is_failed_at_market_open(self):
         async def scenario():

@@ -27,6 +27,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from kalshi_ml_features import FEATURE_SCHEMA, ML_ONLY_FEATURE_COLUMNS
+
 try:  # Installed by the dedicated live-runner requirements file.
     import aiohttp
 except ImportError:  # pragma: no cover - keeps pure helper tests dependency-light
@@ -620,8 +622,8 @@ class MLDirectionSelector:
         try:
             ml = self.module()
             self._harvest_completion(ml)
-            current_ticker, next_ticker = ml.kalshi.current_and_next_tickers(SERIES_TICKER)
-            seconds_to_open = ml.kalshi.seconds_until_ticker_settle(current_ticker)
+            current_ticker, next_ticker = ml.market_data.current_and_next_tickers(SERIES_TICKER)
+            seconds_to_open = ml.market_data.seconds_until_ticker_settle(current_ticker)
         except Exception as exc:  # noqa: BLE001
             LOG.error("ML PREOPEN UNAVAILABLE | cannot resolve next market: %s", exc)
             return
@@ -714,7 +716,7 @@ class MLDirectionSelector:
             self.ready[ticker] = cached
         cached = self.ready[ticker]
         try:
-            target = ml.kalshi._extract_target(market)
+            target = ml.market_data.extract_target(market)
             if target is None:
                 raise ValueError("market strike is unavailable")
             features = ml.feature_values(
@@ -1656,6 +1658,29 @@ def log_ml_deployment(
     )
 
 
+def preflight_ml_deployment(model_path: Path, metadata: dict[str, Any]) -> None:
+    """Reject an unusable ML artifact before the live loop starts.
+
+    Model loading previously first happened during the next market's pre-open
+    task.  That delayed artifact compatibility failures until the bot was
+    already running and left every watcher without an eligible ML side.
+    """
+    if metadata.get("feature_schema") != FEATURE_SCHEMA:
+        raise ValueError("ML metadata does not declare the required ML-only feature schema")
+    if metadata.get("feature_columns") != ML_ONLY_FEATURE_COLUMNS:
+        raise ValueError("ML metadata feature columns do not match the live ML-only schema")
+    import kalshi_ml_inference_live as ml_inference
+
+    model = ml_inference.load_saved_model(model_path)
+    if not hasattr(model, "predict_proba"):
+        raise ValueError("Stored ML model has no probability inference method")
+    LOG.info(
+        "ML PREFLIGHT OK | stored_model=%s schema=%s type=%s calibration=%s rows=%s",
+        model_path, FEATURE_SCHEMA, metadata.get("model_type", "unknown"),
+        metadata.get("calibration", "unknown"), metadata.get("training_rows", "unknown"),
+    )
+
+
 async def log_heartbeat(
     rest: KalshiREST,
     state: dict[str, Any],
@@ -1794,6 +1819,7 @@ async def run(args: argparse.Namespace) -> int:
     model_metadata = load_json(args.ml_model_metadata.expanduser(), {}) if args.ml_model_metadata else {}
     validation_report = load_json(args.ml_validation_report.expanduser(), {}) if args.ml_validation_report else {}
     try:
+        preflight_ml_deployment(args.ml_model_path.expanduser(), model_metadata)
         ml_selector = MLDirectionSelector(
             args.ml_training_csv.expanduser(), args.ml_model_path.expanduser(), config["ml_preopen_lead_seconds"],
             config["ml_min_confidence"], model_metadata, args.ml_model_run_id, args.ml_training_run_id,
