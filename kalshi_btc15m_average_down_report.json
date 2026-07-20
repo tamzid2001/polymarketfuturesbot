@@ -5,18 +5,19 @@
   "average_profit_per_market": -0.229122,
   "configuration": {
     "fee_reserve": 0.05,
-    "format_version": 4,
+    "format_version": 5,
     "initial_position_size": 1.0,
     "market_refresh_seconds": 15.0,
     "max_active_markets": 1,
     "max_contracts_per_market": 4.0,
     "max_total_capital": 1.0,
+    "ml_preopen_lead_seconds": 120.0,
     "order_reconcile_seconds": 5.0,
     "poll_seconds": 2.0,
     "status_log_seconds": 30.0,
     "watch_start_grace_seconds": 45.0
   },
-  "generated_at": "2026-07-20T19:46:30.900992+00:00",
+  "generated_at": "2026-07-20T20:01:10.603609+00:00",
   "largest_losing_trade": -1.0168,
   "largest_winning_trade": 3.0,
   "longest_losing_streak": 9,
@@ -24,7 +25,7 @@
   "losing_trades": 32,
   "maximum_drawdown": 11.7149,
   "net_profit": -10.5396,
-  "note": "Only finalized records with filled contracts count as trades. No historical model or backtest is used.",
+  "note": "Only finalized records with filled contracts count as trades. The pre-open ML side is an execution filter; this report is realized live-ledger data, not a profitability proof.",
   "percentage_entering_at_40c": 36.9565,
   "percentage_reaching_10c": 73.913,
   "percentage_reaching_20c": 80.4348,
@@ -32,6 +33,44 @@
   "percentage_starting_below_40c": 63.0435,
   "profit_factor": 0.669895,
   "return_on_capital": -0.258349,
+  "rung_order_activity": {
+    "0.10": {
+      "canceled_unfilled_orders": 11,
+      "filled_contracts": 34.0,
+      "filled_order_submissions": 34,
+      "resting_orders": 0,
+      "rung_price": 0.1,
+      "submitted_contracts": 45.0,
+      "submitted_orders": 45
+    },
+    "0.20": {
+      "canceled_unfilled_orders": 8,
+      "filled_contracts": 37.0,
+      "filled_order_submissions": 37,
+      "resting_orders": 0,
+      "rung_price": 0.2,
+      "submitted_contracts": 45.0,
+      "submitted_orders": 45
+    },
+    "0.30": {
+      "canceled_unfilled_orders": 3,
+      "filled_contracts": 42.0,
+      "filled_order_submissions": 42,
+      "resting_orders": 0,
+      "rung_price": 0.3,
+      "submitted_contracts": 45.0,
+      "submitted_orders": 45
+    },
+    "0.40": {
+      "canceled_unfilled_orders": 11,
+      "filled_contracts": 46.0,
+      "filled_order_submissions": 46,
+      "resting_orders": 1,
+      "rung_price": 0.4,
+      "submitted_contracts": 58.0,
+      "submitted_orders": 58
+    }
+  },
   "rung_performance": {
     "0.10": {
       "breakeven_orders": 0,
@@ -83,12 +122,12 @@
     }
   },
   "sharpe_ratio_per_market": -0.182699,
-  "strategy": "pure_mechanical_price_average_down_v1",
+  "strategy": "ml_side_mechanical_price_average_down_v1",
   "total_contracts_purchased": 159.0,
   "total_fees": 0.7436,
   "total_gross_profit": -9.796,
   "total_markets_traded": 46,
-  "unfilled_market_attempts": 10,
+  "unfilled_market_attempts": 11,
   "win_loss_ratio": 0.4375,
   "win_rate": 0.304348,
   "winning_trades": 14,
