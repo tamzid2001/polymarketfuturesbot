@@ -652,6 +652,13 @@ class MLDirectionSelector:
                 and confidence + 1e-12 >= self.min_confidence
                 and (not self.model_run_id or prior_model_run == self.model_run_id)
             ):
+                if ticker in self.ready:
+                    self._log_once(
+                        record, "confirmed",
+                        "ML SIDE CONFIRMED | %s frozen side=%s p_yes=%.4f confidence=%.4f from this worker.",
+                        ticker, side.upper(), probability_yes, confidence,
+                    )
+                    return side
                 self._log_once(
                     record, "resumed",
                     "ML SIDE RESUMED | %s frozen side=%s p_yes=%.4f confidence=%.4f from prior handoff.",
