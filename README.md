@@ -24,7 +24,7 @@ Use **Actions → “Kalshi BTC 15m Mechanical Average Down” → Run workflow*
 5. **Place the lower same-side ladder.** After the initial fill, it posts only strictly lower limits on the locked side. A 40¢ fill produces 30¢, 20¢, and 10¢ rungs; a 39¢ fill produces 30¢, 20¢, and 10¢; a 10¢ fill creates no lower rung. It never averages up, reverses, or hedges. The default cap is four contracts per market: one contract at each rung.
 6. **Hold to settlement.** Unfilled lower limits have the market close as their expiry and are explicitly canceled when the market closes. Filled contracts remain through settlement; then the runner records payout, fees, net P&L, streaks, drawdown, and per-rung results. A closed prior market cannot block the next fresh watcher.
 
-Key persisted settings in `kalshi_btc15m_average_down_config.json` are `initial_position_size` (contracts per rung), `max_total_capital`, `max_active_markets`, and `watch_start_grace_seconds` (default 45; only for starting a watcher at a fresh open).
+Key persisted settings in `kalshi_btc15m_average_down_config.json` are `initial_position_size` (contracts per rung), `max_total_capital`, `max_active_markets`, and `watch_start_grace_seconds` (default 45; only for starting a watcher at a fresh open). When you change only `initial_position_size` in **Run workflow**, the full ladder scales automatically: `10` shares per rung becomes a `40`-contract per-market ceiling and a `$10` principal cap (before fees). Those values persist into later handoffs. You can still supply explicit caps in the same form if you intentionally want a stricter limit.
 
 ---
 

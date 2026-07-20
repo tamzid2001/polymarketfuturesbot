@@ -312,6 +312,16 @@ def apply_config_overrides(config: dict[str, Any], args: argparse.Namespace) -> 
         if value is not None:
             updated[name] = value
             changed = True
+    # The share input is the primary sizing control.  When it is changed by
+    # itself, carry the complete four-rung contract cap and principal reserve
+    # with it: 10 contracts per rung becomes a 40-contract/$10 ladder, not an
+    # invalid 10-contract request against the old one-contract defaults.
+    rung_override = as_float(getattr(args, "initial_position_size", None))
+    if rung_override is not None and rung_override > 0:
+        if getattr(args, "max_contracts_per_market", None) is None:
+            updated["max_contracts_per_market"] = round(rung_override * len(LADDER_LEVELS), 2)
+        if getattr(args, "max_total_capital", None) is None:
+            updated["max_total_capital"] = ladder_principal(rung_override)
     return validate_config(updated), changed
 
 
@@ -1354,9 +1364,10 @@ async def run(args: argparse.Namespace) -> int:
     last_private_update_count = 0
     active_markets: list[Any] = []
     LOG.info(
-        "STARTUP | mode=%s run_seconds=%.0f quantity_per_rung=%.2f ladder=%s capital_cap=$%.4f",
+        "STARTUP | mode=%s run_seconds=%.0f quantity_per_rung=%.2f market_contract_cap=%.2f ladder=%s capital_cap=$%.4f",
         "DRY_RUN" if dry_run else "LIVE", args.run_seconds, config["initial_position_size"],
-        "/".join(f"${level:.2f}" for level in LADDER_LEVELS), config["max_total_capital"],
+        config["max_contracts_per_market"], "/".join(f"${level:.2f}" for level in LADDER_LEVELS),
+        config["max_total_capital"],
     )
     log_performance_summary(performance_report(state, config), "startup")
     try:

@@ -16,7 +16,7 @@ on:
         type: boolean
         default: true
       initial_position_size:
-        description: "Contracts per 40c/30c/20c/10c rung; blank keeps the persisted value."
+        description: "Contracts per 40c/30c/20c/10c rung. If changed alone, the four-rung contract and capital caps auto-scale; blank keeps persisted values."
         required: false
         type: string
         default: ""
@@ -26,12 +26,12 @@ on:
         type: string
         default: ""
       max_contracts_per_market:
-        description: "Blank keeps persisted value."
+        description: "Optional explicit total contract cap; normally leave blank so it auto-scales to four times the rung quantity."
         required: false
         type: string
         default: ""
       max_total_capital:
-        description: "Maximum principal reserved across all four-rung ladders; blank keeps persisted value."
+        description: "Optional explicit principal cap; normally leave blank so it auto-scales to the full four-rung ladder."
         required: false
         type: string
         default: ""

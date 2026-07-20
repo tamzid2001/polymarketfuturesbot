@@ -8,6 +8,7 @@ from kalshi_btc15m_average_down import (
     KalshiLiveFeed,
     LADDER_LEVELS,
     active_strategy_records,
+    apply_config_overrides,
     classify_submission,
     choose_entry_side,
     consider_initial_entry,
@@ -86,6 +87,14 @@ class MechanicalAverageDownTests(unittest.TestCase):
         invalid = {**DEFAULT_CONFIG, "max_total_capital": 0.99}
         with self.assertRaises(ValueError):
             validate_config(invalid)
+
+    def test_share_size_override_auto_scales_contract_and_capital_guards(self):
+        args = SimpleNamespace(initial_position_size=10.0)
+        config, changed = apply_config_overrides(validate_config(DEFAULT_CONFIG), args)
+        self.assertTrue(changed)
+        self.assertEqual(config["initial_position_size"], 10.0)
+        self.assertEqual(config["max_contracts_per_market"], 40.0)
+        self.assertEqual(config["max_total_capital"], 10.0)
 
     def test_exchange_position_over_cap_blocks_all_further_orders(self):
         class FakeRest:
