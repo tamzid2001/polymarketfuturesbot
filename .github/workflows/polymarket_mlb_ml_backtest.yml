@@ -45,10 +45,9 @@ jobs:
 
       - name: Collect, validate, and evaluate historical MLB data
         env:
-          # These credentials sign read-only reporting/reference calls. The
-          # script has no order client and no live-trading flag.
-          POLYMARKET_PUBLIC_KEY: ${{ secrets.POLYMARKET_PUBLIC_KEY }}
-          POLYMARKET_SECRET_KEY: ${{ secrets.POLYMARKET_SECRET_KEY }}
+          # The current aggregated-trade endpoint requires a scoped Auth0 JWT
+          # (read:reports). This job has no order client and no live flag.
+          POLYMARKET_REPORT_JWT: ${{ secrets.POLYMARKET_REPORT_JWT }}
         run: |
           set -euo pipefail
           args=(run-all --root .)

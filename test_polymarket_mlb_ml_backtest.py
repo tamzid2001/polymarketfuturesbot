@@ -81,6 +81,52 @@ class MlbBacktestTests(unittest.TestCase):
         self.assertEqual(features["market_implied_home"] + features["market_implied_away"], 1.0)
         self.assertFalse(features["historical_book_available"])
 
+    def test_current_report_schema_uses_scoped_bearer_and_price_scale(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths = Paths(Path(directory))
+            history = PolymarketHistory(paths, report_jwt="test-reports-token")
+            calls = []
+
+            def fake_post(url, payload, *, headers=None):
+                calls.append((url, payload, headers))
+                self.assertEqual(headers["Authorization"], "Bearer test-reports-token")
+                if url.endswith("/v1/report/trades/stats"):
+                    self.assertEqual(payload["symbol"], "aec-mlb-away-home-2026-07-20")
+                    self.assertIn("startTime", payload)
+                    self.assertIn("endTime", payload)
+                    self.assertIn("startTradeDate", payload)
+                    self.assertIn("endTradeDate", payload)
+                    self.assertNotIn("start_time", payload)
+                    return {
+                        "bars": [{"first": "500", "last": "550", "high": "560", "low": "490", "volume": "10", "notional": "5500"}],
+                        "barStartTime": ["2026-07-19T18:00:00Z"],
+                        "barEndTime": ["2026-07-19T19:00:00Z"],
+                    }
+                self.assertTrue(url.endswith("/v1/refdata/instruments"))
+                self.assertEqual(payload["eventSeries"], "mlb")
+                return {"instruments": [{"symbol": "aec-mlb-away-home-2026-07-20", "priceScale": "1000"}], "eof": True}
+
+            history.http.post = fake_post
+            candles, error = history.candles("aec-mlb-away-home-2026-07-20", self.start - timedelta(days=1), self.start)
+            self.assertIsNone(error)
+            self.assertEqual(len(candles), 1)
+            self.assertAlmostEqual(candles[0]["close"], .55)
+            self.assertAlmostEqual(candles[0]["notional"], 5.5)
+            self.assertEqual(len(calls), 2)
+
+    def test_missing_report_jwt_blocks_repeated_historical_requests(self):
+        with tempfile.TemporaryDirectory() as directory:
+            history = PolymarketHistory(Paths(Path(directory)))
+            calls = []
+            history.http.post = lambda *args, **kwargs: calls.append(args)
+            first, first_error = history.candles("symbol", self.start - timedelta(days=1), self.start)
+            second, second_error = history.candles("another-symbol", self.start - timedelta(days=1), self.start)
+            self.assertIsNone(first)
+            self.assertIsNone(second)
+            self.assertEqual(first_error, "historical_reporting_jwt_unavailable:POLYMARKET_REPORT_JWT")
+            self.assertEqual(second_error, first_error)
+            self.assertEqual(calls, [])
+
     def test_rolling_features_are_shifted_before_current_game(self):
         first = {
             "game_pk": "1", "scheduled_start": "2026-07-10T18:00:00Z", "home_team": "Home", "away_team": "Away",

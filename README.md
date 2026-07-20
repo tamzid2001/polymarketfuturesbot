@@ -103,7 +103,9 @@ Polymarket's API price is always the LONG/YES price, so buying the short/NO team
 
 ### Historical MLB ML backtest and optional ML-side mode
 
-`polymarket_mlb_ml_backtest.py` is a distinct, read-only research pipeline. It uses the official Polymarket US public gateway for completed MLB events/settlements, the authenticated Polymarket reporting endpoint for historical trade statistics, and the MLB Stats API for final game records and strictly prior team features. It does not use the 15 observed dry-run games as an ML sample.
+`polymarket_mlb_ml_backtest.py` is a distinct, read-only research pipeline. It uses the official Polymarket US public gateway for completed MLB events/settlements, the current Polymarket Exchange reporting endpoint for historical trade statistics, and the MLB Stats API for final game records and strictly prior team features. It does not use the 15 observed dry-run games as an ML sample.
+
+The reporting service currently requires `POLYMARKET_REPORT_JWT`, an Auth0 bearer token with the `read:reports` scope. This is intentionally separate from the live runner's Ed25519 API credentials. The collector uses the current `POST https://api.prod.polymarketexchange.com/v1/report/trades/stats` camelCase schema; it records the legacy `/v1beta1` snake_case documentation/schema discrepancy in `dataset_summary.json` rather than silently mixing formats. If this token or the required scope is absent, the run reports the exact access failure and produces no ML accuracy or P&L claim.
 
 Run it locally after installing its isolated dependencies:
 
@@ -167,6 +169,7 @@ Go to **Settings → Environments → Polymarket US Futures → Add secret**.
 |---|---|
 | `POLYMARKET_PUBLIC_KEY` | Your Polymarket US API key ID (UUID) |
 | `POLYMARKET_SECRET_KEY` | Your Polymarket US API secret key (Ed25519, base64) |
+| `POLYMARKET_REPORT_JWT` | Auth0 bearer token with `read:reports`, required only for the read-only MLB historical trade-statistics backtest |
 
 Get these from [polymarket.us/developer](https://polymarket.us/developer) after completing identity verification in the Polymarket US app.
 

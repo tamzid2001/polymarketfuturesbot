@@ -16,9 +16,11 @@ Data sources:
 * Polymarket US authenticated reporting API: historical trade statistics.
 * MLB Stats API: schedule, final scores, and strictly prior team statistics.
 
-The report endpoint is authenticated with the same Ed25519 API credentials
-used by the existing runner.  The client records HTTP/authentication failures
-as exclusion reasons instead of silently changing data sources.
+The current report endpoint is authenticated with an Auth0 bearer JWT carrying
+the ``read:reports`` scope.  That is deliberately separate from the Ed25519
+API credentials used by the live runner.  The client records
+HTTP/authentication failures as exclusion reasons instead of silently changing
+data sources.
 """
 
 from __future__ import annotations
@@ -42,6 +44,7 @@ from urllib.request import Request, urlopen
 
 LOG = logging.getLogger("polymarket_mlb_ml_backtest")
 GATEWAY_BASE = "https://gateway.polymarket.us"
+POLYMARKET_EXCHANGE_BASE = "https://api.prod.polymarketexchange.com"
 MLB_STATS_BASE = "https://statsapi.mlb.com/api/v1"
 POLYMARKET_LEAGUE_TAG_ID = 4
 HORIZONS_HOURS = (24, 6, 1)
@@ -234,21 +237,38 @@ class HttpJson:
         self.timeout = timeout
         self.retries = retries
 
-    def get(self, url: str) -> Any:
+    def _request(self, request: Request, *, method: str, url: str) -> Any:
         error: Exception | None = None
         for attempt in range(self.retries):
             try:
-                request = Request(url, headers={
-                    "Accept": "application/json",
-                    "User-Agent": "polymarket-mlb-ml-backtest/1.0",
-                })
                 with urlopen(request, timeout=self.timeout) as response:  # noqa: S310 - fixed HTTPS sources
                     return json.loads(response.read().decode("utf-8"))
             except Exception as exc:  # noqa: BLE001
                 error = exc
                 if attempt + 1 < self.retries:
                     time.sleep(min(8.0, 0.5 * (2 ** attempt)))
-        raise RuntimeError(f"GET failed after {self.retries} attempts: {url}: {error}")
+        raise RuntimeError(f"{method} failed after {self.retries} attempts: {url}: {error}")
+
+    def get(self, url: str) -> Any:
+        return self._request(Request(url, headers={
+            "Accept": "application/json",
+            "User-Agent": "polymarket-mlb-ml-backtest/1.0",
+        }), method="GET", url=url)
+
+    def post(self, url: str, payload: dict[str, Any], *, headers: dict[str, str] | None = None) -> Any:
+        request_headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": "polymarket-mlb-ml-backtest/1.0",
+            **(headers or {}),
+        }
+        request = Request(
+            url,
+            data=json.dumps(payload, separators=(",", ":")).encode("utf-8"),
+            headers=request_headers,
+            method="POST",
+        )
+        return self._request(request, method="POST", url=url)
 
 
 def is_full_game_moneyline(market: dict[str, Any]) -> bool:
@@ -301,14 +321,24 @@ def market_outcome_from_settlement(home: dict[str, Any], settlement: float) -> i
 
 
 class PolymarketHistory:
-    """Official public metadata plus optional authenticated reporting data."""
+    """Official public metadata plus optional Auth0-protected reporting data."""
 
-    def __init__(self, paths: Paths, *, key_id: str | None, secret_key: str | None) -> None:
+    def __init__(
+        self,
+        paths: Paths,
+        *,
+        key_id: str | None = None,
+        secret_key: str | None = None,
+        report_jwt: str | None = None,
+    ) -> None:
         self.paths = paths
         self.http = HttpJson()
+        # Retain these optional parameters for backwards-compatible callers,
+        # but never send them to the report API.  That API requires a scoped
+        # Auth0 bearer token, not an Ed25519 request signature.
         self.key_id = key_id
         self.secret_key = secret_key
-        self._auth_client: Any | None = None
+        self.report_jwt = report_jwt
         self._price_scales: dict[str, float] | None = None
         self._report_error: str | None = None
 
@@ -350,19 +380,25 @@ class PolymarketHistory:
         value = finite(response.get("settlement"))
         return value, None if value in {0.0, 1.0} else "ambiguous_or_missing_settlement"
 
-    def _client(self) -> Any | None:
-        if self._auth_client is not None:
-            return self._auth_client
-        if not self.key_id or not self.secret_key:
-            self._report_error = "historical_reporting_credentials_unavailable"
+    def _report_headers(self) -> dict[str, str] | None:
+        if self._report_error:
+            return None
+        if not self.report_jwt:
+            self._report_error = "historical_reporting_jwt_unavailable:POLYMARKET_REPORT_JWT"
+            return None
+        return {"Authorization": f"Bearer {self.report_jwt}"}
+
+    def _report_post(self, path: str, payload: dict[str, Any]) -> Any | None:
+        headers = self._report_headers()
+        if headers is None:
             return None
         try:
-            from polymarket_us import PolymarketUS
-        except ImportError:
-            self._report_error = "polymarket_us_sdk_not_installed"
+            return self.http.post(f"{POLYMARKET_EXCHANGE_BASE}{path}", payload, headers=headers)
+        except Exception as exc:  # noqa: BLE001
+            # Avoid hundreds of identical failing requests when a scope,
+            # endpoint, or token problem is detected on the first market.
+            self._report_error = f"historical_report_request_failed:{exc}"
             return None
-        self._auth_client = PolymarketUS(key_id=self.key_id, secret_key=self.secret_key)
-        return self._auth_client
 
     def _instrument_scales(self) -> dict[str, float]:
         """Read the documented priceScale from authenticated reference data.
@@ -372,23 +408,26 @@ class PolymarketHistory:
         """
         if self._price_scales is not None:
             return self._price_scales
-        client = self._client()
-        if client is None:
+        headers = self._report_headers()
+        if headers is None:
             self._price_scales = {}
             return self._price_scales
         cache = self.paths.raw / "reference" / "mlb_instruments.json"
         cached = read_json(cache, None)
         if not isinstance(cached, dict):
             try:
-                # The public documentation supports event_series filtering and
-                # page tokens. Retain every response for schema auditing.
+                # The documented v1 schema is camelCase and paginated. Retain
+                # every response for schema auditing rather than inferring a
+                # scale from raw integer prices.
                 pages: list[dict[str, Any]] = []
                 token: str | None = None
                 while True:
-                    request: dict[str, Any] = {"event_series": "mlb"}
+                    request: dict[str, Any] = {"eventSeries": "mlb", "pageSize": 1000}
                     if token:
-                        request["page_token"] = token
-                    response = client.post("/v1/refdata/instruments", body=request, authenticated=True)
+                        request["pageToken"] = token
+                    response = self.http.post(
+                        f"{POLYMARKET_EXCHANGE_BASE}/v1/refdata/instruments", request, headers=headers,
+                    )
                     if not isinstance(response, dict):
                         raise RuntimeError("reference-data response was not an object")
                     pages.append(response)
@@ -414,36 +453,46 @@ class PolymarketHistory:
         return scales
 
     def candles(self, symbol: str, start: datetime, end: datetime) -> tuple[list[dict[str, Any]] | None, str | None]:
-        """Fetch 1h trade statistics; no BBO/ask is claimed by this endpoint."""
+        """Fetch documented v1 hourly trade statistics; never claim a BBO/ask."""
         cache = self.paths.raw / "trade_stats" / f"{symbol}.json"
         cached = read_json(cache, None)
-        if isinstance(cached, dict) and isinstance(cached.get("candles"), list):
+        if isinstance(cached, dict) and cached.get("report_api_version") == "v1" and isinstance(cached.get("candles"), list):
             return cached["candles"], cached.get("error")
-        client = self._client()
-        if client is None:
+        if self._report_error:
+            return None, self._report_error
+        headers = self._report_headers()
+        if headers is None:
             return None, self._report_error or "historical_reporting_credentials_unavailable"
-        try:
-            response = client.post("/v1beta1/report/trades/stats", body={
-                "symbol": symbol, "start_time": iso(start), "end_time": iso(end), "interval": "1h",
-            }, authenticated=True)
-        except Exception as exc:  # noqa: BLE001
-            reason = f"historical_report_request_failed:{exc}"
-            atomic_json(cache, {"retrieved_at": iso(), "error": reason, "candles": []})
+        duration_hours = max(1, math.ceil((end - start).total_seconds() / 3600))
+        payload = {
+            "symbol": symbol,
+            "startTime": iso(start),
+            "endTime": iso(end),
+            "bars": min(1000, duration_hours),
+            "startTradeDate": {"year": start.year, "month": start.month, "day": start.day},
+            "endTradeDate": {"year": end.year, "month": end.month, "day": end.day},
+        }
+        response = self._report_post("/v1/report/trades/stats", payload)
+        if response is None:
+            reason = self._report_error or "historical_report_request_failed"
+            atomic_json(cache, {"retrieved_at": iso(), "report_api_version": "v1", "request": payload, "error": reason, "candles": []})
             return None, reason
-        raw_stats = response.get("stats") if isinstance(response, dict) else None
-        if not isinstance(raw_stats, list):
-            reason = "historical_report_schema_missing_stats"
-            atomic_json(cache, {"retrieved_at": iso(), "response": response, "error": reason, "candles": []})
+        raw_bars = response.get("bars") if isinstance(response, dict) else None
+        starts = response.get("barStartTime") if isinstance(response, dict) else None
+        ends = response.get("barEndTime") if isinstance(response, dict) else None
+        if not isinstance(raw_bars, list) or not isinstance(starts, list) or not isinstance(ends, list) or not (len(raw_bars) == len(starts) == len(ends)):
+            reason = "historical_report_schema_missing_bars_or_timestamps"
+            atomic_json(cache, {"retrieved_at": iso(), "report_api_version": "v1", "request": payload, "response": response, "error": reason, "candles": []})
             return None, reason
         scales = self._instrument_scales()
         scale = scales.get(symbol)
         candles: list[dict[str, Any]] = []
-        for item in raw_stats:
+        for item, interval_start, interval_end in zip(raw_bars, starts, ends):
             if not isinstance(item, dict):
                 continue
-            stamp = parse_time(item.get("interval_end") or item.get("intervalEnd"))
-            raw_close = finite(item.get("close"))
-            raw_open = finite(item.get("open"))
+            stamp = parse_time(interval_end)
+            raw_close = finite(item.get("last"))
+            raw_open = finite(item.get("first"))
             raw_high = finite(item.get("high"))
             raw_low = finite(item.get("low"))
             # Values already expressed in dollars are safe. Integer-priced
@@ -458,13 +507,14 @@ class PolymarketHistory:
             if any(value < 0 or value > 1 for value in converted):
                 continue
             candles.append({
-                "interval_start": item.get("interval_start") or item.get("intervalStart"),
+                "interval_start": interval_start,
                 "interval_end": iso(stamp), "open": converted[0], "high": converted[1],
-                "low": converted[2], "close": converted[3], "volume": finite(item.get("volume")),
-                "notional": finite(item.get("notional")), "price_scale": divisor,
+                "low": converted[2], "close": converted[3], "volume": finite(item.get("clearedVolume") or item.get("volume")),
+                "notional": (finite(item.get("clearedNotional") or item.get("notional")) or 0.0) / divisor,
+                "price_scale": divisor,
             })
         reason = None if candles else ("historical_prices_missing_or_price_scale_unavailable" if scale is None else "historical_prices_missing")
-        atomic_json(cache, {"retrieved_at": iso(), "request": {"symbol": symbol, "start": iso(start), "end": iso(end)},
+        atomic_json(cache, {"retrieved_at": iso(), "report_api_version": "v1", "request": payload,
                             "response": response, "candles": candles, "error": reason})
         return candles or None, reason
 
@@ -654,7 +704,12 @@ def snapshot_features(candles: list[dict[str, Any]], cutoff: datetime, home_is_l
 def collect_history(paths: Paths, *, refresh: bool = False, max_games: int | None = None) -> dict[str, Any]:
     """Download/cache authoritative event, settlement, schedule, and trade data."""
     key_id, secret = os.getenv("POLYMARKET_PUBLIC_KEY"), os.getenv("POLYMARKET_SECRET_KEY")
-    poly = PolymarketHistory(paths, key_id=key_id, secret_key=secret)
+    poly = PolymarketHistory(
+        paths,
+        key_id=key_id,
+        secret_key=secret,
+        report_jwt=os.getenv("POLYMARKET_REPORT_JWT"),
+    )
     exclusions: list[dict[str, Any]] = []
     selected: list[dict[str, Any]] = []
     events = poly.closed_events(refresh=refresh)
@@ -750,7 +805,8 @@ def collect_history(paths: Paths, *, refresh: bool = False, max_games: int | Non
         "official_final_games_available": len(final_games), "eligible_game_horizon_rows": len(canonical),
         "eligible_unique_games": len(seen_game_keys), "excluded_records": len(exclusions),
         "historical_reporting_error": poly._report_error,
-        "price_source": "authenticated Polymarket US /v1beta1/report/trades/stats; trade candles only, no historical BBO",
+        "price_source": "authenticated Polymarket Exchange /v1/report/trades/stats; trade candles only, no historical BBO",
+        "api_schema_note": "The legacy /v1beta1 snake_case candle schema was not used. The collector uses the current documented v1 camelCase report schema and records this discrepancy.",
         "execution_note": "Historical trade candles are not executable asks; trading simulation will report no executable fills unless historical bid/ask data is supplied.",
     }
     atomic_json(paths.dataset_summary, summary)
