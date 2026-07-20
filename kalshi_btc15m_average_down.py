@@ -79,6 +79,10 @@ DEFAULT_CONFIG = {
     # order reconciliation if the stream is interrupted.
     "market_refresh_seconds": 15.0,
     "order_reconcile_seconds": 5.0,
+    # Initial entries are permitted only immediately after a new market opens.
+    # This prevents a long-running process from opening a fresh position late
+    # in a 15-minute contract.
+    "initial_entry_window_seconds": 15.0,
     "status_log_seconds": 30.0,
 }
 
@@ -163,6 +167,19 @@ def market_is_tradeable(market: Any) -> bool:
     )
 
 
+def market_is_in_initial_entry_window(market: Any, entry_window_seconds: float) -> bool:
+    """Allow a new initial ladder only during the opening seconds of a market.
+
+    The open timestamp must be known.  If Kalshi omits it, failing closed is
+    safer than accidentally turning a late quote into a new position.
+    """
+    open_time = timestamp_epoch(field(market, "open_time"))
+    if open_time is None or not market_is_tradeable(market):
+        return False
+    seconds_since_open = time.time() - open_time
+    return 0.0 <= seconds_since_open <= entry_window_seconds
+
+
 def market_result(market: Any) -> str | None:
     raw = field(market, "result")
     result = str(getattr(raw, "value", raw) or "").lower()
@@ -227,6 +244,7 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
     for name in (
         "initial_position_size", "max_contracts_per_market", "max_total_capital",
         "fee_reserve", "poll_seconds", "market_refresh_seconds", "order_reconcile_seconds",
+        "initial_entry_window_seconds",
         "status_log_seconds",
     ):
         value = as_float(merged.get(name))
@@ -249,7 +267,7 @@ def apply_config_overrides(config: dict[str, Any], args: argparse.Namespace) -> 
     names = (
         "initial_position_size", "max_active_markets", "max_contracts_per_market",
         "max_total_capital", "fee_reserve", "poll_seconds", "market_refresh_seconds",
-        "order_reconcile_seconds", "status_log_seconds",
+        "order_reconcile_seconds", "initial_entry_window_seconds", "status_log_seconds",
     )
     changed = False
     updated = dict(config)
@@ -789,7 +807,7 @@ async def consider_initial_entry(
     live_asks: dict[str, float | None] | None = None,
 ) -> bool:
     ticker = str(field(market, "ticker") or "")
-    if not ticker or not market_is_tradeable(market):
+    if not ticker or not market_is_in_initial_entry_window(market, config["initial_entry_window_seconds"]):
         return False
     record = state.get("markets", {}).get(ticker)
     if isinstance(record, dict) and record.get("candidate_side"):
@@ -1173,6 +1191,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--poll-seconds", type=float)
     parser.add_argument("--market-refresh-seconds", type=float)
     parser.add_argument("--order-reconcile-seconds", type=float)
+    parser.add_argument("--initial-entry-window-seconds", type=float)
     parser.add_argument("--status-log-seconds", type=float)
     return parser
 

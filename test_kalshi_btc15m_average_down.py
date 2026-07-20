@@ -1,4 +1,5 @@
 import asyncio
+import time
 import unittest
 from types import SimpleNamespace
 
@@ -17,6 +18,7 @@ from kalshi_btc15m_average_down import (
     side_api_price,
     submit_ladder,
     market_is_tradeable,
+    market_is_in_initial_entry_window,
     market_asks,
     normalized_order_status,
     validate_config,
@@ -31,6 +33,7 @@ class MechanicalAverageDownTests(unittest.TestCase):
         self.assertEqual(ladder_principal(1.0), 1.0)
         self.assertEqual(config["market_refresh_seconds"], 15.0)
         self.assertEqual(config["order_reconcile_seconds"], 5.0)
+        self.assertEqual(config["initial_entry_window_seconds"], 15.0)
 
     def test_fresh_websocket_quote_supplies_both_executable_sides(self):
         feed = KalshiLiveFeed(auth=None)
@@ -143,7 +146,8 @@ class MechanicalAverageDownTests(unittest.TestCase):
             state = default_state()
             market = SimpleNamespace(
                 ticker="KXBTC15M-TEST", status="active", yes_ask_dollars="0.3500",
-                no_ask_dollars="0.6500", close_time="2099-07-20T00:15:00Z",
+                no_ask_dollars="0.6500", open_time=time.time() - 1,
+                close_time="2099-07-20T00:15:00Z",
             )
             rest = FakeRest()
             entered = await consider_initial_entry(rest, state, market, config, dry_run=False)
@@ -177,7 +181,11 @@ class MechanicalAverageDownTests(unittest.TestCase):
         async def scenario():
             config = validate_config(DEFAULT_CONFIG)
             state = default_state()
-            market = SimpleNamespace(ticker="KXBTC15M-TEST-10", status="active", yes_ask_dollars="0.90", no_ask_dollars="0.10")
+            market = SimpleNamespace(
+                ticker="KXBTC15M-TEST-10", status="active", yes_ask_dollars="0.90",
+                no_ask_dollars="0.10", open_time=time.time() - 1,
+                close_time=time.time() + 899,
+            )
             rest = FakeRest()
             await consider_initial_entry(rest, state, market, config, dry_run=False)
             record = state["markets"]["KXBTC15M-TEST-10"]
@@ -199,6 +207,20 @@ class MechanicalAverageDownTests(unittest.TestCase):
             status="active", open_time="2099-01-01T00:00:00Z", close_time="2099-01-01T00:15:00Z",
         )
         self.assertFalse(market_is_tradeable(pre_open))
+
+    def test_initial_entry_requires_a_known_recent_open(self):
+        just_opened = SimpleNamespace(
+            status="active", open_time=time.time() - 5,
+            close_time=time.time() + 895,
+        )
+        late = SimpleNamespace(
+            status="active", open_time=time.time() - 16,
+            close_time=time.time() + 884,
+        )
+        missing_open_time = SimpleNamespace(status="active", close_time=time.time() + 895)
+        self.assertTrue(market_is_in_initial_entry_window(just_opened, 15.0))
+        self.assertFalse(market_is_in_initial_entry_window(late, 15.0))
+        self.assertFalse(market_is_in_initial_entry_window(missing_open_time, 15.0))
 
 
 if __name__ == "__main__":
