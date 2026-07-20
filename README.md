@@ -15,6 +15,22 @@ The continuous runners use GitHub Actions for up to 5 h 45 min per job before se
 
 Use **Actions → “Kalshi BTC 15m ML-Side Average Down” → Run workflow**. It is live by default, uses the persisted contract quantity (default **1 contract per rung**), and runs for 5 h 45 min before handing its state to the next runner. It monitors only `KXBTC15M`. The pinned production artifact is a chronologically calibrated logistic-regression model; its inclusive 50% confidence gate keeps every valid model direction eligible, while the separate 40¢ price rule controls whether an order can be placed. Its feature schema includes a Prophet-derived feature, but Prophet is not an execution signal or fallback and cannot select the opposite side.
 
+### Deployed model, coverage, and evidence
+
+The current pinned artifact is **Actions run `29774183849`**: regularized logistic regression with isotonic probability calibration. It uses a 19,189-row settled feature ledger, split chronologically into 16,311 base-training rows and 2,878 later calibration rows. The runner records the model artifact ID, training cutoff, model `p_yes`, confidence, and selected side with every ML-backed market record.
+
+The deployed `confidence >= 0.50` gate has **100% valid-model-direction coverage**: every valid binary-model score has a YES or NO direction at that threshold. This is not 100% order coverage. An actual position still requires the ML-selected side's executable Kalshi ask to reach `<= $0.40`; it may then fill zero to four same-side rungs depending on market prices and liquidity.
+
+Historical analysis found 18,986 scored ML directions at the 50% gate, with 52.42% directional accuracy and longest historical directional streaks of 17 wins / 10 losses; all seven completed 30-day windows were above 50%. This is historical directional evidence, **not a promised future rate or executable P&L**. The deployed calibrated logistic model and the 40¢ average-down execution rule can select a different set of trades; fees, fills, spread, rung depth, and settlement determine live P&L.
+
+### What the Action logs
+
+At startup the runner prints `ML MODEL`, `ML VALIDATION`, and `ML EXECUTION POLICY` lines with the exact artifact, calibration method, training rows/cutoff, research context, and active 50% gate. For every market it logs `ML SIDE READY` (`p_yes`, confidence, selected side), selected-side-only quote triggers, entry/ladder order IDs and fills, exchange-position guard checks, settlement, rung-level P&L, and `ML LIVE PERFORMANCE`. The latter reports directional accuracy separately from actual fill- and fee-inclusive P&L.
+
+### Retraining policy
+
+Retraining creates a **candidate** artifact; it must not silently replace the pinned live model. Refit weekly or after roughly 500 new settled, feature-complete markets, then evaluate it on a frozen later holdout and compare its live fill/fee results with the incumbent. Pin and deploy a new artifact only after that review. The current artifact was trained on July 20, 2026 and does not require an immediate retrain.
+
 ### Exact Kalshi lifecycle
 
 1. **Freeze one ML side before opening.** During the two-minute pre-open window, the runner builds the existing model's features from only then-available settled labels and market data, then evaluates the pinned calibrated logistic model. It records the ML `p_yes`, confidence, selected YES/NO side, exact model run, and training cutoff. The inclusive `≥50%` confidence gate gives every valid binary-model direction coverage; if this inference is unavailable, it submits no order for that market. There is no mechanical, Prophet, or price-side fallback.
