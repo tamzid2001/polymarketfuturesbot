@@ -18,6 +18,7 @@ import json
 import logging
 import math
 import os
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -112,6 +113,27 @@ def side_book_side(side: str):
 
 def market_is_active(market: Any) -> bool:
     return str(field(market, "status") or "").lower() == "active"
+
+
+def timestamp_epoch(raw: Any) -> int | None:
+    if raw is None:
+        return None
+    numeric = as_float(raw)
+    if numeric is not None:
+        return int(numeric)
+    try:
+        parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return int(parsed.timestamp())
+    except ValueError:
+        return None
+
+
+def market_is_tradeable(market: Any) -> bool:
+    """Require both Kalshi's active status and an unexpired close time."""
+    close_time = timestamp_epoch(field(market, "close_time", "expected_expiration_time"))
+    return market_is_active(market) and (close_time is None or time.time() < close_time)
 
 
 def market_result(market: Any) -> str | None:
@@ -288,7 +310,7 @@ class KalshiREST:
         for event in field(response, "events") or []:
             for market in field(event, "markets") or []:
                 ticker = str(field(market, "ticker") or "")
-                if ticker.startswith(SERIES_TICKER + "-") and market_is_active(market):
+                if ticker.startswith(SERIES_TICKER + "-") and market_is_tradeable(market):
                     markets.append(market)
         return markets
 
@@ -386,19 +408,7 @@ class KalshiREST:
 
 
 def expiration_epoch(market: Any) -> int | None:
-    raw = field(market, "close_time", "expected_expiration_time")
-    if raw is None:
-        return None
-    numeric = as_float(raw)
-    if numeric is not None:
-        return int(numeric)
-    try:
-        parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
-        return int(parsed.timestamp())
-    except ValueError:
-        return None
+    return timestamp_epoch(field(market, "close_time", "expected_expiration_time"))
 
 
 def market_record(state: dict[str, Any], ticker: str) -> dict[str, Any]:
@@ -424,8 +434,14 @@ def filled_contracts(record: dict[str, Any]) -> float:
 
 
 def active_strategy_records(state: dict[str, Any]) -> list[dict[str, Any]]:
-    return [record for record in state.get("markets", {}).values()
-            if isinstance(record, dict) and record.get("status") not in {"finalized", "abandoned"}]
+    active: list[dict[str, Any]] = []
+    for record in state.get("markets", {}).values():
+        if not isinstance(record, dict) or record.get("status") not in {"initial_submitted", "ladder_active"}:
+            continue
+        close_time = timestamp_epoch(record.get("market_close_time"))
+        if close_time is None or time.time() < close_time:
+            active.append(record)
+    return active
 
 
 def reserved_principal(state: dict[str, Any]) -> float:
@@ -492,7 +508,7 @@ async def submit_ladder(
 
 
 async def settle_or_cancel(rest: KalshiREST, record: dict[str, Any], market: Any, dry_run: bool) -> None:
-    if market_is_active(market):
+    if market_is_tradeable(market):
         return
     record["status"] = "closed_waiting_finalization"
     record["closed_at"] = now_iso()
@@ -525,7 +541,7 @@ async def consider_initial_entry(
     rest: KalshiREST, state: dict[str, Any], market: Any, config: dict[str, Any], dry_run: bool,
 ) -> bool:
     ticker = str(field(market, "ticker") or "")
-    if not ticker or not market_is_active(market):
+    if not ticker or not market_is_tradeable(market):
         return False
     record = state.get("markets", {}).get(ticker)
     if isinstance(record, dict) and record.get("candidate_side"):
@@ -676,7 +692,7 @@ async def run(args: argparse.Namespace) -> int:
                     continue
                 await reconcile_orders(rest, record, dry_run)
                 await settle_or_cancel(rest, record, market, dry_run)
-                if market_is_active(market):
+                if market_is_tradeable(market):
                     await submit_ladder(rest, record, market, config, dry_run)
             for market in await rest.active_markets():
                 await consider_initial_entry(rest, state, market, config, dry_run)
