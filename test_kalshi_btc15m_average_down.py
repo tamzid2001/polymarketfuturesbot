@@ -27,6 +27,7 @@ from kalshi_btc15m_average_down import (
     market_record,
     market_asks,
     managed_mechanical_order_role,
+    ml_live_directional_performance,
     normalized_order_status,
     normalized_outcome_side,
     rung_order_activity,
@@ -125,6 +126,23 @@ class MechanicalAverageDownTests(unittest.TestCase):
         self.assertEqual(report["strategy"], "ml_side_mechanical_price_average_down_v1")
         self.assertEqual(report["total_markets_traded"], 0)
         self.assertEqual(tuple(LADDER_LEVELS), (0.40, 0.30, 0.20, 0.10))
+
+    def test_ml_live_directional_performance_keeps_direction_separate_from_pnl(self):
+        settled = [
+            {
+                "settlement_outcome": "yes", "locked_side": "yes",
+                "ml_inference": {"probability_yes": 0.60, "confidence": 0.60},
+            },
+            {
+                "settlement_outcome": "yes", "candidate_side": "no",
+                "ml_inference": {"probability_yes": 0.40, "confidence": 0.60},
+            },
+            {"settlement_outcome": "no", "locked_side": "no"},
+        ]
+        summary = ml_live_directional_performance(settled)
+        self.assertEqual((summary["settled_markets"], summary["directional_wins"], summary["directional_losses"]), (2, 1, 1))
+        self.assertEqual(summary["directional_win_rate"], 0.5)
+        self.assertEqual(summary["average_model_confidence"], 0.6)
 
     def test_zero_contract_finalization_is_excluded_from_performance(self):
         state = {"markets": {

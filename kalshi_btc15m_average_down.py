@@ -84,9 +84,13 @@ DEFAULT_CONFIG = {
     # observing a brand-new market and starting its watcher.  Once started,
     # the watcher runs until the market closes or one side reaches 40c.
     "watch_start_grace_seconds": 45.0,
-    # ML is computed before the next market opens.  A watcher never chooses a
+    # ML is computed before the next market opens. A watcher never chooses a
     # side from prices; it only acts after this frozen model side is ready.
     "ml_preopen_lead_seconds": 120.0,
+    # Inclusive 50% confidence: every valid binary-model direction is eligible
+    # for the price ladder. This is model coverage, not order coverage: the
+    # selected side must still reach the mechanical 40c entry level.
+    "ml_min_confidence": 0.50,
     "status_log_seconds": 30.0,
 }
 
@@ -284,13 +288,15 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
     for name in (
         "initial_position_size", "max_contracts_per_market", "max_total_capital",
         "fee_reserve", "poll_seconds", "market_refresh_seconds", "order_reconcile_seconds",
-        "watch_start_grace_seconds", "ml_preopen_lead_seconds",
+        "watch_start_grace_seconds", "ml_preopen_lead_seconds", "ml_min_confidence",
         "status_log_seconds",
     ):
         value = as_float(merged.get(name))
         if value is None or value <= 0:
             raise ValueError(f"{name} must be positive")
         merged[name] = value
+    if merged["ml_min_confidence"] < 0.5 or merged["ml_min_confidence"] > 1.0:
+        raise ValueError("ml_min_confidence must be between 0.5 and 1.0")
     active = int(merged.get("max_active_markets", 0))
     if active < 1:
         raise ValueError("max_active_markets must be at least one")
@@ -307,7 +313,8 @@ def apply_config_overrides(config: dict[str, Any], args: argparse.Namespace) -> 
     names = (
         "initial_position_size", "max_active_markets", "max_contracts_per_market",
         "max_total_capital", "fee_reserve", "poll_seconds", "market_refresh_seconds",
-        "order_reconcile_seconds", "watch_start_grace_seconds", "ml_preopen_lead_seconds", "status_log_seconds",
+        "order_reconcile_seconds", "watch_start_grace_seconds", "ml_preopen_lead_seconds",
+        "ml_min_confidence", "status_log_seconds",
     )
     changed = False
     updated = dict(config)
@@ -553,7 +560,16 @@ class MLDirectionSelector:
     to a mechanical YES/NO choice.
     """
 
-    def __init__(self, training_csv: Path, model_path: Path, preopen_lead_seconds: float) -> None:
+    def __init__(
+        self,
+        training_csv: Path,
+        model_path: Path,
+        preopen_lead_seconds: float,
+        min_confidence: float,
+        model_metadata: dict[str, Any] | None = None,
+        model_run_id: str = "",
+        training_run_id: str = "",
+    ) -> None:
         if not training_csv.is_file():
             raise FileNotFoundError(f"Missing ML feature ledger: {training_csv}")
         if not model_path.is_file():
@@ -561,6 +577,10 @@ class MLDirectionSelector:
         self.training_csv = training_csv
         self.model_path = model_path
         self.preopen_lead_seconds = preopen_lead_seconds
+        self.min_confidence = min_confidence
+        self.model_metadata = model_metadata or {}
+        self.model_run_id = model_run_id
+        self.training_run_id = training_run_id
         self.tasks: dict[str, asyncio.Task[Any]] = {}
         self.ready: dict[str, dict[str, Any]] = {}
         self.completed_preopen: dict[str, bool] = {}
@@ -640,9 +660,22 @@ class MLDirectionSelector:
             return None
         side = "yes" if probability_yes >= 0.5 else "no"
         confidence = probability_yes if side == "yes" else 1.0 - probability_yes
+        if confidence + 1e-12 < self.min_confidence:
+            self._log_once(
+                record, "below_confidence",
+                "ML SIDE SKIP | %s p_yes=%.4f confidence=%.4f < gate=%.4f; no order will be placed.",
+                ticker, probability_yes, confidence, self.min_confidence,
+            )
+            return None
         training_rows = cached.get("rows")
         record["ml_inference"] = {
-            "source": "stored_gradient_boosting_preopen",
+            "source": "stored_ml_preopen",
+            "model_run_id": self.model_run_id or None,
+            "training_ledger_run_id": self.training_run_id or None,
+            "model_type": self.model_metadata.get("model_type"),
+            "trained_at": self.model_metadata.get("trained_at"),
+            "settlement_cutoff": self.model_metadata.get("settlement_cutoff"),
+            "model_training_rows": self.model_metadata.get("training_rows"),
             "side": side,
             "probability_yes": round(probability_yes, 6),
             "confidence": round(confidence, 6),
@@ -651,8 +684,10 @@ class MLDirectionSelector:
         }
         self._log_once(
             record, "ready",
-            "ML SIDE READY | %s side=%s p_yes=%.4f confidence=%.4f; watching only this side for <= $0.40.",
-            ticker, side.upper(), probability_yes, confidence,
+            "ML SIDE READY | %s model=%s run=%s side=%s p_yes=%.4f confidence=%.4f "
+            "gate=%.4f; watching only this side for <= $0.40.",
+            ticker, self.model_metadata.get("model_type", "unknown"), self.model_run_id or "unknown",
+            side.upper(), probability_yes, confidence, self.min_confidence,
         )
         return side
 
@@ -1254,7 +1289,13 @@ async def consider_initial_entry(
     record["orders"]["0.4000"]["reason"] = (
         "First qualifying executable ask; resting same-side limit through market close."
     )
-    LOG.info("WATCH TRIGGERED | %s %s selected; stopped watching the other side.", ticker, side.upper())
+    ml_signal = record.get("ml_inference") if isinstance(record.get("ml_inference"), dict) else {}
+    LOG.info(
+        "WATCH TRIGGERED | %s %s selected p_yes=%s confidence=%s; stopped watching the other side.",
+        ticker, side.upper(),
+        "unknown" if ml_signal.get("probability_yes") is None else f"{float(ml_signal['probability_yes']):.4f}",
+        "unknown" if ml_signal.get("confidence") is None else f"{float(ml_signal['confidence']):.4f}",
+    )
     return True
 
 
@@ -1357,6 +1398,36 @@ def rung_order_activity(state: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return stats
 
 
+def ml_live_directional_performance(settled: list[dict[str, Any]]) -> dict[str, Any]:
+    """Summarize realized outcomes for filled markets with ML provenance.
+
+    Directional correctness is intentionally kept separate from executable
+    P&L, which remains the main report's source for prices, fills, and fees.
+    """
+    records = [
+        record for record in settled
+        if isinstance(record.get("ml_inference"), dict)
+        and str(record.get("settlement_outcome") or "") in {"yes", "no"}
+        and str(record.get("locked_side") or record.get("candidate_side") or "") in {"yes", "no"}
+    ]
+    wins = sum(
+        str(record.get("locked_side") or record.get("candidate_side")) == str(record.get("settlement_outcome"))
+        for record in records
+    )
+    confidences = [as_float((record.get("ml_inference") or {}).get("confidence")) for record in records]
+    probabilities = [as_float((record.get("ml_inference") or {}).get("probability_yes")) for record in records]
+    confidence_values = [value for value in confidences if value is not None]
+    probability_values = [value for value in probabilities if value is not None]
+    return {
+        "settled_markets": len(records),
+        "directional_wins": wins,
+        "directional_losses": len(records) - wins,
+        "directional_win_rate": round(wins / len(records), 6) if records else None,
+        "average_model_confidence": round(sum(confidence_values) / len(confidence_values), 6) if confidence_values else None,
+        "average_probability_yes": round(sum(probability_values) / len(probability_values), 6) if probability_values else None,
+    }
+
+
 def performance_report(state: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
     settled = sorted((record for record in state.get("markets", {}).values()
                       if isinstance(record, dict) and record.get("status") == "finalized"
@@ -1405,6 +1476,7 @@ def performance_report(state: dict[str, Any], config: dict[str, Any]) -> dict[st
         "worst_historical_drawdown": round(max(drawdowns, default=0.0), 6),
         "rung_performance": rung_performance(settled),
         "rung_order_activity": rung_order_activity(state),
+        "ml_live_directional_performance": ml_live_directional_performance(settled),
         "note": "Only finalized records with filled contracts count as trades. The pre-open ML side is an execution filter; this report is realized live-ledger data, not a profitability proof.",
     }
     if settled:
@@ -1465,6 +1537,48 @@ def log_performance_summary(report: dict[str, Any], context: str) -> None:
             activity["filled_order_submissions"], activity["filled_contracts"],
             activity["resting_orders"], activity["canceled_unfilled_orders"],
         )
+    model = report["ml_live_directional_performance"]
+    LOG.info(
+        "ML LIVE PERFORMANCE | %s settled_with_ml=%d directional_wins=%d directional_losses=%d "
+        "directional_win_rate=%s avg_confidence=%s avg_p_yes=%s | P&L above includes fills and fees.",
+        context, model["settled_markets"], model["directional_wins"], model["directional_losses"],
+        "n/a" if model["directional_win_rate"] is None else f"{100 * model['directional_win_rate']:.2f}%",
+        "n/a" if model["average_model_confidence"] is None else f"{model['average_model_confidence']:.4f}",
+        "n/a" if model["average_probability_yes"] is None else f"{model['average_probability_yes']:.4f}",
+    )
+
+
+def log_ml_deployment(
+    metadata: dict[str, Any], validation: dict[str, Any], model_run_id: str, training_run_id: str,
+    execution_gate: float,
+) -> None:
+    """Print immutable model provenance and validation context once per run."""
+    LOG.info(
+        "ML MODEL | model_run=%s training_ledger_run=%s type=%s calibration=%s trained_at=%s "
+        "settlement_cutoff=%s training_rows=%s base_rows=%s calibration_rows=%s source_sha256=%s",
+        model_run_id or "unknown", training_run_id or "unknown", metadata.get("model_type", "unknown"),
+        metadata.get("calibration", "raw"), metadata.get("trained_at", "unknown"),
+        metadata.get("settlement_cutoff", "unknown"), metadata.get("training_rows", "unknown"),
+        metadata.get("base_training_rows", metadata.get("training_rows", "unknown")),
+        metadata.get("calibration_rows", 0), metadata.get("source_sha256", "unknown"),
+    )
+    metrics = field(validation.get("selected_model_untouched_test"), "selected_metrics") or {}
+    research_threshold = as_float(validation.get("selected_threshold"))
+    LOG.info(
+        "ML VALIDATION | research_selected=%s research_gate=%s final_test=%s/%s=%.2f%% "
+        "streaks=W%s/L%s p_value=%s | deployed_confidence_gate=%.2f.",
+        validation.get("selected_model", "unknown"),
+        "unknown" if research_threshold is None else f"{research_threshold:.3f}",
+        metrics.get("wins", "?"), metrics.get("trades", "?"), 100.0 * float(metrics.get("win_rate") or 0.0),
+        field(metrics.get("streaks") or {}, "longest_win") or "?",
+        field(metrics.get("streaks") or {}, "longest_loss") or "?",
+        metrics.get("win_rate_vs_50pct_pvalue", "unknown"), execution_gate,
+    )
+    LOG.info(
+        "ML EXECUTION POLICY | model gate >= %.2f (100%% valid-model direction coverage at 0.50); "
+        "actual orders still require the selected side's executable ask <= $0.40 and then use only lower same-side rungs.",
+        execution_gate,
+    )
 
 
 async def log_heartbeat(
@@ -1495,16 +1609,22 @@ async def log_heartbeat(
         ticker = str(field(market, "ticker") or "")
         live_asks = feed.executable_asks(ticker) if feed else None
         asks = market_asks(market, live_asks)
-        choice = choose_entry_side(asks)
         record = state.get("markets", {}).get(ticker)
         watch_state = str(record.get("status")) if isinstance(record, dict) else "not_started"
+        ml_signal = record.get("ml_inference") if isinstance(record, dict) and isinstance(record.get("ml_inference"), dict) else {}
+        ml_side = str(ml_signal.get("side") or "").lower()
+        selected_ask = asks.get(ml_side) if ml_side in {"yes", "no"} else None
+        trigger = (
+            f"ML_{ml_side.upper()} @ ${selected_ask:.4f}"
+            if selected_ask is not None and selected_ask <= LADDER_LEVELS[0] else
+            ("awaiting_ml" if watch_state == "watching" and not ml_side else "none")
+        )
         LOG.info(
-            "QUOTE | %s source=%s yes_ask=%s no_ask=%s watcher=%s price_condition=%s close=%s",
+            "QUOTE | %s source=%s yes_ask=%s no_ask=%s watcher=%s ml_side=%s trigger=%s close=%s",
             ticker or "?", "WS" if live_asks is not None else "REST_FALLBACK",
             "none" if asks["yes"] is None else f"${asks['yes']:.4f}",
             "none" if asks["no"] is None else f"${asks['no']:.4f}",
-            watch_state,
-            "none" if choice is None else f"{choice[0].upper()} @ ${choice[1]:.4f}",
+            watch_state, ml_side.upper() or "none", trigger,
             field(market, "close_time", "expected_expiration_time") or "unknown",
         )
     for record in state.get("markets", {}).values():
@@ -1515,7 +1635,8 @@ async def log_heartbeat(
             ml_side = str(ml_signal.get("side") or "").upper()
             LOG.info(
                 "WATCH | %s active; %s.", record.get("ticker", "?"),
-                (f"ML selected {ml_side}; only its ask can trigger at <= $0.40" if ml_side
+                (f"ML selected {ml_side} p_yes={float(ml_signal.get('probability_yes')):.4f} "
+                 f"confidence={float(ml_signal.get('confidence')):.4f}; only its ask can trigger at <= $0.40" if ml_side
                  else "awaiting frozen ML direction; no order can be placed"),
             )
             continue
@@ -1595,9 +1716,12 @@ async def run(args: argparse.Namespace) -> int:
     if args.ml_training_csv is None or args.ml_model_path is None:
         await rest.close()
         raise SystemExit("ML-side execution requires --ml-training-csv and --ml-model-path; refusing a price-only fallback")
+    model_metadata = load_json(args.ml_model_metadata.expanduser(), {}) if args.ml_model_metadata else {}
+    validation_report = load_json(args.ml_validation_report.expanduser(), {}) if args.ml_validation_report else {}
     try:
         ml_selector = MLDirectionSelector(
             args.ml_training_csv.expanduser(), args.ml_model_path.expanduser(), config["ml_preopen_lead_seconds"],
+            config["ml_min_confidence"], model_metadata, args.ml_model_run_id, args.ml_training_run_id,
         )
     except Exception:
         await rest.close()
@@ -1619,8 +1743,11 @@ async def run(args: argparse.Namespace) -> int:
         config["max_total_capital"],
     )
     LOG.info(
-        "ML SIDE FILTER | stored_model=%s feature_ledger=%s preopen_lead=%.0fs fallback=disabled",
-        args.ml_model_path, args.ml_training_csv, config["ml_preopen_lead_seconds"],
+        "ML SIDE FILTER | stored_model=%s feature_ledger=%s preopen_lead=%.0fs confidence_gate=%.2f fallback=disabled",
+        args.ml_model_path, args.ml_training_csv, config["ml_preopen_lead_seconds"], config["ml_min_confidence"],
+    )
+    log_ml_deployment(
+        model_metadata, validation_report, args.ml_model_run_id, args.ml_training_run_id, config["ml_min_confidence"],
     )
     log_performance_summary(performance_report(state, config), "startup")
     try:
@@ -1724,8 +1851,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--order-reconcile-seconds", type=float)
     parser.add_argument("--watch-start-grace-seconds", type=float)
     parser.add_argument("--ml-preopen-lead-seconds", type=float)
+    parser.add_argument("--ml-min-confidence", type=float)
     parser.add_argument("--ml-training-csv", type=Path, help="Frozen historical feature ledger for the stored ML model.")
     parser.add_argument("--ml-model-path", type=Path, help="Stored ML joblib model used to choose the only eligible side.")
+    parser.add_argument("--ml-model-metadata", type=Path, help="Optional JSON metadata paired with the stored ML model.")
+    parser.add_argument("--ml-validation-report", type=Path, help="Optional immutable validation report for startup audit logging.")
+    parser.add_argument("--ml-model-run-id", default="", help="Actions run ID that produced the exact stored model artifact.")
+    parser.add_argument("--ml-training-run-id", default="", help="Actions run ID that produced the feature ledger artifact.")
     parser.add_argument("--status-log-seconds", type=float)
     return parser
 

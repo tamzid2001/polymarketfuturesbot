@@ -36,7 +36,7 @@ on:
         type: string
         default: ""
       model_run_id:
-        description: "Successful ML-model training run. Blank keeps the default stored gradient model."
+        description: "Successful calibrated ML-model training run. Blank keeps the pinned production model."
         required: false
         type: string
         default: "29706847167"
@@ -91,6 +91,8 @@ jobs:
           gh run download "$TRAINING_RUN_ID" -R "$GITHUB_REPOSITORY" \
             -n "kalshi-btc15m-backtest-$TRAINING_RUN_ID" -D training_data
           test -s stored_model/kxbtc15m_ml_model.joblib
+          test -s stored_model/kxbtc15m_ml_model_metadata.json
+          test -s stored_model/holdout_backtest.json
           test -s training_data/prophet_ml_backtest_rows.csv
 
       - name: Write Kalshi RSA private key
@@ -110,12 +112,18 @@ jobs:
           MAX_ACTIVE_MARKETS: ${{ inputs.max_active_markets }}
           MAX_CONTRACTS_PER_MARKET: ${{ inputs.max_contracts_per_market }}
           MAX_TOTAL_CAPITAL: ${{ inputs.max_total_capital }}
+          MODEL_RUN_ID: ${{ inputs.model_run_id || '29706847167' }}
+          TRAINING_RUN_ID: ${{ inputs.training_run_id || '29698207476' }}
         run: |
           set -euo pipefail
           args=(--config kalshi_btc15m_average_down_config.json
                 --state-file kalshi_btc15m_average_down_state.json
                 --report kalshi_btc15m_average_down_report.json
                 --ml-model-path stored_model/kxbtc15m_ml_model.joblib
+                --ml-model-metadata stored_model/kxbtc15m_ml_model_metadata.json
+                --ml-validation-report stored_model/holdout_backtest.json
+                --ml-model-run-id "$MODEL_RUN_ID"
+                --ml-training-run-id "$TRAINING_RUN_ID"
                 --ml-training-csv training_data/prophet_ml_backtest_rows.csv
                 --persist-config --run-seconds 20700)
           [ -z "$INITIAL_POSITION_SIZE" ] || args+=(--initial-position-size "$INITIAL_POSITION_SIZE")

@@ -7,6 +7,26 @@ on:
         description: "Historical backtest run whose artifact contains prophet_ml_backtest_rows.csv."
         required: true
         default: "29698207476"
+      model_type:
+        description: "Production classifier to serialize."
+        required: true
+        type: choice
+        options:
+          - logistic_regression
+          - hist_gradient_boosting
+        default: logistic_regression
+      calibration:
+        description: "Probability calibration method."
+        required: true
+        type: choice
+        options:
+          - isotonic
+          - raw
+        default: isotonic
+      calibration_fraction:
+        description: "Trailing chronological fraction held only for calibration."
+        required: true
+        default: "0.15"
 
 permissions:
   actions: read
@@ -62,7 +82,9 @@ jobs:
             --input model_input/prophet_ml_backtest_rows.csv \
             --model-output model_output/kxbtc15m_ml_model.joblib \
             --metadata-output model_output/kxbtc15m_ml_model_metadata.json \
-            --model-type hist_gradient_boosting
+            --model-type "${{ inputs.model_type }}" \
+            --calibration "${{ inputs.calibration }}" \
+            --calibration-fraction "${{ inputs.calibration_fraction }}"
 
       - name: Upload Model and Validation Report
         uses: actions/upload-artifact@v4

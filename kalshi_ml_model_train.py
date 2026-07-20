@@ -15,8 +15,10 @@ from pathlib import Path
 from typing import Any
 
 import joblib
+import numpy as np
 import pandas as pd
 from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.isotonic import IsotonicRegression
 from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
@@ -24,8 +26,22 @@ from sklearn.preprocessing import StandardScaler
 from kalshi_btc15m_backtest import FEATURE_COLUMNS
 
 
-MODEL_FORMAT_VERSION = 1
+MODEL_FORMAT_VERSION = 2
 MODEL_TYPES = ("hist_gradient_boosting", "logistic_regression")
+CALIBRATION_TYPES = ("raw", "isotonic")
+
+
+class IsotonicCalibratedClassifier:
+    """Serializable binary classifier that calibrates its base probability."""
+
+    def __init__(self, base_model: Any, calibrator: IsotonicRegression) -> None:
+        self.base_model = base_model
+        self.calibrator = calibrator
+
+    def predict_proba(self, values: Any) -> np.ndarray:
+        raw_probability = self.base_model.predict_proba(values)[:, 1]
+        probability = np.clip(self.calibrator.predict(raw_probability), 0.0, 1.0)
+        return np.column_stack((1.0 - probability, probability))
 
 
 def read_training_rows(path: Path, as_of: pd.Timestamp | None) -> pd.DataFrame:
@@ -83,16 +99,59 @@ def train(rows: pd.DataFrame, model_type: str) -> Any:
     return model
 
 
+def train_calibrated(
+    rows: pd.DataFrame, model_type: str, calibration: str, calibration_fraction: float,
+) -> tuple[Any, dict[str, Any]]:
+    """Fit a strictly chronological production classifier and calibrator.
+
+    The latest trailing labels are reserved for isotonic calibration, so no
+    calibration outcome is used to fit the base classifier.  This preserves a
+    meaningful historical probability mapping at deployment time.
+    """
+    if calibration == "raw":
+        return train(rows, model_type), {
+            "calibration": "raw", "base_training_rows": int(len(rows)), "calibration_rows": 0,
+        }
+    if calibration != "isotonic":
+        raise ValueError(f"Unsupported calibration method: {calibration}")
+    calibration_rows = max(100, int(round(len(rows) * calibration_fraction)))
+    base_rows = len(rows) - calibration_rows
+    if base_rows < 1_000 or calibration_rows < 100:
+        raise ValueError("Not enough chronological rows for base training plus isotonic calibration")
+    base = rows.iloc[:base_rows].copy()
+    calibration_rows_frame = rows.iloc[base_rows:].copy()
+    if calibration_rows_frame["actual_yes"].nunique() < 2:
+        raise ValueError("Chronological calibration rows contain only one outcome class")
+    base_model = train(base, model_type)
+    raw_probability = base_model.predict_proba(
+        calibration_rows_frame[FEATURE_COLUMNS].to_numpy(dtype=float)
+    )[:, 1]
+    calibrator = IsotonicRegression(y_min=0.0, y_max=1.0, out_of_bounds="clip")
+    calibrator.fit(raw_probability, calibration_rows_frame["actual_yes"].to_numpy(dtype=int))
+    return IsotonicCalibratedClassifier(base_model, calibrator), {
+        "calibration": "isotonic",
+        "base_training_rows": int(len(base)),
+        "calibration_rows": int(len(calibration_rows_frame)),
+        "base_training_cutoff": base["settlement_timestamp"].max().isoformat(),
+        "calibration_start": calibration_rows_frame["settlement_timestamp"].min().isoformat(),
+        "calibration_cutoff": calibration_rows_frame["settlement_timestamp"].max().isoformat(),
+        "calibration_fraction": calibration_fraction,
+    }
+
+
 def serialize(
     input_path: Path,
     rows: pd.DataFrame,
     model_path: Path,
     metadata_path: Path,
     model_type: str,
+    calibration: str,
+    calibration_fraction: float,
 ) -> dict[str, Any]:
     model_path.parent.mkdir(parents=True, exist_ok=True)
     metadata_path.parent.mkdir(parents=True, exist_ok=True)
     trained_at = datetime.now(tz=timezone.utc).isoformat()
+    model, calibration_metadata = train_calibrated(rows, model_type, calibration, calibration_fraction)
     metadata: dict[str, Any] = {
         "format_version": MODEL_FORMAT_VERSION,
         "model_type": model_type,
@@ -103,11 +162,12 @@ def serialize(
         "settlement_cutoff": rows["settlement_timestamp"].max().isoformat(),
         "source_filename": input_path.name,
         "source_sha256": sha256(input_path),
+        **calibration_metadata,
     }
     payload = {
         "format_version": MODEL_FORMAT_VERSION,
         "feature_columns": FEATURE_COLUMNS,
-        "model": train(rows, model_type),
+        "model": model,
         "metadata": metadata,
     }
     joblib.dump(payload, model_path, compress=3)
@@ -128,8 +188,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model-type",
         choices=MODEL_TYPES,
-        default="hist_gradient_boosting",
-        help="Classifier to serialize; default is the robust-backtest winner.",
+        default="logistic_regression",
+        help="Classifier to serialize; logistic regression is the calibrated production default.",
+    )
+    parser.add_argument(
+        "--calibration", choices=CALIBRATION_TYPES, default="isotonic",
+        help="Probability calibration method. Isotonic reserves the latest chronological rows for calibration.",
+    )
+    parser.add_argument(
+        "--calibration-fraction", type=float, default=0.15,
+        help="Trailing chronological fraction reserved for isotonic calibration (default 0.15).",
     )
     parser.add_argument(
         "--as-of",
@@ -141,9 +209,12 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    if not 0.01 <= args.calibration_fraction < 0.5:
+        raise ValueError("--calibration-fraction must be in [0.01, 0.5)")
     rows = read_training_rows(args.input, args.as_of)
     metadata = serialize(
-        args.input, rows, args.model_output, args.metadata_output, args.model_type
+        args.input, rows, args.model_output, args.metadata_output, args.model_type,
+        args.calibration, args.calibration_fraction,
     )
     print(json.dumps(metadata, indent=2, sort_keys=True))
     return 0
