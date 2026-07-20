@@ -62,6 +62,35 @@ class MechanicalAverageDownTests(unittest.TestCase):
         self.assertEqual(report["total_markets_traded"], 0)
         self.assertEqual(tuple(LADDER_LEVELS), (0.40, 0.30, 0.20, 0.10))
 
+    def test_report_breaks_out_profit_loss_for_each_filled_rung(self):
+        def order(fill, price, fee=0.0):
+            return {"fill_count": fill, "average_fill_price": price, "fees_paid": fee}
+
+        state = {"markets": {
+            "winner": {
+                "status": "finalized", "settled_at": "2026-07-20T00:00:00Z",
+                "settlement_outcome": "yes", "locked_side": "yes", "total_cost": 0.70,
+                "contracts": 2.0, "gross_profit_loss": 1.30, "kalshi_fees": 0.02,
+                "net_profit_loss": 1.28, "orders": {
+                    "0.4000": order(1.0, 0.40, 0.01), "0.3000": order(1.0, 0.30, 0.01),
+                },
+            },
+            "loser": {
+                "status": "finalized", "settled_at": "2026-07-20T00:15:00Z",
+                "settlement_outcome": "yes", "locked_side": "no", "total_cost": 0.40,
+                "contracts": 1.0, "gross_profit_loss": -0.40, "kalshi_fees": 0.01,
+                "net_profit_loss": -0.41, "orders": {"0.4000": order(1.0, 0.40, 0.01)},
+            },
+        }}
+        report = performance_report(state, validate_config(DEFAULT_CONFIG))
+        first = report["rung_performance"]["0.40"]
+        second = report["rung_performance"]["0.30"]
+        self.assertEqual((report["winning_trades"], report["losing_trades"], report["win_loss_ratio"]), (1, 1, 1.0))
+        self.assertEqual((first["filled_orders"], first["winning_orders"], first["losing_orders"]), (2, 1, 1))
+        self.assertEqual(first["net_profit"], 0.18)
+        self.assertEqual((second["filled_orders"], second["winning_orders"], second["losing_orders"]), (1, 1, 0))
+        self.assertEqual(second["net_profit"], 0.69)
+
     def test_below_40_entry_locks_one_side_then_places_only_30_20_10_limits(self):
         class FakeRest:
             def __init__(self):

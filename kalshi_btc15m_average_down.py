@@ -650,6 +650,58 @@ def streak(values: list[float], winning: bool) -> int:
     return best
 
 
+def empty_rung_performance(level: float) -> dict[str, Any]:
+    return {
+        "rung_price": level,
+        "filled_orders": 0,
+        "filled_contracts": 0.0,
+        "winning_orders": 0,
+        "losing_orders": 0,
+        "breakeven_orders": 0,
+        "winning_contracts": 0.0,
+        "losing_contracts": 0.0,
+        "net_profit": 0.0,
+    }
+
+
+def rung_performance(settled: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Attribute settled P&L to the actual filled 40c/30c/20c/10c order rungs."""
+    stats = {f"{level:.2f}": empty_rung_performance(level) for level in LADDER_LEVELS}
+    for record in settled:
+        resolved_side = record.get("settlement_outcome")
+        position_side = record.get("locked_side") or record.get("candidate_side")
+        for level in LADDER_LEVELS:
+            order = (record.get("orders") or {}).get(f"{level:.4f}")
+            if not isinstance(order, dict):
+                continue
+            fill = float(order.get("fill_count") or 0.0)
+            if fill <= 0.004:
+                continue
+            result = stats[f"{level:.2f}"]
+            average_price = float(order.get("average_fill_price") or order.get("position_price") or 0.0)
+            fee = float(order.get("fees_paid") or 0.0)
+            order_net = (fill if position_side == resolved_side else 0.0) - fill * average_price - fee
+            result["filled_orders"] += 1
+            result["filled_contracts"] += fill
+            result["net_profit"] += order_net
+            if order_net > 1e-9:
+                result["winning_orders"] += 1
+                result["winning_contracts"] += fill
+            elif order_net < -1e-9:
+                result["losing_orders"] += 1
+                result["losing_contracts"] += fill
+            else:
+                result["breakeven_orders"] += 1
+    for result in stats.values():
+        denominator = result["winning_orders"] + result["losing_orders"]
+        result["win_rate"] = round(result["winning_orders"] / denominator, 6) if denominator else None
+        result["filled_contracts"] = round(result["filled_contracts"], 2)
+        result["winning_contracts"] = round(result["winning_contracts"], 2)
+        result["losing_contracts"] = round(result["losing_contracts"], 2)
+        result["net_profit"] = round(result["net_profit"], 6)
+    return stats
+
+
 def performance_report(state: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
     settled = sorted((record for record in state.get("markets", {}).values()
                       if isinstance(record, dict) and record.get("status") == "finalized"),
@@ -674,6 +726,7 @@ def performance_report(state: dict[str, Any], config: dict[str, Any]) -> dict[st
         "configuration": config, "total_markets_traded": len(settled),
         "total_contracts_purchased": round(sum(contracts), 2), "winning_trades": wins,
         "losing_trades": losses, "win_rate": round(wins / len(settled), 6) if settled else None,
+        "win_loss_ratio": round(wins / losses, 6) if losses else None,
         "average_contracts_per_market": round(sum(contracts) / len(settled), 6) if settled else None,
         "average_entry_price": round(sum(costs) / sum(contracts), 6) if sum(contracts) else None,
         "percentage_entering_at_40c": None, "percentage_starting_below_40c": None,
@@ -689,6 +742,7 @@ def performance_report(state: dict[str, Any], config: dict[str, Any]) -> dict[st
         "longest_winning_streak": streak(pnls, True), "longest_losing_streak": streak(pnls, False),
         "largest_losing_trade": round(min(pnls, default=0.0), 6), "largest_winning_trade": round(max(pnls, default=0.0), 6),
         "worst_historical_drawdown": round(max(drawdowns, default=0.0), 6),
+        "rung_performance": rung_performance(settled),
         "note": "Metrics remain null until at least one finalized live market exists. No historical model or backtest is used.",
     }
     if settled:
@@ -713,6 +767,33 @@ def performance_report(state: dict[str, Any], config: dict[str, Any]) -> dict[st
             "average_number_of_fills_per_trade": round(sum(fills) / len(fills), 6),
         })
     return report
+
+
+def log_performance_summary(report: dict[str, Any], context: str) -> None:
+    """Print the realized ledger summary alongside live quote/position logs."""
+    ratio = report["win_loss_ratio"]
+    ratio_text = "n/a (no losses yet)" if ratio is None and report["winning_trades"] else (
+        "n/a" if ratio is None else f"{ratio:.2f}"
+    )
+    LOG.info(
+        "PERFORMANCE | %s settled=%d wins=%d losses=%d win_rate=%s win_loss_ratio=%s "
+        "net=$%.4f gross=$%.4f fees=$%.4f roi=%s profit_factor=%s max_drawdown=$%.4f "
+        "streaks=W%d/L%d",
+        context, report["total_markets_traded"], report["winning_trades"], report["losing_trades"],
+        "n/a" if report["win_rate"] is None else f"{100 * report['win_rate']:.2f}%", ratio_text,
+        report["net_profit"], report["total_gross_profit"], report["total_fees"],
+        "n/a" if report["return_on_capital"] is None else f"{100 * report['return_on_capital']:.2f}%",
+        "n/a" if report["profit_factor"] is None else f"{report['profit_factor']:.2f}",
+        report["maximum_drawdown"], report["longest_winning_streak"], report["longest_losing_streak"],
+    )
+    for level, rung in report["rung_performance"].items():
+        LOG.info(
+            "RUNG PERFORMANCE | %sc filled_orders=%d contracts=%.2f winners=%d losers=%d "
+            "win_rate=%s net=$%.4f",
+            level, rung["filled_orders"], rung["filled_contracts"], rung["winning_orders"],
+            rung["losing_orders"], "n/a" if rung["win_rate"] is None else f"{100 * rung['win_rate']:.2f}%",
+            rung["net_profit"],
+        )
 
 
 async def log_heartbeat(
@@ -762,6 +843,7 @@ async def log_heartbeat(
                 float(order.get("fill_count") or 0.0), float(order.get("remaining_count") or 0.0),
                 order.get("status", "?"), order.get("order_id") or order.get("client_order_id") or "?",
             )
+    log_performance_summary(performance_report(state, config), "heartbeat")
 
 
 async def run(args: argparse.Namespace) -> int:
@@ -791,6 +873,7 @@ async def run(args: argparse.Namespace) -> int:
         "DRY_RUN" if dry_run else "LIVE", args.run_seconds, config["initial_position_size"],
         "/".join(f"${level:.2f}" for level in LADDER_LEVELS), config["max_total_capital"],
     )
+    log_performance_summary(performance_report(state, config), "startup")
     try:
         while True:
             # Reconcile every known market before considering fresh entries.
@@ -818,7 +901,9 @@ async def run(args: argparse.Namespace) -> int:
             await asyncio.sleep(config["poll_seconds"])
     finally:
         save_json(state_path, state)
-        save_json(args.report.expanduser(), performance_report(state, config))
+        final_report = performance_report(state, config)
+        save_json(args.report.expanduser(), final_report)
+        log_performance_summary(final_report, "run_complete")
         await rest.close()
     LOG.info("Average-down run complete | mode=%s active_records=%d", "DRY_RUN" if dry_run else "LIVE", len(active_strategy_records(state)))
     return 0
