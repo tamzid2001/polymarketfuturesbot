@@ -155,7 +155,10 @@ def load_json(path: Path, default: dict[str, Any]) -> dict[str, Any]:
 
 
 def save_json(path: Path, payload: dict[str, Any]) -> None:
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    # SDK response objects may expose close_time as datetime.  State persistence
+    # must never fail after an accepted live order, so serialize those values as
+    # ISO-like strings rather than leaving an in-memory-only position.
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True, default=str) + "\n", encoding="utf-8")
 
 
 def validate_config(config: dict[str, Any]) -> dict[str, Any]:
@@ -460,7 +463,14 @@ async def submit_ladder(
     side = record["locked_side"]
     quantity = float(record["quantity"])
     expiry = expiration_epoch(market)
+    initial = (record.get("orders") or {}).get("0.4000") or {}
+    initial_fill_price = float(initial.get("average_fill_price") or initial.get("position_price") or LADDER_LEVELS[0])
     for level in LADDER_LEVELS[1:]:
+        # If discovery was already below 40c, only submit genuinely lower
+        # rungs.  A 10c entry must never generate a 30c/20c buy, which would
+        # be averaging *up* rather than down.
+        if level >= initial_fill_price - 1e-9:
+            continue
         key = f"{level:.4f}"
         if key in record["orders"]:
             continue
