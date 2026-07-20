@@ -42,6 +42,7 @@ concurrency:
 
 permissions:
   contents: write
+  actions: write
 
 jobs:
   trade:
@@ -120,13 +121,11 @@ jobs:
         # just committed above (including any manual share-size update).
         if: success() && (github.event_name == 'schedule' || inputs.live_trading == true)
         env:
-          GH_TOKEN: ${{ secrets.GH_PAT }}
+          # workflow_dispatch is explicitly allowed to create a follow-on run
+          # with GITHUB_TOKEN. GH_PAT remains preferred when configured.
+          GH_TOKEN: ${{ secrets.GH_PAT || github.token }}
         run: |
           set -euo pipefail
-          if [ -z "${GH_TOKEN:-}" ]; then
-            echo "HANDOFF WARNING | GH_PAT is unavailable; six-hour cron remains the restart fallback."
-            exit 0
-          fi
           gh workflow run kalshi_btc15m_average_down.yml \
             --repo "$GITHUB_REPOSITORY" \
             --ref main \
