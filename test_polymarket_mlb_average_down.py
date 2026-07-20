@@ -8,6 +8,7 @@ from polymarket_mlb_average_down import (
     discover_games,
     executable_outcome_asks,
     lower_levels,
+    order_snapshot,
     reserved_capital,
     threshold_from_baseline,
     validate_config,
@@ -52,6 +53,13 @@ class MechanicalMlbAverageDownTests(unittest.TestCase):
         self.assertEqual(asks, {"long": 0.8, "short": 0.21})
         self.assertEqual(api_price_for_outcome("long", 0.70), 0.70)
         self.assertEqual(api_price_for_outcome("short", 0.10), 0.90)
+
+    def test_short_fill_cost_is_inverted_back_from_long_api_price(self):
+        snapshot = order_snapshot(
+            {"quantity": 1, "cumQuantity": 1, "leavesQuantity": 0, "avgPx": {"value": "0.70"}},
+            0.30, "short",
+        )
+        self.assertEqual(snapshot["average_outcome_cost"], 0.30)
 
     def test_example_80_20_baseline_uses_70_10_targets(self):
         self.assertEqual(threshold_from_baseline(0.80, 0.10, 0.01), 0.70)

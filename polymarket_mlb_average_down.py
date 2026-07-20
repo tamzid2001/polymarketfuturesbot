@@ -373,14 +373,20 @@ def planned_ladder_cost(entry_cost: float, quantity: int, step: float, tick_size
     return round(sum([entry_cost, *lower_levels(entry_cost, step, tick_size, order_count)]) * quantity, 8)
 
 
-def order_snapshot(order: dict[str, Any], fallback_cost: float) -> dict[str, Any]:
+def order_snapshot(order: dict[str, Any], fallback_cost: float, outcome: str) -> dict[str, Any]:
     quantity = int(as_float(order.get("quantity")) or 0)
     filled = int(as_float(order.get("cumQuantity")) or 0)
     leaves = int(as_float(order.get("leavesQuantity")) or max(0, quantity - filled))
-    average = price_amount(order.get("avgPx"))
+    average_long_price = price_amount(order.get("avgPx"))
+    if average_long_price is None:
+        average = fallback_cost
+    elif outcome == "long":
+        average = average_long_price
+    else:
+        average = round(1.0 - average_long_price, 8)
     return {
         "exchange_state": order.get("state"), "filled_quantity": filled,
-        "remaining_quantity": leaves, "average_outcome_cost": average if average is not None else fallback_cost,
+        "remaining_quantity": leaves, "average_outcome_cost": average,
     }
 
 
@@ -420,7 +426,7 @@ async def refresh_order(client: Any, order: dict[str, Any]) -> bool:
     if not isinstance(raw, dict):
         return False
     before = (order.get("status"), order.get("filled_quantity"), order.get("remaining_quantity"))
-    order.update(order_snapshot(raw, float(order.get("outcome_cost") or 0.0)))
+    order.update(order_snapshot(raw, float(order.get("outcome_cost") or 0.0), str(order.get("outcome") or "long")))
     state = str(order.get("exchange_state") or "")
     order["status"] = state.lower().replace("order_state_", "") or order.get("status")
     order["checked_at"] = now_iso()
@@ -477,7 +483,7 @@ async def submit_order(
     order_id = field(response, "id") or field(raw_order, "id")
     order["order_id"] = str(order_id) if order_id else None
     if isinstance(raw_order, dict):
-        order.update(order_snapshot(raw_order, outcome_cost))
+        order.update(order_snapshot(raw_order, outcome_cost, outcome))
         order["status"] = str(order.get("exchange_state") or "submitted").lower().replace("order_state_", "")
     else:
         order["status"] = "submitted"
