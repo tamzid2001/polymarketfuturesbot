@@ -1,4 +1,4 @@
-name: Kalshi BTC 15m Mechanical Average Down
+name: Kalshi BTC 15m ML-Side Average Down
 
 # This is a continuous handoff chain: each runner owns the mechanical BTC
 # strategy for 5h45m, persists its state/configuration, then queues its
@@ -35,6 +35,16 @@ on:
         required: false
         type: string
         default: ""
+      model_run_id:
+        description: "Successful ML-model training run. Blank keeps the default stored gradient model."
+        required: false
+        type: string
+        default: "29706847167"
+      training_run_id:
+        description: "Historical feature-ledger run used by the ML model. Blank keeps the default artifact."
+        required: false
+        type: string
+        default: "29698207476"
 
 concurrency:
   group: kalshi-btc15m-average-down-singleton
@@ -59,7 +69,7 @@ jobs:
         with:
           python-version: "3.13"
 
-      - name: Install pure mechanical runner dependencies
+      - name: Install ML-side runner dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements_kalshi_average_down.txt
@@ -68,6 +78,20 @@ jobs:
         run: |
           python -m py_compile kalshi_btc15m_average_down.py
           python -m unittest -v test_kalshi_btc15m_average_down.py
+
+      - name: Download stored ML model and frozen feature ledger
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MODEL_RUN_ID: ${{ inputs.model_run_id || '29706847167' }}
+          TRAINING_RUN_ID: ${{ inputs.training_run_id || '29698207476' }}
+        run: |
+          set -euo pipefail
+          gh run download "$MODEL_RUN_ID" -R "$GITHUB_REPOSITORY" \
+            -n "kalshi-kxbtc15m-ml-model-$MODEL_RUN_ID" -D stored_model
+          gh run download "$TRAINING_RUN_ID" -R "$GITHUB_REPOSITORY" \
+            -n "kalshi-btc15m-backtest-$TRAINING_RUN_ID" -D training_data
+          test -s stored_model/kxbtc15m_ml_model.joblib
+          test -s training_data/prophet_ml_backtest_rows.csv
 
       - name: Write Kalshi RSA private key
         env:
@@ -91,6 +115,8 @@ jobs:
           args=(--config kalshi_btc15m_average_down_config.json
                 --state-file kalshi_btc15m_average_down_state.json
                 --report kalshi_btc15m_average_down_report.json
+                --ml-model-path stored_model/kxbtc15m_ml_model.joblib
+                --ml-training-csv training_data/prophet_ml_backtest_rows.csv
                 --persist-config --run-seconds 20700)
           [ -z "$INITIAL_POSITION_SIZE" ] || args+=(--initial-position-size "$INITIAL_POSITION_SIZE")
           [ -z "$MAX_ACTIVE_MARKETS" ] || args+=(--max-active-markets "$MAX_ACTIVE_MARKETS")

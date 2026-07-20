@@ -1,7 +1,5 @@
-# Pure mechanical KXBTC15M average-down runner.  No ML or forecasting package.
-kalshi-python-async>=3.22,<4
+# KXBTC15M ML-side + mechanical average-down runner.  The stored ML model uses
+# the same pre-open feature construction as the validated ML inference runner.
+-r requirements_kalshi.txt
 # The SDK's current wheel imports urllib3 but does not declare it transitively.
 urllib3>=2,<3
-# Authenticated, real-time Kalshi ticker/fill stream used by the runner.
-aiohttp>=3.9,<4
-cryptography>=42.0

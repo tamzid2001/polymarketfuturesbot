@@ -1,0 +1,83 @@
+name: Controlled Restart — Kalshi BTC 15m ML-Side Average Down
+
+# This workflow is intentionally manual.  It provides a safe live-code
+# handoff: stop one known older runner, cancel only resting orders that carry
+# this runner's deterministic client IDs, then queue the current ML-side
+# runner.  Filled contracts and manual orders are never modified.
+on:
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: "The running Kalshi average-down Actions run to stop before handoff."
+        required: true
+        type: string
+        default: "29766662134"
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: kalshi-btc15m-average-down-controlled-restart
+  cancel-in-progress: false
+
+jobs:
+  handoff:
+    runs-on: ubuntu-latest
+    environment: "Kalshi"
+    timeout-minutes: 12
+    steps:
+      - name: Checkout current ML-side code
+        uses: actions/checkout@v7
+
+      - name: Stop the specified older runner
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+        run: |
+          set -euo pipefail
+          gh run cancel "$SOURCE_RUN_ID" --repo "$GITHUB_REPOSITORY" || true
+          for attempt in $(seq 1 12); do
+            status="$(gh run view "$SOURCE_RUN_ID" --repo "$GITHUB_REPOSITORY" --json status --jq '.status')"
+            echo "SOURCE RUN STATUS | attempt=$attempt status=$status"
+            [ "$status" = "completed" ] && exit 0
+            sleep 5
+          done
+          echo "The old runner did not stop within 60 seconds; refusing to overlap a live bot." >&2
+          exit 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install controlled-handoff dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install 'kalshi-python-async>=3.22,<4' 'aiohttp>=3.9' 'cryptography>=42.0' 'urllib3>=2,<3'
+
+      - name: Write Kalshi RSA private key
+        env:
+          KALSHI_PRIVATE_KEY: ${{ secrets.KALSHI_PRIVATE_KEY }}
+        run: |
+          printf '%s\n' "$KALSHI_PRIVATE_KEY" > kalshi_private_key.pem
+          chmod 600 kalshi_private_key.pem
+
+      - name: Cancel only resting orders owned by this runner
+        env:
+          KALSHI_API_KEY_ID: ${{ secrets.KALSHI_PROD_API_KEY }}
+          KALSHI_PEM_PATH: kalshi_private_key.pem
+          KALSHI_DEMO: "false"
+          DRY_RUN: "false"
+        run: |
+          set -euo pipefail
+          python kalshi_btc15m_average_down.py --cancel-all-resting-mechanical-orders
+
+      - name: Start the current ML-side runner
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh workflow run kalshi_btc15m_average_down.yml \
+            --repo "$GITHUB_REPOSITORY" --ref main -f live_trading=true
+          echo "ML-SIDE RUNNER QUEUED | no overlapping Kalshi average-down run remains."

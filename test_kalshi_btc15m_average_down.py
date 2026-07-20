@@ -10,6 +10,7 @@ from kalshi_btc15m_average_down import (
     active_strategy_records,
     apply_config_overrides,
     classify_submission,
+    client_order_id,
     choose_entry_side,
     consider_initial_entry,
     default_state,
@@ -25,8 +26,10 @@ from kalshi_btc15m_average_down import (
     market_can_start_watcher,
     market_record,
     market_asks,
+    managed_mechanical_order_role,
     normalized_order_status,
     normalized_outcome_side,
+    rung_order_activity,
     validate_config,
 )
 
@@ -61,6 +64,12 @@ class MechanicalAverageDownTests(unittest.TestCase):
     def test_no_orders_map_to_the_requested_economic_cost(self):
         self.assertEqual(side_api_price("yes", 0.30), "0.3000")
         self.assertEqual(side_api_price("no", 0.30), "0.7000")
+
+    def test_handoff_cancels_only_orders_owned_by_this_mechanical_runner(self):
+        ticker = "KXBTC15M-TEST-HANDOFF"
+        owned = {"ticker": ticker, "client_order_id": client_order_id(ticker, "no", "0.3000")}
+        self.assertEqual(managed_mechanical_order_role(owned), ("no", "0.3000"))
+        self.assertIsNone(managed_mechanical_order_role({"ticker": ticker, "client_order_id": "manual-order"}))
 
     def test_unfilled_ioc_is_never_reported_as_filled(self):
         self.assertEqual(
@@ -111,9 +120,9 @@ class MechanicalAverageDownTests(unittest.TestCase):
         self.assertFalse(allowed)
         self.assertIn("exceeds cap", record["exchange_position_guard_blocked"])
 
-    def test_report_has_no_model_metrics(self):
+    def test_report_identifies_the_ml_side_mechanical_strategy(self):
         report = performance_report({"markets": {}}, validate_config(DEFAULT_CONFIG))
-        self.assertEqual(report["strategy"], "pure_mechanical_price_average_down_v1")
+        self.assertEqual(report["strategy"], "ml_side_mechanical_price_average_down_v1")
         self.assertEqual(report["total_markets_traded"], 0)
         self.assertEqual(tuple(LADDER_LEVELS), (0.40, 0.30, 0.20, 0.10))
 
@@ -156,6 +165,19 @@ class MechanicalAverageDownTests(unittest.TestCase):
         self.assertEqual((second["filled_orders"], second["winning_orders"], second["losing_orders"]), (1, 1, 0))
         self.assertEqual(second["net_profit"], 0.69)
 
+    def test_rung_activity_counts_submitted_filled_resting_and_canceled_orders(self):
+        state = {"markets": {
+            "one": {"orders": {
+                "0.4000": {"quantity": 1.0, "fill_count": 1.0, "remaining_count": 0.0},
+                "0.3000": {"quantity": 1.0, "fill_count": 0.0, "remaining_count": 1.0},
+                "0.2000": {"quantity": 1.0, "fill_count": 0.0, "remaining_count": 0.0},
+            }},
+        }}
+        activity = rung_order_activity(state)
+        self.assertEqual((activity["0.40"]["submitted_orders"], activity["0.40"]["filled_order_submissions"]), (1, 1))
+        self.assertEqual(activity["0.30"]["resting_orders"], 1)
+        self.assertEqual(activity["0.20"]["canceled_unfilled_orders"], 1)
+
     def test_below_40_entry_locks_one_side_then_places_only_30_20_10_limits(self):
         class FakeRest:
             def __init__(self):
@@ -188,7 +210,7 @@ class MechanicalAverageDownTests(unittest.TestCase):
             rest = FakeRest()
             record = market_record(state, market.ticker)
             record.update({"status": "watching", "market_open_time": market.open_time})
-            entered = await consider_initial_entry(rest, state, market, config, dry_run=False)
+            entered = await consider_initial_entry(rest, state, market, config, dry_run=False, ml_side="yes")
             record = state["markets"]["KXBTC15M-TEST"]
             await reconcile_orders(rest, record, dry_run=False)
             await submit_ladder(rest, record, market, config, dry_run=False)
@@ -229,10 +251,10 @@ class MechanicalAverageDownTests(unittest.TestCase):
             rest = FakeRest()
             record = market_record(state, market.ticker)
             record.update({"status": "watching", "market_open_time": market.open_time})
-            await consider_initial_entry(rest, state, market, config, dry_run=False)
+            await consider_initial_entry(rest, state, market, config, dry_run=False, ml_side="yes")
             # A later qualifying NO quote must not create an opposite-side order.
             market.yes_ask_dollars, market.no_ask_dollars = "0.6600", "0.3400"
-            await consider_initial_entry(rest, state, market, config, dry_run=False)
+            await consider_initial_entry(rest, state, market, config, dry_run=False, ml_side="no")
             return record, rest.requests
 
         record, requests = asyncio.run(scenario())
@@ -241,6 +263,56 @@ class MechanicalAverageDownTests(unittest.TestCase):
         self.assertEqual(requests[0]["side"], "yes")
         self.assertEqual(requests[0]["position_price"], 0.34)
         self.assertEqual(requests[0]["tif"], "good_till_canceled")
+
+    def test_ml_side_not_cheapest_side_selects_the_initial_limit(self):
+        class FakeRest:
+            async def balance_dollars(self):
+                return 10.0
+
+            async def create_order(self, **kwargs):
+                return {
+                    "order_id": "ml-side", "side": kwargs["side"],
+                    "position_price": kwargs["position_price"], "quantity": kwargs["quantity"],
+                    "fill_count": 0.0, "remaining_count": kwargs["quantity"],
+                    "fees_paid": 0.0, "status": "resting",
+                }
+
+        async def scenario():
+            state = default_state()
+            market = SimpleNamespace(
+                ticker="KXBTC15M-TEST-ML-SIDE", status="active", yes_ask_dollars="0.3500",
+                no_ask_dollars="0.2000", open_time=time.time() - 5, close_time=time.time() + 895,
+            )
+            rest = FakeRest()
+            record = market_record(state, market.ticker)
+            record.update({"status": "watching", "market_open_time": market.open_time})
+            await consider_initial_entry(rest, state, market, validate_config(DEFAULT_CONFIG), dry_run=False, ml_side="yes")
+            return record
+
+        record = asyncio.run(scenario())
+        initial = record["orders"]["0.4000"]
+        self.assertEqual(initial["side"], "yes")
+        self.assertEqual(initial["position_price"], 0.35)
+
+    def test_missing_ml_side_cannot_fall_back_to_a_price_selected_entry(self):
+        class FakeRest:
+            async def balance_dollars(self):
+                return 10.0
+
+            async def create_order(self, **_kwargs):
+                raise AssertionError("No order may be submitted without ML direction")
+
+        async def scenario():
+            state = default_state()
+            market = SimpleNamespace(
+                ticker="KXBTC15M-TEST-NO-ML", status="active", yes_ask_dollars="0.20",
+                no_ask_dollars="0.80", open_time=time.time() - 5, close_time=time.time() + 895,
+            )
+            record = market_record(state, market.ticker)
+            record.update({"status": "watching", "market_open_time": market.open_time})
+            return await consider_initial_entry(FakeRest(), state, market, validate_config(DEFAULT_CONFIG), dry_run=False)
+
+        self.assertFalse(asyncio.run(scenario()))
 
     def test_10_cent_initial_entry_never_averages_up(self):
         class FakeRest:
@@ -266,7 +338,7 @@ class MechanicalAverageDownTests(unittest.TestCase):
                 close_time=time.time() + 899,
             )
             rest = FakeRest()
-            await consider_initial_entry(rest, state, market, config, dry_run=False)
+            await consider_initial_entry(rest, state, market, config, dry_run=False, ml_side="no")
             record = state["markets"]["KXBTC15M-TEST-10"]
             await reconcile_orders(rest, record, dry_run=False)
             await submit_ladder(rest, record, market, config, dry_run=False)

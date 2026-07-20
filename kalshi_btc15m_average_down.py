@@ -1,8 +1,9 @@
-"""Pure mechanical KXBTC15M average-down trader.
+"""ML-side-selected KXBTC15M mechanical average-down trader.
 
-This program intentionally has no model, forecast, technical indicator, price
-prediction, or historical score.  It uses only executable Kalshi YES/NO asks
-and the fixed ladder 40c -> 30c -> 20c -> 10c.
+The stored ML inference chooses one side before the market opens.  The
+execution rule is then mechanical: it watches *only* that side's executable
+ask and uses the fixed 40c -> 30c -> 20c -> 10c ladder.  There is no Prophet
+or mechanical-side fallback if ML inference is unavailable.
 
 Live submission is deliberately opt-in: ``DRY_RUN`` must be false and both
 ``--submit`` and ``--allow-live`` are required.  The GitHub workflow persists
@@ -51,8 +52,8 @@ except ImportError:  # pragma: no cover - exercised only in minimal local enviro
 LOG = logging.getLogger("kalshi_btc15m_average_down")
 SERIES_TICKER = "KXBTC15M"
 LADDER_LEVELS = (0.40, 0.30, 0.20, 0.10)
-CONFIG_VERSION = 4
-STATE_VERSION = 2
+CONFIG_VERSION = 5
+STATE_VERSION = 3
 ORDER_NAMESPACE = uuid.UUID("4d85857e-4dc6-43ec-960f-0b342523bdb7")
 KALSHI_WS_URL = os.getenv(
     "KALSHI_WS_URL",
@@ -83,6 +84,9 @@ DEFAULT_CONFIG = {
     # observing a brand-new market and starting its watcher.  Once started,
     # the watcher runs until the market closes or one side reaches 40c.
     "watch_start_grace_seconds": 45.0,
+    # ML is computed before the next market opens.  A watcher never chooses a
+    # side from prices; it only acts after this frozen model side is ready.
+    "ml_preopen_lead_seconds": 120.0,
     "status_log_seconds": 30.0,
 }
 
@@ -280,7 +284,7 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
     for name in (
         "initial_position_size", "max_contracts_per_market", "max_total_capital",
         "fee_reserve", "poll_seconds", "market_refresh_seconds", "order_reconcile_seconds",
-        "watch_start_grace_seconds",
+        "watch_start_grace_seconds", "ml_preopen_lead_seconds",
         "status_log_seconds",
     ):
         value = as_float(merged.get(name))
@@ -303,7 +307,7 @@ def apply_config_overrides(config: dict[str, Any], args: argparse.Namespace) -> 
     names = (
         "initial_position_size", "max_active_markets", "max_contracts_per_market",
         "max_total_capital", "fee_reserve", "poll_seconds", "market_refresh_seconds",
-        "order_reconcile_seconds", "watch_start_grace_seconds", "status_log_seconds",
+        "order_reconcile_seconds", "watch_start_grace_seconds", "ml_preopen_lead_seconds", "status_log_seconds",
     )
     changed = False
     updated = dict(config)
@@ -359,6 +363,19 @@ def client_order_id(ticker: str, side: str, order_key: str) -> str:
     not collide with the separately requested averaging rung at that price.
     """
     return str(uuid.uuid5(ORDER_NAMESPACE, f"average-down-v1:{ticker}:{side}:{order_key}"))
+
+
+def managed_mechanical_order_role(order: Any) -> tuple[str, str] | None:
+    """Identify an open order created by this runner without touching manual orders."""
+    ticker = str(field(order, "ticker") or "")
+    client_id = str(field(order, "client_order_id") or "")
+    if not ticker.startswith(SERIES_TICKER + "-") or not client_id:
+        return None
+    for side in ("yes", "no"):
+        for order_key in ("initial", "0.3000", "0.2000", "0.1000"):
+            if client_id == client_order_id(ticker, side, order_key):
+                return side, order_key
+    return None
 
 
 def classify_submission(fill_count: float, remaining_count: float, quantity: float, tif: str) -> str:
@@ -526,6 +543,146 @@ class KalshiLiveFeed:
             await asyncio.sleep(5)
 
 
+class MLDirectionSelector:
+    """Prepare frozen ML directions before each BTC 15-minute market opens.
+
+    The existing ML runner's feature construction is intentionally reused so
+    this execution layer sees the exact saved model, feature schema, candle
+    snapshot, and pre-open Prophet-derived input used by the ML inference
+    workflow.  It never returns a price-derived direction and never falls back
+    to a mechanical YES/NO choice.
+    """
+
+    def __init__(self, training_csv: Path, model_path: Path, preopen_lead_seconds: float) -> None:
+        if not training_csv.is_file():
+            raise FileNotFoundError(f"Missing ML feature ledger: {training_csv}")
+        if not model_path.is_file():
+            raise FileNotFoundError(f"Missing saved ML model: {model_path}")
+        self.training_csv = training_csv
+        self.model_path = model_path
+        self.preopen_lead_seconds = preopen_lead_seconds
+        self.tasks: dict[str, asyncio.Task[Any]] = {}
+        self.ready: dict[str, dict[str, Any]] = {}
+        self.completed_preopen: dict[str, bool] = {}
+        self.logged_status: dict[str, str] = {}
+        self._module: Any | None = None
+
+    def module(self) -> Any:
+        if self._module is None:
+            # Delayed import keeps pure order/ledger unit tests lightweight.
+            import kalshi_ml_inference_live as ml_inference
+            self._module = ml_inference
+        return self._module
+
+    async def maybe_prepare_next(self) -> None:
+        """Begin feature/model preparation only during the documented pre-open lead."""
+        try:
+            ml = self.module()
+            self._harvest_completion(ml)
+            current_ticker, next_ticker = ml.kalshi.current_and_next_tickers(SERIES_TICKER)
+            seconds_to_open = ml.kalshi.seconds_until_ticker_settle(current_ticker)
+        except Exception as exc:  # noqa: BLE001
+            LOG.error("ML PREOPEN UNAVAILABLE | cannot resolve next market: %s", exc)
+            return
+        if seconds_to_open is None or not (0 < seconds_to_open <= self.preopen_lead_seconds):
+            return
+        if next_ticker in self.tasks or next_ticker in self.ready:
+            return
+        LOG.info(
+            "ML PREOPEN START | %s preparing frozen inference %.0fs before open.",
+            next_ticker, seconds_to_open,
+        )
+        self.tasks[next_ticker] = asyncio.create_task(
+            ml.build_preopen_signal(self.training_csv, next_ticker, self.model_path),
+            name=f"ml-preopen-{next_ticker}",
+        )
+
+    async def side_for_market(self, market: Any, record: dict[str, Any]) -> str | None:
+        """Return the frozen ML YES/NO direction for this exact live ticker."""
+        ticker = str(field(market, "ticker") or "")
+        task = self.tasks.get(ticker)
+        if task is None:
+            self._log_once(record, "missing_preopen", "ML SIDE WAIT | %s no pre-open inference exists; no order will be placed.", ticker)
+            return None
+        if not task.done():
+            self._log_once(record, "preparing", "ML SIDE WAIT | %s pre-open inference is still preparing.", ticker)
+            return None
+        ml = self.module()
+        self._harvest_completion(ml)
+        if not self.completed_preopen.get(ticker, False):
+            self._log_once(
+                record, "late_preopen", "ML SIDE FAILED | %s pre-open calculation was not complete before open; no order will be placed.", ticker,
+            )
+            return None
+        if ticker not in self.ready:
+            try:
+                cached = task.result()
+            except Exception as exc:  # noqa: BLE001
+                self._log_once(record, "failed", "ML SIDE FAILED | %s inference error: %s; no order will be placed.", ticker, exc)
+                return None
+            if cached is None:
+                self._log_once(record, "invalid", "ML SIDE FAILED | %s input validation failed; no order will be placed.", ticker)
+                return None
+            self.ready[ticker] = cached
+        cached = self.ready[ticker]
+        try:
+            target = ml.kalshi._extract_target(market)
+            if target is None:
+                raise ValueError("market strike is unavailable")
+            features = ml.feature_values(
+                cached["candles"], float(target), cached["forecast"],
+                ml.known_outcomes(cached["rows"]), ml.next_open_timestamp(ticker),
+            )
+            vector = ml.np.asarray([[float(features[name]) for name in ml.FEATURE_COLUMNS]], dtype=float)
+            probability_yes = float(cached["model"].predict_proba(vector)[0][1])
+        except Exception as exc:  # noqa: BLE001
+            self._log_once(record, "score_failed", "ML SIDE FAILED | %s scoring error: %s; no order will be placed.", ticker, exc)
+            return None
+        side = "yes" if probability_yes >= 0.5 else "no"
+        confidence = probability_yes if side == "yes" else 1.0 - probability_yes
+        training_rows = cached.get("rows")
+        record["ml_inference"] = {
+            "source": "stored_gradient_boosting_preopen",
+            "side": side,
+            "probability_yes": round(probability_yes, 6),
+            "confidence": round(confidence, 6),
+            "prepared_at": str(cached.get("as_of") or ""),
+            "training_rows": int(len(training_rows)) if training_rows is not None else 0,
+        }
+        self._log_once(
+            record, "ready",
+            "ML SIDE READY | %s side=%s p_yes=%.4f confidence=%.4f; watching only this side for <= $0.40.",
+            ticker, side.upper(), probability_yes, confidence,
+        )
+        return side
+
+    def _harvest_completion(self, ml: Any) -> None:
+        """Mark whether each async preparation completed strictly before its open."""
+        now = ml.pd.Timestamp.now(tz="UTC")
+        for ticker, task in self.tasks.items():
+            if ticker in self.completed_preopen or not task.done():
+                continue
+            try:
+                open_at = ml.next_open_timestamp(ticker)
+                self.completed_preopen[ticker] = bool(now < open_at)
+            except Exception:  # noqa: BLE001
+                self.completed_preopen[ticker] = False
+
+    def _log_once(self, record: dict[str, Any], status: str, message: str, *args: Any) -> None:
+        if self.logged_status.get(str(record.get("ticker") or "")) == status:
+            return
+        self.logged_status[str(record.get("ticker") or "")] = status
+        record["ml_inference_status"] = status
+        LOG.info(message, *args)
+
+    async def close(self) -> None:
+        for task in self.tasks.values():
+            if not task.done():
+                task.cancel()
+        if self.tasks:
+            await asyncio.gather(*self.tasks.values(), return_exceptions=True)
+
+
 @dataclass
 class KalshiREST:
     """Minimal Kalshi V2 client.  It contains no strategy decision code."""
@@ -584,6 +741,32 @@ class KalshiREST:
         except Exception as exc:  # noqa: BLE001
             LOG.warning("Position lookup failed for %s: %s", ticker, exc)
             return None
+
+    async def cancel_resting_mechanical_orders(self) -> int:
+        """Cancel only this strategy's resting KXBTC15M orders for a handoff."""
+        try:
+            response = await self.orders.get_orders(status="resting", limit=1000)
+        except Exception as exc:  # noqa: BLE001
+            LOG.error("HANDOFF ORDER LOOKUP FAILED | %s", exc)
+            raise
+        canceled = 0
+        for order in field(response, "orders") or []:
+            role = managed_mechanical_order_role(order)
+            order_id = str(field(order, "order_id") or "")
+            if role is None or not order_id:
+                continue
+            ticker = str(field(order, "ticker") or "?")
+            try:
+                await self.orders.cancel_order_v2(order_id)
+                canceled += 1
+                LOG.warning(
+                    "HANDOFF CANCELED | %s %s role=%s id=%s",
+                    ticker, role[0].upper(), role[1], order_id,
+                )
+            except Exception as exc:  # noqa: BLE001
+                LOG.error("HANDOFF CANCEL FAILED | %s id=%s: %s", ticker, order_id, exc)
+                raise
+        return canceled
 
     async def get_market(self, ticker: str) -> Any | None:
         try:
@@ -791,7 +974,7 @@ def start_market_watcher(state: dict[str, Any], market: Any, config: dict[str, A
         "watch_started_at": now_iso(),
     })
     LOG.info(
-        "WATCH STARTED | %s watching YES and NO until the first executable ask reaches $0.40 or lower.",
+        "WATCH STARTED | %s awaiting its frozen ML side, then watching only that side until its executable ask reaches $0.40 or lower.",
         ticker,
     )
     return record
@@ -1018,7 +1201,7 @@ async def settle_or_cancel(rest: KalshiREST, record: dict[str, Any], market: Any
 
 async def consider_initial_entry(
     rest: KalshiREST, state: dict[str, Any], market: Any, config: dict[str, Any], dry_run: bool,
-    live_asks: dict[str, float | None] | None = None,
+    live_asks: dict[str, float | None] | None = None, ml_side: str | None = None,
 ) -> bool:
     ticker = str(field(market, "ticker") or "")
     if not ticker or not market_is_tradeable(market):
@@ -1031,10 +1214,13 @@ async def consider_initial_entry(
     other_active = [candidate for candidate in active_strategy_records(state) if candidate is not record]
     if len(other_active) >= config["max_active_markets"]:
         return False
-    choice = choose_entry_side(market_asks(market, live_asks))
-    if choice is None:
+    if ml_side not in {"yes", "no"}:
         return False
-    side, ask = choice
+    asks = market_asks(market, live_asks)
+    ask = asks[ml_side]
+    if ask is None or ask > LADDER_LEVELS[0] + 1e-9:
+        return False
+    side = ml_side
     quantity = config["initial_position_size"]
     reserve = ladder_principal(quantity)
     if reserved_principal(state) + reserve > config["max_total_capital"] + 1e-9:
@@ -1046,7 +1232,7 @@ async def consider_initial_entry(
         return False
     record.update({
         "candidate_side": side, "quantity": quantity, "status": "initial_submitted",
-        "initial_ask": round(ask, 4), "initial_reason": f"{side.upper()} ask reached <= $0.40",
+        "initial_ask": round(ask, 4), "initial_reason": f"ML selected {side.upper()}; its ask reached <= $0.40",
         "reserved_principal": reserve, "market_close_time": field(market, "close_time"),
     })
     if not await exchange_position_guard(rest, record, config):
@@ -1135,6 +1321,42 @@ def rung_performance(settled: list[dict[str, Any]]) -> dict[str, dict[str, Any]]
     return stats
 
 
+def rung_order_activity(state: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Count every submitted rung, including unfilled and still-resting orders."""
+    stats = {
+        f"{level:.2f}": {
+            "rung_price": level, "submitted_orders": 0, "submitted_contracts": 0.0,
+            "filled_order_submissions": 0, "filled_contracts": 0.0,
+            "resting_orders": 0, "canceled_unfilled_orders": 0,
+        }
+        for level in LADDER_LEVELS
+    }
+    for record in state.get("markets", {}).values():
+        if not isinstance(record, dict):
+            continue
+        for level in LADDER_LEVELS:
+            order = (record.get("orders") or {}).get(f"{level:.4f}")
+            if not isinstance(order, dict):
+                continue
+            result = stats[f"{level:.2f}"]
+            quantity = float(order.get("quantity") or 0.0)
+            fill = float(order.get("fill_count") or 0.0)
+            remaining = float(order.get("remaining_count") or 0.0)
+            result["submitted_orders"] += 1
+            result["submitted_contracts"] += quantity
+            if fill > 0.004:
+                result["filled_order_submissions"] += 1
+                result["filled_contracts"] += fill
+            elif remaining > 0.004:
+                result["resting_orders"] += 1
+            else:
+                result["canceled_unfilled_orders"] += 1
+    for result in stats.values():
+        result["submitted_contracts"] = round(result["submitted_contracts"], 2)
+        result["filled_contracts"] = round(result["filled_contracts"], 2)
+    return stats
+
+
 def performance_report(state: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
     settled = sorted((record for record in state.get("markets", {}).values()
                       if isinstance(record, dict) and record.get("status") == "finalized"
@@ -1161,7 +1383,7 @@ def performance_report(state: dict[str, Any], config: dict[str, Any]) -> dict[st
     mean = sum(pnls) / len(pnls) if pnls else 0.0
     variance = sum((value - mean) ** 2 for value in pnls) / (len(pnls) - 1) if len(pnls) > 1 else 0.0
     report = {
-        "generated_at": now_iso(), "strategy": "pure_mechanical_price_average_down_v1",
+        "generated_at": now_iso(), "strategy": "ml_side_mechanical_price_average_down_v1",
         "configuration": config, "total_markets_traded": len(settled), "unfilled_market_attempts": unfilled,
         "total_contracts_purchased": round(sum(contracts), 2), "winning_trades": wins,
         "losing_trades": losses, "win_rate": round(wins / len(settled), 6) if settled else None,
@@ -1182,7 +1404,8 @@ def performance_report(state: dict[str, Any], config: dict[str, Any]) -> dict[st
         "largest_losing_trade": round(min(pnls, default=0.0), 6), "largest_winning_trade": round(max(pnls, default=0.0), 6),
         "worst_historical_drawdown": round(max(drawdowns, default=0.0), 6),
         "rung_performance": rung_performance(settled),
-        "note": "Only finalized records with filled contracts count as trades. No historical model or backtest is used.",
+        "rung_order_activity": rung_order_activity(state),
+        "note": "Only finalized records with filled contracts count as trades. The pre-open ML side is an execution filter; this report is realized live-ledger data, not a profitability proof.",
     }
     if settled:
         levels = {level: 0 for level in LADDER_LEVELS}
@@ -1234,6 +1457,14 @@ def log_performance_summary(report: dict[str, Any], context: str) -> None:
             rung["losing_orders"], "n/a" if rung["win_rate"] is None else f"{100 * rung['win_rate']:.2f}%",
             rung["net_profit"],
         )
+    for level, activity in report["rung_order_activity"].items():
+        LOG.info(
+            "RUNG ACTIVITY | %sc sent_orders=%d sent_contracts=%.2f filled_orders=%d "
+            "filled_contracts=%.2f resting=%d canceled_unfilled=%d",
+            level, activity["submitted_orders"], activity["submitted_contracts"],
+            activity["filled_order_submissions"], activity["filled_contracts"],
+            activity["resting_orders"], activity["canceled_unfilled_orders"],
+        )
 
 
 async def log_heartbeat(
@@ -1280,9 +1511,12 @@ async def log_heartbeat(
         if not isinstance(record, dict) or record.get("status") in FINAL_RECORD_STATUSES:
             continue
         if record.get("status") == "watching":
+            ml_signal = record.get("ml_inference") if isinstance(record.get("ml_inference"), dict) else {}
+            ml_side = str(ml_signal.get("side") or "").upper()
             LOG.info(
-                "WATCH | %s active; no side selected until the first executable ask reaches $0.40 or lower.",
-                record.get("ticker", "?"),
+                "WATCH | %s active; %s.", record.get("ticker", "?"),
+                (f"ML selected {ml_side}; only its ask can trigger at <= $0.40" if ml_side
+                 else "awaiting frozen ML direction; no order can be placed"),
             )
             continue
         exchange_position = await refresh_exchange_position(rest, record)
@@ -1333,7 +1567,8 @@ async def run(args: argparse.Namespace) -> int:
         save_json(config_path, config)
     dry_run = os.getenv("DRY_RUN", "true").lower() in {"1", "true", "yes"}
     live_allowed = not dry_run and args.submit and args.allow_live
-    if not dry_run and not live_allowed:
+    control_only = args.cancel_open_orders or args.cancel_all_resting_mechanical_orders
+    if not dry_run and not live_allowed and not control_only:
         raise SystemExit("Refusing live orders: pass both --submit and --allow-live with DRY_RUN=false")
     state_path = args.state_file.expanduser()
     state = load_json(state_path, default_state())
@@ -1344,15 +1579,29 @@ async def run(args: argparse.Namespace) -> int:
     if not api_key or not pem_path.exists():
         raise SystemExit("KALSHI_API_KEY_ID and KALSHI_PEM_PATH are required")
     rest = KalshiREST(api_key, pem_path, os.getenv("KALSHI_DEMO", "false").lower() in {"1", "true", "yes"})
-    if args.cancel_open_orders:
+    if control_only:
         try:
-            canceled = await cancel_open_mechanical_orders(rest, state, dry_run)
+            canceled = (
+                await rest.cancel_resting_mechanical_orders()
+                if args.cancel_all_resting_mechanical_orders
+                else await cancel_open_mechanical_orders(rest, state, dry_run)
+            )
             save_json(state_path, state)
             save_json(args.report.expanduser(), performance_report(state, config))
             LOG.warning("CANCEL-ONLY COMPLETE | canceled_open_mechanical_orders=%d", canceled)
             return 0
         finally:
             await rest.close()
+    if args.ml_training_csv is None or args.ml_model_path is None:
+        await rest.close()
+        raise SystemExit("ML-side execution requires --ml-training-csv and --ml-model-path; refusing a price-only fallback")
+    try:
+        ml_selector = MLDirectionSelector(
+            args.ml_training_csv.expanduser(), args.ml_model_path.expanduser(), config["ml_preopen_lead_seconds"],
+        )
+    except Exception:
+        await rest.close()
+        raise
     feed = KalshiLiveFeed(rest.auth)
     feed_task = asyncio.create_task(feed.run(), name="kalshi-average-down-ws")
     started_at = asyncio.get_running_loop().time()
@@ -1369,10 +1618,15 @@ async def run(args: argparse.Namespace) -> int:
         config["max_contracts_per_market"], "/".join(f"${level:.2f}" for level in LADDER_LEVELS),
         config["max_total_capital"],
     )
+    LOG.info(
+        "ML SIDE FILTER | stored_model=%s feature_ledger=%s preopen_lead=%.0fs fallback=disabled",
+        args.ml_model_path, args.ml_training_csv, config["ml_preopen_lead_seconds"],
+    )
     log_performance_summary(performance_report(state, config), "startup")
     try:
         while True:
             monotonic_now = asyncio.get_running_loop().time()
+            await ml_selector.maybe_prepare_next()
             # Discover the current KXBTC15M window periodically.  Once known,
             # the authenticated ticker stream—not REST polling—is the entry
             # trigger for every quote change.
@@ -1406,9 +1660,15 @@ async def run(args: argparse.Namespace) -> int:
 
             for market in active_markets:
                 ticker = str(field(market, "ticker") or "")
+                record = state.get("markets", {}).get(ticker)
+                if not isinstance(record, dict):
+                    record = start_market_watcher(state, market, config)
+                if not isinstance(record, dict) or record.get("status") != "watching":
+                    continue
+                ml_side = await ml_selector.side_for_market(market, record)
                 await consider_initial_entry(
                     rest, state, market, config, dry_run,
-                    live_asks=feed.executable_asks(ticker),
+                    live_asks=feed.executable_asks(ticker), ml_side=ml_side,
                 )
             monotonic_now = asyncio.get_running_loop().time()
             if monotonic_now - last_heartbeat_at >= config["status_log_seconds"]:
@@ -1430,6 +1690,7 @@ async def run(args: argparse.Namespace) -> int:
     finally:
         feed_task.cancel()
         await asyncio.gather(feed_task, return_exceptions=True)
+        await ml_selector.close()
         save_json(state_path, state)
         final_report = performance_report(state, config)
         save_json(args.report.expanduser(), final_report)
@@ -1446,6 +1707,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--report", type=Path, default=Path("kalshi_btc15m_average_down_report.json"))
     parser.add_argument("--run-seconds", type=float, default=840.0)
     parser.add_argument("--cancel-open-orders", action="store_true")
+    parser.add_argument(
+        "--cancel-all-resting-mechanical-orders", action="store_true",
+        help="Cancel only resting orders with this runner's deterministic KXBTC15M client IDs; used for controlled handoff.",
+    )
     parser.add_argument("--persist-config", action="store_true")
     parser.add_argument("--submit", action="store_true")
     parser.add_argument("--allow-live", action="store_true")
@@ -1458,6 +1723,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--market-refresh-seconds", type=float)
     parser.add_argument("--order-reconcile-seconds", type=float)
     parser.add_argument("--watch-start-grace-seconds", type=float)
+    parser.add_argument("--ml-preopen-lead-seconds", type=float)
+    parser.add_argument("--ml-training-csv", type=Path, help="Frozen historical feature ledger for the stored ML model.")
+    parser.add_argument("--ml-model-path", type=Path, help="Stored ML joblib model used to choose the only eligible side.")
     parser.add_argument("--status-log-seconds", type=float)
     return parser
 
