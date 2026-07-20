@@ -127,7 +127,6 @@ def confidence(probabilities: np.ndarray) -> np.ndarray:
 def streaks(wins: np.ndarray) -> dict[str, int]:
     groups = [(result, len(list(group))) for result, group in groupby(wins.astype(int).tolist())]
     return {
-        "feature_schema": FEATURE_SCHEMA,
         "longest_win": max((length for result, length in groups if result), default=0),
         "longest_loss": max((length for result, length in groups if not result), default=0),
     }
@@ -228,6 +227,7 @@ def run(
         )
 
     return {
+        "feature_schema": FEATURE_SCHEMA,
         "method": (
             "Early train / later calibration / final untouched chronological test. "
             "Calibration uses isotonic regression; model and confidence threshold are selected "

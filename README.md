@@ -13,19 +13,19 @@ The continuous runners use GitHub Actions for up to 5 h 45 min per job before se
 
 ## Kalshi BTC 15-minute mechanical average-down runner
 
-Use **Actions → “Kalshi BTC 15m ML-Side Average Down” → Run workflow**. It is live by default, uses the persisted contract quantity (default **1 contract per rung**), and runs for 5 h 45 min before handing its state to the next runner. It monitors only `KXBTC15M`. The pinned production artifact is a chronologically calibrated logistic-regression model; its inclusive 50% confidence gate keeps every valid model direction eligible, while the separate 40¢ price rule controls whether an order can be placed. Its feature schema includes a Prophet-derived feature, but Prophet is not an execution signal or fallback and cannot select the opposite side.
+Use **Actions → “Kalshi BTC 15m ML-Side Average Down” → Run workflow**. It uses the persisted contract quantity (default **1 contract per rung**) and monitors only `KXBTC15M`. The ML-only runner accepts only the schema `ml_only_raw_candles_settled_outcomes_v1`: BTC candle returns/volatility/range, strike distance, clock, and previously settled outcomes. It does not fit, call, or consume Prophet or another price forecast; an old Prophet-feature artifact is rejected rather than used as a fallback.
 
 ### Deployed model, coverage, and evidence
 
-The current pinned artifact is **Actions run `29774183849`**: regularized logistic regression with isotonic probability calibration. It uses a 19,189-row settled feature ledger, split chronologically into 16,311 base-training rows and 2,878 later calibration rows. The runner records the model artifact ID, training cutoff, model `p_yes`, confidence, and selected side with every ML-backed market record.
+The Prophet-free candidate artifact is **Actions run `29776048495`**: regularized logistic regression with isotonic probability calibration. It uses a 19,189-row settled feature ledger, split chronologically into 16,311 base-training rows and 2,878 later calibration rows. Its schema lock prevents an old artifact from being substituted. The runner records the artifact ID, training cutoff, model `p_yes`, confidence, and selected side with every ML-backed market record.
 
-The deployed `confidence >= 0.50` gate has **100% valid-model-direction coverage**: every valid binary-model score has a YES or NO direction at that threshold. This is not 100% order coverage. An actual position still requires the ML-selected side's executable Kalshi ask to reach `<= $0.40`; it may then fill zero to four same-side rungs depending on market prices and liquidity.
+The `confidence >= 0.50` gate has **100% valid-model-direction coverage**: every valid binary-model score has a YES or NO direction at that threshold. This is not 100% order coverage. An actual position still requires the ML-selected side's executable Kalshi ask to reach `<= $0.40`; it may then fill zero to four same-side rungs depending on market prices and liquidity.
 
-Historical analysis found 18,986 scored ML directions at the 50% gate, with 52.42% directional accuracy and longest historical directional streaks of 17 wins / 10 losses; all seven completed 30-day windows were above 50%. This is historical directional evidence, **not a promised future rate or executable P&L**. The deployed calibrated logistic model and the 40¢ average-down execution rule can select a different set of trades; fees, fills, spread, rung depth, and settlement determine live P&L.
+The earlier 52.42% / 18,986-score result used a Prophet-feature schema and is **not evidence for this ML-only model**. On the ML-only logistic model's final untouched 2,879-market test, the 50% gate scored 51.27% (full coverage; p=0.18) and its 55% subset scored 60.27% on 146 scores (p=0.016). These are directional-only measurements, not executable P&L. The live gate must be selected deliberately; fees, fills, spread, rung depth, and settlement determine actual P&L.
 
 ### What the Action logs
 
-At startup the runner prints `ML MODEL`, `ML VALIDATION`, and `ML EXECUTION POLICY` lines with the exact artifact, calibration method, training rows/cutoff, research context, and active 50% gate. For every market it logs `ML SIDE READY` (`p_yes`, confidence, selected side), selected-side-only quote triggers, entry/ladder order IDs and fills, exchange-position guard checks, settlement, rung-level P&L, and `ML LIVE PERFORMANCE`. The latter reports directional accuracy separately from actual fill- and fee-inclusive P&L.
+At startup the runner prints `ML MODEL`, `ML VALIDATION`, and `ML EXECUTION POLICY` lines with the exact artifact, calibration method, training rows/cutoff, schema, and active gate. Before each market it prints `ML INPUT READY` to confirm no forecast input was used, then `ML SIDE READY` (`p_yes`, confidence, selected side). A candle fetch is capped at 45 seconds and an unfinished pre-open task logs `ML SIDE FAILED` at the open; neither condition can fall back to Prophet, stale inference, or price-side selection. The runner also logs selected-side-only quote triggers, entry/ladder IDs and fills, exchange-position guards, settlement, rung P&L, and `ML LIVE PERFORMANCE`.
 
 ### Retraining policy
 
@@ -33,7 +33,7 @@ Retraining creates a **candidate** artifact; it must not silently replace the pi
 
 ### Exact Kalshi lifecycle
 
-1. **Freeze one ML side before opening.** During the two-minute pre-open window, the runner builds the existing model's features from only then-available settled labels and market data, then evaluates the pinned calibrated logistic model. It records the ML `p_yes`, confidence, selected YES/NO side, exact model run, and training cutoff. The inclusive `≥50%` confidence gate gives every valid binary-model direction coverage; if this inference is unavailable, it submits no order for that market. There is no mechanical, Prophet, or price-side fallback.
+1. **Freeze one ML side before opening.** During the two-minute pre-open window, the runner obtains a bounded BTC candle snapshot and builds only raw-candle, strike, clock, and prior-settled-outcome features. It evaluates the schema-locked calibrated model and records `p_yes`, confidence, selected YES/NO side, exact model run, and training cutoff. The inclusive `≥50%` gate gives every valid binary-model direction coverage; if inference is late or unavailable, it submits no order. There is no mechanical, Prophet, forecast, stale-score, or price-side fallback.
 2. **Start one watcher at a fresh opening.** When that KXBTC15M market opens, the runner persists a `watching` record. A short start grace absorbs normal discovery/handoff delay, but it is not an entry deadline. If a runner first discovers an already-old market, it skips that market rather than starting a late watcher. A saved watcher continues through the next Actions handoff.
 3. **Watch only the ML-selected executable ask.** The watcher ignores the opposite side completely and waits as long as needed for the selected side to reach `≤ $0.40`. If it never does, it submits no order and records a no-signal market.
 4. **Lock the ML side with a GTC limit.** The first selected-side qualifying quote posts a same-side GTC limit at that observed price (never above 40¢), expiring at market close. It does **not** submit, switch to, or cancel an opposite-side entry.
@@ -484,13 +484,14 @@ writes every closed market and its outcome to
 `backtest_output/closed_kxbtc15m_markets.csv`, then replays the live
 two-minute-pre-open / 500-candle / 17-minute Prophet decision.
 
-It also evaluates an expanding-window logistic-regression classifier using
-only data that existed at each forecast time: BTC one-minute price features,
-the Prophet output, and earlier *settled* Kalshi outcomes. The previous market
-is excluded until its settlement timestamp, which prevents future-outcome
-leakage. The report is directional accuracy and calibration only; it does not
-claim dollar P&L because historical result records do not provide executable
-opening fills, spreads, or fees.
+It also evaluates the historical legacy schema and produces a feature ledger.
+The production ML-only trainer selects only BTC one-minute raw features,
+strike distance, clock, and earlier *settled* Kalshi outcomes from that ledger;
+it ignores every Prophet column. The previous market is excluded until its
+settlement timestamp, which prevents future-outcome leakage. The report is
+directional accuracy and calibration only; it does not claim dollar P&L because
+historical result records do not provide executable opening fills, spreads, or
+fees.
 
 ```bash
 pip install -r requirements_kalshi.txt
