@@ -86,6 +86,35 @@ class MechanicalAverageDownTests(unittest.TestCase):
         self.assertEqual(requests[0]["tif"], "immediate_or_cancel")
         self.assertTrue(all(request["side"] == "yes" for request in requests))
 
+    def test_10_cent_initial_entry_never_averages_up(self):
+        class FakeRest:
+            async def balance_dollars(self):
+                return 10.0
+
+            async def create_order(self, **kwargs):
+                return {
+                    "order_id": "initial", "side": kwargs["side"],
+                    "position_price": kwargs["position_price"], "quantity": kwargs["quantity"],
+                    "fill_count": 1.0, "remaining_count": 0.0, "fees_paid": 0.0, "status": "filled",
+                }
+
+            async def refresh_order(self, _order):
+                return None
+
+        async def scenario():
+            config = validate_config(DEFAULT_CONFIG)
+            state = default_state()
+            market = SimpleNamespace(ticker="KXBTC15M-TEST-10", status="active", yes_ask_dollars="0.90", no_ask_dollars="0.10")
+            rest = FakeRest()
+            await consider_initial_entry(rest, state, market, config, dry_run=False)
+            record = state["markets"]["KXBTC15M-TEST-10"]
+            await reconcile_orders(rest, record, dry_run=False)
+            await submit_ladder(rest, record, market, config, dry_run=False)
+            return record
+
+        record = asyncio.run(scenario())
+        self.assertEqual(list(record["orders"]), ["0.4000"])
+
 
 if __name__ == "__main__":
     unittest.main()
