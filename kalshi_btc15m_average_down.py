@@ -554,6 +554,27 @@ class KalshiREST:
             LOG.warning("Balance lookup failed: %s", exc)
             return None
 
+    async def position_for_ticker(self, ticker: str) -> float | None:
+        """Return the signed live Kalshi position for one market.
+
+        Kalshi represents a long YES position as positive contracts and a
+        long NO position as negative contracts.  ``None`` means the portfolio
+        endpoint could not be read; zero means the endpoint was read and no
+        position exists for the ticker.  This method never creates, changes,
+        or cancels an order.
+        """
+        try:
+            response = await self.portfolio.get_positions(limit=200)
+            for position in field(response, "market_positions", "positions") or []:
+                if str(field(position, "ticker") or "") != ticker:
+                    continue
+                raw_position = as_float(field(position, "position_fp", "position"))
+                return round(raw_position or 0.0, 2)
+            return 0.0
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning("Position lookup failed for %s: %s", ticker, exc)
+            return None
+
     async def get_market(self, ticker: str) -> Any | None:
         try:
             response = await self.markets.get_market(ticker)
@@ -774,6 +795,59 @@ def filled_contracts(record: dict[str, Any]) -> float:
     return round(sum(float(order.get("fill_count") or 0.0) for order in orders_for_market(record)), 2)
 
 
+async def refresh_exchange_position(rest: KalshiREST, record: dict[str, Any]) -> float | None:
+    """Read and persist the exchange's signed position without changing it."""
+    lookup = getattr(rest, "position_for_ticker", None)
+    # Lightweight test doubles predate this safety check.  Real KalshiREST
+    # always implements it; preserving this fallback keeps decision-unit tests
+    # focused on the mechanical ladder itself.
+    if not callable(lookup):
+        return 0.0
+    position = await lookup(str(record.get("ticker") or ""))
+    record["exchange_position_checked_at"] = now_iso()
+    if position is None:
+        record["exchange_position_status"] = "unavailable"
+        return None
+    record["exchange_position_status"] = "ok"
+    record["exchange_position_contracts"] = round(position, 2)
+    record["exchange_position_side"] = "yes" if position > 0.004 else ("no" if position < -0.004 else "flat")
+    return position
+
+
+async def exchange_position_guard(rest: KalshiREST, record: dict[str, Any], config: dict[str, Any]) -> bool:
+    """Fail closed if Kalshi's account position cannot match this one-rung ledger.
+
+    The ledger alone prevents this process from submitting more than four
+    contracts.  This independent exchange check additionally prevents it from
+    adding any order to a ticker with an unexpected, externally created, or
+    over-cap position.
+    """
+    if record.get("exchange_position_guard_blocked"):
+        return False
+    position = await refresh_exchange_position(rest, record)
+    ticker = str(record.get("ticker") or "?")
+    if position is None:
+        record["exchange_position_guard_blocked"] = "position lookup unavailable"
+        LOG.critical("EXCHANGE POSITION GUARD | %s lookup unavailable; refusing new orders for this ticker.", ticker)
+        return False
+    abs_position = abs(position)
+    expected_side = record.get("locked_side") or record.get("candidate_side")
+    actual_side = "yes" if position > 0.004 else ("no" if position < -0.004 else None)
+    recorded_fills = filled_contracts(record)
+    reason: str | None = None
+    if abs_position > config["max_contracts_per_market"] + 0.004:
+        reason = f"exchange position {position:+.2f} exceeds cap {config['max_contracts_per_market']:.2f}"
+    elif actual_side is not None and expected_side is not None and actual_side != expected_side:
+        reason = f"exchange side {actual_side.upper()} conflicts with ledger side {str(expected_side).upper()}"
+    elif abs_position > recorded_fills + 0.004:
+        reason = f"exchange position {position:+.2f} exceeds ledger fills {recorded_fills:.2f}"
+    if reason is not None:
+        record["exchange_position_guard_blocked"] = reason
+        LOG.critical("EXCHANGE POSITION GUARD | %s %s; refusing all further orders for this ticker.", ticker, reason)
+        return False
+    return True
+
+
 def active_strategy_records(state: dict[str, Any]) -> list[dict[str, Any]]:
     active: list[dict[str, Any]] = []
     for record in state.get("markets", {}).values():
@@ -838,6 +912,8 @@ async def submit_ladder(
     rest: KalshiREST, record: dict[str, Any], market: Any, config: dict[str, Any], dry_run: bool,
 ) -> None:
     if not record.get("locked_side"):
+        return
+    if not await exchange_position_guard(rest, record, config):
         return
     side = record["locked_side"]
     quantity = float(record["quantity"])
@@ -963,6 +1039,10 @@ async def consider_initial_entry(
         "initial_ask": round(ask, 4), "initial_reason": f"{side.upper()} ask reached <= $0.40",
         "reserved_principal": reserve, "market_close_time": field(market, "close_time"),
     })
+    if not await exchange_position_guard(rest, record, config):
+        record["status"] = "initial_blocked_exchange_position"
+        LOG.critical("INITIAL ENTRY BLOCKED | %s no order submitted because the live exchange position is unsafe.", ticker)
+        return False
     # When already below 40c, IOC at the observed price is the protected
     # equivalent of a market order.  It cannot fill above the observed <=40c ask.
     below_threshold = ask < LADDER_LEVELS[0] - 1e-9
@@ -1195,12 +1275,15 @@ async def log_heartbeat(
                 record.get("ticker", "?"),
             )
             continue
+        exchange_position = await refresh_exchange_position(rest, record)
         LOG.info(
-            "POSITION | %s status=%s side=%s filled=%.2f submitted=%.2f",
+            "POSITION | %s status=%s side=%s ledger_filled=%.2f submitted=%.2f exchange=%s guard=%s",
             record.get("ticker", "?"), record.get("status", "?"),
             str(record.get("locked_side") or record.get("candidate_side") or "none").upper(),
             filled_contracts(record),
             sum(float(order.get("quantity") or 0.0) for order in orders_for_market(record)),
+            "unavailable" if exchange_position is None else f"{exchange_position:+.2f}",
+            record.get("exchange_position_guard_blocked") or "clear",
         )
         for order in orders_for_market(record):
             LOG.info(

@@ -1,0 +1,41 @@
+name: Kalshi BTC 15m Position Audit (Read Only)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ticker:
+        description: "Exact Kalshi ticker to inspect. This workflow only reads the account position."
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    environment: "Kalshi"
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install read-only audit dependencies
+        run: pip install -r requirements_kalshi_average_down.txt
+
+      - name: Write Kalshi RSA private key
+        env:
+          KALSHI_PRIVATE_KEY: ${{ secrets.KALSHI_PRIVATE_KEY }}
+        run: |
+          printf '%s\n' "$KALSHI_PRIVATE_KEY" > kalshi_private_key.pem
+          chmod 600 kalshi_private_key.pem
+
+      - name: Audit the exact exchange position (no orders)
+        env:
+          KALSHI_API_KEY_ID: ${{ secrets.KALSHI_PROD_API_KEY }}
+          KALSHI_PEM_PATH: kalshi_private_key.pem
+          KALSHI_DEMO: "false"
+        run: |
+          python kalshi_btc15m_position_audit.py --ticker "${{ inputs.ticker }}"

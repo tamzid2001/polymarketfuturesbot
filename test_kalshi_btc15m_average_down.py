@@ -12,6 +12,7 @@ from kalshi_btc15m_average_down import (
     choose_entry_side,
     consider_initial_entry,
     default_state,
+    exchange_position_guard,
     exchange_outcome_side,
     ladder_principal,
     performance_report,
@@ -85,6 +86,21 @@ class MechanicalAverageDownTests(unittest.TestCase):
         invalid = {**DEFAULT_CONFIG, "max_total_capital": 0.99}
         with self.assertRaises(ValueError):
             validate_config(invalid)
+
+    def test_exchange_position_over_cap_blocks_all_further_orders(self):
+        class FakeRest:
+            async def position_for_ticker(self, _ticker):
+                return -18.0
+
+        async def scenario():
+            record = market_record(default_state(), "KXBTC15M-TEST-OVER-CAP")
+            record.update({"candidate_side": "no", "quantity": 1.0, "status": "initial_submitted"})
+            allowed = await exchange_position_guard(FakeRest(), record, validate_config(DEFAULT_CONFIG))
+            return allowed, record
+
+        allowed, record = asyncio.run(scenario())
+        self.assertFalse(allowed)
+        self.assertIn("exceeds cap", record["exchange_position_guard_blocked"])
 
     def test_report_has_no_model_metrics(self):
         report = performance_report({"markets": {}}, validate_config(DEFAULT_CONFIG))
