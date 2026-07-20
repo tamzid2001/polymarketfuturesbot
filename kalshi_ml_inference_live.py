@@ -297,9 +297,21 @@ async def build_preopen_signal(
     training_csv: Path,
     target_ticker: str,
     model_path: Path | None,
+    *,
+    as_of: pd.Timestamp | None = None,
 ) -> dict[str, Any] | None:
-    """Freeze historical labels, candles, and ML model before the target opens."""
-    as_of = pd.Timestamp.now(tz="UTC")
+    """Freeze historical labels, candles, and ML model at one causal instant.
+
+    ``as_of`` is normally the instant this pre-open job starts.  The execution
+    runner may also reconstruct a just-opened market after an Actions handoff;
+    in that case it supplies the market-open timestamp and this function uses
+    only candles and settled labels available strictly before that timestamp.
+    """
+    if as_of is None:
+        as_of = pd.Timestamp.now(tz="UTC")
+    else:
+        as_of = pd.Timestamp(as_of)
+        as_of = as_of.tz_localize("UTC") if as_of.tzinfo is None else as_of.tz_convert("UTC")
     rows = load_training_rows(training_csv, as_of)
     loop = asyncio.get_running_loop()
     try:
@@ -316,10 +328,23 @@ async def build_preopen_signal(
     if not valid:
         LOG.warning("ML input data failed validation for %s: %s", target_ticker, reason)
         return None
+    # A fetch can complete after the target opens.  Preserve the causal
+    # snapshot by discarding every candle at or after the frozen timestamp.
+    # This also lets a new Actions worker reconstruct a current decision from
+    # the exact pre-open history instead of falling back to a non-ML side.
+    candles = candles.copy()
+    candles["ds"] = pd.to_datetime(candles["ds"], utc=True, errors="coerce")
+    candles = candles[candles["ds"] < as_of].reset_index(drop=True)
+    if len(candles) < 61:
+        LOG.warning(
+            "ML INPUT FAILED | %s has only %d candles strictly before frozen as_of=%s.",
+            target_ticker, len(candles), as_of.isoformat(),
+        )
+        return None
     model = load_saved_model(model_path) if model_path is not None else train_model(rows)
     LOG.info(
-        "ML INPUT READY | %s schema=%s rows=%d candles=%d; no Prophet or forecast input.",
-        target_ticker, FEATURE_SCHEMA, len(rows), len(candles),
+        "ML INPUT READY | %s schema=%s rows=%d candles=%d as_of=%s; no Prophet or forecast input.",
+        target_ticker, FEATURE_SCHEMA, len(rows), len(candles), as_of.isoformat(),
     )
     return {
         "target_ticker": target_ticker,

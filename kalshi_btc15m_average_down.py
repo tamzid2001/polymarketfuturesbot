@@ -583,6 +583,10 @@ class MLDirectionSelector:
         self.model_run_id = model_run_id
         self.training_run_id = training_run_id
         self.tasks: dict[str, asyncio.Task[Any]] = {}
+        # The exact instant at which each task's input is frozen.  A task may
+        # finish after the market opens, but remains causal when this timestamp
+        # is no later than that market's opening time.
+        self.task_as_of: dict[str, Any] = {}
         self.ready: dict[str, dict[str, Any]] = {}
         self.completed_preopen: dict[str, bool] = {}
         self.logged_status: dict[str, str] = {}
@@ -594,6 +598,22 @@ class MLDirectionSelector:
             import kalshi_ml_inference_live as ml_inference
             self._module = ml_inference
         return self._module
+
+    def _schedule(self, ml: Any, ticker: str, as_of: Any, reason: str) -> None:
+        """Launch exactly one ML-input task with a recorded causal cutoff."""
+        if ticker in self.tasks or ticker in self.ready:
+            return
+        frozen_at = ml.pd.Timestamp(as_of)
+        frozen_at = frozen_at.tz_localize("UTC") if frozen_at.tzinfo is None else frozen_at.tz_convert("UTC")
+        self.task_as_of[ticker] = frozen_at
+        LOG.info(
+            "ML PREOPEN START | %s %s frozen_as_of=%s.",
+            ticker, reason, frozen_at.isoformat(),
+        )
+        self.tasks[ticker] = asyncio.create_task(
+            ml.build_preopen_signal(self.training_csv, ticker, self.model_path, as_of=frozen_at),
+            name=f"ml-preopen-{ticker}",
+        )
 
     async def maybe_prepare_next(self) -> None:
         """Begin feature/model preparation only during the documented pre-open lead."""
@@ -607,39 +627,73 @@ class MLDirectionSelector:
             return
         if seconds_to_open is None or not (0 < seconds_to_open <= self.preopen_lead_seconds):
             return
-        if next_ticker in self.tasks or next_ticker in self.ready:
-            return
-        LOG.info(
-            "ML PREOPEN START | %s preparing frozen inference %.0fs before open.",
-            next_ticker, seconds_to_open,
-        )
-        self.tasks[next_ticker] = asyncio.create_task(
-            ml.build_preopen_signal(self.training_csv, next_ticker, self.model_path),
-            name=f"ml-preopen-{next_ticker}",
+        self._schedule(
+            ml, next_ticker, ml.pd.Timestamp.now(tz="UTC"),
+            f"preparing {seconds_to_open:.0f}s before open",
         )
 
     async def side_for_market(self, market: Any, record: dict[str, Any]) -> str | None:
         """Return the frozen ML YES/NO direction for this exact live ticker."""
         ticker = str(field(market, "ticker") or "")
+        # A continuous Actions handoff persists the frozen direction in the
+        # strategy ledger.  Resume it rather than incorrectly treating the
+        # already-open current market as having no ML side.
+        persisted = record.get("ml_inference") if isinstance(record.get("ml_inference"), dict) else None
+        if persisted is not None:
+            side = str(persisted.get("side") or "").lower()
+            confidence = as_float(persisted.get("confidence"))
+            probability_yes = as_float(persisted.get("probability_yes"))
+            prior_model_run = str(persisted.get("model_run_id") or "")
+            if (
+                side in {"yes", "no"}
+                and confidence is not None and probability_yes is not None
+                and confidence + 1e-12 >= self.min_confidence
+                and (not self.model_run_id or prior_model_run == self.model_run_id)
+            ):
+                self._log_once(
+                    record, "resumed",
+                    "ML SIDE RESUMED | %s frozen side=%s p_yes=%.4f confidence=%.4f from prior handoff.",
+                    ticker, side.upper(), probability_yes, confidence,
+                )
+                return side
         task = self.tasks.get(ticker)
         if task is None:
-            self._log_once(record, "missing_preopen", "ML SIDE WAIT | %s no pre-open inference exists; no order will be placed.", ticker)
+            try:
+                # This covers a worker that begins in the first seconds of an
+                # open market.  The reconstruction still uses only data before
+                # the known market-open timestamp, never post-open prices.
+                open_at = self.module().next_open_timestamp(ticker)
+                self._schedule(
+                    self.module(), ticker, open_at,
+                    "reconstructing from this market's opening snapshot",
+                )
+            except Exception as exc:  # noqa: BLE001
+                self._log_once(record, "missing_preopen", "ML SIDE FAILED | %s cannot determine market open: %s.", ticker, exc)
+                return None
+            self._log_once(
+                record, "reconstructing",
+                "ML SIDE WAIT | %s reconstructing its frozen market-open ML input; no order until the ML side is ready.",
+                ticker,
+            )
             return None
         if not task.done():
-            try:
-                opened = ml.pd.Timestamp.now(tz="UTC") >= ml.next_open_timestamp(ticker)
-            except Exception:  # noqa: BLE001
-                opened = True
-            if opened:
+            # Production tasks always carry ``task_as_of``.  Retain the strict
+            # rejection for an unlabelled/unknown task, but do not discard a
+            # valid frozen calculation merely because network work finishes a
+            # few seconds after the market opens.
+            if ticker not in self.task_as_of:
                 self.completed_preopen[ticker] = False
                 task.cancel()
                 self._log_once(
                     record, "late_preopen",
-                    "ML SIDE FAILED | %s pre-open calculation did not complete before open; no order will be placed.",
+                    "ML SIDE FAILED | %s had no causal frozen-input timestamp; no order will be placed.",
                     ticker,
                 )
                 return None
-            self._log_once(record, "preparing", "ML SIDE WAIT | %s pre-open inference is still preparing.", ticker)
+            self._log_once(
+                record, "preparing",
+                "ML SIDE WAIT | %s frozen ML input is preparing; no order until the ML side is ready.", ticker,
+            )
             return None
         ml = self.module()
         self._harvest_completion(ml)
@@ -708,14 +762,19 @@ class MLDirectionSelector:
         return side
 
     def _harvest_completion(self, ml: Any) -> None:
-        """Mark whether each async preparation completed strictly before its open."""
-        now = ml.pd.Timestamp.now(tz="UTC")
+        """Mark whether each completed task used a causal frozen snapshot."""
         for ticker, task in self.tasks.items():
             if ticker in self.completed_preopen or not task.done():
                 continue
             try:
                 open_at = ml.next_open_timestamp(ticker)
-                self.completed_preopen[ticker] = bool(now < open_at)
+                frozen_at = self.task_as_of.get(ticker)
+                if frozen_at is None:
+                    self.completed_preopen[ticker] = False
+                    continue
+                frozen_at = ml.pd.Timestamp(frozen_at)
+                frozen_at = frozen_at.tz_localize("UTC") if frozen_at.tzinfo is None else frozen_at.tz_convert("UTC")
+                self.completed_preopen[ticker] = bool(frozen_at <= open_at)
             except Exception:  # noqa: BLE001
                 self.completed_preopen[ticker] = False
 

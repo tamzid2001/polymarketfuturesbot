@@ -90,6 +90,37 @@ class MechanicalAverageDownTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_matching_frozen_ml_side_is_resumed_after_an_actions_handoff(self):
+        async def scenario():
+            import tempfile
+            from pathlib import Path
+
+            with tempfile.TemporaryDirectory() as temporary:
+                base = Path(temporary)
+                (base / "rows.csv").write_text("placeholder\n", encoding="utf-8")
+                (base / "model.joblib").write_text("placeholder\n", encoding="utf-8")
+                ticker = "KXBTC15M-26JUL201645-45"
+                selector = MLDirectionSelector(
+                    base / "rows.csv", base / "model.joblib", 120.0, 0.5,
+                    model_run_id="same-frozen-model",
+                )
+                record = {
+                    "ticker": ticker,
+                    "ml_inference": {
+                        "source": "stored_ml_preopen",
+                        "model_run_id": "same-frozen-model",
+                        "side": "no",
+                        "probability_yes": 0.41,
+                        "confidence": 0.59,
+                    },
+                }
+                side = await selector.side_for_market(SimpleNamespace(ticker=ticker), record)
+                self.assertEqual(side, "no")
+                self.assertEqual(record["ml_inference_status"], "resumed")
+                self.assertNotIn(ticker, selector.tasks)
+
+        asyncio.run(scenario())
+
     def test_fresh_websocket_quote_supplies_both_executable_sides(self):
         feed = KalshiLiveFeed(auth=None)
         feed._handle(
