@@ -3,10 +3,13 @@ import time
 import unittest
 from types import SimpleNamespace
 
+import pandas as pd
+
 from kalshi_btc15m_average_down import (
     DEFAULT_CONFIG,
     KalshiLiveFeed,
     LADDER_LEVELS,
+    MLDirectionSelector,
     active_strategy_records,
     apply_config_overrides,
     classify_submission,
@@ -33,6 +36,7 @@ from kalshi_btc15m_average_down import (
     rung_order_activity,
     validate_config,
 )
+from kalshi_ml_features import FEATURE_SCHEMA, ML_ONLY_FEATURE_COLUMNS, feature_values
 
 
 class MechanicalAverageDownTests(unittest.TestCase):
@@ -45,6 +49,46 @@ class MechanicalAverageDownTests(unittest.TestCase):
         self.assertEqual(config["order_reconcile_seconds"], 5.0)
         self.assertEqual(config["watch_start_grace_seconds"], 45.0)
         self.assertEqual(config["ml_min_confidence"], 0.5)
+
+    def test_ml_only_features_have_no_prophet_inputs(self):
+        candles = pd.DataFrame({
+            "ds": pd.date_range("2026-07-20T00:00:00Z", periods=61, freq="min"),
+            "close": [60_000.0 + value for value in range(61)],
+        })
+        values = feature_values(
+            candles, 60_050.0, [1, 0, 1, 1], pd.Timestamp("2026-07-20T00:15:00Z"),
+        )
+        self.assertEqual(set(values), set(ML_ONLY_FEATURE_COLUMNS))
+        self.assertEqual(FEATURE_SCHEMA, "ml_only_raw_candles_settled_outcomes_v1")
+        self.assertFalse(any("prophet" in name for name in ML_ONLY_FEATURE_COLUMNS))
+
+    def test_unfinished_ml_task_is_failed_at_market_open(self):
+        async def scenario():
+            with self.subTest("late task"):
+                import tempfile
+                from pathlib import Path
+
+                with tempfile.TemporaryDirectory() as temporary:
+                    base = Path(temporary)
+                    (base / "rows.csv").write_text("placeholder\n", encoding="utf-8")
+                    (base / "model.joblib").write_text("placeholder\n", encoding="utf-8")
+                    selector = MLDirectionSelector(
+                        base / "rows.csv", base / "model.joblib", 120.0, 0.5,
+                    )
+                    selector._module = SimpleNamespace(
+                        pd=pd,
+                        next_open_timestamp=lambda _ticker: pd.Timestamp.now(tz="UTC") - pd.Timedelta(seconds=1),
+                    )
+                    ticker = "KXBTC15M-26JUL201630-30"
+                    selector.tasks[ticker] = asyncio.create_task(asyncio.sleep(60))
+                    record = {"ticker": ticker}
+                    side = await selector.side_for_market(SimpleNamespace(ticker=ticker), record)
+                    self.assertIsNone(side)
+                    self.assertEqual(record["ml_inference_status"], "late_preopen")
+                    self.assertTrue(selector.tasks[ticker].cancelled() or selector.tasks[ticker].cancelling())
+                    await selector.close()
+
+        asyncio.run(scenario())
 
     def test_fresh_websocket_quote_supplies_both_executable_sides(self):
         feed = KalshiLiveFeed(auth=None)

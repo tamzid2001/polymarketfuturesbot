@@ -42,7 +42,7 @@ from sklearn.neural_network import MLPClassifier
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
-from kalshi_btc15m_backtest import FEATURE_COLUMNS
+from kalshi_ml_features import FEATURE_SCHEMA, ML_ONLY_FEATURE_COLUMNS
 
 
 MINIMUM_ROWS = 1_000
@@ -60,7 +60,7 @@ class Candidate:
 def load_rows(path: Path) -> pd.DataFrame:
     """Read feature-complete historical rows in prediction-time order."""
     rows = pd.read_csv(path)
-    required = set(FEATURE_COLUMNS) | {"actual_yes", "forecast_at", "settlement_ts"}
+    required = set(ML_ONLY_FEATURE_COLUMNS) | {"actual_yes", "forecast_at", "settlement_ts"}
     missing = required - set(rows.columns)
     if missing:
         raise ValueError(f"Input is missing required columns: {', '.join(sorted(missing))}")
@@ -68,13 +68,13 @@ def load_rows(path: Path) -> pd.DataFrame:
     rows["forecast_timestamp"] = pd.to_datetime(rows["forecast_at"], utc=True, errors="coerce")
     rows["settlement_timestamp"] = pd.to_datetime(rows["settlement_ts"], utc=True, errors="coerce")
     rows["actual_yes"] = pd.to_numeric(rows["actual_yes"], errors="coerce")
-    for name in FEATURE_COLUMNS:
+    for name in ML_ONLY_FEATURE_COLUMNS:
         rows[name] = pd.to_numeric(rows[name], errors="coerce")
     rows = rows[
         rows["forecast_timestamp"].notna()
         & rows["settlement_timestamp"].notna()
         & rows["actual_yes"].isin([0, 1])
-        & rows[FEATURE_COLUMNS].notna().all(axis=1)
+        & rows[ML_ONLY_FEATURE_COLUMNS].notna().all(axis=1)
     ].sort_values("forecast_timestamp", kind="stable").reset_index(drop=True)
     if len(rows) < MINIMUM_ROWS:
         raise ValueError(f"At least {MINIMUM_ROWS:,} usable rows are required")
@@ -281,11 +281,11 @@ def candidate_probabilities(
     selection = blocks["selection"]
     test = blocks["test"]
     model = candidate.factory()
-    model.fit(train[FEATURE_COLUMNS].to_numpy(dtype=float), train["actual_yes"].to_numpy(dtype=int))
-    calibration_raw = model.predict_proba(calibration[FEATURE_COLUMNS].to_numpy(dtype=float))[:, 1]
+    model.fit(train[ML_ONLY_FEATURE_COLUMNS].to_numpy(dtype=float), train["actual_yes"].to_numpy(dtype=int))
+    calibration_raw = model.predict_proba(calibration[ML_ONLY_FEATURE_COLUMNS].to_numpy(dtype=float))[:, 1]
     calibrator = fit_calibrator(candidate.calibration, calibration_raw, calibration["actual_yes"].to_numpy(dtype=int))
-    selection_raw = model.predict_proba(selection[FEATURE_COLUMNS].to_numpy(dtype=float))[:, 1]
-    test_raw = model.predict_proba(test[FEATURE_COLUMNS].to_numpy(dtype=float))[:, 1]
+    selection_raw = model.predict_proba(selection[ML_ONLY_FEATURE_COLUMNS].to_numpy(dtype=float))[:, 1]
+    test_raw = model.predict_proba(test[ML_ONLY_FEATURE_COLUMNS].to_numpy(dtype=float))[:, 1]
     return (
         apply_calibrator(calibrator, calibration_raw),
         apply_calibrator(calibrator, selection_raw),
@@ -324,11 +324,11 @@ def rolling_diagnostics(
                 start = end
                 continue
         model = candidate.factory()
-        model.fit(base_train[FEATURE_COLUMNS].to_numpy(dtype=float), base_train["actual_yes"].to_numpy(dtype=int))
+        model.fit(base_train[ML_ONLY_FEATURE_COLUMNS].to_numpy(dtype=float), base_train["actual_yes"].to_numpy(dtype=int))
         if calibration is None:
             calibrator = None
         else:
-            calibration_raw = model.predict_proba(calibration[FEATURE_COLUMNS].to_numpy(dtype=float))[:, 1]
+            calibration_raw = model.predict_proba(calibration[ML_ONLY_FEATURE_COLUMNS].to_numpy(dtype=float))[:, 1]
             calibrator = fit_calibrator(
                 candidate.calibration,
                 calibration_raw,
@@ -336,7 +336,7 @@ def rolling_diagnostics(
             )
         probabilities = apply_calibrator(
             calibrator,
-            model.predict_proba(test[FEATURE_COLUMNS].to_numpy(dtype=float))[:, 1],
+            model.predict_proba(test[ML_ONLY_FEATURE_COLUMNS].to_numpy(dtype=float))[:, 1],
         )
         reports.append({
             "start": start.isoformat(),
@@ -392,6 +392,7 @@ def run(
         for report in rolling
     )
     return {
+        "feature_schema": FEATURE_SCHEMA,
         "method": (
             "Four chronological blocks: base training, probability calibration, model/gate selection, "
             "and a final untouched test. Every labeled block is embargoed by settlement timestamp."

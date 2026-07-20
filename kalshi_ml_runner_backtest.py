@@ -29,12 +29,12 @@ from sklearn.metrics import brier_score_loss, log_loss
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
-from kalshi_btc15m_backtest import FEATURE_COLUMNS
+from kalshi_ml_features import FEATURE_SCHEMA, ML_ONLY_FEATURE_COLUMNS
 
 
 def load_rows(path: Path) -> pd.DataFrame:
     rows = pd.read_csv(path)
-    required = set(FEATURE_COLUMNS) | {
+    required = set(ML_ONLY_FEATURE_COLUMNS) | {
         "actual_yes", "forecast_at", "settlement_ts", "ml_probability_yes",
     }
     missing = required - set(rows.columns)
@@ -45,13 +45,13 @@ def load_rows(path: Path) -> pd.DataFrame:
     rows["settlement_timestamp"] = pd.to_datetime(rows["settlement_ts"], utc=True, errors="coerce")
     rows["actual_yes"] = pd.to_numeric(rows["actual_yes"], errors="coerce")
     rows["ml_probability_yes"] = pd.to_numeric(rows["ml_probability_yes"], errors="coerce")
-    for name in FEATURE_COLUMNS:
+    for name in ML_ONLY_FEATURE_COLUMNS:
         rows[name] = pd.to_numeric(rows[name], errors="coerce")
     rows = rows[
         rows["forecast_timestamp"].notna()
         & rows["settlement_timestamp"].notna()
         & rows["actual_yes"].isin([0, 1])
-        & rows[FEATURE_COLUMNS].notna().all(axis=1)
+        & rows[ML_ONLY_FEATURE_COLUMNS].notna().all(axis=1)
     ].sort_values("forecast_timestamp", kind="stable").reset_index(drop=True)
     if len(rows) < 1_000:
         raise ValueError("At least 1,000 usable rows are required for a holdout backtest")
@@ -107,11 +107,11 @@ def calibrated_probabilities(
     calibration: pd.DataFrame,
     test: pd.DataFrame,
 ) -> tuple[np.ndarray, np.ndarray]:
-    x_train = train[FEATURE_COLUMNS].to_numpy(dtype=float)
+    x_train = train[ML_ONLY_FEATURE_COLUMNS].to_numpy(dtype=float)
     y_train = train["actual_yes"].to_numpy(dtype=int)
-    x_calibration = calibration[FEATURE_COLUMNS].to_numpy(dtype=float)
+    x_calibration = calibration[ML_ONLY_FEATURE_COLUMNS].to_numpy(dtype=float)
     y_calibration = calibration["actual_yes"].to_numpy(dtype=int)
-    x_test = test[FEATURE_COLUMNS].to_numpy(dtype=float)
+    x_test = test[ML_ONLY_FEATURE_COLUMNS].to_numpy(dtype=float)
     model.fit(x_train, y_train)
     calibration_raw = model.predict_proba(x_calibration)[:, 1]
     test_raw = model.predict_proba(x_test)[:, 1]
@@ -127,6 +127,7 @@ def confidence(probabilities: np.ndarray) -> np.ndarray:
 def streaks(wins: np.ndarray) -> dict[str, int]:
     groups = [(result, len(list(group))) for result, group in groupby(wins.astype(int).tolist())]
     return {
+        "feature_schema": FEATURE_SCHEMA,
         "longest_win": max((length for result, length in groups if result), default=0),
         "longest_loss": max((length for result, length in groups if not result), default=0),
     }

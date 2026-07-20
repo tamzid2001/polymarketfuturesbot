@@ -1,10 +1,8 @@
 """Standalone ML-side runner for live KXBTC15M markets.
 
 The trade side comes only from the ML model's ``probability_yes``: YES at or
-above 0.5, otherwise NO. It has no Prophet-side fallback and no loss-streak
-switch. The historical model's feature schema includes forecast-derived
-features, which this runner recreates only as model inputs so its inference is
-compatible with the validated walk-forward ML backtest.
+above 0.5, otherwise NO. It has no Prophet-side fallback, no Prophet-derived
+feature, and no loss-streak switch.
 
 Use a current ``prophet_ml_backtest_rows.csv`` as ``--training-csv``. The
 runner trains only on rows whose outcomes settled before the pre-open inference
@@ -39,7 +37,7 @@ from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
 import kalshibtc15minupordown as kalshi
-from kalshi_btc15m_backtest import FEATURE_COLUMNS, feature_values
+from kalshi_ml_features import FEATURE_SCHEMA, ML_ONLY_FEATURE_COLUMNS, feature_values
 
 
 LOG = logging.getLogger("kalshi_ml_inference_live")
@@ -54,6 +52,7 @@ MODEL_TYPE = os.getenv("ML_MODEL_TYPE", "hist_gradient_boosting")
 MAX_ENTRY_PRICE = float(os.getenv("ML_MAX_ENTRY_PRICE", "0.50"))
 MIN_EDGE = float(os.getenv("ML_MIN_EDGE", "0.03"))
 PREOPEN_LEAD_S = float(os.getenv("ML_PREOPEN_LEAD_S", "120"))
+PREOPEN_DATA_TIMEOUT_S = float(os.getenv("ML_PREOPEN_DATA_TIMEOUT_S", "45"))
 LEDGER_FORMAT_VERSION = 1
 
 
@@ -75,20 +74,20 @@ def load_training_rows(path: Path, as_of: pd.Timestamp) -> pd.DataFrame:
             "--training-csv with prophet_ml_backtest_rows.csv."
         )
     rows = pd.read_csv(path)
-    required = set(FEATURE_COLUMNS) | {"actual_yes", "settlement_ts"}
+    required = set(ML_ONLY_FEATURE_COLUMNS) | {"actual_yes", "settlement_ts"}
     missing = required - set(rows.columns)
     if missing:
         raise ValueError(f"Training artifact missing columns: {', '.join(sorted(missing))}")
     rows = rows.copy()
     rows["settlement_timestamp"] = pd.to_datetime(rows["settlement_ts"], utc=True, errors="coerce")
     rows["actual_yes"] = pd.to_numeric(rows["actual_yes"], errors="coerce")
-    for name in FEATURE_COLUMNS:
+    for name in ML_ONLY_FEATURE_COLUMNS:
         rows[name] = pd.to_numeric(rows[name], errors="coerce")
     rows = rows[
         rows["settlement_timestamp"].notna()
         & (rows["settlement_timestamp"] < as_of)
         & rows["actual_yes"].isin([0, 1])
-        & rows[FEATURE_COLUMNS].notna().all(axis=1)
+        & rows[ML_ONLY_FEATURE_COLUMNS].notna().all(axis=1)
     ].sort_values("settlement_timestamp", kind="stable").reset_index(drop=True)
     if len(rows) < MIN_TRAIN_ROWS:
         raise ValueError(
@@ -119,19 +118,21 @@ def train_model(rows: pd.DataFrame):
         raise ValueError(
             "ML_MODEL_TYPE must be 'hist_gradient_boosting' or 'logistic_regression'"
         )
-    model.fit(rows[FEATURE_COLUMNS].to_numpy(dtype=float), rows["actual_yes"].to_numpy(dtype=int))
+    model.fit(rows[ML_ONLY_FEATURE_COLUMNS].to_numpy(dtype=float), rows["actual_yes"].to_numpy(dtype=int))
     return model
 
 
 def load_saved_model(path: Path):
     """Load a model produced by kalshi_ml_model_train.py and verify its schema."""
     payload = joblib.load(path)
-    if not isinstance(payload, dict) or payload.get("feature_columns") != FEATURE_COLUMNS:
+    if not isinstance(payload, dict) or payload.get("feature_columns") != ML_ONLY_FEATURE_COLUMNS:
         raise ValueError(f"Saved model {path} does not match the current ML feature schema")
     model = payload.get("model")
     if model is None or not hasattr(model, "predict_proba"):
         raise ValueError(f"Saved model {path} has no probability classifier")
     metadata = payload.get("metadata") or {}
+    if metadata.get("feature_schema") != FEATURE_SCHEMA:
+        raise ValueError(f"Saved model {path} is not the required Prophet-free ML-only schema")
     LOG.info("Loaded saved ML model %s (%s rows; settlement cutoff %s).",
              path, metadata.get("training_rows", "?"), metadata.get("settlement_cutoff", "?"))
     return model
@@ -301,24 +302,31 @@ async def build_preopen_signal(
     as_of = pd.Timestamp.now(tz="UTC")
     rows = load_training_rows(training_csv, as_of)
     loop = asyncio.get_running_loop()
-    candles = await loop.run_in_executor(None, kalshi.fetch_btc_1m)
+    try:
+        candles = await asyncio.wait_for(
+            loop.run_in_executor(None, kalshi.fetch_btc_1m), timeout=PREOPEN_DATA_TIMEOUT_S,
+        )
+    except TimeoutError:
+        LOG.warning(
+            "ML INPUT FAILED | %s BTC candle fetch exceeded %.0fs; no frozen signal.",
+            target_ticker, PREOPEN_DATA_TIMEOUT_S,
+        )
+        return None
     valid, reason = kalshi.validate_data(candles)
     if not valid:
         LOG.warning("ML input data failed validation for %s: %s", target_ticker, reason)
         return None
-    forecast = await loop.run_in_executor(
-        None, kalshi.run_prophet_forecast, candles, kalshi.FORECAST_MINUTES
+    model = load_saved_model(model_path) if model_path is not None else train_model(rows)
+    LOG.info(
+        "ML INPUT READY | %s schema=%s rows=%d candles=%d; no Prophet or forecast input.",
+        target_ticker, FEATURE_SCHEMA, len(rows), len(candles),
     )
-    if forecast is None:
-        LOG.warning("Feature forecast failed for %s.", target_ticker)
-        return None
     return {
         "target_ticker": target_ticker,
         "as_of": as_of,
         "rows": rows,
         "candles": candles,
-        "forecast": forecast,
-        "model": load_saved_model(model_path) if model_path is not None else train_model(rows),
+        "model": model,
     }
 
 
@@ -353,13 +361,10 @@ async def score_and_maybe_submit(
         return
 
     features = feature_values(
-        cached["candles"],
-        float(market["target"]),
-        cached["forecast"],
-        known_outcomes(cached["rows"]),
+        cached["candles"], float(market["target"]), known_outcomes(cached["rows"]),
         next_open_timestamp(target_ticker),
     )
-    vector = np.asarray([[float(features[name]) for name in FEATURE_COLUMNS]], dtype=float)
+    vector = np.asarray([[float(features[name]) for name in ML_ONLY_FEATURE_COLUMNS]], dtype=float)
     probability_yes = float(cached["model"].predict_proba(vector)[0][1])
     side = "yes" if probability_yes >= 0.5 else "no"
     confidence = probability_yes if side == "yes" else 1.0 - probability_yes

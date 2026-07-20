@@ -1,8 +1,9 @@
 """Train and serialize the ML pipeline used by ``kalshi_ml_inference_live.py``.
 
-The input must be a historical ``prophet_ml_backtest_rows.csv``. Only labels
-settled before the requested cutoff are included, so the saved model records
-exactly what information was available when it was trained.
+The input may be the historical ``prophet_ml_backtest_rows.csv`` artifact, but
+the production schema deliberately selects only candle, strike, clock, and
+previously-settled-outcome fields. It does not use the artifact's Prophet
+columns. Only labels settled before the requested cutoff are included.
 """
 
 from __future__ import annotations
@@ -23,10 +24,10 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
-from kalshi_btc15m_backtest import FEATURE_COLUMNS
+from kalshi_ml_features import FEATURE_SCHEMA, ML_ONLY_FEATURE_COLUMNS
 
 
-MODEL_FORMAT_VERSION = 2
+MODEL_FORMAT_VERSION = 3
 MODEL_TYPES = ("hist_gradient_boosting", "logistic_regression")
 CALIBRATION_TYPES = ("raw", "isotonic")
 
@@ -46,19 +47,19 @@ class IsotonicCalibratedClassifier:
 
 def read_training_rows(path: Path, as_of: pd.Timestamp | None) -> pd.DataFrame:
     rows = pd.read_csv(path)
-    required = set(FEATURE_COLUMNS) | {"actual_yes", "settlement_ts"}
+    required = set(ML_ONLY_FEATURE_COLUMNS) | {"actual_yes", "settlement_ts"}
     missing = required - set(rows.columns)
     if missing:
         raise ValueError(f"Input is missing required columns: {', '.join(sorted(missing))}")
     rows = rows.copy()
     rows["settlement_timestamp"] = pd.to_datetime(rows["settlement_ts"], utc=True, errors="coerce")
     rows["actual_yes"] = pd.to_numeric(rows["actual_yes"], errors="coerce")
-    for name in FEATURE_COLUMNS:
+    for name in ML_ONLY_FEATURE_COLUMNS:
         rows[name] = pd.to_numeric(rows[name], errors="coerce")
     valid = (
         rows["settlement_timestamp"].notna()
         & rows["actual_yes"].isin([0, 1])
-        & rows[FEATURE_COLUMNS].notna().all(axis=1)
+        & rows[ML_ONLY_FEATURE_COLUMNS].notna().all(axis=1)
     )
     if as_of is not None:
         valid &= rows["settlement_timestamp"] < as_of
@@ -95,7 +96,7 @@ def train(rows: pd.DataFrame, model_type: str) -> Any:
         )
     else:
         raise ValueError(f"Unsupported model type: {model_type}")
-    model.fit(rows[FEATURE_COLUMNS].to_numpy(dtype=float), rows["actual_yes"].to_numpy(dtype=int))
+    model.fit(rows[ML_ONLY_FEATURE_COLUMNS].to_numpy(dtype=float), rows["actual_yes"].to_numpy(dtype=int))
     return model
 
 
@@ -124,7 +125,7 @@ def train_calibrated(
         raise ValueError("Chronological calibration rows contain only one outcome class")
     base_model = train(base, model_type)
     raw_probability = base_model.predict_proba(
-        calibration_rows_frame[FEATURE_COLUMNS].to_numpy(dtype=float)
+        calibration_rows_frame[ML_ONLY_FEATURE_COLUMNS].to_numpy(dtype=float)
     )[:, 1]
     calibrator = IsotonicRegression(y_min=0.0, y_max=1.0, out_of_bounds="clip")
     calibrator.fit(raw_probability, calibration_rows_frame["actual_yes"].to_numpy(dtype=int))
@@ -155,7 +156,8 @@ def serialize(
     metadata: dict[str, Any] = {
         "format_version": MODEL_FORMAT_VERSION,
         "model_type": model_type,
-        "feature_columns": FEATURE_COLUMNS,
+        "feature_columns": ML_ONLY_FEATURE_COLUMNS,
+        "feature_schema": FEATURE_SCHEMA,
         "trained_at": trained_at,
         "training_rows": int(len(rows)),
         "training_actual_yes_rate": float(rows["actual_yes"].mean()),
@@ -166,7 +168,7 @@ def serialize(
     }
     payload = {
         "format_version": MODEL_FORMAT_VERSION,
-        "feature_columns": FEATURE_COLUMNS,
+        "feature_columns": ML_ONLY_FEATURE_COLUMNS,
         "model": model,
         "metadata": metadata,
     }

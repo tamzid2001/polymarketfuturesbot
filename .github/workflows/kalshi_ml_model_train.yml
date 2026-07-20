@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       source_run_id:
-        description: "Historical backtest run whose artifact contains prophet_ml_backtest_rows.csv."
+        description: "Historical feature-ledger run. The legacy CSV name remains prophet_ml_backtest_rows.csv, but the production model ignores every Prophet column."
         required: true
         default: "29698207476"
       model_type:
@@ -52,7 +52,7 @@ jobs:
 
       - name: Verify ML Programs Compile
         run: |
-          python -m py_compile kalshi_ml_inference_live.py kalshi_ml_model_train.py kalshi_ml_runner_backtest.py kalshi_ml_robust_backtest.py
+          python -m py_compile kalshi_ml_features.py kalshi_ml_inference_live.py kalshi_ml_model_train.py kalshi_ml_runner_backtest.py kalshi_ml_robust_backtest.py
 
       - name: Download Historical Backtest Artifact
         env:

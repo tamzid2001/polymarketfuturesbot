@@ -2,8 +2,8 @@
 
 The stored ML inference chooses one side before the market opens.  The
 execution rule is then mechanical: it watches *only* that side's executable
-ask and uses the fixed 40c -> 30c -> 20c -> 10c ladder.  There is no Prophet
-or mechanical-side fallback if ML inference is unavailable.
+ask and uses the fixed 40c -> 30c -> 20c -> 10c ladder.  There is no Prophet,
+forecast, or mechanical-side fallback if ML inference is unavailable.
 
 Live submission is deliberately opt-in: ``DRY_RUN`` must be false and both
 ``--submit`` and ``--allow-live`` are required.  The GitHub workflow persists
@@ -84,8 +84,9 @@ DEFAULT_CONFIG = {
     # observing a brand-new market and starting its watcher.  Once started,
     # the watcher runs until the market closes or one side reaches 40c.
     "watch_start_grace_seconds": 45.0,
-    # ML is computed before the next market opens. A watcher never chooses a
-    # side from prices; it only acts after this frozen model side is ready.
+    # ML is computed before the next market opens from raw candles and settled
+    # outcomes only. A watcher never chooses a side from prices; it only acts
+    # after this frozen model side is ready.
     "ml_preopen_lead_seconds": 120.0,
     # Inclusive 50% confidence: every valid binary-model direction is eligible
     # for the price ladder. This is model coverage, not order coverage: the
@@ -553,11 +554,11 @@ class KalshiLiveFeed:
 class MLDirectionSelector:
     """Prepare frozen ML directions before each BTC 15-minute market opens.
 
-    The existing ML runner's feature construction is intentionally reused so
-    this execution layer sees the exact saved model, feature schema, candle
-    snapshot, and pre-open Prophet-derived input used by the ML inference
-    workflow.  It never returns a price-derived direction and never falls back
-    to a mechanical YES/NO choice.
+    The ML runner's Prophet-free feature construction is intentionally reused
+    so this execution layer sees the exact saved model, raw-candle snapshot,
+    and settled-outcome history used by the ML inference workflow. It never
+    returns a price-derived direction and never falls back to a mechanical
+    YES/NO choice.
     """
 
     def __init__(
@@ -625,6 +626,19 @@ class MLDirectionSelector:
             self._log_once(record, "missing_preopen", "ML SIDE WAIT | %s no pre-open inference exists; no order will be placed.", ticker)
             return None
         if not task.done():
+            try:
+                opened = ml.pd.Timestamp.now(tz="UTC") >= ml.next_open_timestamp(ticker)
+            except Exception:  # noqa: BLE001
+                opened = True
+            if opened:
+                self.completed_preopen[ticker] = False
+                task.cancel()
+                self._log_once(
+                    record, "late_preopen",
+                    "ML SIDE FAILED | %s pre-open calculation did not complete before open; no order will be placed.",
+                    ticker,
+                )
+                return None
             self._log_once(record, "preparing", "ML SIDE WAIT | %s pre-open inference is still preparing.", ticker)
             return None
         ml = self.module()
@@ -650,10 +664,12 @@ class MLDirectionSelector:
             if target is None:
                 raise ValueError("market strike is unavailable")
             features = ml.feature_values(
-                cached["candles"], float(target), cached["forecast"],
-                ml.known_outcomes(cached["rows"]), ml.next_open_timestamp(ticker),
+                cached["candles"], float(target), ml.known_outcomes(cached["rows"]),
+                ml.next_open_timestamp(ticker),
             )
-            vector = ml.np.asarray([[float(features[name]) for name in ml.FEATURE_COLUMNS]], dtype=float)
+            vector = ml.np.asarray(
+                [[float(features[name]) for name in ml.ML_ONLY_FEATURE_COLUMNS]], dtype=float,
+            )
             probability_yes = float(cached["model"].predict_proba(vector)[0][1])
         except Exception as exc:  # noqa: BLE001
             self._log_once(record, "score_failed", "ML SIDE FAILED | %s scoring error: %s; no order will be placed.", ticker, exc)
