@@ -574,6 +574,19 @@ async def settle_or_cancel(rest: KalshiREST, record: dict[str, Any], market: Any
         return
     side = record.get("locked_side") or record.get("candidate_side")
     quantity = filled_contracts(record)
+    if quantity <= 0.004:
+        # An expired/canceled initial order with no execution is operational
+        # audit data, not a trade.  Keep it in the ledger but never let it
+        # distort win rate, P&L, streaks, or rung statistics.
+        record.update({
+            "status": "finalized_unfilled", "settled_at": now_iso(), "settlement_outcome": result,
+            "contracts": 0.0, "total_cost": 0.0, "average_entry": None,
+            "gross_payout": 0.0, "gross_profit_loss": 0.0, "kalshi_fees": 0.0,
+            "net_profit_loss": 0.0, "return_percentage": None,
+        })
+        LOG.info("FINALIZED UNFILLED | %s %s: zero contracts held; excluded from performance.",
+                 record["ticker"], result.upper())
+        return
     cost = sum(float(order.get("fill_count") or 0.0) * float(order.get("average_fill_price") or order.get("position_price") or 0.0)
                for order in orders_for_market(record))
     fees = sum(float(order.get("fees_paid") or 0.0) for order in orders_for_market(record))
@@ -704,8 +717,14 @@ def rung_performance(settled: list[dict[str, Any]]) -> dict[str, dict[str, Any]]
 
 def performance_report(state: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
     settled = sorted((record for record in state.get("markets", {}).values()
-                      if isinstance(record, dict) and record.get("status") == "finalized"),
+                      if isinstance(record, dict) and record.get("status") == "finalized"
+                      and float(record.get("contracts") or 0.0) > 0.004),
                      key=lambda record: str(record.get("settled_at") or ""))
+    unfilled = sum(1 for record in state.get("markets", {}).values()
+                   if isinstance(record, dict) and (
+                       record.get("status") == "finalized_unfilled"
+                       or (record.get("status") == "finalized" and float(record.get("contracts") or 0.0) <= 0.004)
+                   ))
     pnls = [float(record.get("net_profit_loss") or 0.0) for record in settled]
     costs = [float(record.get("total_cost") or 0.0) for record in settled]
     contracts = [float(record.get("contracts") or 0.0) for record in settled]
@@ -723,7 +742,7 @@ def performance_report(state: dict[str, Any], config: dict[str, Any]) -> dict[st
     variance = sum((value - mean) ** 2 for value in pnls) / (len(pnls) - 1) if len(pnls) > 1 else 0.0
     report = {
         "generated_at": now_iso(), "strategy": "pure_mechanical_price_average_down_v1",
-        "configuration": config, "total_markets_traded": len(settled),
+        "configuration": config, "total_markets_traded": len(settled), "unfilled_market_attempts": unfilled,
         "total_contracts_purchased": round(sum(contracts), 2), "winning_trades": wins,
         "losing_trades": losses, "win_rate": round(wins / len(settled), 6) if settled else None,
         "win_loss_ratio": round(wins / losses, 6) if losses else None,
@@ -743,7 +762,7 @@ def performance_report(state: dict[str, Any], config: dict[str, Any]) -> dict[st
         "largest_losing_trade": round(min(pnls, default=0.0), 6), "largest_winning_trade": round(max(pnls, default=0.0), 6),
         "worst_historical_drawdown": round(max(drawdowns, default=0.0), 6),
         "rung_performance": rung_performance(settled),
-        "note": "Metrics remain null until at least one finalized live market exists. No historical model or backtest is used.",
+        "note": "Only finalized records with filled contracts count as trades. No historical model or backtest is used.",
     }
     if settled:
         levels = {level: 0 for level in LADDER_LEVELS}
@@ -776,10 +795,11 @@ def log_performance_summary(report: dict[str, Any], context: str) -> None:
         "n/a" if ratio is None else f"{ratio:.2f}"
     )
     LOG.info(
-        "PERFORMANCE | %s settled=%d wins=%d losses=%d win_rate=%s win_loss_ratio=%s "
+        "PERFORMANCE | %s settled=%d unfilled=%d wins=%d losses=%d win_rate=%s win_loss_ratio=%s "
         "net=$%.4f gross=$%.4f fees=$%.4f roi=%s profit_factor=%s max_drawdown=$%.4f "
         "streaks=W%d/L%d",
-        context, report["total_markets_traded"], report["winning_trades"], report["losing_trades"],
+        context, report["total_markets_traded"], report["unfilled_market_attempts"],
+        report["winning_trades"], report["losing_trades"],
         "n/a" if report["win_rate"] is None else f"{100 * report['win_rate']:.2f}%", ratio_text,
         report["net_profit"], report["total_gross_profit"], report["total_fees"],
         "n/a" if report["return_on_capital"] is None else f"{100 * report['return_on_capital']:.2f}%",

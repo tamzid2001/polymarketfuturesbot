@@ -62,6 +62,16 @@ class MechanicalAverageDownTests(unittest.TestCase):
         self.assertEqual(report["total_markets_traded"], 0)
         self.assertEqual(tuple(LADDER_LEVELS), (0.40, 0.30, 0.20, 0.10))
 
+    def test_zero_contract_finalization_is_excluded_from_performance(self):
+        state = {"markets": {
+            "unfilled": {"status": "finalized", "contracts": 0.0, "net_profit_loss": 0.0},
+        }}
+        report = performance_report(state, validate_config(DEFAULT_CONFIG))
+        self.assertEqual(report["total_markets_traded"], 0)
+        self.assertEqual(report["unfilled_market_attempts"], 1)
+        self.assertEqual(report["winning_trades"], 0)
+        self.assertEqual(report["losing_trades"], 0)
+
     def test_report_breaks_out_profit_loss_for_each_filled_rung(self):
         def order(fill, price, fee=0.0):
             return {"fill_count": fill, "average_fill_price": price, "fees_paid": fee}
