@@ -17,7 +17,7 @@ Use **Actions → “Kalshi BTC 15m ML-Side Average Down” → Run workflow**. 
 
 ### Deployed model, coverage, and evidence
 
-The Prophet-free candidate artifact is **Actions run `29776048495`**: regularized logistic regression with isotonic probability calibration. It uses a 19,189-row settled feature ledger, split chronologically into 16,311 base-training rows and 2,878 later calibration rows. Its schema lock prevents an old artifact from being substituted. The runner records the artifact ID, training cutoff, model `p_yes`, confidence, and selected side with every ML-backed market record.
+The pinned Prophet-free artifact is **Actions run `29776048495`**: regularized logistic regression with isotonic probability calibration. It uses a 19,189-row settled feature ledger, split chronologically into 16,311 base-training rows and 2,878 later calibration rows. Its schema lock prevents an old artifact from being substituted. The runner records the artifact ID, training cutoff, model `p_yes`, confidence, and selected side with every ML-backed market record.
 
 The `confidence >= 0.50` gate has **100% valid-model-direction coverage**: every valid binary-model score has a YES or NO direction at that threshold. This is not 100% order coverage. An actual position still requires the ML-selected side's executable Kalshi ask to reach `<= $0.40`; it may then fill zero to four same-side rungs depending on market prices and liquidity.
 
