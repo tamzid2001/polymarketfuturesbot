@@ -310,7 +310,7 @@ class MechanicalAverageDownTests(unittest.TestCase):
             state = default_state()
             market = SimpleNamespace(
                 ticker="KXBTC15M-TEST", status="active", yes_ask_dollars="0.3500",
-                no_ask_dollars="0.6500", open_time=time.time() - 120,
+                no_ask_dollars="0.6500", open_time=time.time() - 5,
                 close_time="2099-07-20T00:15:00Z",
             )
             rest = FakeRest()
@@ -472,6 +472,32 @@ class MechanicalAverageDownTests(unittest.TestCase):
             return await consider_initial_entry(FakeRest(), state, market, validate_config(DEFAULT_CONFIG), dry_run=False)
 
         self.assertFalse(asyncio.run(scenario()))
+
+    def test_legacy_watcher_never_converts_to_a_new_gtc_ladder_mid_market(self):
+        class FakeRest:
+            async def balance_dollars(self):
+                return 10.0
+
+            async def create_order(self, **_kwargs):
+                raise AssertionError("A legacy watcher must not post a new mid-market ladder")
+
+        async def scenario():
+            state = default_state()
+            market = SimpleNamespace(
+                ticker="KXBTC15M-TEST-LEGACY-WATCH", status="active", yes_ask_dollars="0.70",
+                no_ask_dollars="0.30", open_time=time.time() - 60, close_time=time.time() + 840,
+            )
+            record = market_record(state, market.ticker)
+            record.update({"status": "watching", "market_open_time": market.open_time})
+            entered = await consider_initial_entry(
+                FakeRest(), state, market, validate_config(DEFAULT_CONFIG), dry_run=False, ml_side="no",
+            )
+            return entered, record
+
+        entered, record = asyncio.run(scenario())
+        self.assertFalse(entered)
+        self.assertEqual(record["status"], "prepost_window_missed")
+        self.assertEqual(record["orders"], {})
 
     def test_selected_side_at_10_cents_still_gets_the_fixed_preposted_ladder(self):
         class FakeRest:

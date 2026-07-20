@@ -1348,6 +1348,19 @@ async def consider_initial_entry(
         return False
     if ml_side not in {"yes", "no"}:
         return False
+    if not record.get("ladder_mode") and not orders_for_market(record) and not market_can_start_watcher(
+        market, config["watch_start_grace_seconds"],
+    ):
+        # A watcher persisted by the retired quote-triggered version must not
+        # be converted into a brand-new pre-posted ladder mid-market during a
+        # deployment or Actions handoff. The next fresh market gets the new
+        # four-GTC behavior from its opening instead.
+        record["status"] = "prepost_window_missed"
+        record["prepost_window_missed_at"] = now_iso()
+        LOG.warning(
+            "GTC LADDER SKIPPED | %s was not a fresh opening; refusing to pre-post a new ladder mid-market.", ticker,
+        )
+        return False
     # Quotes remain useful for heartbeat/audit output, but they do not gate
     # this mode.  Once the frozen ML side is available, every fixed rung is a
     # market-close-expiring GTC limit on that side.
