@@ -15,10 +15,12 @@ from kalshi_btc15m_average_down import (
     ladder_principal,
     performance_report,
     reconcile_orders,
+    settle_or_cancel,
     side_api_price,
     submit_ladder,
     market_is_tradeable,
-    market_is_in_initial_entry_window,
+    market_can_start_watcher,
+    market_record,
     market_asks,
     normalized_order_status,
     normalized_outcome_side,
@@ -34,7 +36,7 @@ class MechanicalAverageDownTests(unittest.TestCase):
         self.assertEqual(ladder_principal(1.0), 1.0)
         self.assertEqual(config["market_refresh_seconds"], 15.0)
         self.assertEqual(config["order_reconcile_seconds"], 5.0)
-        self.assertEqual(config["initial_entry_window_seconds"], 15.0)
+        self.assertEqual(config["watch_start_grace_seconds"], 30.0)
 
     def test_fresh_websocket_quote_supplies_both_executable_sides(self):
         feed = KalshiLiveFeed(auth=None)
@@ -152,10 +154,12 @@ class MechanicalAverageDownTests(unittest.TestCase):
             state = default_state()
             market = SimpleNamespace(
                 ticker="KXBTC15M-TEST", status="active", yes_ask_dollars="0.3500",
-                no_ask_dollars="0.6500", open_time=time.time() - 1,
+                no_ask_dollars="0.6500", open_time=time.time() - 120,
                 close_time="2099-07-20T00:15:00Z",
             )
             rest = FakeRest()
+            record = market_record(state, market.ticker)
+            record.update({"status": "watching", "market_open_time": market.open_time})
             entered = await consider_initial_entry(rest, state, market, config, dry_run=False)
             record = state["markets"]["KXBTC15M-TEST"]
             await reconcile_orders(rest, record, dry_run=False)
@@ -208,13 +212,30 @@ class MechanicalAverageDownTests(unittest.TestCase):
         expired = SimpleNamespace(status="active", close_time="2020-01-01T00:00:00Z")
         self.assertFalse(market_is_tradeable(expired))
 
+    def test_watcher_without_a_40_cent_signal_is_not_counted_as_an_unfilled_order(self):
+        class FakeRest:
+            async def cancel_order(self, _order, _dry_run):
+                raise AssertionError("A watcher with no order must not cancel anything")
+
+        async def scenario():
+            state = default_state()
+            record = market_record(state, "KXBTC15M-NO-SIGNAL")
+            record.update({"status": "watching", "market_close_time": time.time() - 1})
+            market = SimpleNamespace(status="finalized", result="yes", close_time=time.time() - 1)
+            await settle_or_cancel(FakeRest(), record, market, dry_run=False)
+            return record
+
+        record = asyncio.run(scenario())
+        self.assertEqual(record["status"], "finalized_no_signal")
+        self.assertEqual(record["contracts"], 0.0)
+
     def test_market_is_not_tradeable_before_its_open_time(self):
         pre_open = SimpleNamespace(
             status="active", open_time="2099-01-01T00:00:00Z", close_time="2099-01-01T00:15:00Z",
         )
         self.assertFalse(market_is_tradeable(pre_open))
 
-    def test_initial_entry_requires_a_known_recent_open(self):
+    def test_watcher_starts_at_open_and_an_existing_watcher_can_wait_longer(self):
         just_opened = SimpleNamespace(
             status="active", open_time=time.time() - 5,
             close_time=time.time() + 895,
@@ -224,9 +245,12 @@ class MechanicalAverageDownTests(unittest.TestCase):
             close_time=time.time() + 884,
         )
         missing_open_time = SimpleNamespace(status="active", close_time=time.time() + 895)
-        self.assertTrue(market_is_in_initial_entry_window(just_opened, 15.0))
-        self.assertFalse(market_is_in_initial_entry_window(late, 15.0))
-        self.assertFalse(market_is_in_initial_entry_window(missing_open_time, 15.0))
+        self.assertTrue(market_can_start_watcher(just_opened, 30.0))
+        self.assertTrue(market_can_start_watcher(late, 30.0))
+        self.assertFalse(market_can_start_watcher(missing_open_time, 30.0))
+        self.assertFalse(market_can_start_watcher(
+            SimpleNamespace(status="active", open_time=time.time() - 31, close_time=time.time() + 869), 30.0,
+        ))
 
 
 if __name__ == "__main__":

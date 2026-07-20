@@ -1,10 +1,11 @@
 # Polymarket Futures Bot + Kalshi BTC Bot
 
-The repository contains two continuous bots plus one separately controlled mechanical MLB runner:
+The repository contains the original futures and Prophet runners, plus two separately controlled mechanical average-down strategies:
 
 1. **Polymarket Futures Bot** (`polymarket_bot.py`) — WebSocket-driven take-profit and re-entry bot for Polymarket US Futures markets (MLB World Series 2026 focus).
 2. **Kalshi BTC 15-Min Prophet Bot** (`kalshibtc15minupordown.py`) — pre-forecasts BTC two minutes before each new Kalshi market opens with a fixed 17-minute horizon, then compares the cached p50 with the live strike immediately at the open. [Jump to docs ↓](#kalshi-btc-15-minute-prophet-bot)
-3. **Polymarket US MLB Mechanical Average-Down Bot** (`polymarket_mlb_average_down.py`) — manual-only, disabled-by-default runner for same-day MLB full-game moneylines. It takes no baseball prediction: it snapshots both team costs, waits for the first team to trade 10¢ below its own snapshot, then buys that side and posts only lower 10¢ rungs.
+3. **Kalshi BTC 15-Min Mechanical Average-Down Bot** (`kalshi_btc15m_average_down.py`) — continuous KXBTC15M-only runner with no forecast or ML. It starts a persisted two-sided watcher at each new market opening, waits as long as needed for one side to reach 40¢ or lower, then holds only that side's 40¢/30¢/20¢/10¢ economic ladder to settlement. [Jump to docs ↓](#kalshi-btc-15-minute-mechanical-average-down-runner)
+4. **Polymarket US MLB Mechanical Average-Down Bot** (`polymarket_mlb_average_down.py`) — manual-only, disabled-by-default runner for same-day MLB full-game moneylines. It takes no baseball prediction: it snapshots both team costs, waits for the first team to trade 10¢ below its own snapshot, then buys that side and posts only lower 10¢ rungs.
 
 The two continuous bots run inside GitHub Actions for up to 5 h 45 min per job before self-triggering the next run for uninterrupted 24/7 operation.
 
@@ -12,11 +13,38 @@ The mechanical MLB runner is intentionally excluded from that automatic schedule
 
 ---
 
+## Kalshi BTC 15-minute mechanical average-down runner
+
+Use **Actions → “Kalshi BTC 15m Mechanical Average Down” → Run workflow**. It is live by default, uses the persisted contract quantity (default **1 contract per rung**), and runs for 5 h 45 min before handing its state to the next runner. It monitors only `KXBTC15M`; it does not use ML, Prophet, a forecast, indicators, or an opposite-side hedge.
+
+### Exact Kalshi lifecycle
+
+1. **Start one watcher at a fresh opening.** When a KXBTC15M market opens, the runner persists a `watching` record for that ticker. A short start grace absorbs normal discovery/handoff delay, but it is not an entry deadline. If a runner first discovers an already-old market, it skips that market rather than starting a late watcher. A saved watcher continues through the next Actions handoff.
+2. **Watch both executable asks for the whole market.** The watcher keeps reading the YES and NO asks until one reaches `≤ $0.40` or the market closes. It may therefore wait much longer than 15 seconds. If neither side reaches 40¢, it submits no order and records a no-signal market.
+3. **Choose exactly one side, once.** The first qualifying update selects one side. If both qualify in the same update, the lower ask wins; an exact tie chooses YES. The watcher immediately stops; the bot does **not** submit both sides first, so there is no opposite-side order to cancel.
+4. **Fill locks the side.** Only an actual initial fill locks the market. A zero-fill protected immediate order is recorded as unfilled and releases the capital/market slot. Once YES is locked, NO is never submitted for that ticker; once NO is locked, YES is never submitted.
+5. **Place the lower same-side ladder.** After the initial fill, it posts only strictly lower limits on the locked side. A 40¢ fill produces 30¢, 20¢, and 10¢ rungs; a 39¢ fill produces 30¢, 20¢, and 10¢; a 10¢ fill creates no lower rung. It never averages up, reverses, or hedges. The default cap is four contracts per market: one contract at each rung.
+6. **Hold to settlement.** Unfilled lower limits have the market close as their expiry and are explicitly canceled when the market closes. Filled contracts remain through settlement; then the runner records payout, fees, net P&L, streaks, drawdown, and per-rung results. A closed prior market cannot block the next fresh watcher.
+
+Key persisted settings in `kalshi_btc15m_average_down_config.json` are `initial_position_size` (contracts per rung), `max_total_capital`, `max_active_markets`, and `watch_start_grace_seconds` (default 30; only for starting a watcher at a fresh open).
+
+---
+
 ## Mechanical MLB average-down runner
 
 Use **Actions → “Polymarket US MLB Mechanical Average Down” → Run workflow**. Its default is a dry run; real orders require setting `live_trading` to true in that specific manual dispatch.
 
-For every eligible MLB full-game moneyline starting that day in New York time, the runner records the first executable home and away costs. A snapshot of `$0.80` for one team and `$0.20` for the other produces entry limits of `$0.70` and `$0.10`, respectively. The first outcome that reaches its limit is locked; the bot posts further limits only at lower 10¢ prices and cancels unfilled rungs once the game starts. It excludes first-five markets, totals, spreads, props, and futures.
+For every eligible MLB full-game moneyline starting that day in New York time, the runner records the first executable home and away costs. A snapshot of `$0.80` for one team and `$0.20` for the other produces entry limits of `$0.70` and `$0.10`, respectively. It excludes first-five markets, totals, spreads, props, and futures.
+
+### Exact MLB lifecycle
+
+1. **Snapshot both teams.** Before the game starts, record the executable home and away outcome costs. The entry target for each is exactly 10¢ below its own snapshot.
+2. **Wait for the first trigger.** The runner polls the executable asks. Whichever team first reaches its target is selected; if both are first observed in the same poll, the larger discount wins, with home used only as the final tie-breaker. It does not submit an order for the other team.
+3. **Fill locks the outcome.** A filled IOC limit locks that home or away outcome. The other team is abandoned: there is no hedge, flip, reverse, prediction, or ML filter.
+4. **Average only down.** The actual initial fill becomes the starting point. The runner submits only lower same-team limits, in 10¢ steps, subject to the configured contract and capital caps. It never creates a rung at or above the actual fill.
+5. **At game start, stop orders.** It cancels every unfilled entry/ladder order and will not place another one. Filled contracts are not actively sold: they remain for the exchange's game settlement. The report is an entry-and-ladder audit, not a realized-P&L exit strategy.
+
+Example: home 80¢ / away 20¢ at baseline gives home `≤70¢` and away `≤10¢` triggers. If home reaches 70¢ first and fills, only home can receive lower 60¢/50¢/... rungs; away receives no order.
 
 Polymarket's API price is always the LONG/YES price, so buying the short/NO team at a 10¢ outcome cost is correctly submitted as a 90¢ API price. The runner stores both prices in its state and logs them on every submission.
 

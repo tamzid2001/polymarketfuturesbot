@@ -51,8 +51,8 @@ except ImportError:  # pragma: no cover - exercised only in minimal local enviro
 LOG = logging.getLogger("kalshi_btc15m_average_down")
 SERIES_TICKER = "KXBTC15M"
 LADDER_LEVELS = (0.40, 0.30, 0.20, 0.10)
-CONFIG_VERSION = 3
-STATE_VERSION = 1
+CONFIG_VERSION = 4
+STATE_VERSION = 2
 ORDER_NAMESPACE = uuid.UUID("4d85857e-4dc6-43ec-960f-0b342523bdb7")
 KALSHI_WS_URL = os.getenv(
     "KALSHI_WS_URL",
@@ -79,10 +79,10 @@ DEFAULT_CONFIG = {
     # order reconciliation if the stream is interrupted.
     "market_refresh_seconds": 15.0,
     "order_reconcile_seconds": 5.0,
-    # Initial entries are permitted only immediately after a new market opens.
-    # This prevents a long-running process from opening a fresh position late
-    # in a 15-minute contract.
-    "initial_entry_window_seconds": 15.0,
+    # This is *not* an entry window.  It is only the short allowance for
+    # observing a brand-new market and starting its watcher.  Once started,
+    # the watcher runs until the market closes or one side reaches 40c.
+    "watch_start_grace_seconds": 30.0,
     "status_log_seconds": 30.0,
 }
 
@@ -167,17 +167,18 @@ def market_is_tradeable(market: Any) -> bool:
     )
 
 
-def market_is_in_initial_entry_window(market: Any, entry_window_seconds: float) -> bool:
-    """Allow a new initial ladder only during the opening seconds of a market.
+def market_can_start_watcher(market: Any, start_grace_seconds: float) -> bool:
+    """Start a market watcher only at the market's opening, never late.
 
-    The open timestamp must be known.  If Kalshi omits it, failing closed is
-    safer than accidentally turning a late quote into a new position.
+    The watcher is allowed to continue for the whole market after it starts.
+    The small grace period absorbs normal market-discovery and handoff delay;
+    it does not limit how long the watcher may wait for a 40c trigger.
     """
     open_time = timestamp_epoch(field(market, "open_time"))
     if open_time is None or not market_is_tradeable(market):
         return False
     seconds_since_open = time.time() - open_time
-    return 0.0 <= seconds_since_open <= entry_window_seconds
+    return 0.0 <= seconds_since_open <= start_grace_seconds
 
 
 def market_result(market: Any) -> str | None:
@@ -248,10 +249,14 @@ def save_json(path: Path, payload: dict[str, Any]) -> None:
 
 def validate_config(config: dict[str, Any]) -> dict[str, Any]:
     merged = {**DEFAULT_CONFIG, **config, "format_version": CONFIG_VERSION}
+    # Version 3 used a 15-second *entry* window.  Version 4 uses a persisted
+    # whole-market watcher instead, so remove the retired setting when an old
+    # state/configuration is handed forward.
+    merged.pop("initial_entry_window_seconds", None)
     for name in (
         "initial_position_size", "max_contracts_per_market", "max_total_capital",
         "fee_reserve", "poll_seconds", "market_refresh_seconds", "order_reconcile_seconds",
-        "initial_entry_window_seconds",
+        "watch_start_grace_seconds",
         "status_log_seconds",
     ):
         value = as_float(merged.get(name))
@@ -274,7 +279,7 @@ def apply_config_overrides(config: dict[str, Any], args: argparse.Namespace) -> 
     names = (
         "initial_position_size", "max_active_markets", "max_contracts_per_market",
         "max_total_capital", "fee_reserve", "poll_seconds", "market_refresh_seconds",
-        "order_reconcile_seconds", "initial_entry_window_seconds", "status_log_seconds",
+        "order_reconcile_seconds", "watch_start_grace_seconds", "status_log_seconds",
     )
     changed = False
     updated = dict(config)
@@ -560,9 +565,6 @@ class KalshiREST:
             "order_type": "ioc_protected" if tif == "immediate_or_cancel" else "limit",
             "position_price": round(position_price, 4),
             "api_price": side_api_price(side, position_price),
-            # V2 quotes the single YES book. For a NO position this is the
-            # complementary YES-book price shown by some account views.
-            "yes_book_price": side_api_price(side, position_price),
             "expected_outcome_side": side,
             "quantity": round(quantity, 2),
             "time_in_force": tif,
@@ -611,9 +613,8 @@ class KalshiREST:
             record["fill_count"], record["remaining_count"], quantity, tif,
         )
         LOG.info(
-            "ORDER DIRECTION | %s expected=%s book_side=%s economic_price=$%.4f yes_book_price=$%.4f response_outcome=%s",
-            ticker, side.upper(), side_book_side(side).value, position_price,
-            float(record["api_price"]), observed_side or "not_returned",
+            "ORDER DIRECTION | %s expected_outcome=%s economic_price=$%.4f response_outcome=%s",
+            ticker, side.upper(), position_price, observed_side or "not_returned",
         )
         if observed_side is not None and observed_side != side:
             record["status"] = "direction_mismatch"
@@ -703,6 +704,38 @@ def market_record(state: dict[str, Any], ticker: str) -> dict[str, Any]:
     return markets[ticker]
 
 
+FINAL_RECORD_STATUSES = {"finalized", "finalized_unfilled", "finalized_no_signal"}
+
+
+def start_market_watcher(state: dict[str, Any], market: Any, config: dict[str, Any]) -> dict[str, Any] | None:
+    """Persist one whole-market watcher as soon as a new market is observed.
+
+    A saved watcher is deliberately resumed by the next Actions handoff.  A
+    ticker first discovered after its opening grace is ignored rather than
+    becoming a late fresh entry.
+    """
+    ticker = str(field(market, "ticker") or "")
+    if not ticker:
+        return None
+    existing = state.get("markets", {}).get(ticker)
+    if isinstance(existing, dict):
+        return existing if existing.get("status") == "watching" else None
+    if not market_can_start_watcher(market, config["watch_start_grace_seconds"]):
+        return None
+    record = market_record(state, ticker)
+    record.update({
+        "status": "watching",
+        "market_open_time": field(market, "open_time"),
+        "market_close_time": field(market, "close_time", "expected_expiration_time"),
+        "watch_started_at": now_iso(),
+    })
+    LOG.info(
+        "WATCH STARTED | %s watching YES and NO until the first executable ask reaches $0.40 or lower.",
+        ticker,
+    )
+    return record
+
+
 def orders_for_market(record: dict[str, Any]) -> list[dict[str, Any]]:
     return [order for order in (record.get("orders") or {}).values() if isinstance(order, dict)]
 
@@ -714,7 +747,7 @@ def filled_contracts(record: dict[str, Any]) -> float:
 def active_strategy_records(state: dict[str, Any]) -> list[dict[str, Any]]:
     active: list[dict[str, Any]] = []
     for record in state.get("markets", {}).values():
-        if not isinstance(record, dict) or record.get("status") not in {"initial_submitted", "ladder_active"}:
+        if not isinstance(record, dict) or record.get("status") not in {"watching", "initial_submitted", "ladder_active"}:
             continue
         close_time = timestamp_epoch(record.get("market_close_time"))
         if close_time is None or time.time() < close_time:
@@ -810,8 +843,25 @@ async def submit_ladder(
 async def settle_or_cancel(rest: KalshiREST, record: dict[str, Any], market: Any, dry_run: bool) -> None:
     if market_is_tradeable(market):
         return
+    prior_status = record.get("status")
     record["status"] = "closed_waiting_finalization"
     record["closed_at"] = now_iso()
+    if not record.get("candidate_side") and not orders_for_market(record):
+        result = market_result(market)
+        status = str(field(market, "status") or "").lower()
+        if result is None or status != "finalized":
+            if prior_status != "closed_waiting_finalization":
+                LOG.info("WATCH CLOSED | %s no side reached $0.40; awaiting final market status.", record["ticker"])
+            return
+        record.update({
+            "status": "finalized_no_signal", "settled_at": now_iso(), "settlement_outcome": result,
+            "contracts": 0.0, "total_cost": 0.0, "average_entry": None,
+            "gross_payout": 0.0, "gross_profit_loss": 0.0, "kalshi_fees": 0.0,
+            "net_profit_loss": 0.0, "return_percentage": None,
+        })
+        LOG.info("WATCH COMPLETE | %s settled %s with no 40c trigger; no order submitted.",
+                 record["ticker"], result.upper())
+        return
     for order in orders_for_market(record):
         await rest.cancel_order(order, dry_run)
     result = market_result(market)
@@ -855,12 +905,15 @@ async def consider_initial_entry(
     live_asks: dict[str, float | None] | None = None,
 ) -> bool:
     ticker = str(field(market, "ticker") or "")
-    if not ticker or not market_is_in_initial_entry_window(market, config["initial_entry_window_seconds"]):
+    if not ticker or not market_is_tradeable(market):
         return False
     record = state.get("markets", {}).get(ticker)
-    if isinstance(record, dict) and record.get("candidate_side"):
+    if not isinstance(record, dict):
+        record = start_market_watcher(state, market, config)
+    if not isinstance(record, dict) or record.get("status") != "watching":
         return False
-    if len(active_strategy_records(state)) >= config["max_active_markets"]:
+    other_active = [candidate for candidate in active_strategy_records(state) if candidate is not record]
+    if len(other_active) >= config["max_active_markets"]:
         return False
     choice = choose_entry_side(market_asks(market, live_asks))
     if choice is None:
@@ -875,7 +928,6 @@ async def consider_initial_entry(
     if balance is None or balance + 1e-9 < reserve + config["fee_reserve"]:
         LOG.warning("SKIP BALANCE | %s need >= $%.2f including fee reserve; available=%s", ticker, reserve + config["fee_reserve"], balance)
         return False
-    record = market_record(state, ticker)
     record.update({
         "candidate_side": side, "quantity": quantity, "status": "initial_submitted",
         "initial_ask": round(ask, 4), "initial_reason": f"{side.upper()} ask reached <= $0.40",
@@ -896,6 +948,7 @@ async def consider_initial_entry(
         "Market discovered below 40c; protected immediate-or-cancel order."
         if below_threshold else "Ask reached the 40c initial threshold."
     )
+    LOG.info("WATCH TRIGGERED | %s %s selected; stopped watching the other side.", ticker, side.upper())
     return True
 
 
@@ -1074,11 +1127,14 @@ async def log_heartbeat(
 ) -> None:
     """Emit enough live context to audit decisions without 2-second log spam."""
     balance = await rest.balance_dollars()
+    active_records = active_strategy_records(state)
+    watching_count = sum(record.get("status") == "watching" for record in active_records)
+    active_ladders = sum(record.get("status") in {"initial_submitted", "ladder_active"} for record in active_records)
     LOG.info(
-        "HEARTBEAT | mode=%s elapsed=%.0fs quotes=%d tracked=%d active_positions=%d "
+        "HEARTBEAT | mode=%s elapsed=%.0fs quotes=%d tracked=%d watching=%d active_ladders=%d "
         "reserved=$%.4f cap=$%.4f balance=%s stream=%s stream_messages=%d fallback_check=%.1fs",
         "DRY_RUN" if dry_run else "LIVE", elapsed_seconds, len(active_markets),
-        len(state.get("markets", {})), len(active_strategy_records(state)),
+        len(state.get("markets", {})), watching_count, active_ladders,
         reserved_principal(state), config["max_total_capital"],
         "unknown" if balance is None else f"${balance:.4f}",
         "connected" if feed and feed.connected else "fallback",
@@ -1089,16 +1145,25 @@ async def log_heartbeat(
         live_asks = feed.executable_asks(ticker) if feed else None
         asks = market_asks(market, live_asks)
         choice = choose_entry_side(asks)
+        record = state.get("markets", {}).get(ticker)
+        watch_state = str(record.get("status")) if isinstance(record, dict) else "not_started"
         LOG.info(
-            "QUOTE | %s source=%s yes_ask=%s no_ask=%s entry_signal=%s close=%s",
+            "QUOTE | %s source=%s yes_ask=%s no_ask=%s watcher=%s price_condition=%s close=%s",
             ticker or "?", "WS" if live_asks is not None else "REST_FALLBACK",
             "none" if asks["yes"] is None else f"${asks['yes']:.4f}",
             "none" if asks["no"] is None else f"${asks['no']:.4f}",
+            watch_state,
             "none" if choice is None else f"{choice[0].upper()} @ ${choice[1]:.4f}",
             field(market, "close_time", "expected_expiration_time") or "unknown",
         )
     for record in state.get("markets", {}).values():
-        if not isinstance(record, dict) or record.get("status") == "finalized":
+        if not isinstance(record, dict) or record.get("status") in FINAL_RECORD_STATUSES:
+            continue
+        if record.get("status") == "watching":
+            LOG.info(
+                "WATCH | %s active; no side selected until the first executable ask reaches $0.40 or lower.",
+                record.get("ticker", "?"),
+            )
             continue
         LOG.info(
             "POSITION | %s status=%s side=%s filled=%.2f submitted=%.2f",
@@ -1122,7 +1187,7 @@ async def cancel_open_mechanical_orders(rest: KalshiREST, state: dict[str, Any],
     """Cancel only the known unfilled rungs in the persisted mechanical ledger."""
     canceled = 0
     for record in state.get("markets", {}).values():
-        if not isinstance(record, dict) or record.get("status") in {"finalized", "finalized_unfilled"}:
+        if not isinstance(record, dict) or record.get("status") in FINAL_RECORD_STATUSES:
             continue
         for order in orders_for_market(record):
             if float(order.get("remaining_count") or 0.0) <= 0.004:
@@ -1149,7 +1214,7 @@ async def run(args: argparse.Namespace) -> int:
         raise SystemExit("Refusing live orders: pass both --submit and --allow-live with DRY_RUN=false")
     state_path = args.state_file.expanduser()
     state = load_json(state_path, default_state())
-    state.setdefault("format_version", STATE_VERSION)
+    state["format_version"] = STATE_VERSION
     state.setdefault("markets", {})
     api_key = os.getenv("KALSHI_API_KEY_ID", "")
     pem_path = Path(os.getenv("KALSHI_PEM_PATH", "kalshi_private_key.pem"))
@@ -1193,7 +1258,7 @@ async def run(args: argparse.Namespace) -> int:
 
             tracked_tickers = [
                 str(ticker) for ticker, record in state["markets"].items()
-                if isinstance(record, dict) and record.get("status") not in {"finalized", "finalized_unfilled"}
+                if isinstance(record, dict) and record.get("status") not in FINAL_RECORD_STATUSES
             ]
             feed.set_tickers(tracked_tickers + [str(field(market, "ticker") or "") for market in active_markets])
 
@@ -1203,7 +1268,7 @@ async def run(args: argparse.Namespace) -> int:
             private_update = feed.private_update_count != last_private_update_count
             if private_update or monotonic_now - last_order_reconcile_at >= config["order_reconcile_seconds"]:
                 for ticker, record in list(state["markets"].items()):
-                    if not isinstance(record, dict) or record.get("status") in {"finalized", "finalized_unfilled"}:
+                    if not isinstance(record, dict) or record.get("status") in FINAL_RECORD_STATUSES:
                         continue
                     market = await rest.get_market(ticker)
                     if market is None:
@@ -1268,7 +1333,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--poll-seconds", type=float)
     parser.add_argument("--market-refresh-seconds", type=float)
     parser.add_argument("--order-reconcile-seconds", type=float)
-    parser.add_argument("--initial-entry-window-seconds", type=float)
+    parser.add_argument("--watch-start-grace-seconds", type=float)
     parser.add_argument("--status-log-seconds", type=float)
     return parser
 
