@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 from kalshi_btc15m_average_down import (
     DEFAULT_CONFIG,
+    KalshiLiveFeed,
     LADDER_LEVELS,
     active_strategy_records,
     classify_submission,
@@ -16,6 +17,7 @@ from kalshi_btc15m_average_down import (
     side_api_price,
     submit_ladder,
     market_is_tradeable,
+    market_asks,
     normalized_order_status,
     validate_config,
 )
@@ -27,6 +29,20 @@ class MechanicalAverageDownTests(unittest.TestCase):
         self.assertEqual(config["initial_position_size"], 1.0)
         self.assertEqual(config["max_contracts_per_market"], 4.0)
         self.assertEqual(ladder_principal(1.0), 1.0)
+        self.assertEqual(config["market_refresh_seconds"], 15.0)
+        self.assertEqual(config["order_reconcile_seconds"], 5.0)
+
+    def test_fresh_websocket_quote_supplies_both_executable_sides(self):
+        feed = KalshiLiveFeed(auth=None)
+        feed._handle(
+            '{"type":"ticker","msg":{"market_ticker":"KXBTC15M-TEST",'
+            '"yes_bid_dollars":"0.7200","yes_ask_dollars":"0.7500"}}'
+        )
+        self.assertEqual(feed.executable_asks("KXBTC15M-TEST"), {"yes": 0.75, "no": 0.28})
+
+    def test_live_quote_overrides_discovery_snapshot(self):
+        market = SimpleNamespace(yes_ask_dollars="0.70", no_ask_dollars="0.30")
+        self.assertEqual(market_asks(market, {"yes": 0.39, "no": 0.61}), {"yes": 0.39, "no": 0.61})
 
     def test_only_price_selects_entry_side(self):
         self.assertEqual(choose_entry_side({"yes": 0.40, "no": 0.41}), ("yes", 0.40))

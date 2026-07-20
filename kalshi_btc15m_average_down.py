@@ -24,12 +24,19 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
+
+try:  # Installed by the dedicated live-runner requirements file.
+    import aiohttp
+except ImportError:  # pragma: no cover - keeps pure helper tests dependency-light
+    aiohttp = None
 
 try:  # Keeps the pure helper tests importable before the live SDK is installed.
     from kalshi_python_async import (
         BookSide,
         Configuration,
         EventsApi,
+        KalshiAuth,
         KalshiClient,
         MarketApi,
         OrdersApi,
@@ -37,16 +44,23 @@ try:  # Keeps the pure helper tests importable before the live SDK is installed.
         SelfTradePreventionType,
     )
 except ImportError:  # pragma: no cover - exercised only in minimal local environments
-    BookSide = Configuration = EventsApi = KalshiClient = MarketApi = OrdersApi = PortfolioApi = None
+    BookSide = Configuration = EventsApi = KalshiAuth = KalshiClient = MarketApi = OrdersApi = PortfolioApi = None
     SelfTradePreventionType = None
 
 
 LOG = logging.getLogger("kalshi_btc15m_average_down")
 SERIES_TICKER = "KXBTC15M"
 LADDER_LEVELS = (0.40, 0.30, 0.20, 0.10)
-CONFIG_VERSION = 2
+CONFIG_VERSION = 3
 STATE_VERSION = 1
 ORDER_NAMESPACE = uuid.UUID("4d85857e-4dc6-43ec-960f-0b342523bdb7")
+KALSHI_WS_URL = os.getenv(
+    "KALSHI_WS_URL",
+    "wss://external-api-ws.demo.kalshi.co/trade-api/ws/v2"
+    if os.getenv("KALSHI_DEMO", "false").lower() in {"1", "true", "yes"}
+    else "wss://external-api-ws.kalshi.com/trade-api/ws/v2",
+)
+QUOTE_STALE_SECONDS = 20.0
 
 DEFAULT_CONFIG = {
     "format_version": CONFIG_VERSION,
@@ -58,8 +72,13 @@ DEFAULT_CONFIG = {
     # available balance separately with fee_reserve.
     "max_total_capital": 1.00,
     "fee_reserve": 0.05,
+    # Upper bound on sleep while waiting for the WebSocket; it is not a REST
+    # quote-poll interval. Quote changes wake the runner immediately.
     "poll_seconds": 2.0,
-    # The loop still polls at poll_seconds; this only limits diagnostic logs.
+    # REST is retained only for market discovery, settlement, and authoritative
+    # order reconciliation if the stream is interrupted.
+    "market_refresh_seconds": 15.0,
+    "order_reconcile_seconds": 5.0,
     "status_log_seconds": 30.0,
 }
 
@@ -157,8 +176,13 @@ def normalized_order_status(raw: Any) -> str:
     return status.rsplit(".", 1)[-1]
 
 
-def market_asks(market: Any) -> dict[str, float | None]:
+def market_asks(market: Any, live_asks: dict[str, float | None] | None = None) -> dict[str, float | None]:
     """Read executable position asks as dollars, accepting API migrations."""
+    if live_asks is not None:
+        return {
+            side: value if (value := as_float(live_asks.get(side))) is not None and 0.0 < value < 1.0 else None
+            for side in ("yes", "no")
+        }
     result: dict[str, float | None] = {}
     for side in ("yes", "no"):
         value = as_float(field(market, f"{side}_ask_dollars", f"{side}_ask"))
@@ -202,7 +226,8 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
     merged = {**DEFAULT_CONFIG, **config, "format_version": CONFIG_VERSION}
     for name in (
         "initial_position_size", "max_contracts_per_market", "max_total_capital",
-        "fee_reserve", "poll_seconds", "status_log_seconds",
+        "fee_reserve", "poll_seconds", "market_refresh_seconds", "order_reconcile_seconds",
+        "status_log_seconds",
     ):
         value = as_float(merged.get(name))
         if value is None or value <= 0:
@@ -223,7 +248,8 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
 def apply_config_overrides(config: dict[str, Any], args: argparse.Namespace) -> tuple[dict[str, Any], bool]:
     names = (
         "initial_position_size", "max_active_markets", "max_contracts_per_market",
-        "max_total_capital", "fee_reserve", "poll_seconds", "status_log_seconds",
+        "max_total_capital", "fee_reserve", "poll_seconds", "market_refresh_seconds",
+        "order_reconcile_seconds", "status_log_seconds",
     )
     changed = False
     updated = dict(config)
@@ -284,6 +310,159 @@ def classify_submission(fill_count: float, remaining_count: float, quantity: flo
 
 
 @dataclass
+class KalshiLiveFeed:
+    """Authenticated Kalshi stream used for quote-triggered decisions.
+
+    REST remains the source of truth for discovery, order status, and
+    settlement.  The stream prevents those periodic checks from becoming the
+    quote trigger: a ticker update wakes the strategy immediately.
+    """
+
+    auth: Any
+    url: str = KALSHI_WS_URL
+
+    def __post_init__(self) -> None:
+        self.path = urlparse(self.url).path or "/trade-api/ws/v2"
+        self.desired_tickers: set[str] = set()
+        self.subscribed_tickers: set[str] = set()
+        self.quotes: dict[str, dict[str, Any]] = {}
+        self.connected = False
+        self.message_count = 0
+        self.update_count = 0
+        self.private_update_count = 0
+        self._command_id = 0
+        self._wake = asyncio.Event()
+
+    def set_tickers(self, tickers: list[str] | set[str] | tuple[str, ...]) -> None:
+        desired = {str(ticker) for ticker in tickers if ticker}
+        if desired != self.desired_tickers:
+            self.desired_tickers = desired
+            self._wake.set()
+
+    def executable_asks(self, ticker: str) -> dict[str, float | None] | None:
+        """Return current YES/NO executable asks from a fresh ticker update."""
+        quote = self.quotes.get(ticker)
+        if not quote or time.monotonic() - float(quote.get("received_monotonic") or 0.0) > QUOTE_STALE_SECONDS:
+            return None
+        yes_ask = as_float(quote.get("yes_ask"))
+        yes_bid = as_float(quote.get("yes_bid"))
+        if yes_ask is None or yes_bid is None:
+            return None
+        no_ask = 1.0 - yes_bid
+        if not (0.0 < yes_ask < 1.0 and 0.0 < no_ask < 1.0):
+            return None
+        return {"yes": round(yes_ask, 4), "no": round(no_ask, 4)}
+
+    async def wait_for_update(self, timeout: float, observed_update_count: int) -> int:
+        """Return the latest update sequence without losing a just-arrived event."""
+        if self.update_count != observed_update_count:
+            return self.update_count
+        self._wake.clear()
+        # A message can arrive between the check above and clear(). Re-check
+        # the monotonically increasing sequence so that event is not lost.
+        if self.update_count != observed_update_count:
+            return self.update_count
+        try:
+            await asyncio.wait_for(self._wake.wait(), timeout=max(0.01, timeout))
+        except asyncio.TimeoutError:
+            pass
+        return self.update_count
+
+    async def _subscribe_private(self, ws: Any) -> None:
+        self._command_id += 1
+        await ws.send_json({
+            "id": self._command_id,
+            "cmd": "subscribe",
+            "params": {"channels": ["fill", "user_orders"]},
+        })
+
+    async def _subscribe_tickers(self, ws: Any, tickers: set[str]) -> None:
+        if not tickers:
+            return
+        self._command_id += 1
+        await ws.send_json({
+            "id": self._command_id,
+            "cmd": "subscribe",
+            "params": {"channels": ["ticker"], "market_tickers": sorted(tickers)},
+        })
+        self.subscribed_tickers.update(tickers)
+        LOG.info("WS SUBSCRIBE | tickers=%s", ",".join(sorted(tickers)))
+
+    async def _sync_subscriptions(self, ws: Any) -> None:
+        missing = self.desired_tickers - self.subscribed_tickers
+        if missing:
+            await self._subscribe_tickers(ws, missing)
+
+    def _handle(self, raw: str) -> None:
+        try:
+            payload = json.loads(raw)
+        except (TypeError, ValueError):
+            return
+        self.message_count += 1
+        message_type = str(payload.get("type") or "").lower()
+        if message_type == "error":
+            LOG.warning("WS ERROR | %s", payload.get("msg"))
+            return
+        if message_type in {"fill", "user_orders"}:
+            self.update_count += 1
+            self.private_update_count += 1
+            self._wake.set()
+            return
+        if message_type != "ticker":
+            return
+        message = payload.get("msg") or {}
+        ticker = str(message.get("market_ticker") or message.get("ticker") or "")
+        if not ticker:
+            return
+        quote = self.quotes.setdefault(ticker, {})
+        yes_bid = as_float(message.get("yes_bid_dollars", message.get("yes_bid")))
+        yes_ask = as_float(message.get("yes_ask_dollars", message.get("yes_ask")))
+        if yes_bid is not None:
+            quote["yes_bid"] = yes_bid
+        if yes_ask is not None:
+            quote["yes_ask"] = yes_ask
+        quote["received_monotonic"] = time.monotonic()
+        self.update_count += 1
+        self._wake.set()
+
+    async def _session_loop(self, ws: Any) -> None:
+        await self._subscribe_private(ws)
+        while True:
+            await self._sync_subscriptions(ws)
+            try:
+                message = await ws.receive(timeout=1.0)
+            except asyncio.TimeoutError:
+                continue
+            if message.type == aiohttp.WSMsgType.TEXT:
+                self._handle(message.data)
+            elif message.type in {aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSING, aiohttp.WSMsgType.ERROR}:
+                return
+
+    async def run(self) -> None:
+        if aiohttp is None:
+            LOG.warning("WS UNAVAILABLE | aiohttp is not installed; using REST fallback checks.")
+            return
+        while True:
+            try:
+                headers = self.auth.create_auth_headers("GET", self.path)
+                async with aiohttp.ClientSession() as session:
+                    async with session.ws_connect(self.url, headers=headers, heartbeat=10) as ws:
+                        self.connected = True
+                        self.subscribed_tickers.clear()
+                        LOG.info("WS CONNECTED | %s", self.url)
+                        await self._session_loop(ws)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                LOG.warning("WS DISCONNECTED | %s", exc)
+            finally:
+                self.connected = False
+                self.subscribed_tickers.clear()
+            LOG.info("WS RECONNECT | retrying in 5s")
+            await asyncio.sleep(5)
+
+
+@dataclass
 class KalshiREST:
     """Minimal Kalshi V2 client.  It contains no strategy decision code."""
 
@@ -292,7 +471,7 @@ class KalshiREST:
     demo: bool = False
 
     def __post_init__(self) -> None:
-        if KalshiClient is None:
+        if KalshiClient is None or KalshiAuth is None:
             raise RuntimeError("Install requirements_kalshi_average_down.txt before running")
         pem = self.pem_path.read_text(encoding="utf-8")
         base_url = "https://demo-api.kalshi.co/trade-api/v2" if self.demo else "https://api.elections.kalshi.com/trade-api/v2"
@@ -300,6 +479,7 @@ class KalshiREST:
         configuration.api_key_id = self.api_key_id
         configuration.private_key_pem = pem
         self.client = KalshiClient(configuration)
+        self.auth = KalshiAuth(self.api_key_id, pem)
         self.portfolio = PortfolioApi(self.client)
         self.events = EventsApi(self.client)
         self.markets = MarketApi(self.client)
@@ -606,6 +786,7 @@ async def settle_or_cancel(rest: KalshiREST, record: dict[str, Any], market: Any
 
 async def consider_initial_entry(
     rest: KalshiREST, state: dict[str, Any], market: Any, config: dict[str, Any], dry_run: bool,
+    live_asks: dict[str, float | None] | None = None,
 ) -> bool:
     ticker = str(field(market, "ticker") or "")
     if not ticker or not market_is_tradeable(market):
@@ -615,7 +796,7 @@ async def consider_initial_entry(
         return False
     if len(active_strategy_records(state)) >= config["max_active_markets"]:
         return False
-    choice = choose_entry_side(market_asks(market))
+    choice = choose_entry_side(market_asks(market, live_asks))
     if choice is None:
         return False
     side, ask = choice
@@ -823,23 +1004,28 @@ async def log_heartbeat(
     config: dict[str, Any],
     dry_run: bool,
     elapsed_seconds: float,
+    feed: KalshiLiveFeed | None = None,
 ) -> None:
     """Emit enough live context to audit decisions without 2-second log spam."""
     balance = await rest.balance_dollars()
     LOG.info(
         "HEARTBEAT | mode=%s elapsed=%.0fs quotes=%d tracked=%d active_positions=%d "
-        "reserved=$%.4f cap=$%.4f balance=%s poll=%.1fs",
+        "reserved=$%.4f cap=$%.4f balance=%s stream=%s stream_messages=%d fallback_check=%.1fs",
         "DRY_RUN" if dry_run else "LIVE", elapsed_seconds, len(active_markets),
         len(state.get("markets", {})), len(active_strategy_records(state)),
         reserved_principal(state), config["max_total_capital"],
-        "unknown" if balance is None else f"${balance:.4f}", config["poll_seconds"],
+        "unknown" if balance is None else f"${balance:.4f}",
+        "connected" if feed and feed.connected else "fallback",
+        0 if feed is None else feed.message_count, config["poll_seconds"],
     )
     for market in active_markets:
-        asks = market_asks(market)
+        ticker = str(field(market, "ticker") or "")
+        live_asks = feed.executable_asks(ticker) if feed else None
+        asks = market_asks(market, live_asks)
         choice = choose_entry_side(asks)
         LOG.info(
-            "QUOTE | %s yes_ask=%s no_ask=%s entry_signal=%s close=%s",
-            field(market, "ticker") or "?",
+            "QUOTE | %s source=%s yes_ask=%s no_ask=%s entry_signal=%s close=%s",
+            ticker or "?", "WS" if live_asks is not None else "REST_FALLBACK",
             "none" if asks["yes"] is None else f"${asks['yes']:.4f}",
             "none" if asks["no"] is None else f"${asks['no']:.4f}",
             "none" if choice is None else f"{choice[0].upper()} @ ${choice[1]:.4f}",
@@ -885,9 +1071,16 @@ async def run(args: argparse.Namespace) -> int:
     if not api_key or not pem_path.exists():
         raise SystemExit("KALSHI_API_KEY_ID and KALSHI_PEM_PATH are required")
     rest = KalshiREST(api_key, pem_path, os.getenv("KALSHI_DEMO", "false").lower() in {"1", "true", "yes"})
+    feed = KalshiLiveFeed(rest.auth)
+    feed_task = asyncio.create_task(feed.run(), name="kalshi-average-down-ws")
     started_at = asyncio.get_running_loop().time()
     deadline = started_at + args.run_seconds
     last_heartbeat_at = float("-inf")
+    last_market_refresh_at = float("-inf")
+    last_order_reconcile_at = float("-inf")
+    last_feed_update_count = feed.update_count
+    last_private_update_count = 0
+    active_markets: list[Any] = []
     LOG.info(
         "STARTUP | mode=%s run_seconds=%.0f quantity_per_rung=%.2f ladder=%s capital_cap=$%.4f",
         "DRY_RUN" if dry_run else "LIVE", args.run_seconds, config["initial_position_size"],
@@ -896,30 +1089,64 @@ async def run(args: argparse.Namespace) -> int:
     log_performance_summary(performance_report(state, config), "startup")
     try:
         while True:
-            # Reconcile every known market before considering fresh entries.
-            for ticker, record in list(state["markets"].items()):
-                if not isinstance(record, dict) or record.get("status") == "finalized":
-                    continue
-                market = await rest.get_market(ticker)
-                if market is None:
-                    continue
-                await reconcile_orders(rest, record, dry_run)
-                await settle_or_cancel(rest, record, market, dry_run)
-                if market_is_tradeable(market):
-                    await submit_ladder(rest, record, market, config, dry_run)
-            active_markets = await rest.active_markets()
+            monotonic_now = asyncio.get_running_loop().time()
+            # Discover the current KXBTC15M window periodically.  Once known,
+            # the authenticated ticker stream—not REST polling—is the entry
+            # trigger for every quote change.
+            if monotonic_now - last_market_refresh_at >= config["market_refresh_seconds"]:
+                active_markets = await rest.active_markets()
+                last_market_refresh_at = monotonic_now
+
+            tracked_tickers = [
+                str(ticker) for ticker, record in state["markets"].items()
+                if isinstance(record, dict) and record.get("status") not in {"finalized", "finalized_unfilled"}
+            ]
+            feed.set_tickers(tracked_tickers + [str(field(market, "ticker") or "") for market in active_markets])
+
+            # A private fill/order update gets an immediate authoritative REST
+            # reconciliation.  The interval is only a recovery path when a
+            # stream message was missed or the connection was interrupted.
+            private_update = feed.private_update_count != last_private_update_count
+            if private_update or monotonic_now - last_order_reconcile_at >= config["order_reconcile_seconds"]:
+                for ticker, record in list(state["markets"].items()):
+                    if not isinstance(record, dict) or record.get("status") in {"finalized", "finalized_unfilled"}:
+                        continue
+                    market = await rest.get_market(ticker)
+                    if market is None:
+                        continue
+                    await reconcile_orders(rest, record, dry_run)
+                    await settle_or_cancel(rest, record, market, dry_run)
+                    if market_is_tradeable(market):
+                        await submit_ladder(rest, record, market, config, dry_run)
+                last_order_reconcile_at = monotonic_now
+                last_private_update_count = feed.private_update_count
+
             for market in active_markets:
-                await consider_initial_entry(rest, state, market, config, dry_run)
+                ticker = str(field(market, "ticker") or "")
+                await consider_initial_entry(
+                    rest, state, market, config, dry_run,
+                    live_asks=feed.executable_asks(ticker),
+                )
             monotonic_now = asyncio.get_running_loop().time()
             if monotonic_now - last_heartbeat_at >= config["status_log_seconds"]:
-                await log_heartbeat(rest, state, active_markets, config, dry_run, monotonic_now - started_at)
+                await log_heartbeat(rest, state, active_markets, config, dry_run, monotonic_now - started_at, feed)
                 last_heartbeat_at = monotonic_now
             save_json(state_path, state)
             save_json(args.report.expanduser(), performance_report(state, config))
             if monotonic_now >= deadline:
                 break
-            await asyncio.sleep(config["poll_seconds"])
+            next_due = min(
+                deadline - monotonic_now,
+                config["market_refresh_seconds"] - (monotonic_now - last_market_refresh_at),
+                config["order_reconcile_seconds"] - (monotonic_now - last_order_reconcile_at),
+                config["status_log_seconds"] - (monotonic_now - last_heartbeat_at),
+            )
+            last_feed_update_count = await feed.wait_for_update(
+                min(config["poll_seconds"], max(0.01, next_due)), last_feed_update_count,
+            )
     finally:
+        feed_task.cancel()
+        await asyncio.gather(feed_task, return_exceptions=True)
         save_json(state_path, state)
         final_report = performance_report(state, config)
         save_json(args.report.expanduser(), final_report)
@@ -944,6 +1171,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-total-capital", type=float)
     parser.add_argument("--fee-reserve", type=float)
     parser.add_argument("--poll-seconds", type=float)
+    parser.add_argument("--market-refresh-seconds", type=float)
+    parser.add_argument("--order-reconcile-seconds", type=float)
     parser.add_argument("--status-log-seconds", type=float)
     return parser
 

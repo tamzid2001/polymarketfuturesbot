@@ -1,11 +1,13 @@
 name: Kalshi BTC 15m Mechanical Average Down
 
-# Scheduled runs trade only KXBTC15M and use the last committed configuration.
+# This is a continuous handoff chain: each runner owns the mechanical BTC
+# strategy for 5h45m, persists its state/configuration, then queues its
+# successor. The six-hour cron is only a restart safety net if a handoff fails.
 # A manual run can update the configuration; blank numeric inputs preserve the
 # prior persisted setting for all later scheduled and manual runs.
 on:
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "11 */6 * * *"
   workflow_dispatch:
     inputs:
       live_trading:
@@ -45,7 +47,8 @@ jobs:
   trade:
     runs-on: ubuntu-latest
     environment: "Kalshi"
-    timeout-minutes: 20
+    # The trading process exits at 5h45m. This ceiling handles a hung runner.
+    timeout-minutes: 370
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -72,7 +75,7 @@ jobs:
           printf '%s\n' "$KALSHI_PRIVATE_KEY" > kalshi_private_key.pem
           chmod 600 kalshi_private_key.pem
 
-      - name: Run BTC 15-minute average-down loop
+      - name: Run continuous BTC 15-minute average-down loop
         env:
           KALSHI_API_KEY_ID: ${{ secrets.KALSHI_PROD_API_KEY }}
           KALSHI_PEM_PATH: kalshi_private_key.pem
@@ -87,7 +90,7 @@ jobs:
           args=(--config kalshi_btc15m_average_down_config.json
                 --state-file kalshi_btc15m_average_down_state.json
                 --report kalshi_btc15m_average_down_report.json
-                --persist-config --run-seconds 840)
+                --persist-config --run-seconds 20700)
           [ -z "$INITIAL_POSITION_SIZE" ] || args+=(--initial-position-size "$INITIAL_POSITION_SIZE")
           [ -z "$MAX_ACTIVE_MARKETS" ] || args+=(--max-active-markets "$MAX_ACTIVE_MARKETS")
           [ -z "$MAX_CONTRACTS_PER_MARKET" ] || args+=(--max-contracts-per-market "$MAX_CONTRACTS_PER_MARKET")
@@ -110,6 +113,25 @@ jobs:
           git diff-index --quiet HEAD || \
             (git commit -m "chore: record BTC average-down state [skip ci]" && \
              git pull --rebase --autostash origin main && git push)
+
+      - name: Queue the next 5h45m live handoff
+        # A requested dry run remains a one-off safety check. Scheduled and
+        # explicitly live runs hand off as live runs, using the configuration
+        # just committed above (including any manual share-size update).
+        if: success() && (github.event_name == 'schedule' || inputs.live_trading == true)
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "HANDOFF WARNING | GH_PAT is unavailable; six-hour cron remains the restart fallback."
+            exit 0
+          fi
+          gh workflow run kalshi_btc15m_average_down.yml \
+            --repo "$GITHUB_REPOSITORY" \
+            --ref main \
+            -f live_trading=true
+          echo "HANDOFF QUEUED | next live 5h45m runner uses the persisted configuration."
 
       - name: Upload execution audit artifact
         if: always()
