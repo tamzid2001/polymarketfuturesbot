@@ -51,6 +51,8 @@ class MechanicalMlbAverageDownTests(unittest.TestCase):
     def test_binary_bbo_converts_short_ask_and_inverts_api_price(self):
         asks = executable_outcome_asks({"bestAsk": {"value": "0.80"}, "bestBid": {"value": "0.79"}})
         self.assertEqual(asks, {"long": 0.8, "short": 0.21})
+        wrapped = executable_outcome_asks({"marketData": {"bestAsk": {"value": "0.525"}, "bestBid": {"value": "0.52"}}})
+        self.assertEqual(wrapped, {"long": 0.525, "short": 0.48})
         self.assertEqual(api_price_for_outcome("long", 0.70), 0.70)
         self.assertEqual(api_price_for_outcome("short", 0.10), 0.90)
 

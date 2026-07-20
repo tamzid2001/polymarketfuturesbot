@@ -131,8 +131,11 @@ def api_price_for_outcome(outcome: str, outcome_cost: float) -> float:
 
 def executable_outcome_asks(bbo: Any) -> dict[str, float | None]:
     """LONG ask is direct; SHORT ask is 1 - LONG bid for the binary market."""
-    long_ask = price_amount(field(bbo, "bestAsk", "best_ask"))
-    long_bid = price_amount(field(bbo, "bestBid", "best_bid"))
+    # The public SDK currently wraps the BBO payload in ``marketData`` while
+    # the documented inner object exposes bestAsk/bestBid.
+    payload = field(bbo, "marketData", "market_data") or bbo
+    long_ask = price_amount(field(payload, "bestAsk", "best_ask"))
+    long_bid = price_amount(field(payload, "bestBid", "best_bid"))
     short_ask = round(1.0 - long_bid, 8) if long_bid is not None else None
     return {"long": long_ask, "short": short_ask}
 
