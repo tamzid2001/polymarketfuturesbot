@@ -1,9 +1,8 @@
-"""Train and serialize the ML pipeline used by ``kalshi_ml_inference_live.py``.
+"""Train and serialize the ML-only pipeline used by ``kalshi_ml_inference_live.py``.
 
-The input may be the historical ``prophet_ml_backtest_rows.csv`` artifact, but
-the production schema deliberately selects only candle, strike, clock, and
-previously-settled-outcome fields. It does not use the artifact's Prophet
-columns. Only labels settled before the requested cutoff are included.
+The production schema contains only BTC candle, strike, clock, and
+previously-settled-outcome fields. Only labels settled before the requested
+cutoff are included.
 """
 
 from __future__ import annotations
@@ -52,7 +51,7 @@ def read_training_rows(path: Path, as_of: pd.Timestamp | None) -> pd.DataFrame:
     if missing:
         raise ValueError(f"Input is missing required columns: {', '.join(sorted(missing))}")
     rows = rows.copy()
-    rows["settlement_timestamp"] = pd.to_datetime(rows["settlement_ts"], utc=True, errors="coerce")
+    rows["settlement_timestamp"] = pd.to_datetime(rows["settlement_ts"], utc=True, errors="coerce", format="mixed")
     rows["actual_yes"] = pd.to_numeric(rows["actual_yes"], errors="coerce")
     for name in ML_ONLY_FEATURE_COLUMNS:
         rows[name] = pd.to_numeric(rows[name], errors="coerce")

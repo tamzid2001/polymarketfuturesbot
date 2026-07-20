@@ -65,8 +65,8 @@ def load_rows(path: Path) -> pd.DataFrame:
     if missing:
         raise ValueError(f"Input is missing required columns: {', '.join(sorted(missing))}")
     rows = rows.copy()
-    rows["forecast_timestamp"] = pd.to_datetime(rows["forecast_at"], utc=True, errors="coerce")
-    rows["settlement_timestamp"] = pd.to_datetime(rows["settlement_ts"], utc=True, errors="coerce")
+    rows["forecast_timestamp"] = pd.to_datetime(rows["forecast_at"], utc=True, errors="coerce", format="mixed")
+    rows["settlement_timestamp"] = pd.to_datetime(rows["settlement_ts"], utc=True, errors="coerce", format="mixed")
     rows["actual_yes"] = pd.to_numeric(rows["actual_yes"], errors="coerce")
     for name in ML_ONLY_FEATURE_COLUMNS:
         rows[name] = pd.to_numeric(rows[name], errors="coerce")

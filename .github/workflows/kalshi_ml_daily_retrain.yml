@@ -1,0 +1,179 @@
+name: Kalshi BTC 15m ML-Only Daily Retrain
+
+# The live execution runner reads kalshi_ml_model_registry.json at each 5h45m
+# handoff.  This job updates that registry only after it has refreshed the
+# ML-only ledger, completed chronological validation, and stored the model
+# bundle as an Actions artifact.
+on:
+  schedule:
+    # Daily instead of every six hours: the pre-registered cadence study found
+    # no meaningful directional benefit from the extra refits.
+    - cron: "32 0 * * *"
+  workflow_dispatch:
+    inputs:
+      publish_model:
+        description: "Make this validated candidate active for the next live-runner handoff. Scheduled runs publish automatically."
+        required: true
+        type: boolean
+        default: false
+      request_pause_seconds:
+        description: "Pause between public Coinbase candle requests."
+        required: true
+        type: string
+        default: "0.10"
+
+concurrency:
+  group: kalshi-btc15m-ml-daily-retrain
+  cancel-in-progress: false
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  refresh-train-validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install ML-only dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements_kalshi_ml_only.txt
+
+      - name: Verify ML-only programs
+        run: |
+          python -m py_compile \
+            kalshi_ml_features.py \
+            kalshi_ml_feature_ledger_refresh.py \
+            kalshi_ml_model_train.py \
+            kalshi_ml_runner_backtest.py \
+            kalshi_ml_robust_backtest.py \
+            kalshi_ml_retraining_cadence_backtest.py \
+            kalshi_ml_model_registry.py
+
+      - name: Resolve active ML-only ledger
+        run: |
+          set -euo pipefail
+          test -s kalshi_ml_model_registry.json
+          LEDGER_RUN_ID="$(jq -er '.active_ledger_run_id' kalshi_ml_model_registry.json)"
+          LEDGER_ARTIFACT="$(jq -er '.active_ledger_artifact_name' kalshi_ml_model_registry.json)"
+          LEDGER_PATH="$(jq -er '.active_ledger_path' kalshi_ml_model_registry.json)"
+          test "$LEDGER_RUN_ID" != "null"
+          test "$LEDGER_ARTIFACT" != "null"
+          test "$LEDGER_PATH" != "null"
+          {
+            echo "LEDGER_RUN_ID=$LEDGER_RUN_ID"
+            echo "LEDGER_ARTIFACT=$LEDGER_ARTIFACT"
+            echo "LEDGER_PATH=$LEDGER_PATH"
+          } >> "$GITHUB_ENV"
+          echo "ML LEDGER SOURCE | run=$LEDGER_RUN_ID artifact=$LEDGER_ARTIFACT path=$LEDGER_PATH"
+
+      - name: Download active feature ledger
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh run download "$LEDGER_RUN_ID" -R "$GITHUB_REPOSITORY" \
+            -n "$LEDGER_ARTIFACT" -D ledger_input
+          test -s "ledger_input/$LEDGER_PATH"
+
+      - name: Refresh settled ML-only ledger
+        env:
+          REQUEST_PAUSE_SECONDS: ${{ inputs.request_pause_seconds || '0.10' }}
+        run: |
+          set -euo pipefail
+          mkdir -p model_output/training_data
+          python kalshi_ml_feature_ledger_refresh.py \
+            --input "ledger_input/$LEDGER_PATH" \
+            --output model_output/training_data/kxbtc15m_ml_only_feature_ledger.csv \
+            --report model_output/ledger_refresh_report.json \
+            --request-pause-seconds "$REQUEST_PAUSE_SECONDS"
+          ADDED_ROWS="$(jq -er '.added_rows' model_output/ledger_refresh_report.json)"
+          echo "ADDED_ROWS=$ADDED_ROWS" >> "$GITHUB_ENV"
+          if [ "$ADDED_ROWS" = "0" ]; then
+            echo "NO_NEW_ROWS=true" >> "$GITHUB_ENV"
+            echo "LEDGER REFRESH | no newly settled, feature-complete markets; leaving the active model unchanged."
+          else
+            echo "NO_NEW_ROWS=false" >> "$GITHUB_ENV"
+            echo "LEDGER REFRESH | added_rows=$ADDED_ROWS"
+          fi
+
+      - name: Run retraining-cadence audit
+        if: env.NO_NEW_ROWS != 'true'
+        run: |
+          python kalshi_ml_retraining_cadence_backtest.py \
+            --input model_output/training_data/kxbtc15m_ml_only_feature_ledger.csv \
+            --output model_output/retraining_cadence_backtest.json \
+            --cadences static,6h,12h,1d,3d,7d,14d \
+            --gates 0.50,0.55,0.60
+
+      - name: Run chronological production-model validation
+        if: env.NO_NEW_ROWS != 'true'
+        run: |
+          python kalshi_ml_runner_backtest.py \
+            --input model_output/training_data/kxbtc15m_ml_only_feature_ledger.csv \
+            --output model_output/holdout_backtest.json \
+            --minimum-coverage 0.05 \
+            --model-type logistic_regression
+          python kalshi_ml_robust_backtest.py \
+            --input model_output/training_data/kxbtc15m_ml_only_feature_ledger.csv \
+            --output model_output/robust_backtest.json \
+            --minimum-coverage 0.05
+
+      - name: Train refreshed calibrated logistic model
+        if: env.NO_NEW_ROWS != 'true'
+        run: |
+          python kalshi_ml_model_train.py \
+            --input model_output/training_data/kxbtc15m_ml_only_feature_ledger.csv \
+            --model-output model_output/kxbtc15m_ml_model.joblib \
+            --metadata-output model_output/kxbtc15m_ml_model_metadata.json \
+            --model-type logistic_regression \
+            --calibration isotonic \
+            --calibration-fraction 0.15
+
+      - name: Store candidate model and full audit
+        if: env.NO_NEW_ROWS != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: kalshi-kxbtc15m-ml-model-${{ github.run_id }}
+          path: model_output/
+          retention-days: 90
+
+      - name: Store no-op refresh audit
+        if: env.NO_NEW_ROWS == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: kalshi-kxbtc15m-ml-retrain-audit-${{ github.run_id }}
+          path: model_output/ledger_refresh_report.json
+          retention-days: 90
+
+      - name: Publish validated model for the next live handoff
+        if: env.NO_NEW_ROWS != 'true' && (github.event_name == 'schedule' || inputs.publish_model == true)
+        run: |
+          set -euo pipefail
+          python kalshi_ml_model_registry.py \
+            --path kalshi_ml_model_registry.json \
+            --model-run-id "${{ github.run_id }}" \
+            --artifact-name "kalshi-kxbtc15m-ml-model-${{ github.run_id }}" \
+            --ledger-path training_data/kxbtc15m_ml_only_feature_ledger.csv \
+            --cadence 1d
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add kalshi_ml_model_registry.json
+          git diff --cached --quiet || git commit -m "chore: refresh Kalshi ML-only model [skip ci]"
+          git pull --rebase --autostash origin main
+          git push origin HEAD:main
+          echo "MODEL PUBLISHED | run=${{ github.run_id }}; the live bot will adopt it only at its next handoff."
+
+      - name: Report manual candidate status
+        if: env.NO_NEW_ROWS != 'true' && github.event_name == 'workflow_dispatch' && inputs.publish_model != true
+        run: |
+          echo "CANDIDATE STORED | model was not made active because publish_model=false."

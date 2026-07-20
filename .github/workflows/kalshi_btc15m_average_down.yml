@@ -36,15 +36,15 @@ on:
         type: string
         default: ""
       model_run_id:
-        description: "Successful Prophet-free calibrated ML-model training run. Blank keeps the pinned production model."
+        description: "Optional one-off ML model artifact run override. Blank uses the validated model registry."
         required: false
         type: string
-        default: "29776048495"
+        default: ""
       training_run_id:
-        description: "Historical feature-ledger run used by the ML model. Blank keeps the default artifact."
+        description: "Optional ledger-run override paired with model_run_id. Blank uses the model registry."
         required: false
         type: string
-        default: "29698207476"
+        default: ""
 
 concurrency:
   group: kalshi-btc15m-average-down-singleton
@@ -64,6 +64,43 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v7
 
+      - name: Resolve validated ML model and feature ledger
+        env:
+          MANUAL_MODEL_RUN_ID: ${{ inputs.model_run_id }}
+          MANUAL_TRAINING_RUN_ID: ${{ inputs.training_run_id }}
+        run: |
+          set -euo pipefail
+          if [ -n "$MANUAL_MODEL_RUN_ID" ]; then
+            # A manual override preserves the former artifact convention for
+            # emergency rollback only. The runner still validates the saved
+            # model's exact ML-only feature schema before it can trade.
+            MODEL_RUN_ID="$MANUAL_MODEL_RUN_ID"
+            MODEL_ARTIFACT="kalshi-kxbtc15m-ml-model-$MODEL_RUN_ID"
+            TRAINING_RUN_ID="${MANUAL_TRAINING_RUN_ID:-29698207476}"
+            LEDGER_ARTIFACT="kalshi-btc15m-backtest-$TRAINING_RUN_ID"
+            LEDGER_PATH="prophet_ml_backtest_rows.csv"
+            MODEL_SOURCE="manual_override"
+          else
+            test -s kalshi_ml_model_registry.json
+            FEATURE_SCHEMA="$(jq -er '.feature_schema' kalshi_ml_model_registry.json)"
+            test "$FEATURE_SCHEMA" = "ml_only_raw_candles_settled_outcomes_v1"
+            MODEL_RUN_ID="$(jq -er '.active_model_run_id' kalshi_ml_model_registry.json)"
+            MODEL_ARTIFACT="$(jq -er '.active_model_artifact_name' kalshi_ml_model_registry.json)"
+            TRAINING_RUN_ID="$(jq -er '.active_ledger_run_id' kalshi_ml_model_registry.json)"
+            LEDGER_ARTIFACT="$(jq -er '.active_ledger_artifact_name' kalshi_ml_model_registry.json)"
+            LEDGER_PATH="$(jq -er '.active_ledger_path' kalshi_ml_model_registry.json)"
+            MODEL_SOURCE="validated_registry"
+          fi
+          {
+            echo "MODEL_RUN_ID=$MODEL_RUN_ID"
+            echo "MODEL_ARTIFACT=$MODEL_ARTIFACT"
+            echo "TRAINING_RUN_ID=$TRAINING_RUN_ID"
+            echo "LEDGER_ARTIFACT=$LEDGER_ARTIFACT"
+            echo "LEDGER_PATH=$LEDGER_PATH"
+            echo "MODEL_SOURCE=$MODEL_SOURCE"
+          } >> "$GITHUB_ENV"
+          echo "ML MODEL RESOLVED | source=$MODEL_SOURCE model_run=$MODEL_RUN_ID ledger_run=$TRAINING_RUN_ID ledger_path=$LEDGER_PATH"
+
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
@@ -82,18 +119,16 @@ jobs:
       - name: Download stored ML model and frozen feature ledger
         env:
           GH_TOKEN: ${{ github.token }}
-          MODEL_RUN_ID: ${{ inputs.model_run_id || '29776048495' }}
-          TRAINING_RUN_ID: ${{ inputs.training_run_id || '29698207476' }}
         run: |
           set -euo pipefail
           gh run download "$MODEL_RUN_ID" -R "$GITHUB_REPOSITORY" \
-            -n "kalshi-kxbtc15m-ml-model-$MODEL_RUN_ID" -D stored_model
+            -n "$MODEL_ARTIFACT" -D stored_model
           gh run download "$TRAINING_RUN_ID" -R "$GITHUB_REPOSITORY" \
-            -n "kalshi-btc15m-backtest-$TRAINING_RUN_ID" -D training_data
+            -n "$LEDGER_ARTIFACT" -D training_data
           test -s stored_model/kxbtc15m_ml_model.joblib
           test -s stored_model/kxbtc15m_ml_model_metadata.json
           test -s stored_model/holdout_backtest.json
-          test -s training_data/prophet_ml_backtest_rows.csv
+          test -s "training_data/$LEDGER_PATH"
 
       - name: Write Kalshi RSA private key
         env:
@@ -112,8 +147,6 @@ jobs:
           MAX_ACTIVE_MARKETS: ${{ inputs.max_active_markets }}
           MAX_CONTRACTS_PER_MARKET: ${{ inputs.max_contracts_per_market }}
           MAX_TOTAL_CAPITAL: ${{ inputs.max_total_capital }}
-          MODEL_RUN_ID: ${{ inputs.model_run_id || '29776048495' }}
-          TRAINING_RUN_ID: ${{ inputs.training_run_id || '29698207476' }}
         run: |
           set -euo pipefail
           args=(--config kalshi_btc15m_average_down_config.json
@@ -124,7 +157,7 @@ jobs:
                 --ml-validation-report stored_model/holdout_backtest.json
                 --ml-model-run-id "$MODEL_RUN_ID"
                 --ml-training-run-id "$TRAINING_RUN_ID"
-                --ml-training-csv training_data/prophet_ml_backtest_rows.csv
+                --ml-training-csv "training_data/$LEDGER_PATH"
                 --persist-config --run-seconds 20700)
           [ -z "$INITIAL_POSITION_SIZE" ] || args+=(--initial-position-size "$INITIAL_POSITION_SIZE")
           [ -z "$MAX_ACTIVE_MARKETS" ] || args+=(--max-active-markets "$MAX_ACTIVE_MARKETS")

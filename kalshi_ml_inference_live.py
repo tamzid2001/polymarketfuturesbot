@@ -4,9 +4,9 @@ The trade side comes only from the ML model's ``probability_yes``: YES at or
 above 0.5, otherwise NO. It has no Prophet-side fallback, no Prophet-derived
 feature, and no loss-streak switch.
 
-Use a current ``prophet_ml_backtest_rows.csv`` as ``--training-csv``. The
-runner trains only on rows whose outcomes settled before the pre-open inference
-time. It is inference-only by default; a real order requires all of:
+Use a current ML-only feature ledger as ``--training-csv``. The runner trains
+only on rows whose outcomes settled before the pre-open inference time. It is
+inference-only by default; a real order requires all of:
 
 * ``DRY_RUN=false``;
 * ``--submit``; and
@@ -41,7 +41,7 @@ from kalshi_ml_features import FEATURE_SCHEMA, ML_ONLY_FEATURE_COLUMNS, feature_
 
 
 LOG = logging.getLogger("kalshi_ml_inference_live")
-DEFAULT_TRAINING_CSV = os.getenv("ML_TRAINING_CSV", "prophet_ml_backtest_rows.csv")
+DEFAULT_TRAINING_CSV = os.getenv("ML_TRAINING_CSV", "kxbtc15m_ml_only_feature_ledger.csv")
 DEFAULT_MODEL_PATH = os.getenv("ML_MODEL_PATH", "")
 DEFAULT_STATE_FILE = os.getenv("ML_INFERENCE_STATE_FILE", "ml_inference_live_state.json")
 MIN_TRAIN_ROWS = int(os.getenv("ML_MIN_TRAIN_ROWS", "1000"))
@@ -71,7 +71,7 @@ def load_training_rows(path: Path, as_of: pd.Timestamp) -> pd.DataFrame:
     if not path.exists():
         raise FileNotFoundError(
             f"Missing ML training artifact {path}. Set ML_TRAINING_CSV or pass "
-            "--training-csv with prophet_ml_backtest_rows.csv."
+            "--training-csv with an ML-only feature ledger."
         )
     rows = pd.read_csv(path)
     required = set(ML_ONLY_FEATURE_COLUMNS) | {"actual_yes", "settlement_ts"}
@@ -79,7 +79,7 @@ def load_training_rows(path: Path, as_of: pd.Timestamp) -> pd.DataFrame:
     if missing:
         raise ValueError(f"Training artifact missing columns: {', '.join(sorted(missing))}")
     rows = rows.copy()
-    rows["settlement_timestamp"] = pd.to_datetime(rows["settlement_ts"], utc=True, errors="coerce")
+    rows["settlement_timestamp"] = pd.to_datetime(rows["settlement_ts"], utc=True, errors="coerce", format="mixed")
     rows["actual_yes"] = pd.to_numeric(rows["actual_yes"], errors="coerce")
     for name in ML_ONLY_FEATURE_COLUMNS:
         rows[name] = pd.to_numeric(rows[name], errors="coerce")

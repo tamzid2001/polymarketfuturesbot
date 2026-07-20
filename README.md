@@ -13,11 +13,11 @@ The continuous runners use GitHub Actions for up to 5 h 45 min per job before se
 
 ## Kalshi BTC 15-minute mechanical average-down runner
 
-Use **Actions → “Kalshi BTC 15m ML-Side Average Down” → Run workflow**. It uses the persisted contract quantity (default **1 contract per rung**) and monitors only `KXBTC15M`. The ML-only runner accepts only the schema `ml_only_raw_candles_settled_outcomes_v1`: BTC candle returns/volatility/range, strike distance, clock, and previously settled outcomes. It does not fit, call, or consume Prophet or another price forecast; an old Prophet-feature artifact is rejected rather than used as a fallback.
+Use **Actions → “Kalshi BTC 15m ML-Side Average Down” → Run workflow**. It uses the persisted contract quantity (default **1 contract per rung**) and monitors only `KXBTC15M`. The ML-only runner accepts only the schema `ml_only_raw_candles_settled_outcomes_v1`: BTC candle returns/volatility/range, strike distance, clock, and previously settled outcomes. It does not fit, call, or consume Prophet or another price forecast. It rejects a saved model whose schema is not exactly ML-only; there is no fallback model or forecast path.
 
 ### Deployed model, coverage, and evidence
 
-The pinned Prophet-free artifact is **Actions run `29776048495`**: regularized logistic regression with isotonic probability calibration. It uses a 19,189-row settled feature ledger, split chronologically into 16,311 base-training rows and 2,878 later calibration rows. Its schema lock prevents an old artifact from being substituted. The runner records the artifact ID, training cutoff, model `p_yes`, confidence, and selected side with every ML-backed market record.
+The live runner resolves its artifact from [`kalshi_ml_model_registry.json`](kalshi_ml_model_registry.json) at every 5h45m handoff. The bootstrap artifact is **Actions run `29776048495`**: regularized logistic regression with isotonic probability calibration. Its schema lock prevents a model with any non-ML-only feature from being substituted. The runner records the artifact ID, training cutoff, model `p_yes`, confidence, and selected side with every ML-backed market record.
 
 The `confidence >= 0.50` gate has **100% valid-model-direction coverage**: every valid binary-model score has a YES or NO direction at that threshold. This is not 100% order coverage. An actual position still requires the ML-selected side's executable Kalshi ask to reach `<= $0.40`; it may then fill zero to four same-side rungs depending on market prices and liquidity.
 
@@ -27,9 +27,11 @@ The earlier 52.42% / 18,986-score result used a Prophet-feature schema and is **
 
 At startup the runner prints `ML MODEL`, `ML VALIDATION`, and `ML EXECUTION POLICY` lines with the exact artifact, calibration method, training rows/cutoff, schema, and active gate. Before each market it prints `ML INPUT READY` to confirm no forecast input was used, then `ML SIDE READY` (`p_yes`, confidence, selected side). A candle fetch is capped at 45 seconds and an unfinished pre-open task logs `ML SIDE FAILED` at the open; neither condition can fall back to Prophet, stale inference, or price-side selection. The runner also logs selected-side-only quote triggers, entry/ladder IDs and fills, exchange-position guards, settlement, rung P&L, and `ML LIVE PERFORMANCE`.
 
-### Retraining policy
+### ML-only retraining
 
-Retraining creates a **candidate** artifact; it must not silently replace the pinned live model. Refit weekly or after roughly 500 new settled, feature-complete markets, then evaluate it on a frozen later holdout and compare its live fill/fee results with the incumbent. Pin and deploy a new artifact only after that review. The current artifact was trained on July 20, 2026 and does not require an immediate retrain.
+**“Kalshi BTC 15m ML-Only Daily Retrain”** runs daily at 00:32 UTC and can also be started manually. It downloads the active ledger, appends only newly settled, feature-complete BTC 15-minute rows, reruns chronological validation, and stores the ledger, trained logistic/isotonic model, cadence audit, and validation reports in one 90-day artifact. Scheduled runs publish the validated artifact to the registry; a manual run stores a candidate unless `publish_model` is selected. A live runner never changes model mid-market: it adopts the newly published artifact only when its next 5h45m job starts.
+
+Daily is the operational cadence, not six-hour retraining. The ML-only expanding-window cadence audit compared static, 6-hour, 12-hour, daily, 3-day, weekly, and 14-day refits with each fit restricted to outcomes settled before its prediction boundary. In the final untouched 3,860 markets, 12-hour retraining was 51.61% (1,992/3,860) and daily was 51.53% (1,989/3,860); the three-call difference was not significant (paired p=0.784). Six-hour retraining was worse at 51.32%. Daily therefore keeps the model current without paying for unsupported extra churn. These are directional metrics only, not executable P&L.
 
 ### Exact Kalshi lifecycle
 

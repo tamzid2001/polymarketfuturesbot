@@ -35,16 +35,25 @@ from kalshi_ml_features import FEATURE_SCHEMA, ML_ONLY_FEATURE_COLUMNS
 def load_rows(path: Path) -> pd.DataFrame:
     rows = pd.read_csv(path)
     required = set(ML_ONLY_FEATURE_COLUMNS) | {
-        "actual_yes", "forecast_at", "settlement_ts", "ml_probability_yes",
+        "actual_yes", "forecast_at", "settlement_ts",
     }
     missing = required - set(rows.columns)
     if missing:
         raise ValueError(f"Input is missing required columns: {', '.join(sorted(missing))}")
     rows = rows.copy()
-    rows["forecast_timestamp"] = pd.to_datetime(rows["forecast_at"], utc=True, errors="coerce")
-    rows["settlement_timestamp"] = pd.to_datetime(rows["settlement_ts"], utc=True, errors="coerce")
+    rows["forecast_timestamp"] = pd.to_datetime(rows["forecast_at"], utc=True, errors="coerce", format="mixed")
+    rows["settlement_timestamp"] = pd.to_datetime(rows["settlement_ts"], utc=True, errors="coerce", format="mixed")
     rows["actual_yes"] = pd.to_numeric(rows["actual_yes"], errors="coerce")
-    rows["ml_probability_yes"] = pd.to_numeric(rows["ml_probability_yes"], errors="coerce")
+    # ``ml_probability_yes`` existed in the legacy research ledger only.  A
+    # refreshed production ledger intentionally contains no historical model
+    # score because it is not a feature and would make a later validation
+    # dependent on an old model.  Keep the optional baseline only when it is
+    # genuinely available; the train/calibration/test evaluation below always
+    # fits from the ML-only feature schema.
+    if "ml_probability_yes" in rows:
+        rows["ml_probability_yes"] = pd.to_numeric(rows["ml_probability_yes"], errors="coerce")
+    else:
+        rows["ml_probability_yes"] = np.nan
     for name in ML_ONLY_FEATURE_COLUMNS:
         rows[name] = pd.to_numeric(rows[name], errors="coerce")
     rows = rows[
@@ -84,8 +93,8 @@ def chronological_splits(
     }
 
 
-def candidates() -> dict[str, Any]:
-    return {
+def candidates(model_type: str = "all") -> dict[str, Any]:
+    all_candidates = {
         "logistic_regression": make_pipeline(
             StandardScaler(),
             LogisticRegression(C=0.25, max_iter=2_000, class_weight="balanced", random_state=0),
@@ -99,6 +108,9 @@ def candidates() -> dict[str, Any]:
             random_state=0,
         ),
     }
+    if model_type == "all":
+        return all_candidates
+    return {model_type: all_candidates[model_type]}
 
 
 def calibrated_probabilities(
@@ -195,6 +207,7 @@ def run(
     test_fraction: float,
     thresholds: list[float],
     minimum_coverage: float,
+    model_type: str,
 ) -> dict[str, Any]:
     train, calibration, test, timing = chronological_splits(rows, calibration_fraction, test_fraction)
     actual_calibration = calibration["actual_yes"].to_numpy(dtype=int)
@@ -202,7 +215,7 @@ def run(
     candidate_reports: dict[str, dict[str, Any]] = {}
     candidate_probabilities: dict[str, tuple[np.ndarray, np.ndarray]] = {}
 
-    for name, model in candidates().items():
+    for name, model in candidates(model_type).items():
         calibration_probabilities, test_probabilities = calibrated_probabilities(
             model, train, calibration, test
         )
@@ -228,6 +241,7 @@ def run(
 
     return {
         "feature_schema": FEATURE_SCHEMA,
+        "production_model_type": model_type,
         "method": (
             "Early train / later calibration / final untouched chronological test. "
             "Calibration uses isotonic regression; model and confidence threshold are selected "
@@ -265,6 +279,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--test-fraction", type=float, default=0.15)
     parser.add_argument("--thresholds", type=parse_thresholds, default=parse_thresholds("0.50,0.55,0.60,0.65"))
     parser.add_argument("--minimum-coverage", type=float, default=0.05)
+    parser.add_argument(
+        "--model-type", choices=("all", "logistic_regression", "extra_trees"), default="all",
+        help="Validate one fixed production model, or use 'all' for research comparison.",
+    )
     args = parser.parse_args()
     if not (0.05 <= args.calibration_fraction < 0.4 and 0.05 <= args.test_fraction < 0.4):
         parser.error("calibration/test fractions must each be from 0.05 through 0.4")
@@ -283,6 +301,7 @@ def main() -> int:
         args.test_fraction,
         args.thresholds,
         args.minimum_coverage,
+        args.model_type,
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
