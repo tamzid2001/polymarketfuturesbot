@@ -198,8 +198,49 @@ class MechanicalAverageDownTests(unittest.TestCase):
         self.assertTrue(entered)
         self.assertEqual(record["locked_side"], "yes")
         self.assertEqual([request["position_price"] for request in requests], [0.35, 0.30, 0.20, 0.10])
-        self.assertEqual(requests[0]["tif"], "immediate_or_cancel")
+        self.assertEqual(requests[0]["tif"], "good_till_canceled")
+        self.assertIsNotNone(requests[0]["expiration_time"])
         self.assertTrue(all(request["side"] == "yes" for request in requests))
+
+    def test_first_below_40_trigger_remains_a_resting_limit_and_never_switches_sides(self):
+        class FakeRest:
+            def __init__(self):
+                self.requests = []
+
+            async def balance_dollars(self):
+                return 10.0
+
+            async def create_order(self, **kwargs):
+                self.requests.append(kwargs)
+                return {
+                    "order_id": "initial", "side": kwargs["side"],
+                    "position_price": kwargs["position_price"], "quantity": kwargs["quantity"],
+                    "fill_count": 0.0, "remaining_count": kwargs["quantity"],
+                    "fees_paid": 0.0, "status": "resting",
+                }
+
+        async def scenario():
+            config = validate_config(DEFAULT_CONFIG)
+            state = default_state()
+            market = SimpleNamespace(
+                ticker="KXBTC15M-TEST-GTC", status="active", yes_ask_dollars="0.3400",
+                no_ask_dollars="0.6600", open_time=time.time() - 5, close_time=time.time() + 895,
+            )
+            rest = FakeRest()
+            record = market_record(state, market.ticker)
+            record.update({"status": "watching", "market_open_time": market.open_time})
+            await consider_initial_entry(rest, state, market, config, dry_run=False)
+            # A later qualifying NO quote must not create an opposite-side order.
+            market.yes_ask_dollars, market.no_ask_dollars = "0.6600", "0.3400"
+            await consider_initial_entry(rest, state, market, config, dry_run=False)
+            return record, rest.requests
+
+        record, requests = asyncio.run(scenario())
+        self.assertEqual(record["status"], "initial_submitted")
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(requests[0]["side"], "yes")
+        self.assertEqual(requests[0]["position_price"], 0.34)
+        self.assertEqual(requests[0]["tif"], "good_till_canceled")
 
     def test_10_cent_initial_entry_never_averages_up(self):
         class FakeRest:

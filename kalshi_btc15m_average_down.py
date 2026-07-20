@@ -1053,20 +1053,20 @@ async def consider_initial_entry(
         record["status"] = "initial_blocked_exchange_position"
         LOG.critical("INITIAL ENTRY BLOCKED | %s no order submitted because the live exchange position is unsafe.", ticker)
         return False
-    # When already below 40c, IOC at the observed price is the protected
-    # equivalent of a market order.  It cannot fill above the observed <=40c ask.
-    below_threshold = ask < LADDER_LEVELS[0] - 1e-9
-    tif = "immediate_or_cancel" if below_threshold else "good_till_canceled"
-    price = ask if below_threshold else LADDER_LEVELS[0]
+    # Lock the first qualifying side with a resting, market-close-expiring
+    # limit.  An IOC can miss a transient quote and abandon the entire market;
+    # an unbounded market order could buy above the mechanical 40c ceiling.
+    # This GTC order preserves both requirements: the selected side cannot
+    # switch, and its executable cost can never exceed the observed <=40c ask.
+    price = min(ask, LADDER_LEVELS[0])
     record["orders"]["0.4000"] = await rest.create_order(
-        ticker=ticker, side=side, position_price=price, quantity=quantity, tif=tif,
-        expiration_time=None if below_threshold else expiration_epoch(market), dry_run=dry_run,
+        ticker=ticker, side=side, position_price=price, quantity=quantity, tif="good_till_canceled",
+        expiration_time=expiration_epoch(market), dry_run=dry_run,
         order_key="initial",
     )
     record["orders"]["0.4000"]["ladder_level"] = 0.40
     record["orders"]["0.4000"]["reason"] = (
-        "Market discovered below 40c; protected immediate-or-cancel order."
-        if below_threshold else "Ask reached the 40c initial threshold."
+        "First qualifying executable ask; resting same-side limit through market close."
     )
     LOG.info("WATCH TRIGGERED | %s %s selected; stopped watching the other side.", ticker, side.upper())
     return True
