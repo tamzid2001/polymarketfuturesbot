@@ -12,6 +12,7 @@ from kalshi_btc15m_average_down import (
     choose_entry_side,
     consider_initial_entry,
     default_state,
+    exchange_outcome_side,
     ladder_principal,
     performance_report,
     reconcile_orders,
@@ -36,7 +37,7 @@ class MechanicalAverageDownTests(unittest.TestCase):
         self.assertEqual(ladder_principal(1.0), 1.0)
         self.assertEqual(config["market_refresh_seconds"], 15.0)
         self.assertEqual(config["order_reconcile_seconds"], 5.0)
-        self.assertEqual(config["watch_start_grace_seconds"], 30.0)
+        self.assertEqual(config["watch_start_grace_seconds"], 45.0)
 
     def test_fresh_websocket_quote_supplies_both_executable_sides(self):
         feed = KalshiLiveFeed(auth=None)
@@ -55,7 +56,7 @@ class MechanicalAverageDownTests(unittest.TestCase):
         self.assertEqual(choose_entry_side({"yes": 0.39, "no": 0.25}), ("no", 0.25))
         self.assertIsNone(choose_entry_side({"yes": 0.41, "no": 0.42}))
 
-    def test_no_orders_use_complementary_yes_book_price(self):
+    def test_no_orders_map_to_the_requested_economic_cost(self):
         self.assertEqual(side_api_price("yes", 0.30), "0.3000")
         self.assertEqual(side_api_price("no", 0.30), "0.7000")
 
@@ -77,6 +78,8 @@ class MechanicalAverageDownTests(unittest.TestCase):
         self.assertEqual(normalized_outcome_side("OutcomeSide.NO"), "no")
         self.assertEqual(normalized_outcome_side("yes"), "yes")
         self.assertIsNone(normalized_outcome_side("ask"))
+        self.assertEqual(exchange_outcome_side({"book_side": "ask"}), "no")
+        self.assertEqual(exchange_outcome_side({"side": "yes", "action": "sell"}), "no")
 
     def test_config_rejects_an_unfunded_ladder(self):
         invalid = {**DEFAULT_CONFIG, "max_total_capital": 0.99}
@@ -245,11 +248,11 @@ class MechanicalAverageDownTests(unittest.TestCase):
             close_time=time.time() + 884,
         )
         missing_open_time = SimpleNamespace(status="active", close_time=time.time() + 895)
-        self.assertTrue(market_can_start_watcher(just_opened, 30.0))
-        self.assertTrue(market_can_start_watcher(late, 30.0))
-        self.assertFalse(market_can_start_watcher(missing_open_time, 30.0))
+        self.assertTrue(market_can_start_watcher(just_opened, 45.0))
+        self.assertTrue(market_can_start_watcher(late, 45.0))
+        self.assertFalse(market_can_start_watcher(missing_open_time, 45.0))
         self.assertFalse(market_can_start_watcher(
-            SimpleNamespace(status="active", open_time=time.time() - 31, close_time=time.time() + 869), 30.0,
+            SimpleNamespace(status="active", open_time=time.time() - 46, close_time=time.time() + 854), 45.0,
         ))
 
 

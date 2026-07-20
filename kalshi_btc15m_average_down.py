@@ -82,7 +82,7 @@ DEFAULT_CONFIG = {
     # This is *not* an entry window.  It is only the short allowance for
     # observing a brand-new market and starting its watcher.  Once started,
     # the watcher runs until the market closes or one side reaches 40c.
-    "watch_start_grace_seconds": 30.0,
+    "watch_start_grace_seconds": 45.0,
     "status_log_seconds": 30.0,
 }
 
@@ -118,7 +118,7 @@ def field(obj: Any, *names: str) -> Any:
 
 
 def side_api_price(side: str, position_price: float) -> str:
-    """Translate a YES/NO purchase into Kalshi's single YES-book V2 price."""
+    """Translate an economic YES/NO purchase to the V2 exchange price."""
     if side == "yes":
         return f"{position_price:.4f}"
     if side == "no":
@@ -199,6 +199,30 @@ def normalized_outcome_side(raw: Any) -> str | None:
     value = getattr(raw, "value", raw)
     side = str(value or "").lower().rsplit(".", 1)[-1]
     return side if side in {"yes", "no"} else None
+
+
+def normalized_book_side(raw: Any) -> str | None:
+    """Normalize the V2 book-side field, where bid is YES and ask is NO."""
+    value = getattr(raw, "value", raw)
+    side = str(value or "").lower().rsplit(".", 1)[-1]
+    return side if side in {"bid", "ask"} else None
+
+
+def exchange_outcome_side(order: Any) -> str | None:
+    """Read Kalshi's canonical direction, with documented V2/legacy fallbacks."""
+    canonical = normalized_outcome_side(field(order, "outcome_side"))
+    if canonical is not None:
+        return canonical
+    book_side = normalized_book_side(field(order, "book_side"))
+    if book_side is not None:
+        return "yes" if book_side == "bid" else "no"
+    legacy_side = normalized_outcome_side(field(order, "side"))
+    action = str(getattr(field(order, "action"), "value", field(order, "action")) or "").lower()
+    if legacy_side is None or action not in {"buy", "sell"}:
+        return None
+    if action == "buy":
+        return legacy_side
+    return "no" if legacy_side == "yes" else "yes"
 
 
 def market_asks(market: Any, live_asks: dict[str, float | None] | None = None) -> dict[str, float | None]:
@@ -601,7 +625,7 @@ class KalshiREST:
         record["remaining_count"] = round(order_remaining_count(response) if order_remaining_count(response) is not None else quantity - record["fill_count"], 2)
         record["average_fill_price"] = order_average_position_price(response, side, position_price)
         record["fees_paid"] = order_fee_total(response)
-        observed_side = normalized_outcome_side(field(response, "outcome_side"))
+        observed_side = exchange_outcome_side(response)
         if observed_side is not None:
             record["observed_outcome_side"] = observed_side
             record["direction_verified"] = observed_side == side
@@ -645,7 +669,8 @@ class KalshiREST:
             status = normalized_order_status(field(order, "status"))
             if status:
                 record["status"] = status
-            observed_side = normalized_outcome_side(field(order, "outcome_side"))
+            prior_observed_side = record.get("observed_outcome_side")
+            observed_side = exchange_outcome_side(order)
             if observed_side is not None:
                 record["observed_outcome_side"] = observed_side
                 record["direction_verified"] = observed_side == record.get("side")
@@ -654,6 +679,11 @@ class KalshiREST:
                     LOG.critical(
                         "DIRECTION MISMATCH | %s expected=%s exchange_returned=%s; order is quarantined.",
                         order_id, str(record.get("side") or "?").upper(), observed_side.upper(),
+                    )
+                elif prior_observed_side != observed_side:
+                    LOG.info(
+                        "DIRECTION VERIFIED | %s long=%s economic_price=$%.4f",
+                        order_id, observed_side.upper(), float(record.get("position_price") or 0.0),
                     )
             record["last_checked_at"] = now_iso()
         except Exception as exc:  # noqa: BLE001
