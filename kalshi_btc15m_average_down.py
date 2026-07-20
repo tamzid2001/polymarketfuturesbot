@@ -133,9 +133,15 @@ def timestamp_epoch(raw: Any) -> int | None:
 
 
 def market_is_tradeable(market: Any) -> bool:
-    """Require both Kalshi's active status and an unexpired close time."""
+    """Trade only in the actual open window, never during an active pre-open."""
+    open_time = timestamp_epoch(field(market, "open_time"))
     close_time = timestamp_epoch(field(market, "close_time", "expected_expiration_time"))
-    return market_is_active(market) and (close_time is None or time.time() < close_time)
+    now = time.time()
+    return (
+        market_is_active(market)
+        and (open_time is None or now >= open_time)
+        and (close_time is None or now < close_time)
+    )
 
 
 def market_result(market: Any) -> str | None:

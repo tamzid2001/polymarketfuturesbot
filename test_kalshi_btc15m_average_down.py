@@ -134,6 +134,12 @@ class MechanicalAverageDownTests(unittest.TestCase):
         expired = SimpleNamespace(status="active", close_time="2020-01-01T00:00:00Z")
         self.assertFalse(market_is_tradeable(expired))
 
+    def test_market_is_not_tradeable_before_its_open_time(self):
+        pre_open = SimpleNamespace(
+            status="active", open_time="2099-01-01T00:00:00Z", close_time="2099-01-01T00:15:00Z",
+        )
+        self.assertFalse(market_is_tradeable(pre_open))
+
 
 if __name__ == "__main__":
     unittest.main()
