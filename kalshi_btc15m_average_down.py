@@ -193,6 +193,13 @@ def normalized_order_status(raw: Any) -> str:
     return status.rsplit(".", 1)[-1]
 
 
+def normalized_outcome_side(raw: Any) -> str | None:
+    """Normalize Kalshi's canonical outcome-side field without guessing."""
+    value = getattr(raw, "value", raw)
+    side = str(value or "").lower().rsplit(".", 1)[-1]
+    return side if side in {"yes", "no"} else None
+
+
 def market_asks(market: Any, live_asks: dict[str, float | None] | None = None) -> dict[str, float | None]:
     """Read executable position asks as dollars, accepting API migrations."""
     if live_asks is not None:
@@ -553,6 +560,10 @@ class KalshiREST:
             "order_type": "ioc_protected" if tif == "immediate_or_cancel" else "limit",
             "position_price": round(position_price, 4),
             "api_price": side_api_price(side, position_price),
+            # V2 quotes the single YES book. For a NO position this is the
+            # complementary YES-book price shown by some account views.
+            "yes_book_price": side_api_price(side, position_price),
+            "expected_outcome_side": side,
             "quantity": round(quantity, 2),
             "time_in_force": tif,
             "submitted_at": now_iso(),
@@ -588,6 +599,10 @@ class KalshiREST:
         record["remaining_count"] = round(order_remaining_count(response) if order_remaining_count(response) is not None else quantity - record["fill_count"], 2)
         record["average_fill_price"] = order_average_position_price(response, side, position_price)
         record["fees_paid"] = order_fee_total(response)
+        observed_side = normalized_outcome_side(field(response, "outcome_side"))
+        if observed_side is not None:
+            record["observed_outcome_side"] = observed_side
+            record["direction_verified"] = observed_side == side
         # An IOC that gets no execution is returned with zero remaining
         # quantity because the exchange cancelled the remainder.  Zero
         # remaining is therefore *not* evidence of a fill.  Only call an
@@ -595,6 +610,17 @@ class KalshiREST:
         record["status"] = classify_submission(
             record["fill_count"], record["remaining_count"], quantity, tif,
         )
+        LOG.info(
+            "ORDER DIRECTION | %s expected=%s book_side=%s economic_price=$%.4f yes_book_price=$%.4f response_outcome=%s",
+            ticker, side.upper(), side_book_side(side).value, position_price,
+            float(record["api_price"]), observed_side or "not_returned",
+        )
+        if observed_side is not None and observed_side != side:
+            record["status"] = "direction_mismatch"
+            LOG.critical(
+                "DIRECTION MISMATCH | %s expected=%s exchange_returned=%s; no additional ladder orders will be placed.",
+                ticker, side.upper(), observed_side.upper(),
+            )
         LOG.info("ORDER %s | %s %s @ $%.2f x %.2f | fill=%.2f remaining=%.2f id=%s",
                  record["status"].upper(), ticker, side.upper(), position_price, quantity,
                  record["fill_count"], record["remaining_count"], record["order_id"] or "?")
@@ -618,8 +644,26 @@ class KalshiREST:
             status = normalized_order_status(field(order, "status"))
             if status:
                 record["status"] = status
+            observed_side = normalized_outcome_side(field(order, "outcome_side"))
+            if observed_side is not None:
+                record["observed_outcome_side"] = observed_side
+                record["direction_verified"] = observed_side == record.get("side")
+                if not record["direction_verified"]:
+                    record["status"] = "direction_mismatch"
+                    LOG.critical(
+                        "DIRECTION MISMATCH | %s expected=%s exchange_returned=%s; order is quarantined.",
+                        order_id, str(record.get("side") or "?").upper(), observed_side.upper(),
+                    )
             record["last_checked_at"] = now_iso()
         except Exception as exc:  # noqa: BLE001
+            # A just-executed IOC can briefly be absent from the active-order
+            # endpoint before it appears in historical orders. The write
+            # response already confirmed its fill, so this is not a rejection.
+            if (getattr(exc, "status", None) == 404
+                    and float(record.get("fill_count") or 0.0) > 0.004
+                    and float(record.get("remaining_count") or 0.0) <= 0.004):
+                LOG.info("ORDER LOOKUP PENDING HISTORY | %s; accepted fill is retained.", order_id)
+                return
             LOG.warning("Order lookup failed for %s: %s", order_id, exc)
 
     async def cancel_order(self, record: dict[str, Any], dry_run: bool) -> None:
@@ -704,7 +748,11 @@ async def reconcile_orders(rest: KalshiREST, record: dict[str, Any], dry_run: bo
             )
             changed = True
     initial = (record.get("orders") or {}).get("0.4000")
-    if isinstance(initial, dict) and float(initial.get("fill_count") or 0.0) > 0.004 and not record.get("locked_side"):
+    if isinstance(initial, dict) and initial.get("direction_verified") is False:
+        record["status"] = "direction_mismatch"
+        LOG.critical("LADDER BLOCKED | %s initial order direction did not match the requested side.", record["ticker"])
+        changed = True
+    elif isinstance(initial, dict) and float(initial.get("fill_count") or 0.0) > 0.004 and not record.get("locked_side"):
         record["locked_side"] = record.get("candidate_side")
         record["locked_at"] = now_iso()
         record["status"] = "ladder_active"
@@ -1070,6 +1118,25 @@ async def log_heartbeat(
     log_performance_summary(performance_report(state, config), "heartbeat")
 
 
+async def cancel_open_mechanical_orders(rest: KalshiREST, state: dict[str, Any], dry_run: bool) -> int:
+    """Cancel only the known unfilled rungs in the persisted mechanical ledger."""
+    canceled = 0
+    for record in state.get("markets", {}).values():
+        if not isinstance(record, dict) or record.get("status") in {"finalized", "finalized_unfilled"}:
+            continue
+        for order in orders_for_market(record):
+            if float(order.get("remaining_count") or 0.0) <= 0.004:
+                continue
+            await rest.cancel_order(order, dry_run)
+            canceled += 1
+            LOG.info(
+                "EMERGENCY CANCEL | %s %s @ $%.4f id=%s",
+                record.get("ticker", "?"), str(order.get("side") or "?").upper(),
+                float(order.get("position_price") or 0.0), order.get("order_id") or "?",
+            )
+    return canceled
+
+
 async def run(args: argparse.Namespace) -> int:
     config_path = args.config.expanduser()
     config = validate_config(load_json(config_path, DEFAULT_CONFIG))
@@ -1089,6 +1156,15 @@ async def run(args: argparse.Namespace) -> int:
     if not api_key or not pem_path.exists():
         raise SystemExit("KALSHI_API_KEY_ID and KALSHI_PEM_PATH are required")
     rest = KalshiREST(api_key, pem_path, os.getenv("KALSHI_DEMO", "false").lower() in {"1", "true", "yes"})
+    if args.cancel_open_orders:
+        try:
+            canceled = await cancel_open_mechanical_orders(rest, state, dry_run)
+            save_json(state_path, state)
+            save_json(args.report.expanduser(), performance_report(state, config))
+            LOG.warning("CANCEL-ONLY COMPLETE | canceled_open_mechanical_orders=%d", canceled)
+            return 0
+        finally:
+            await rest.close()
     feed = KalshiLiveFeed(rest.auth)
     feed_task = asyncio.create_task(feed.run(), name="kalshi-average-down-ws")
     started_at = asyncio.get_running_loop().time()
@@ -1180,6 +1256,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--state-file", type=Path, default=Path("kalshi_btc15m_average_down_state.json"))
     parser.add_argument("--report", type=Path, default=Path("kalshi_btc15m_average_down_report.json"))
     parser.add_argument("--run-seconds", type=float, default=840.0)
+    parser.add_argument("--cancel-open-orders", action="store_true")
     parser.add_argument("--persist-config", action="store_true")
     parser.add_argument("--submit", action="store_true")
     parser.add_argument("--allow-live", action="store_true")

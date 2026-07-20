@@ -21,6 +21,7 @@ from kalshi_btc15m_average_down import (
     market_is_in_initial_entry_window,
     market_asks,
     normalized_order_status,
+    normalized_outcome_side,
     validate_config,
 )
 
@@ -69,6 +70,11 @@ class MechanicalAverageDownTests(unittest.TestCase):
     def test_sdk_enum_style_status_is_normalized(self):
         self.assertEqual(normalized_order_status("OrderStatus.CANCELED"), "canceled")
         self.assertEqual(normalized_order_status("FILLED"), "filled")
+
+    def test_exchange_outcome_side_is_checked_without_reversing_no_prices(self):
+        self.assertEqual(normalized_outcome_side("OutcomeSide.NO"), "no")
+        self.assertEqual(normalized_outcome_side("yes"), "yes")
+        self.assertIsNone(normalized_outcome_side("ask"))
 
     def test_config_rejects_an_unfunded_ladder(self):
         invalid = {**DEFAULT_CONFIG, "max_total_capital": 0.99}
