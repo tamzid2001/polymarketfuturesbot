@@ -1,11 +1,24 @@
-# Polymarket Futures Bot + Kalshi BTC Prophet Bot
+# Polymarket Futures Bot + Kalshi BTC Bot
 
-Two independent async trading bots that run 24/7 inside GitHub Actions:
+The repository contains two continuous bots plus one separately controlled mechanical MLB runner:
 
 1. **Polymarket Futures Bot** (`polymarket_bot.py`) — WebSocket-driven take-profit and re-entry bot for Polymarket US Futures markets (MLB World Series 2026 focus).
 2. **Kalshi BTC 15-Min Prophet Bot** (`kalshibtc15minupordown.py`) — pre-forecasts BTC two minutes before each new Kalshi market opens with a fixed 17-minute horizon, then compares the cached p50 with the live strike immediately at the open. [Jump to docs ↓](#kalshi-btc-15-minute-prophet-bot)
+3. **Polymarket US MLB Mechanical Average-Down Bot** (`polymarket_mlb_average_down.py`) — manual-only, disabled-by-default runner for same-day MLB full-game moneylines. It takes no baseball prediction: it snapshots both team costs, waits for the first team to trade 10¢ below its own snapshot, then buys that side and posts only lower 10¢ rungs.
 
-Both run inside GitHub Actions for up to 5 h 45 min per job before self-triggering the next run for uninterrupted 24/7 operation.
+The two continuous bots run inside GitHub Actions for up to 5 h 45 min per job before self-triggering the next run for uninterrupted 24/7 operation.
+
+The mechanical MLB runner is intentionally excluded from that automatic schedule: it starts only from its own manual workflow and requires an explicit live-order confirmation.
+
+---
+
+## Mechanical MLB average-down runner
+
+Use **Actions → “Polymarket US MLB Mechanical Average Down” → Run workflow**. Its default is a dry run; real orders require setting `live_trading` to true in that specific manual dispatch.
+
+For every eligible MLB full-game moneyline starting that day in New York time, the runner records the first executable home and away costs. A snapshot of `$0.80` for one team and `$0.20` for the other produces entry limits of `$0.70` and `$0.10`, respectively. The first outcome that reaches its limit is locked; the bot posts further limits only at lower 10¢ prices and cancels unfilled rungs once the game starts. It excludes first-five markets, totals, spreads, props, and futures.
+
+Polymarket's API price is always the LONG/YES price, so buying the short/NO team at a 10¢ outcome cost is correctly submitted as a 90¢ API price. The runner stores both prices in its state and logs them on every submission.
 
 ---
 

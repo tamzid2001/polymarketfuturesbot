@@ -1,0 +1,106 @@
+name: Polymarket US MLB Mechanical Average Down
+
+# This is intentionally manual-only and dry-run by default.  It does not share
+# the futures bot's schedule or auto-entry behavior.
+on:
+  workflow_dispatch:
+    inputs:
+      live_trading:
+        description: "Submit real orders (disabled by default)."
+        required: true
+        type: boolean
+        default: false
+      initial_position_size:
+        description: "Whole contracts per rung; blank keeps the saved value."
+        required: false
+        type: string
+        default: ""
+      max_total_capital:
+        description: "Maximum reserved USD exposure; blank keeps the saved value."
+        required: false
+        type: string
+        default: ""
+      run_seconds:
+        description: "Monitoring duration in seconds (maximum 20,700 on GitHub-hosted runners)."
+        required: true
+        type: string
+        default: "20700"
+
+concurrency:
+  group: polymarket-mlb-average-down-singleton
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    environment: "Polymarket US Futures"
+    timeout-minutes: 370
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Verify mechanical MLB strategy
+        run: |
+          python -m py_compile polymarket_mlb_average_down.py
+          python -m unittest -v test_polymarket_mlb_average_down.py
+
+      - name: Run MLB average-down monitor
+        env:
+          POLYMARKET_PUBLIC_KEY: ${{ secrets.POLYMARKET_PUBLIC_KEY }}
+          POLYMARKET_SECRET_KEY: ${{ secrets.POLYMARKET_SECRET_KEY }}
+          LIVE_TRADING: ${{ inputs.live_trading }}
+          INITIAL_POSITION_SIZE: ${{ inputs.initial_position_size }}
+          MAX_TOTAL_CAPITAL: ${{ inputs.max_total_capital }}
+          RUN_SECONDS: ${{ inputs.run_seconds }}
+        run: |
+          set -euo pipefail
+          args=(--config polymarket_mlb_average_down_config.json
+                --state-file polymarket_mlb_average_down_state.json
+                --report polymarket_mlb_average_down_report.json
+                --persist-config
+                --run-seconds "$RUN_SECONDS")
+          [ -z "$INITIAL_POSITION_SIZE" ] || args+=(--initial-position-size "$INITIAL_POSITION_SIZE")
+          [ -z "$MAX_TOTAL_CAPITAL" ] || args+=(--max-total-capital "$MAX_TOTAL_CAPITAL")
+          if [ "$LIVE_TRADING" = "true" ]; then
+            DRY_RUN=false python polymarket_mlb_average_down.py "${args[@]}" --submit --allow-live
+          else
+            DRY_RUN=true python polymarket_mlb_average_down.py "${args[@]}"
+          fi
+
+      - name: Persist MLB strategy state
+        if: always()
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add polymarket_mlb_average_down_config.json
+          for file in polymarket_mlb_average_down_state.json polymarket_mlb_average_down_report.json; do
+            test ! -f "$file" || git add "$file"
+          done
+          git diff-index --quiet HEAD || \
+            (git commit -m "chore: record MLB average-down state [skip ci]" && \
+             git pull --rebase --autostash origin main && git push)
+
+      - name: Upload execution audit artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: polymarket-mlb-average-down-${{ github.run_id }}
+          path: |
+            polymarket_mlb_average_down_config.json
+            polymarket_mlb_average_down_state.json
+            polymarket_mlb_average_down_report.json
+          if-no-files-found: warn
+          retention-days: 90
