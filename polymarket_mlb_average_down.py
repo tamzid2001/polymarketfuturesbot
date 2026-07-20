@@ -9,8 +9,9 @@ each further ``price_step``.  It never hedges, flips sides, uses ML, or opens a
 position after the game has begun.
 
 Live submission is deliberately opt-in: DRY_RUN must be false and both
---submit and --allow-live must be present.  The supplied GitHub workflow is
-manual-only and defaults to dry run.
+--submit and --allow-live must be present. The supplied GitHub workflow runs a
+24/7 dry-monitoring handoff chain; only an explicit manual dispatch can submit
+live orders, and that live run does not self-handoff.
 """
 
 from __future__ import annotations

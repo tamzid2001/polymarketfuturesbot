@@ -5,11 +5,9 @@ The repository contains the original futures and Prophet runners, plus two separ
 1. **Polymarket Futures Bot** (`polymarket_bot.py`) — WebSocket-driven take-profit and re-entry bot for Polymarket US Futures markets (MLB World Series 2026 focus).
 2. **Kalshi BTC 15-Min Prophet Bot** (`kalshibtc15minupordown.py`) — pre-forecasts BTC two minutes before each new Kalshi market opens with a fixed 17-minute horizon, then compares the cached p50 with the live strike immediately at the open. [Jump to docs ↓](#kalshi-btc-15-minute-prophet-bot)
 3. **Kalshi BTC 15-Min Mechanical Average-Down Bot** (`kalshi_btc15m_average_down.py`) — continuous KXBTC15M-only runner with no forecast or ML. It starts a persisted two-sided watcher at each new market opening, waits as long as needed for one side to reach 40¢ or lower, then holds only that side's 40¢/30¢/20¢/10¢ economic ladder to settlement. [Jump to docs ↓](#kalshi-btc-15-minute-mechanical-average-down-runner)
-4. **Polymarket US MLB Mechanical Average-Down Bot** (`polymarket_mlb_average_down.py`) — manual-only, disabled-by-default runner for same-day MLB full-game moneylines. It takes no baseball prediction: it snapshots both team costs, waits for the first team to trade 10¢ below its own snapshot, then buys that side and posts only lower 10¢ rungs.
+4. **Polymarket US MLB Mechanical Average-Down Bot** (`polymarket_mlb_average_down.py`) — continuous dry-monitoring runner for same-day MLB full-game moneylines. It takes no baseball prediction: it snapshots both team costs, waits for the first team to trade 10¢ below its own snapshot, and records the resulting mechanical ladder audit. Scheduled runs cannot place orders; a separate manual switch permits a one-off live run.
 
-The two continuous bots run inside GitHub Actions for up to 5 h 45 min per job before self-triggering the next run for uninterrupted 24/7 operation.
-
-The mechanical MLB runner is intentionally excluded from that automatic schedule: it starts only from its own manual workflow and requires an explicit live-order confirmation.
+The continuous runners use GitHub Actions for up to 5 h 45 min per job before self-triggering the next run. The Polymarket MLB mechanical runner is now a 24/7 **dry-monitoring** chain: scheduled and handoff jobs are explicitly dry, while live trading remains a separate manual choice.
 
 ---
 
@@ -32,7 +30,9 @@ Key persisted settings in `kalshi_btc15m_average_down_config.json` are `initial_
 
 ## Mechanical MLB average-down runner
 
-Use **Actions → “Polymarket US MLB Mechanical Average Down” → Run workflow**. Its default is a dry run; real orders require setting `live_trading` to true in that specific manual dispatch.
+The **“Polymarket US MLB Mechanical Average Down”** workflow now runs 24/7 dry monitoring: it runs for 5 h 45 min, saves its state and report, then queues the next dry run. The six-hour schedule is a recovery path if a handoff fails. Scheduled and handoff runs hard-code `LIVE_TRADING=false` and cannot submit an order.
+
+Use **Actions → “Polymarket US MLB Mechanical Average Down” → Run workflow** for a manual run. Its default is dry. Setting `live_trading` to true is an explicit **one-off** live run; it does not self-handoff, so it cannot silently become continuous live trading.
 
 For every eligible MLB full-game moneyline starting that day in New York time, the runner records the first executable home and away costs. A snapshot of `$0.80` for one team and `$0.20` for the other produces entry limits of `$0.70` and `$0.10`, respectively. It excludes first-five markets, totals, spreads, props, and futures.
 

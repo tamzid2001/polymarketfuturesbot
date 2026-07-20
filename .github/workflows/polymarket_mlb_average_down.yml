@@ -1,12 +1,16 @@
 name: Polymarket US MLB Mechanical Average Down
 
-# This is intentionally manual-only and dry-run by default.  It does not share
-# the futures bot's schedule or auto-entry behavior.
+# This is a continuous dry-monitoring chain: each job observes the mechanical
+# MLB strategy for 5h45m, persists its state, and queues the next dry job. The
+# six-hour cron is a restart safety net. Scheduled and handoff jobs never send
+# orders; live trading remains an explicit, one-off manual dispatch choice.
 on:
+  schedule:
+    - cron: "11 */6 * * *"
   workflow_dispatch:
     inputs:
       live_trading:
-        description: "Submit real orders (disabled by default)."
+        description: "Submit real orders for this one manual run (disabled by default; it will not self-handoff)."
         required: true
         type: boolean
         default: false
@@ -32,6 +36,7 @@ concurrency:
 
 permissions:
   contents: write
+  actions: write
 
 jobs:
   monitor:
@@ -57,14 +62,16 @@ jobs:
           python -m py_compile polymarket_mlb_average_down.py
           python -m unittest -v test_polymarket_mlb_average_down.py
 
-      - name: Run MLB average-down monitor
+      - name: Run continuous MLB average-down monitor
         env:
           POLYMARKET_PUBLIC_KEY: ${{ secrets.POLYMARKET_PUBLIC_KEY }}
           POLYMARKET_SECRET_KEY: ${{ secrets.POLYMARKET_SECRET_KEY }}
-          LIVE_TRADING: ${{ inputs.live_trading }}
+          # Scheduled and queued runs are hard-coded dry. Only a human's
+          # explicit manual dispatch may set this to true.
+          LIVE_TRADING: ${{ github.event_name == 'workflow_dispatch' && inputs.live_trading == true }}
           INITIAL_POSITION_SIZE: ${{ inputs.initial_position_size }}
           MAX_TOTAL_CAPITAL: ${{ inputs.max_total_capital }}
-          RUN_SECONDS: ${{ inputs.run_seconds }}
+          RUN_SECONDS: ${{ inputs.run_seconds || '20700' }}
         run: |
           set -euo pipefail
           args=(--config polymarket_mlb_average_down_config.json
@@ -92,6 +99,21 @@ jobs:
           git diff-index --quiet HEAD || \
             (git commit -m "chore: record MLB average-down state [skip ci]" && \
              git pull --rebase --autostash origin main && git push)
+
+      - name: Queue the next 5h45m dry-monitoring handoff
+        # A live manual run is intentionally one-off. Scheduled and manually
+        # started dry runs form the 24/7 chain and always dispatch dry mode.
+        if: success() && (github.event_name == 'schedule' || inputs.live_trading == false)
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT || github.token }}
+        run: |
+          set -euo pipefail
+          gh workflow run polymarket_mlb_average_down.yml \
+            --repo "$GITHUB_REPOSITORY" \
+            --ref main \
+            -f live_trading=false \
+            -f run_seconds=20700
+          echo "HANDOFF QUEUED | next 5h45m MLB mechanical monitor remains DRY_RUN."
 
       - name: Upload execution audit artifact
         if: always()
