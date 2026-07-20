@@ -24,24 +24,12 @@ from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
 from kalshi_ml_features import FEATURE_SCHEMA, ML_ONLY_FEATURE_COLUMNS
+from kalshi_ml_calibration import IsotonicCalibratedClassifier
 
 
 MODEL_FORMAT_VERSION = 3
 MODEL_TYPES = ("hist_gradient_boosting", "logistic_regression")
 CALIBRATION_TYPES = ("raw", "isotonic")
-
-
-class IsotonicCalibratedClassifier:
-    """Serializable binary classifier that calibrates its base probability."""
-
-    def __init__(self, base_model: Any, calibrator: IsotonicRegression) -> None:
-        self.base_model = base_model
-        self.calibrator = calibrator
-
-    def predict_proba(self, values: Any) -> np.ndarray:
-        raw_probability = self.base_model.predict_proba(values)[:, 1]
-        probability = np.clip(self.calibrator.predict(raw_probability), 0.0, 1.0)
-        return np.column_stack((1.0 - probability, probability))
 
 
 def read_training_rows(path: Path, as_of: pd.Timestamp | None) -> pd.DataFrame:

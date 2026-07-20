@@ -24,6 +24,7 @@ import asyncio
 import json
 import logging
 import os
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -38,6 +39,7 @@ from sklearn.preprocessing import StandardScaler
 
 import kalshibtc15minupordown as kalshi
 from kalshi_ml_features import FEATURE_SCHEMA, ML_ONLY_FEATURE_COLUMNS, feature_values
+from kalshi_ml_calibration import IsotonicCalibratedClassifier
 
 
 LOG = logging.getLogger("kalshi_ml_inference_live")
@@ -124,6 +126,14 @@ def train_model(rows: pd.DataFrame):
 
 def load_saved_model(path: Path):
     """Load a model produced by kalshi_ml_model_train.py and verify its schema."""
+    # Models created before the stable calibration module was introduced
+    # pickle this wrapper as ``__main__.IsotonicCalibratedClassifier``.  Give
+    # Python's current entry-point module that exact compatibility attribute
+    # before unpickling, so the active production artifact loads safely. New
+    # models use kalshi_ml_calibration.IsotonicCalibratedClassifier instead.
+    main_module = sys.modules.get("__main__")
+    if main_module is not None:
+        setattr(main_module, "IsotonicCalibratedClassifier", IsotonicCalibratedClassifier)
     payload = joblib.load(path)
     if not isinstance(payload, dict) or payload.get("feature_columns") != ML_ONLY_FEATURE_COLUMNS:
         raise ValueError(f"Saved model {path} does not match the current ML feature schema")
