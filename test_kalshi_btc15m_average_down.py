@@ -44,6 +44,7 @@ class MechanicalAverageDownTests(unittest.TestCase):
         self.assertEqual(config["market_refresh_seconds"], 15.0)
         self.assertEqual(config["order_reconcile_seconds"], 5.0)
         self.assertEqual(config["watch_start_grace_seconds"], 45.0)
+        self.assertEqual(config["ml_min_confidence"], 0.5)
 
     def test_fresh_websocket_quote_supplies_both_executable_sides(self):
         feed = KalshiLiveFeed(auth=None)

@@ -39,7 +39,7 @@ on:
         description: "Successful calibrated ML-model training run. Blank keeps the pinned production model."
         required: false
         type: string
-        default: "29706847167"
+        default: "29774183849"
       training_run_id:
         description: "Historical feature-ledger run used by the ML model. Blank keeps the default artifact."
         required: false
@@ -82,7 +82,7 @@ jobs:
       - name: Download stored ML model and frozen feature ledger
         env:
           GH_TOKEN: ${{ github.token }}
-          MODEL_RUN_ID: ${{ inputs.model_run_id || '29706847167' }}
+          MODEL_RUN_ID: ${{ inputs.model_run_id || '29774183849' }}
           TRAINING_RUN_ID: ${{ inputs.training_run_id || '29698207476' }}
         run: |
           set -euo pipefail
@@ -112,7 +112,7 @@ jobs:
           MAX_ACTIVE_MARKETS: ${{ inputs.max_active_markets }}
           MAX_CONTRACTS_PER_MARKET: ${{ inputs.max_contracts_per_market }}
           MAX_TOTAL_CAPITAL: ${{ inputs.max_total_capital }}
-          MODEL_RUN_ID: ${{ inputs.model_run_id || '29706847167' }}
+          MODEL_RUN_ID: ${{ inputs.model_run_id || '29774183849' }}
           TRAINING_RUN_ID: ${{ inputs.training_run_id || '29698207476' }}
         run: |
           set -euo pipefail
