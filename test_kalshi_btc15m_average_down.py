@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from kalshi_btc15m_average_down import (
     DEFAULT_CONFIG,
     LADDER_LEVELS,
+    active_strategy_records,
     choose_entry_side,
     consider_initial_entry,
     default_state,
@@ -13,6 +14,7 @@ from kalshi_btc15m_average_down import (
     reconcile_orders,
     side_api_price,
     submit_ladder,
+    market_is_tradeable,
     validate_config,
 )
 
@@ -70,7 +72,7 @@ class MechanicalAverageDownTests(unittest.TestCase):
             state = default_state()
             market = SimpleNamespace(
                 ticker="KXBTC15M-TEST", status="active", yes_ask_dollars="0.3500",
-                no_ask_dollars="0.6500", close_time="2026-07-20T00:15:00Z",
+                no_ask_dollars="0.6500", close_time="2099-07-20T00:15:00Z",
             )
             rest = FakeRest()
             entered = await consider_initial_entry(rest, state, market, config, dry_run=False)
@@ -114,6 +116,12 @@ class MechanicalAverageDownTests(unittest.TestCase):
 
         record = asyncio.run(scenario())
         self.assertEqual(list(record["orders"]), ["0.4000"])
+
+    def test_closed_prior_market_does_not_block_a_fresh_new_market(self):
+        state = {"markets": {"old": {"status": "closed_waiting_finalization", "quantity": 1.0}}}
+        self.assertEqual(active_strategy_records(state), [])
+        expired = SimpleNamespace(status="active", close_time="2020-01-01T00:00:00Z")
+        self.assertFalse(market_is_tradeable(expired))
 
 
 if __name__ == "__main__":
