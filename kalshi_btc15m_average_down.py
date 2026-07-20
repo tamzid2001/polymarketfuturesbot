@@ -150,6 +150,13 @@ def market_result(market: Any) -> str | None:
     return result if result in {"yes", "no"} else None
 
 
+def normalized_order_status(raw: Any) -> str:
+    """Accept SDK enums as well as plain status strings (e.g. OrderStatus.CANCELED)."""
+    value = getattr(raw, "value", raw)
+    status = str(value or "").lower()
+    return status.rsplit(".", 1)[-1]
+
+
 def market_asks(market: Any) -> dict[str, float | None]:
     """Read executable position asks as dollars, accepting API migrations."""
     result: dict[str, float | None] = {}
@@ -410,7 +417,7 @@ class KalshiREST:
                 record["remaining_count"] = round(remaining, 2)
             record["average_fill_price"] = order_average_position_price(order, record["side"], record["position_price"])
             record["fees_paid"] = max(float(record.get("fees_paid") or 0.0), order_fee_total(order))
-            status = str(field(order, "status") or "").lower()
+            status = normalized_order_status(field(order, "status"))
             if status:
                 record["status"] = status
             record["last_checked_at"] = now_iso()
@@ -504,6 +511,16 @@ async def reconcile_orders(rest: KalshiREST, record: dict[str, Any], dry_run: bo
         record["locked_at"] = now_iso()
         record["status"] = "ladder_active"
         LOG.info("SIDE LOCKED | %s %s after initial fill %.2f", record["ticker"], record["locked_side"].upper(), initial["fill_count"])
+        changed = True
+    elif isinstance(initial, dict) and float(initial.get("fill_count") or 0.0) <= 0.004 and initial.get("status") in {
+        "canceled", "canceled_unfilled", "rejected", "expired",
+    } and record.get("status") == "initial_submitted":
+        # A protected IOC with no fill is not a position and must not consume
+        # the active-market slot or the capital reserve on a later handoff.
+        record["status"] = "initial_unfilled"
+        record["initial_unfilled_at"] = now_iso()
+        LOG.info("INITIAL UNFILLED | %s %s; zero contracts held, slot released.",
+                 record["ticker"], str(record.get("candidate_side") or "?").upper())
         changed = True
     return changed
 

@@ -16,6 +16,7 @@ from kalshi_btc15m_average_down import (
     side_api_price,
     submit_ladder,
     market_is_tradeable,
+    normalized_order_status,
     validate_config,
 )
 
@@ -45,6 +46,10 @@ class MechanicalAverageDownTests(unittest.TestCase):
             classify_submission(1.0, 0.0, 1.0, "immediate_or_cancel"),
             "filled",
         )
+
+    def test_sdk_enum_style_status_is_normalized(self):
+        self.assertEqual(normalized_order_status("OrderStatus.CANCELED"), "canceled")
+        self.assertEqual(normalized_order_status("FILLED"), "filled")
 
     def test_config_rejects_an_unfunded_ladder(self):
         invalid = {**DEFAULT_CONFIG, "max_total_capital": 0.99}
