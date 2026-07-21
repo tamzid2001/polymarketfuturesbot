@@ -154,6 +154,8 @@ The optional `ml_side_average_down` runner mode remains disabled by default:
 
 To use a successfully validated artifact in a future **dry run**, set `strategy_mode` to `ml_side_average_down` and point `ml_model_path` at that artifact. The runner loads no Prophet model and has no fallback side: once it stores the ML-selected home or away outcome, only that outcome can trigger the initial 10¢ discount order and all later rungs stay on that same team through settlement. Missing/unreadable artifacts, unavailable features, or failed inference place no order.
 
+When that ML dry mode is enabled, `ml_inverse_shadow_enabled` (default `true`) also creates a separate, paper-only shadow for the *opposite* team. It mirrors the inverse team's own baseline, 10¢ trigger, and lower rungs, but never calls the order API or changes the ML-selected ladder. Each shadow hit records the fresh BBO-derived outcome ask and timestamp used; because this BBO endpoint supplies no displayed depth, a hit is explicitly a quote observation—not an exchange fill or executable-P&L claim. After settlement, the report separately shows inverse directional accuracy and clearly labelled illustrative quote-hit results. The default mechanical workflow has no model artifact and therefore creates no ML or inverse-shadow selections.
+
 ---
 
 ## How it works

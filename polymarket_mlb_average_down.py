@@ -1,12 +1,14 @@
-"""Mechanical Polymarket US MLB full-game moneyline average-down bot.
+"""Polymarket US MLB full-game moneyline average-down bot.
 
 The runner takes no view on baseball.  For each MLB full-game moneyline that
 starts today (America/New_York), it snapshots the first executable cost of the
 home and away outcomes.  It waits until either outcome can be bought at least
 ``price_step`` below that snapshot, buys the first triggered outcome with a
 protected IOC limit order, locks that outcome, and posts lower GTC limits at
-each further ``price_step``.  It never hedges, flips sides, uses ML, or opens a
-position after the game has begun.
+each further ``price_step``.  The default strategy is price-only mechanical;
+the separately configured ML mode freezes one selected side and may maintain a
+paper-only inverse selection comparison.  Neither mode hedges, flips an actual
+position, or opens a position after the game has begun.
 
 Live submission is deliberately opt-in: DRY_RUN must be false and both
 --submit and --allow-live must be present. The supplied GitHub workflow runs a
@@ -29,7 +31,7 @@ from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
@@ -43,8 +45,8 @@ LOG = logging.getLogger("polymarket_mlb_average_down")
 GATEWAY_BASE_URL = "https://gateway.polymarket.us"
 LEAGUE = "mlb"
 ET = ZoneInfo("America/New_York")
-CONFIG_VERSION = 2
-STATE_VERSION = 1
+CONFIG_VERSION = 3
+STATE_VERSION = 2
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "format_version": CONFIG_VERSION,
@@ -61,6 +63,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "strategy_mode": "mechanical",
     "ml_model_path": "",
     "ml_min_confidence": 0.50,
+    # Runs only with the explicitly enabled ML strategy in DRY_RUN. It
+    # evaluates the other ML outcome without submitting an order.
+    "ml_inverse_shadow_enabled": True,
 }
 
 
@@ -166,6 +171,14 @@ def lower_levels(first_fill: float, step: float, tick_size: float, max_orders: i
         if level not in levels:
             levels.append(level)
     return levels
+
+
+def opposite_outcome(outcome: str) -> str:
+    if outcome == "long":
+        return "short"
+    if outcome == "short":
+        return "long"
+    raise ValueError(f"Unsupported outcome: {outcome}")
 
 
 def choose_first_trigger(
@@ -309,6 +322,7 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
     if confidence is None or not .5 <= confidence <= 1:
         raise ValueError("ml_min_confidence must be between 0.50 and 1.00")
     merged["ml_min_confidence"] = confidence
+    merged["ml_inverse_shadow_enabled"] = as_bool(merged.get("ml_inverse_shadow_enabled"))
     return merged
 
 
@@ -608,7 +622,167 @@ async def snapshot_baseline(client: Any, record: dict[str, Any], game: GameMarke
     return True
 
 
-async def resolve_ml_side(game: GameMarket, record: dict[str, Any], config: dict[str, Any]) -> bool:
+def ml_inverse_shadow_enabled(config: dict[str, Any], dry_run: bool) -> bool:
+    """The comparison is intentionally dry-only and requires a real ML side."""
+    return bool(
+        dry_run
+        and config.get("ml_inverse_shadow_enabled")
+        and config.get("strategy_mode") == "ml_side_average_down"
+    )
+
+
+def inverse_shadow_rung_key(level: float) -> str:
+    return f"ladder-{level:.8f}"
+
+
+def shadow_quote_evidence(asks: dict[str, float | None]) -> dict[str, Any]:
+    """Record the exact fresh BBO-derived costs used by the paper comparison.
+
+    The market BBO endpoint does not provide displayed size here.  A quote hit
+    is therefore deliberately *not* represented as an exchange fill.
+    """
+    long_ask = asks.get("long")
+    short_ask = asks.get("short")
+    return {
+        "source": "polymarket_bbo_poll_no_displayed_depth",
+        "observed_at": now_iso(),
+        "long_ask": long_ask,
+        "long_bid": round(1.0 - short_ask, 8) if short_ask is not None else None,
+        "short_ask": short_ask,
+        "short_bid": round(1.0 - long_ask, 8) if long_ask is not None else None,
+    }
+
+
+def ensure_inverse_ml_shadow(record: dict[str, Any], config: dict[str, Any], dry_run: bool) -> dict[str, Any] | None:
+    """Create one non-executable inverse side for an already frozen ML pick."""
+    if not ml_inverse_shadow_enabled(config, dry_run):
+        return None
+    existing = record.get("ml_inverse_shadow")
+    if isinstance(existing, dict):
+        return existing
+    selected = record.get("ml_selected_outcome")
+    outcomes = record.get("outcomes") or {}
+    if selected not in {"long", "short"} or set(outcomes) != {"long", "short"}:
+        return None
+    inverse = opposite_outcome(str(selected))
+    side = outcomes[inverse]
+    quantity = int(record.get("quantity") or 0)
+    if quantity <= 0:
+        return None
+    target = as_float(side.get("entry_target"))
+    baseline = as_float(side.get("initial_ask"))
+    if target is None or baseline is None:
+        return None
+    shadow = {
+        "version": 1,
+        "mode": "dry_run_ml_inverse_bbo_quote_shadow_v1",
+        "order_policy": "paper_only_no_order_submission",
+        "fill_policy": "quote_hit_is_not_an_exchange_fill_no_displayed_depth",
+        "status": "watching_trigger",
+        "created_at": now_iso(),
+        "source_ml_selected_outcome": selected,
+        "outcome": inverse,
+        "role": side.get("role"),
+        "team": side.get("team"),
+        "quantity_per_rung": quantity,
+        "baseline_ask": baseline,
+        "entry_target": target,
+        "rungs": {
+            "initial": {
+                "rung_price": target,
+                "quantity": quantity,
+                "status": "watching_fresh_bbo_quote",
+            },
+        },
+    }
+    record["ml_inverse_shadow"] = shadow
+    LOG.info(
+        "ML INVERSE SHADOW STARTED | %s source=%s inverse=%s %s baseline=$%.4f trigger<=$%.4f "
+        "mode=paper_only_no_order",
+        record["market_slug"], str(selected).upper(), inverse.upper(), side.get("team", "?"), baseline, target,
+    )
+    return shadow
+
+
+def shadow_quote_hit_rungs(shadow: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        rung for rung in (shadow.get("rungs") or {}).values()
+        if isinstance(rung, dict) and rung.get("status") == "simulated_quote_hit"
+    ]
+
+
+def observe_inverse_ml_shadow(record: dict[str, Any], config: dict[str, Any], dry_run: bool,
+                              asks: dict[str, float | None]) -> bool:
+    """Advance the inverse dry shadow from a fresh, independently polled BBO.
+
+    This function never calls the exchange order API.  It only records a
+    *simulated quote hit* after the inverse outcome's executable ask reaches a
+    rung.  Lower rungs are installed in the shadow only after the initial
+    quote hit and are evaluated on later polling cycles, avoiding a same-poll
+    retroactive fill assumption.
+    """
+    shadow = ensure_inverse_ml_shadow(record, config, dry_run)
+    if not isinstance(shadow, dict) or shadow.get("status") in {
+        "game_started_waiting_settlement", "settled", "disabled",
+    }:
+        return False
+    outcome = shadow.get("outcome")
+    ask = as_float(asks.get(outcome))
+    if outcome not in {"long", "short"} or ask is None:
+        return False
+    evidence = shadow_quote_evidence(asks)
+    shadow["last_quote"] = {**evidence, "outcome": outcome, "outcome_ask": ask}
+    rungs = shadow.get("rungs") or {}
+    initial = rungs.get("initial")
+    if not isinstance(initial, dict):
+        return False
+    if initial.get("status") == "watching_fresh_bbo_quote":
+        target = as_float(initial.get("rung_price"))
+        if target is None or ask > target + 1e-9:
+            return False
+        initial.update({
+            "status": "simulated_quote_hit", "observed_outcome_ask": ask,
+            "quote": evidence, "simulated_cost": target,
+            "note": "BBO threshold observation only; not an exchange fill.",
+        })
+        quantity = int(shadow["quantity_per_rung"])
+        tick_size = float(record["tick_size"])
+        slots = config["max_contracts_per_game"] // quantity
+        for level in lower_levels(target, config["price_step"], tick_size, slots):
+            rungs[inverse_shadow_rung_key(level)] = {
+                "rung_price": level,
+                "quantity": quantity,
+                "status": "watching_fresh_bbo_quote",
+            }
+        shadow.update({"status": "ladder_quote_shadow_active", "initial_quote_hit_at": now_iso()})
+        LOG.info(
+            "ML INVERSE SHADOW QUOTE HIT | %s %s observed=$%.4f trigger=$%.4f qty=%d "
+            "(not an exchange fill; no order sent)",
+            record["market_slug"], str(outcome).upper(), ask, target, quantity,
+        )
+        return True
+    changed = False
+    for key, rung in rungs.items():
+        if key == "initial" or not isinstance(rung, dict) or rung.get("status") != "watching_fresh_bbo_quote":
+            continue
+        level = as_float(rung.get("rung_price"))
+        if level is None or ask > level + 1e-9:
+            continue
+        rung.update({
+            "status": "simulated_quote_hit", "observed_outcome_ask": ask,
+            "quote": evidence, "simulated_cost": level,
+            "note": "BBO threshold observation only; not an exchange fill.",
+        })
+        LOG.info(
+            "ML INVERSE SHADOW RUNG HIT | %s %s observed=$%.4f rung=$%.4f qty=%d "
+            "(not an exchange fill; no order sent)",
+            record["market_slug"], str(outcome).upper(), ask, level, int(rung["quantity"]),
+        )
+        changed = True
+    return changed
+
+
+async def resolve_ml_side(game: GameMarket, record: dict[str, Any], config: dict[str, Any], dry_run: bool = True) -> bool:
     """Freeze one ML-selected team before the mechanical discount watcher runs."""
     if config["strategy_mode"] != "ml_side_average_down":
         return True
@@ -635,6 +809,7 @@ async def resolve_ml_side(game: GameMarket, record: dict[str, Any], config: dict
         "ml_selected_outcome": outcome, "ml_selected_at": now_iso(), "ml_p_home": result.get("p_home"),
         "ml_confidence": result.get("confidence"), "ml_model": result.get("model"), "ml_result": result,
     })
+    ensure_inverse_ml_shadow(record, config, dry_run)
     side = record["outcomes"][outcome]
     LOG.info(
         "ML SIDE FROZEN | %s %s %s p_home=%.4f confidence=%.4f model=%s; only this team can trigger the 10c ladder.",
@@ -645,7 +820,7 @@ async def resolve_ml_side(game: GameMarket, record: dict[str, Any], config: dict
 
 async def consider_entry(
     client: Any, record: dict[str, Any], config: dict[str, Any], dry_run: bool,
-    state_path: Path, state: dict[str, Any], now: datetime,
+    state_path: Path, state: dict[str, Any], now: datetime, asks: dict[str, float | None] | None = None,
 ) -> None:
     if record.get("status") != "watching_trigger" or record.get("locked_outcome"):
         return
@@ -654,7 +829,7 @@ async def consider_entry(
     outcomes = record.get("outcomes") or {}
     if set(outcomes) != {"long", "short"}:
         return
-    asks = await bbo(client, record["market_slug"])
+    asks = asks if asks is not None else await bbo(client, record["market_slug"])
     selected = record.get("ml_selected_outcome") if config["strategy_mode"] == "ml_side_average_down" else None
     if config["strategy_mode"] == "ml_side_average_down" and selected not in {"long", "short"}:
         return
@@ -695,28 +870,134 @@ async def close_started_games(client: Any, state: dict[str, Any], dry_run: bool,
             continue
         for order in orders_for_game(record):
             await cancel_order(client, order, dry_run)
+        shadow = record.get("ml_inverse_shadow")
+        if isinstance(shadow, dict) and shadow.get("status") not in {"settled", "disabled"}:
+            shadow.update({"status": "game_started_waiting_settlement", "quote_window_closed_at": now_iso()})
         record.update({"status": "game_started", "orders_canceled_at_start": now_iso()})
         LOG.info("GAME STARTED | %s: no new orders; unfilled ladder orders canceled.", record.get("market_slug", "?"))
 
 
-def performance_report(state: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
+async def fetch_market_settlement(market_slug: str) -> float | None:
+    """Fetch the authoritative binary settlement once a tracked game is over."""
+    url = f"{GATEWAY_BASE_URL}/v1/markets/{quote(market_slug, safe='')}/settlement"
+
+    def fetch() -> float | None:
+        request = Request(url, headers={"Accept": "application/json", "User-Agent": "polymarket-mlb-average-down/1.0"})
+        try:
+            with urlopen(request, timeout=20) as response:  # noqa: S310 - fixed first-party HTTPS endpoint
+                payload = json.loads(response.read().decode("utf-8"))
+        except (OSError, ValueError):
+            return None
+        value = as_float(payload.get("settlement")) if isinstance(payload, dict) else None
+        return value if value in {0.0, 1.0} else None
+
+    return await asyncio.to_thread(fetch)
+
+
+def inverse_shadow_performance(records: list[dict[str, Any]], config: dict[str, Any], dry_run: bool = True) -> dict[str, Any]:
+    shadows = [record.get("ml_inverse_shadow") for record in records if isinstance(record.get("ml_inverse_shadow"), dict)]
+    settled = [shadow for shadow in shadows if shadow.get("status") == "settled"]
+    wins = sum(shadow.get("selection_result") == "win" for shadow in settled)
+    losses = sum(shadow.get("selection_result") == "loss" for shadow in settled)
+    hit_rungs = [rung for shadow in shadows for rung in shadow_quote_hit_rungs(shadow)]
+    quote_cost = sum(float(rung.get("simulated_cost") or 0.0) * int(rung.get("quantity") or 0) for rung in hit_rungs)
+    quote_payout = sum(float(shadow.get("simulated_quote_hit_payout") or 0.0) for shadow in settled)
+    quote_pnl = sum(float(shadow.get("simulated_quote_hit_pnl_before_fees") or 0.0) for shadow in settled)
+    return {
+        "enabled_for_this_run": ml_inverse_shadow_enabled(config, dry_run),
+        "mode": "dry_run_ml_inverse_bbo_quote_shadow_v1",
+        "order_policy": "paper_only_no_order_submission",
+        "fill_policy": "quote_hit_is_not_an_exchange_fill_no_displayed_depth",
+        "shadow_selections": len(shadows),
+        "selection_settled": len(settled),
+        "inverse_directional_wins": wins,
+        "inverse_directional_losses": losses,
+        "inverse_directional_win_rate": round(wins / len(settled), 6) if settled else None,
+        "active_quote_shadows": sum(shadow.get("status") == "ladder_quote_shadow_active" for shadow in shadows),
+        "waiting_for_settlement": sum(shadow.get("status") == "game_started_waiting_settlement" for shadow in shadows),
+        "simulated_quote_hit_rungs": len(hit_rungs),
+        "simulated_quote_hit_cost": round(quote_cost, 8),
+        "simulated_quote_hit_payout": round(quote_payout, 8),
+        "simulated_quote_hit_pnl_before_fees": round(quote_pnl, 8),
+        "limitation": (
+            "Quote hits use a fresh Polymarket BBO poll but this endpoint exposes no displayed depth here. "
+            "They are trigger observations, not exchange fills or executable-P&L evidence."
+        ),
+    }
+
+
+async def settle_inverse_ml_shadows(state: dict[str, Any], config: dict[str, Any], now: datetime) -> None:
+    """Settle only the paper inverse comparison; it never affects real orders."""
+    for record in state.get("games", {}).values():
+        if not isinstance(record, dict) or record.get("status") != "game_started":
+            continue
+        shadow = record.get("ml_inverse_shadow")
+        if not isinstance(shadow, dict) or shadow.get("status") == "settled":
+            continue
+        last_check = parse_timestamp(shadow.get("settlement_last_checked_at"))
+        if last_check is not None and (now - last_check).total_seconds() < 120:
+            continue
+        shadow["settlement_last_checked_at"] = now_iso()
+        settlement = await fetch_market_settlement(str(record.get("market_slug") or ""))
+        if settlement is None:
+            continue
+        winning_outcome = "long" if settlement == 1.0 else "short"
+        selected = shadow.get("outcome")
+        hit_rungs = shadow_quote_hit_rungs(shadow)
+        cost = sum(float(rung.get("simulated_cost") or 0.0) * int(rung.get("quantity") or 0) for rung in hit_rungs)
+        payout = sum(int(rung.get("quantity") or 0) for rung in hit_rungs) if selected == winning_outcome else 0
+        shadow.update({
+            "status": "settled",
+            "settled_at": now_iso(),
+            "market_settlement": settlement,
+            "winning_outcome": winning_outcome,
+            "selection_result": "win" if selected == winning_outcome else "loss",
+            "simulated_quote_hit_cost": round(cost, 8),
+            "simulated_quote_hit_payout": round(float(payout), 8),
+            "simulated_quote_hit_pnl_before_fees": round(float(payout) - cost, 8),
+            "settlement_note": "Payout is illustrative because BBO quote hits are not verified fills.",
+        })
+        LOG.info(
+            "ML INVERSE SHADOW SETTLED | %s inverse=%s winner=%s selection=%s quote_hit_rungs=%d "
+            "illustrative_pnl_before_fees=$%+.4f (not executable fill evidence)",
+            record.get("market_slug"), str(selected).upper(), winning_outcome.upper(), shadow["selection_result"],
+            len(hit_rungs), float(shadow["simulated_quote_hit_pnl_before_fees"]),
+        )
+
+
+def performance_report(state: dict[str, Any], config: dict[str, Any], dry_run: bool = True) -> dict[str, Any]:
     records = [record for record in state.get("games", {}).values() if isinstance(record, dict)]
     locked = [record for record in records if record.get("locked_outcome")]
     return {
-        "generated_at": now_iso(), "strategy": "mechanical_mlb_price_average_down_v1",
+        "generated_at": now_iso(), "strategy": "polymarket_mlb_average_down_v2", "strategy_mode": config["strategy_mode"],
         "configuration": config, "games_observed": len(records), "games_with_filled_entry": len(locked),
         "contracts_filled": sum(filled_contracts(record) for record in records),
         "active_ladders": sum(record.get("status") == "ladder_active" for record in records),
         "game_started_records": sum(record.get("status") == "game_started" for record in records),
-        "note": "Entry and ladder audit only. This runner intentionally does not forecast games or add an exit strategy.",
+        "ml_inverse_shadow_performance": inverse_shadow_performance(records, config, dry_run),
+        "note": (
+            "Entry and ladder audit only. Mechanical mode makes no forecast; ML mode has no exit strategy. "
+            "Inverse quote hits are paper observations, not exchange fills."
+        ),
     }
 
 
 async def log_heartbeat(state: dict[str, Any], games: list[GameMarket], config: dict[str, Any], dry_run: bool) -> None:
     now = datetime.now(timezone.utc)
+    records = [record for record in state.get("games", {}).values() if isinstance(record, dict)]
+    inverse = inverse_shadow_performance(records, config, dry_run)
     LOG.info("HEARTBEAT | mode=%s discovered=%d tracked=%d active_ladders=%d reserved=$%.4f cap=$%.4f",
              "DRY_RUN" if dry_run else "LIVE", len(games), len(state.get("games", {})),
              len(active_position_records(state, now)), reserved_capital(state, now), config["max_total_capital"])
+    if ml_inverse_shadow_enabled(config, dry_run):
+        LOG.info(
+            "ML INVERSE SHADOW | selections=%d settled=%d W=%d L=%d win_rate=%s quote_hit_rungs=%d "
+            "(paper-only; no exchange orders)",
+            inverse["shadow_selections"], inverse["selection_settled"], inverse["inverse_directional_wins"],
+            inverse["inverse_directional_losses"],
+            "n/a" if inverse["inverse_directional_win_rate"] is None else f"{inverse['inverse_directional_win_rate']:.2%}",
+            inverse["simulated_quote_hit_rungs"],
+        )
     for record in state.get("games", {}).values():
         if not isinstance(record, dict) or record.get("status") == "game_started":
             continue
@@ -750,11 +1031,14 @@ async def run(args: argparse.Namespace) -> int:
              config["max_contracts_per_game"])
     LOG.info("STRATEGY | mode=%s%s", config["strategy_mode"],
              f" model={config['ml_model_path']} confidence_gate={config['ml_min_confidence']:.2f}" if config["strategy_mode"] == "ml_side_average_down" else "")
+    if ml_inverse_shadow_enabled(config, dry_run):
+        LOG.info("ML INVERSE SHADOW POLICY | enabled=paper_only_no_order_submission; inverse quote hits are not exchange fills.")
     async with AsyncPolymarketUS(key_id=api_key, secret_key=secret_key) as client:
         try:
             while True:
                 now = datetime.now(timezone.utc)
                 await close_started_games(client, state, dry_run, now)
+                await settle_inverse_ml_shadows(state, config, now)
                 payload = await fetch_mlb_events()
                 games = discover_games(payload, now)
                 for game in games:
@@ -764,9 +1048,17 @@ async def run(args: argparse.Namespace) -> int:
                     await reconcile_game(client, record, dry_run)
                     if record.get("status") == "watching_baseline":
                         if await snapshot_baseline(client, record, game, config):
-                            await resolve_ml_side(game, record, config)
+                            await resolve_ml_side(game, record, config, dry_run)
                             save_json(args.state_file, state)
-                    await consider_entry(client, record, config, dry_run, args.state_file, state, now)
+                    shadow = record.get("ml_inverse_shadow")
+                    shadow_needs_quote = isinstance(shadow, dict) and shadow.get("status") in {
+                        "watching_trigger", "ladder_quote_shadow_active",
+                    }
+                    if record.get("status") == "watching_trigger" or shadow_needs_quote:
+                        observed_asks = await bbo(client, record["market_slug"])
+                        observe_inverse_ml_shadow(record, config, dry_run, observed_asks)
+                        if record.get("status") == "watching_trigger":
+                            await consider_entry(client, record, config, dry_run, args.state_file, state, now, observed_asks)
                     await reconcile_game(client, record, dry_run)
                     await submit_ladder(client, record, config, dry_run, args.state_file, state)
                 monotonic_now = asyncio.get_running_loop().time()
@@ -774,13 +1066,13 @@ async def run(args: argparse.Namespace) -> int:
                     await log_heartbeat(state, games, config, dry_run)
                     last_heartbeat = monotonic_now
                 save_json(args.state_file, state)
-                save_json(args.report, performance_report(state, config))
+                save_json(args.report, performance_report(state, config, dry_run))
                 if monotonic_now >= deadline:
                     break
                 await asyncio.sleep(config["poll_seconds"])
         finally:
             save_json(args.state_file, state)
-            save_json(args.report, performance_report(state, config))
+            save_json(args.report, performance_report(state, config, dry_run))
     return 0
 
 

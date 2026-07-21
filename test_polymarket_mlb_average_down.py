@@ -8,7 +8,10 @@ from polymarket_mlb_average_down import (
     discover_games,
     executable_outcome_asks,
     lower_levels,
+    observe_inverse_ml_shadow,
     order_snapshot,
+    opposite_outcome,
+    inverse_shadow_performance,
     reserved_capital,
     threshold_from_baseline,
     validate_config,
@@ -91,6 +94,57 @@ class MechanicalMlbAverageDownTests(unittest.TestCase):
     def test_lower_ladder_is_strictly_below_actual_fill(self):
         self.assertEqual(lower_levels(0.67, 0.10, 0.01, 10), [0.57, 0.47, 0.37, 0.27, 0.17, 0.07])
 
+    def test_inverse_ml_shadow_is_paper_only_and_uses_the_opposite_teams_own_ladder(self):
+        config = validate_config({**DEFAULT_CONFIG, "strategy_mode": "ml_side_average_down"})
+        record = {
+            "market_slug": "away-at-home-moneyline", "tick_size": 0.01, "quantity": 1,
+            "ml_selected_outcome": "long",
+            "outcomes": {
+                "long": {"role": "away", "team": "Away", "initial_ask": 0.80, "entry_target": 0.70},
+                "short": {"role": "home", "team": "Home", "initial_ask": 0.30, "entry_target": 0.20},
+            },
+        }
+        self.assertTrue(observe_inverse_ml_shadow(record, config, True, {"long": 0.80, "short": 0.20}))
+        shadow = record["ml_inverse_shadow"]
+        self.assertEqual(opposite_outcome(record["ml_selected_outcome"]), "short")
+        self.assertEqual(shadow["outcome"], "short")
+        self.assertEqual(shadow["rungs"]["initial"]["status"], "simulated_quote_hit")
+        self.assertEqual(shadow["rungs"]["initial"]["simulated_cost"], 0.20)
+        self.assertNotIn("order_id", shadow["rungs"]["initial"])
+        self.assertEqual(shadow["rungs"]["ladder-0.10000000"]["status"], "watching_fresh_bbo_quote")
+        # The lower rung is considered only on a later BBO poll, not filled
+        # retroactively by the initial trigger snapshot.
+        self.assertTrue(observe_inverse_ml_shadow(record, config, True, {"long": 0.89, "short": 0.10}))
+        self.assertEqual(shadow["rungs"]["ladder-0.10000000"]["status"], "simulated_quote_hit")
+
+    def test_inverse_ml_shadow_cannot_start_during_a_live_run(self):
+        config = validate_config({**DEFAULT_CONFIG, "strategy_mode": "ml_side_average_down"})
+        record = {
+            "market_slug": "game", "tick_size": 0.01, "quantity": 1, "ml_selected_outcome": "long",
+            "outcomes": {
+                "long": {"role": "away", "team": "Away", "initial_ask": 0.60, "entry_target": 0.50},
+                "short": {"role": "home", "team": "Home", "initial_ask": 0.40, "entry_target": 0.30},
+            },
+        }
+        self.assertFalse(observe_inverse_ml_shadow(record, config, False, {"long": 0.60, "short": 0.30}))
+        self.assertNotIn("ml_inverse_shadow", record)
+
+    def test_inverse_shadow_report_separates_directional_result_from_quote_hit_pnl(self):
+        config = validate_config({**DEFAULT_CONFIG, "strategy_mode": "ml_side_average_down"})
+        state = {"games": {
+            "game": {"ml_inverse_shadow": {
+                "status": "settled", "selection_result": "win",
+                "simulated_quote_hit_payout": 1.0, "simulated_quote_hit_pnl_before_fees": 0.8,
+                "rungs": {"initial": {"status": "simulated_quote_hit", "simulated_cost": 0.2, "quantity": 1}},
+            }},
+        }}
+        report = inverse_shadow_performance(list(state["games"].values()), config)
+        self.assertEqual(report["shadow_selections"], 1)
+        self.assertEqual(report["inverse_directional_wins"], 1)
+        self.assertEqual(report["inverse_directional_win_rate"], 1.0)
+        self.assertEqual(report["simulated_quote_hit_rungs"], 1)
+        self.assertEqual(report["order_policy"], "paper_only_no_order_submission")
+
     def test_filled_contracts_remain_reserved_after_game_start(self):
         state = {"games": {
             "game": {
@@ -109,6 +163,7 @@ class MechanicalMlbAverageDownTests(unittest.TestCase):
         self.assertEqual(config["price_step"], 0.10)
         self.assertEqual(config["strategy_mode"], "mechanical")
         self.assertEqual(config["ml_model_path"], "")
+        self.assertTrue(config["ml_inverse_shadow_enabled"])
 
 
 if __name__ == "__main__":
