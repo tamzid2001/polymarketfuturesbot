@@ -1,0 +1,76 @@
+{
+  "generated_at": "2026-07-21T22:30:49.073564+00:00",
+  "strategy": "inverse_prophet_executable_quote_shadow_v1",
+  "mode": "paper_only_no_exchange_orders",
+  "fill_rule": "YES buy: yes_ask <= rung; NO buy: 1 - yes_bid <= rung; fresh complete top-of-book and displayed depth >= rung quantity",
+  "quote_max_age_seconds": 3.0,
+  "fee_treatment": "excluded_no_exchange_fill",
+  "limitations": [
+    "A quote hit is a paper fill, not a Kalshi exchange fill.",
+    "Queue position, quote cancellation, hidden liquidity, and fees are not modeled.",
+    "P&L uses the pre-posted rung limit rather than favorable price improvement."
+  ],
+  "shadow_signals_started": 18,
+  "active_shadow_markets": 1,
+  "settled_signal_markets": 17,
+  "unfilled_shadow_markets": 5,
+  "filled_market_trades": 12,
+  "directional_wins": 10,
+  "directional_losses": 7,
+  "directional_win_rate": 0.588235,
+  "winning_trades": 5,
+  "losing_trades": 7,
+  "win_rate": 0.416667,
+  "total_simulated_cost": 10.1,
+  "net_profit": -1.1,
+  "return_on_simulated_capital": -0.108911,
+  "average_profit_per_filled_market": -0.091667,
+  "largest_winning_trade": 2.1,
+  "largest_losing_trade": -1.0,
+  "profit_factor": 0.842857,
+  "maximum_drawdown": 4.4,
+  "longest_winning_streak": 2,
+  "longest_losing_streak": 4,
+  "rung_performance": {
+    "0.40": {
+      "rung_price": 0.4,
+      "paper_orders": 18,
+      "quote_hits": 13,
+      "paper_contracts": 18.0,
+      "filled_contracts": 13.0,
+      "winning_hits": 5,
+      "losing_hits": 8,
+      "net_profit": -0.2
+    },
+    "0.30": {
+      "rung_price": 0.3,
+      "paper_orders": 18,
+      "quote_hits": 10,
+      "paper_contracts": 18.0,
+      "filled_contracts": 10.0,
+      "winning_hits": 3,
+      "losing_hits": 7,
+      "net_profit": -0.0
+    },
+    "0.20": {
+      "rung_price": 0.2,
+      "paper_orders": 18,
+      "quote_hits": 8,
+      "paper_contracts": 18.0,
+      "filled_contracts": 8.0,
+      "winning_hits": 1,
+      "losing_hits": 7,
+      "net_profit": -0.6
+    },
+    "0.10": {
+      "rung_price": 0.1,
+      "paper_orders": 18,
+      "quote_hits": 7,
+      "paper_contracts": 18.0,
+      "filled_contracts": 7.0,
+      "winning_hits": 0,
+      "losing_hits": 7,
+      "net_profit": -0.7
+    }
+  }
+}
