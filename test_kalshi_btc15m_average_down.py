@@ -46,11 +46,11 @@ from kalshi_ml_features import FEATURE_SCHEMA, ML_ONLY_FEATURE_COLUMNS, feature_
 
 
 class MechanicalAverageDownTests(unittest.TestCase):
-    def test_default_is_one_contract_per_rung(self):
+    def test_default_is_one_hundredth_contract_per_rung(self):
         config = validate_config(DEFAULT_CONFIG)
-        self.assertEqual(config["initial_position_size"], 1.0)
-        self.assertEqual(config["max_contracts_per_market"], 4.0)
-        self.assertEqual(ladder_principal(1.0), 1.0)
+        self.assertEqual(config["initial_position_size"], 0.01)
+        self.assertEqual(config["max_contracts_per_market"], 0.04)
+        self.assertEqual(ladder_principal(0.01), 0.01)
         self.assertEqual(config["market_refresh_seconds"], 15.0)
         self.assertEqual(config["order_reconcile_seconds"], 5.0)
         self.assertEqual(config["watch_start_grace_seconds"], 45.0)
@@ -245,7 +245,7 @@ class MechanicalAverageDownTests(unittest.TestCase):
         self.assertEqual(exchange_outcome_side({"side": "yes", "action": "sell"}), "no")
 
     def test_config_rejects_an_unfunded_ladder(self):
-        invalid = {**DEFAULT_CONFIG, "max_total_capital": 0.99}
+        invalid = {**DEFAULT_CONFIG, "max_total_capital": 0.009}
         with self.assertRaises(ValueError):
             validate_config(invalid)
 

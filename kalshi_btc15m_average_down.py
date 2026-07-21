@@ -85,12 +85,12 @@ CHECKPOINT_IGNORED_KEYS = {
 DEFAULT_CONFIG = {
     "format_version": CONFIG_VERSION,
     # Contracts per rung.  This is a quantity, not a dollar amount.
-    "initial_position_size": 1.00,
+    "initial_position_size": 0.01,
     "max_active_markets": 1,
-    "max_contracts_per_market": 4.00,
+    "max_contracts_per_market": 0.04,
     # Principal reserved for all four possible rungs.  Fees are checked against
     # available balance separately with fee_reserve.
-    "max_total_capital": 1.00,
+    "max_total_capital": 0.01,
     "fee_reserve": 0.05,
     # Upper bound on sleep while waiting for the WebSocket; it is not a REST
     # quote-poll interval. Quote changes wake the runner immediately.
