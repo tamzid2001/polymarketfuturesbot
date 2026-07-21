@@ -142,6 +142,8 @@ PROPHET_SELECTOR_WINDOWS = (3, 5, 7, 10, 25, 50)
 # trailing-window vote; the override is itself recorded in that first snapshot.
 PROPHET_SELECTOR_START_INVERSE = os.getenv("PROPHET_SELECTOR_START_INVERSE", "true").lower() in (
     "1", "true", "yes")
+PROPHET_SELECTOR_TIME_SERIES_LOG_ROWS = max(
+    1, int(float(os.getenv("PROPHET_SELECTOR_TIME_SERIES_LOG_ROWS", "8"))))
 PROPHET_SELECTOR_HISTORY_FILE = os.getenv(
     "PROPHET_SELECTOR_HISTORY_FILE", "prophet_btc_selector_history.json")
 PROPHET_SELECTOR_REPORT_FILE = os.getenv(
@@ -1162,6 +1164,85 @@ def inverse_shadow_rung_performance(records: list[dict]) -> dict[str, dict]:
     return stats
 
 
+def paper_record_cash_flow(rec: dict) -> dict:
+    """Return auditable paper cash flows for one settled shadow/selector record.
+
+    A winning Kalshi contract pays exactly $1.00 total at settlement; its entry
+    cost is not returned separately.  Keeping entry cost and settlement payout
+    as distinct fields prevents a gross-payout figure from being mistaken for
+    P&L.
+    """
+    market_result = str(rec.get("market_result") or "").lower()
+    side = str(rec.get("side") or "").lower()
+    winning_side = market_result in ("yes", "no") and side == market_result
+    filled_contracts = entry_cost = settlement_payout = 0.0
+    rungs = []
+    for rung in rec.get("rungs", []):
+        level = _f(rung.get("economic_price"), 0.0)
+        fill = _f(rung.get("fill_count"), 0.0)
+        if fill <= 0.005:
+            continue
+        entry = _f(rung.get("fill_economic_price"), level)
+        rung_cost = fill * entry
+        rung_payout = fill if winning_side else 0.0
+        filled_contracts += fill
+        entry_cost += rung_cost
+        settlement_payout += rung_payout
+        rungs.append({
+            "rung_price": round(level, 4),
+            "contracts": round(fill, 4),
+            "entry_cost": round(rung_cost, 6),
+            "settlement_payout": round(rung_payout, 6),
+            "net_profit": round(rung_payout - rung_cost, 6),
+            "status": rung.get("status"),
+        })
+    return {
+        "filled_contracts": round(filled_contracts, 4),
+        "entry_cost": round(entry_cost, 6),
+        "settlement_payout": round(settlement_payout, 6),
+        "net_profit": round(settlement_payout - entry_cost, 6),
+        "rungs": rungs,
+    }
+
+
+def paper_pnl_time_series(records: list[dict]) -> list[dict]:
+    """Build a durable, chronological, cash-flow P&L series for paper fills."""
+    settled = [
+        rec for rec in records
+        if str(rec.get("market_result") or "").lower() in ("yes", "no")
+        and rec.get("result") in ("WIN", "LOSS", "UNFILLED")
+    ]
+    settled.sort(key=lambda rec: (
+        str(rec.get("settled_at") or rec.get("settle_et") or rec.get("timestamp") or ""),
+        str(rec.get("ticker") or ""),
+    ))
+    cumulative_pnl = cumulative_cost = cumulative_payout = peak = max_drawdown = 0.0
+    points = []
+    for rec in settled:
+        flow = paper_record_cash_flow(rec)
+        cumulative_pnl += flow["net_profit"]
+        cumulative_cost += flow["entry_cost"]
+        cumulative_payout += flow["settlement_payout"]
+        peak = max(peak, cumulative_pnl)
+        max_drawdown = max(max_drawdown, peak - cumulative_pnl)
+        points.append({
+            "settled_at": rec.get("settled_at") or rec.get("settle_et") or rec.get("timestamp"),
+            "ticker": rec.get("ticker"),
+            "source_prophet_side": rec.get("source_prophet_side"),
+            "selected_side": rec.get("side"),
+            "selector_mode": rec.get("selector_mode"),
+            "market_result": rec.get("market_result"),
+            "result": rec.get("result"),
+            **flow,
+            "cumulative_entry_cost": round(cumulative_cost, 6),
+            "cumulative_settlement_payout": round(cumulative_payout, 6),
+            "cumulative_net_profit": round(cumulative_pnl, 6),
+            "cumulative_roi": round(cumulative_pnl / cumulative_cost, 6) if cumulative_cost else None,
+            "drawdown": round(max_drawdown, 6),
+        })
+    return points
+
+
 def inverse_shadow_performance(records: list[dict]) -> dict:
     """Detailed independent summary; quote hits are never exchange fills."""
     directional = [
@@ -1170,12 +1251,10 @@ def inverse_shadow_performance(records: list[dict]) -> dict:
     ]
     filled = [rec for rec in records if rec.get("result") in ("WIN", "LOSS")]
     wins = sum(rec.get("result") == "WIN" for rec in filled)
-    pnls = [_f(rec.get("profit_loss")) for rec in filled]
-    costs = [
-        sum(_f(rung.get("fill_count")) * _f(rung.get("fill_economic_price"), _f(rung.get("economic_price")))
-            for rung in rec.get("rungs", []))
-        for rec in filled
-    ]
+    time_series = paper_pnl_time_series(records)
+    pnls = [point["net_profit"] for point in time_series if point["result"] in ("WIN", "LOSS")]
+    costs = [point["entry_cost"] for point in time_series if point["result"] in ("WIN", "LOSS")]
+    payouts = [point["settlement_payout"] for point in time_series if point["result"] in ("WIN", "LOSS")]
     directional_wins = sum(
         str(rec.get("side") or "").lower() == str(rec.get("market_result") or "").lower()
         for rec in directional
@@ -1212,6 +1291,7 @@ def inverse_shadow_performance(records: list[dict]) -> dict:
         "losing_trades": len(filled) - wins,
         "win_rate": round(wins / len(filled), 6) if filled else None,
         "total_simulated_cost": round(sum(costs), 6),
+        "gross_settlement_payout": round(sum(payouts), 6),
         "net_profit": round(sum(pnls), 6),
         "return_on_simulated_capital": round(sum(pnls) / sum(costs), 6) if sum(costs) else None,
         "average_profit_per_filled_market": round(sum(pnls) / len(pnls), 6) if pnls else None,
@@ -1219,9 +1299,12 @@ def inverse_shadow_performance(records: list[dict]) -> dict:
         "largest_losing_trade": round(min(pnls, default=0.0), 6),
         "profit_factor": round(gross_win / gross_loss, 6) if gross_loss else None,
         "maximum_drawdown": round(max_drawdown, 6),
+        "current_streak": streaks["current_streak"],
+        "current_kind": streaks["current_kind"],
         "longest_winning_streak": streaks["longest_win"],
         "longest_losing_streak": streaks["longest_loss"],
         "rung_performance": inverse_shadow_rung_performance(records),
+        "pnl_time_series": time_series,
     }
 
 
@@ -1488,6 +1571,7 @@ def print_inverse_prophet_shadow_performance() -> None:
         f"║  Directional W/L : {report['directional_wins']} / {report['directional_losses']}\n"
         f"║  Directional Rate: {directional_rate}\n"
         f"║  Quote-filled    : {report['filled_market_trades']} markets; unfilled {report['unfilled_shadow_markets']}\n"
+        f"║  Cash flow       : spent ${report['total_simulated_cost']:.4f} → payout ${report['gross_settlement_payout']:.4f}\n"
         f"║  Simulated P&L   : ${report['net_profit']:+,.4f}  (fees excluded)\n"
         f"║  Simulated ROI   : {roi}\n"
         f"║  Max Drawdown    : ${-report['maximum_drawdown']:,.4f}\n"
@@ -1501,6 +1585,37 @@ def print_inverse_prophet_shadow_performance() -> None:
             level, rung["paper_orders"], rung["quote_hits"], rung["filled_contracts"],
             rung["winning_hits"], rung["losing_hits"], rung["net_profit"],
         )
+
+
+_selector_pnl_series_logged_count = -1
+
+
+def print_new_prophet_selector_pnl_series(report: dict) -> None:
+    """Log newly settled cash-flow points once; retain every point in JSON."""
+    global _selector_pnl_series_logged_count
+    points = report["pnl_time_series"]
+    if len(points) == _selector_pnl_series_logged_count:
+        return
+    start = max(0, len(points) - PROPHET_SELECTOR_TIME_SERIES_LOG_ROWS)
+    if _selector_pnl_series_logged_count >= 0:
+        start = min(len(points), _selector_pnl_series_logged_count)
+    for point in points[start:]:
+        rungs = "; ".join(
+            f"${rung['rung_price']:.2f}:cost={rung['entry_cost']:.4f}/"
+            f"payout={rung['settlement_payout']:.4f}/net={rung['net_profit']:+.4f}"
+            for rung in point["rungs"]
+        ) or "no fills"
+        roi = "n/a" if point["cumulative_roi"] is None else f"{100 * point['cumulative_roi']:.2f}%"
+        log.info(
+            "PROPHET SELECTOR P&L SERIES | settled_at=%s ticker=%s source=%s selected=%s mode=%s "
+            "result=%s cost=$%.4f payout=$%.4f net=$%+.4f cumulative=$%+.4f roi=%s drawdown=$%.4f "
+            "rungs=[%s]",
+            point["settled_at"], point["ticker"], point.get("source_prophet_side") or "?",
+            point.get("selected_side") or "?", point.get("selector_mode") or "?",
+            point["result"], point["entry_cost"], point["settlement_payout"],
+            point["net_profit"], point["cumulative_net_profit"], roi, point["drawdown"], rungs,
+        )
+    _selector_pnl_series_logged_count = len(points)
 
 
 def print_prophet_selector_performance() -> None:
@@ -1519,6 +1634,11 @@ def print_prophet_selector_performance() -> None:
         "n/a" if report["directional_win_rate"] is None
         else f"{100 * report['directional_win_rate']:.1f}%"
     )
+    current_streak = (
+        f"{report['current_streak']} wins" if report["current_kind"] == "WIN"
+        else f"{report['current_streak']} losses" if report["current_kind"] == "LOSS"
+        else "none"
+    )
     next_source_side = "YES"
     next_decision = prophet_selector_decision(next_source_side)
     next_mode = (next_decision or {}).get("selected_mode", "inverse").upper()
@@ -1536,12 +1656,16 @@ def print_prophet_selector_performance() -> None:
         f"║  Active / Settled: {report['active_shadow_markets']} / {report['settled_signal_markets']}\n"
         f"║  Directional W/L : {report['directional_wins']} / {report['directional_losses']}  ({rate})\n"
         f"║  Quote-filled    : {report['filled_market_trades']} markets; unfilled {report['unfilled_shadow_markets']}\n"
+        f"║  Cash flow       : spent ${report['total_simulated_cost']:.4f} → payout ${report['gross_settlement_payout']:.4f}\n"
         f"║  Simulated P&L   : ${report['net_profit']:+,.4f}  (fees excluded)\n"
         f"║  Simulated ROI   : {roi}\n"
+        f"║  Current streak  : {current_streak}\n"
+        f"║  Longest W / L   : {report['longest_winning_streak']} / {report['longest_losing_streak']}\n"
         f"║  Max Drawdown    : ${-report['maximum_drawdown']:,.4f}\n"
         f"║  {fill_note}\n"
         "╚════════════════════════════════════════════════════════════"
     )
+    print_new_prophet_selector_pnl_series(report)
     for window, item in report["window_monitor"].items():
         normal_rate = "n/a" if item["normal_win_rate"] is None else f"{100 * item['normal_win_rate']:.1f}%"
         inverse_rate = "n/a" if item["inverse_win_rate"] is None else f"{100 * item['inverse_win_rate']:.1f}%"
@@ -1663,6 +1787,7 @@ async def _settle_record_if_ready(rest: KalshiREST, rec: dict) -> bool:
         return True
     ledger = ledger_for_record(rec)
     rec["market_result"] = result
+    rec["settled_at"] = datetime.now(tz=timezone.utc).isoformat()
     win = (result == str(rec["side"]).lower())
     filled_rungs = [r for r in rec.get("rungs", []) if _f(r.get("fill_count"), 0.0) > 0.0]
     count = sum(_f(r.get("fill_count"), bet_count()) for r in filled_rungs)

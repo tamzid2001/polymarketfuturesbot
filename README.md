@@ -494,6 +494,15 @@ line for every requested window showing normal/inverse W/L, win rate, and the
 current leader. Its durable files are `prophet_btc_selector_history.json` and
 `prophet_btc_selector_report.json`.
 
+The inverse and selector report JSON files now include a durable
+`pnl_time_series` for every settled paper market. Each point records the
+ticker/time, source and selected side, result, filled contracts, entry cost,
+gross $1-per-winning-contract settlement payout, net P&L, cumulative cost and
+payout, cumulative P&L/ROI, drawdown, and the cash flow of each filled rung.
+The Action log prints newly settled selector points once (up to the most recent
+eight after a restart), rather than repeatedly printing an ambiguous gross
+payout as though it were profit.
+
 Selector comparisons use paired settled outcomes, not unrelated all-time
 ledgers. Its paper fills require fresh complete top-of-book and displayed-depth
 evidence, but exclude queue position, quote cancellation, hidden liquidity, and
@@ -517,6 +526,7 @@ Environment **variables** (not secrets) tune behavior:
 | `BET_AMOUNT_SHARES` | `1` | BTC contracts per each of the four fixed rungs (**shares — NOT dollars**) |
 | `PROPHET_SELECTOR_ENABLED` | `true` | Enables the paired trailing 3/5/7/10/25/50 win-rate selector. In paper mode it is a third paper ladder; in confirmed live mode it supplies the one actual locked side. |
 | `PROPHET_SELECTOR_START_INVERSE` | `true` | Forces the first selector market after deployment to inverse, then hands control to the frozen trailing-window vote. |
+| `PROPHET_SELECTOR_TIME_SERIES_LOG_ROWS` | `8` | Number of recent selector cash-flow points printed after a runner restart; the report JSON always retains the full series. |
 | `HISTORY_MINUTES` | `500` | 1-minute candles fed to Prophet |
 | `FORECAST_MINUTES` | `17` | Fixed Prophet horizon in one-minute timesteps for every cached forecast |
 | `PREOPEN_FORECAST_LEAD_S` | `120` | Seconds before the next market opens to pre-compute its 17-step forecast |

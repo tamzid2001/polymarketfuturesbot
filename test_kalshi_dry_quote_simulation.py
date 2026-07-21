@@ -316,6 +316,41 @@ class ExecutableDryQuoteTests(unittest.TestCase):
         self.assertEqual(decision["windows"]["3"]["leader"], "normal")
         self.assertEqual(decision["windows"]["50"]["leader"], "inverse")
 
+    def test_paper_pnl_time_series_separates_entry_cost_from_settlement_payout(self) -> None:
+        records = [
+            {
+                "ticker": "cash-flow-win", "settled_at": "2026-07-21T18:00:00+00:00",
+                "source_prophet_side": "YES", "side": "NO", "selector_mode": "inverse",
+                "market_result": "NO", "result": "WIN",
+                "rungs": [
+                    {"economic_price": 0.40, "fill_count": 1.0, "fill_economic_price": 0.40},
+                    {"economic_price": 0.30, "fill_count": 1.0, "fill_economic_price": 0.30},
+                ],
+            },
+            {
+                "ticker": "cash-flow-loss", "settled_at": "2026-07-21T18:15:00+00:00",
+                "source_prophet_side": "NO", "side": "YES", "selector_mode": "normal",
+                "market_result": "NO", "result": "LOSS",
+                "rungs": [
+                    {"economic_price": 0.20, "fill_count": 1.0, "fill_economic_price": 0.20},
+                ],
+            },
+        ]
+
+        report = runner.inverse_shadow_performance(records)
+        series = report["pnl_time_series"]
+
+        self.assertEqual((report["total_simulated_cost"], report["gross_settlement_payout"],
+                          report["net_profit"]), (0.9, 2.0, 1.1))
+        self.assertEqual((series[0]["entry_cost"], series[0]["settlement_payout"],
+                          series[0]["net_profit"]), (0.7, 2.0, 1.3))
+        self.assertEqual((series[1]["entry_cost"], series[1]["settlement_payout"],
+                          series[1]["net_profit"], series[1]["cumulative_net_profit"]),
+                         (0.2, 0.0, -0.2, 1.1))
+        self.assertEqual((report["current_kind"], report["current_streak"],
+                          report["longest_winning_streak"], report["longest_losing_streak"]),
+                         ("LOSS", 1, 1, 1))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
