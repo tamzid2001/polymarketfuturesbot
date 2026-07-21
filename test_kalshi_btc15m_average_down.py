@@ -19,6 +19,7 @@ from kalshi_btc15m_average_down import (
     choose_entry_side,
     consider_initial_entry,
     default_state,
+    ensure_model_transition_shadow,
     ensure_inverse_shadow,
     exchange_position_guard,
     exchange_outcome_side,
@@ -39,11 +40,14 @@ from kalshi_btc15m_average_down import (
     model_transition_side_comparison,
     ml_live_directional_performance,
     inverse_shadow_performance,
+    model_transition_shadow_performance,
     normalized_order_status,
     normalized_outcome_side,
     rung_order_activity,
     simulate_inverse_shadow,
+    simulate_model_transition_shadow,
     finalize_inverse_shadow,
+    finalize_model_transition_shadow,
     validate_config,
 )
 from datetime import datetime, timezone
@@ -61,6 +65,7 @@ class MechanicalAverageDownTests(unittest.TestCase):
         self.assertEqual(config["watch_start_grace_seconds"], 45.0)
         self.assertEqual(config["ml_min_confidence"], 0.5)
         self.assertEqual(config["inverse_shadow_position_size"], 1.0)
+        self.assertEqual(config["model_transition_shadow_position_size"], 1.0)
 
     def test_ml_only_features_have_no_prophet_inputs(self):
         candles = pd.DataFrame({
@@ -220,6 +225,43 @@ class MechanicalAverageDownTests(unittest.TestCase):
         self.assertEqual(rung["simulated_quote_hits"], 1)
         self.assertEqual(rung["unsettled_quote_hits"], 1)
         self.assertEqual((rung["winning_orders"], rung["losing_orders"], rung["net_profit"]), (0, 0, 0.0))
+
+    def test_model_transition_shadow_paper_tests_predecessor_and_current_model_separately(self):
+        class FakeFeed:
+            def __init__(self):
+                self.counter = 0
+
+            def executable_shadow_quote(self, _ticker, side, _quantity, _max_age):
+                self.counter += 1
+                return ({
+                    "quote_id": f"{side}-{self.counter}", "economic_price": 0.39, "displayed_depth": 1.0,
+                    "yes_bid": 0.39, "yes_ask": 0.40, "yes_bid_size": 1.0, "yes_ask_size": 1.0,
+                    "received_at": "2026-07-21T16:00:00+00:00", "quote_age_seconds": 0.1,
+                }, "executable_top_of_book")
+
+        state = default_state()
+        record = market_record(state, "KXBTC15M-TEST-TRANSITION-SHADOW")
+        record["ml_model_transition"] = {
+            "previous_model_run_id": "old", "previous_model_type": "logistic_regression",
+            "previous_probability_yes": 0.62, "previous_side": "yes",
+            "current_model_run_id": "new", "current_model_type": "logistic_regression",
+            "current_probability_yes": 0.38, "current_side": "no", "input_basis": "same frozen vector",
+        }
+        pair = ensure_model_transition_shadow(
+            record, SimpleNamespace(close_time="2099-07-20T00:15:00Z"), validate_config(DEFAULT_CONFIG),
+        )
+        self.assertIsNotNone(pair)
+        assert pair is not None
+        self.assertEqual((pair["previous_model"]["side"], pair["current_model"]["side"]), ("yes", "no"))
+        self.assertEqual(pair["previous_model"]["quantity_per_rung"], 1.0)
+        self.assertNotIn("order_id", pair["current_model"]["rungs"]["0.4000"])
+        self.assertTrue(simulate_model_transition_shadow(record, FakeFeed(), validate_config(DEFAULT_CONFIG)))
+        self.assertTrue(finalize_model_transition_shadow(record, "no"))
+        comparison = model_transition_shadow_performance(state)["comparisons"][0]
+        self.assertEqual(comparison["paired_shadows_started"], 1)
+        self.assertEqual((comparison["previous_model_paper"]["directional_wins"],
+                          comparison["current_model_paper"]["directional_wins"]), (0, 1))
+        self.assertEqual(comparison["current_minus_previous_paper_pnl"], 1.0)
 
     def test_live_quote_overrides_discovery_snapshot(self):
         market = SimpleNamespace(yes_ask_dollars="0.70", no_ask_dollars="0.30")

@@ -58,7 +58,7 @@ except ImportError:  # pragma: no cover - exercised only in minimal local enviro
 LOG = logging.getLogger("kalshi_btc15m_average_down")
 SERIES_TICKER = "KXBTC15M"
 LADDER_LEVELS = (0.40, 0.30, 0.20, 0.10)
-CONFIG_VERSION = 9
+CONFIG_VERSION = 10
 STATE_VERSION = 7
 ORDER_NAMESPACE = uuid.UUID("4d85857e-4dc6-43ec-960f-0b342523bdb7")
 KALSHI_WS_URL = os.getenv(
@@ -120,6 +120,11 @@ DEFAULT_CONFIG = {
     # single live order or risk limit.
     "inverse_shadow_position_size": 1.0,
     "inverse_shadow_quote_max_age_seconds": 3.0,
+    # When a retrain publishes a new artifact, paper-test both the retained
+    # predecessor and the new model at the same readable size. Neither side
+    # can create or alter an exchange order.
+    "model_transition_shadow_enabled": True,
+    "model_transition_shadow_position_size": 1.0,
     "status_log_seconds": 30.0,
 }
 
@@ -458,7 +463,8 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         "initial_position_size", "max_contracts_per_market", "max_total_capital",
         "fee_reserve", "poll_seconds", "market_refresh_seconds", "order_reconcile_seconds",
         "watch_start_grace_seconds", "ml_preopen_lead_seconds", "ml_min_confidence",
-        "inverse_shadow_position_size", "inverse_shadow_quote_max_age_seconds", "status_log_seconds",
+        "inverse_shadow_position_size", "inverse_shadow_quote_max_age_seconds",
+        "model_transition_shadow_position_size", "status_log_seconds",
     ):
         value = as_float(merged.get(name))
         if value is None or value <= 0:
@@ -470,6 +476,10 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
     if isinstance(shadow_enabled, str):
         shadow_enabled = shadow_enabled.strip().lower() in {"1", "true", "yes", "on"}
     merged["inverse_shadow_enabled"] = bool(shadow_enabled)
+    transition_shadow_enabled = merged.get("model_transition_shadow_enabled", True)
+    if isinstance(transition_shadow_enabled, str):
+        transition_shadow_enabled = transition_shadow_enabled.strip().lower() in {"1", "true", "yes", "on"}
+    merged["model_transition_shadow_enabled"] = bool(transition_shadow_enabled)
     active = int(merged.get("max_active_markets", 0))
     if active < 1:
         raise ValueError("max_active_markets must be at least one")
@@ -1471,6 +1481,37 @@ def opposite_side(side: str) -> str | None:
     return "no" if normalized == "yes" else ("yes" if normalized == "no" else None)
 
 
+def new_quote_paper_shadow(
+    *, strategy: str, side: str, quantity: float, market_close_time: Any, quote_max_age_seconds: float,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Create an isolated, non-executable fixed-rung paper ladder."""
+    return {
+        "strategy": strategy,
+        "mode": "paper_only_no_exchange_orders",
+        "status": "active",
+        "side": side,
+        "created_at": now_iso(),
+        "market_close_time": market_close_time,
+        "quantity_per_rung": quantity,
+        "quote_max_age_seconds": quote_max_age_seconds,
+        "rungs": {
+            f"{level:.4f}": {
+                "rung_price": level,
+                "quantity": quantity,
+                "fill_count": 0.0,
+                "average_fill_price": None,
+                "status": "simulated_resting",
+            }
+            for level in LADDER_LEVELS
+        },
+        # Consumption is local to this *hypothetical* ladder. Separate model
+        # shadows are alternatives, not simultaneous claims on exchange size.
+        "quote_depth_consumed": {},
+        **(extra or {}),
+    }
+
+
 def ensure_inverse_shadow(
     record: dict[str, Any], market: Any, config: dict[str, Any], ml_side: str,
 ) -> dict[str, Any] | None:
@@ -1489,30 +1530,12 @@ def ensure_inverse_shadow(
     if isinstance(existing, dict):
         return existing
     quantity = float(config["inverse_shadow_position_size"])
-    shadow = {
-        "strategy": "inverse_ml_executable_quote_shadow_v1",
-        "mode": "paper_only_no_exchange_orders",
-        "status": "active",
-        "source_ml_side": str(ml_side).lower(),
-        "side": inverse_side,
-        "created_at": now_iso(),
-        "market_close_time": field(market, "close_time", "expected_expiration_time"),
-        "quantity_per_rung": quantity,
-        "quote_max_age_seconds": float(config["inverse_shadow_quote_max_age_seconds"]),
-        "rungs": {
-            f"{level:.4f}": {
-                "rung_price": level,
-                "quantity": quantity,
-                "fill_count": 0.0,
-                "average_fill_price": None,
-                "status": "simulated_resting",
-            }
-            for level in LADDER_LEVELS
-        },
-        # Consume displayed depth within the one market-data snapshot so a
-        # single 0.01 quote cannot falsely fill every rung on repeated loops.
-        "quote_depth_consumed": {},
-    }
+    shadow = new_quote_paper_shadow(
+        strategy="inverse_ml_executable_quote_shadow_v1", side=inverse_side, quantity=quantity,
+        market_close_time=field(market, "close_time", "expected_expiration_time"),
+        quote_max_age_seconds=float(config["inverse_shadow_quote_max_age_seconds"]),
+        extra={"source_ml_side": str(ml_side).lower()},
+    )
     record["inverse_ml_shadow"] = shadow
     LOG.info(
         "INVERSE SHADOW STARTED | %s ML=%s shadow=%s rungs=$0.40/$0.30/$0.20/$0.10 qty=%.2f; paper only, no exchange order.",
@@ -1521,12 +1544,11 @@ def ensure_inverse_shadow(
     return shadow
 
 
-def simulate_inverse_shadow(
-    record: dict[str, Any], feed: KalshiLiveFeed | None, config: dict[str, Any],
+def simulate_quote_paper_shadow(
+    record: dict[str, Any], shadow: dict[str, Any], feed: KalshiLiveFeed | None, *, label: str,
 ) -> bool:
-    """Simulate inverse GTC rung fills from fresh executable book evidence."""
-    shadow = record.get("inverse_ml_shadow")
-    if not isinstance(shadow, dict) or shadow.get("status") != "active":
+    """Simulate one paper ladder only from fresh executable top-of-book data."""
+    if shadow.get("status") != "active":
         return False
     if feed is None:
         shadow["last_quote_state"] = "websocket_unavailable"
@@ -1538,7 +1560,7 @@ def simulate_inverse_shadow(
         shadow["last_quote_state"] = "invalid_shadow_state"
         return False
     quote, quote_state = feed.executable_shadow_quote(
-        ticker, side, quantity, float(config["inverse_shadow_quote_max_age_seconds"]),
+        ticker, side, quantity, float(shadow.get("quote_max_age_seconds") or 0.0),
     )
     shadow["last_quote_state"] = quote_state
     if quote is None:
@@ -1573,18 +1595,27 @@ def simulate_inverse_shadow(
         shadow["quote_depth_consumed"][quote_id] = round(consumed, 4)
         changed = True
         LOG.info(
-            "INVERSE SHADOW RUNG HIT | %s %s limit=$%.2f quote_price=$%.4f depth=%.2f quote_id=%s; paper fill %.2f, not an exchange fill.",
-            ticker, side.upper(), level, float(quote["economic_price"]), float(quote["displayed_depth"]),
+            "%s RUNG HIT | %s %s limit=$%.2f quote_price=$%.4f depth=%.2f quote_id=%s; paper fill %.2f, not an exchange fill.",
+            label, ticker, side.upper(), level, float(quote["economic_price"]), float(quote["displayed_depth"]),
             quote_id, rung_quantity,
         )
     return changed
 
 
-def finalize_inverse_shadow(record: dict[str, Any], result: str | None) -> bool:
-    """Settle the paper-only inverse ladder once Kalshi finalizes the market."""
+def simulate_inverse_shadow(
+    record: dict[str, Any], feed: KalshiLiveFeed | None, config: dict[str, Any],
+) -> bool:
+    """Simulate inverse GTC rung fills from fresh executable book evidence."""
     shadow = record.get("inverse_ml_shadow")
+    if not isinstance(shadow, dict):
+        return False
+    return simulate_quote_paper_shadow(record, shadow, feed, label="INVERSE SHADOW")
+
+
+def finalize_quote_paper_shadow(record: dict[str, Any], shadow: dict[str, Any], result: str | None, *, label: str) -> bool:
+    """Settle one non-executable paper ladder after authoritative market resolution."""
     resolved = str(result or "").lower()
-    if not isinstance(shadow, dict) or shadow.get("status") != "active" or resolved not in {"yes", "no"}:
+    if shadow.get("status") != "active" or resolved not in {"yes", "no"}:
         return False
     rungs = shadow.get("rungs") if isinstance(shadow.get("rungs"), dict) else {}
     contracts = sum(float(rung.get("fill_count") or 0.0) for rung in rungs.values() if isinstance(rung, dict))
@@ -1611,10 +1642,111 @@ def finalize_inverse_shadow(record: dict[str, Any], result: str | None) -> bool:
         "return_percentage": round(100.0 * gross / cost, 4) if cost > 0 else None,
     })
     LOG.info(
-        "INVERSE SHADOW SETTLED | %s %s result=%s contracts=%.2f simulated_net=$%.4f fees=excluded; no exchange fill.",
-        record.get("ticker", "?"), str(shadow.get("side") or "?").upper(), resolved.upper(), contracts, gross,
+        "%s SETTLED | %s %s result=%s contracts=%.2f simulated_net=$%.4f fees=excluded; no exchange fill.",
+        label, record.get("ticker", "?"), str(shadow.get("side") or "?").upper(), resolved.upper(), contracts, gross,
     )
     return True
+
+
+def finalize_inverse_shadow(record: dict[str, Any], result: str | None) -> bool:
+    """Settle the paper-only inverse ladder once Kalshi finalizes the market."""
+    shadow = record.get("inverse_ml_shadow")
+    if not isinstance(shadow, dict):
+        return False
+    return finalize_quote_paper_shadow(record, shadow, result, label="INVERSE SHADOW")
+
+
+def ensure_model_transition_shadow(record: dict[str, Any], market: Any, config: dict[str, Any]) -> dict[str, Any] | None:
+    """Paper-test both retained predecessor and new model on identical inputs.
+
+    The active model can remain live at its own 0.01-contract risk setting.
+    This paired comparison is separately sized, has no order IDs, and does
+    not reserve capital or participate in exchange reconciliation.
+    """
+    if not config.get("model_transition_shadow_enabled", True):
+        return None
+    transition = record.get("ml_model_transition")
+    if not isinstance(transition, dict):
+        return None
+    previous_side = str(transition.get("previous_side") or "").lower()
+    current_side = str(transition.get("current_side") or "").lower()
+    previous_run = str(transition.get("previous_model_run_id") or "")
+    current_run = str(transition.get("current_model_run_id") or "")
+    if previous_side not in {"yes", "no"} or current_side not in {"yes", "no"} or not previous_run or not current_run:
+        return None
+    existing = record.get("ml_model_transition_shadow")
+    if isinstance(existing, dict):
+        return existing
+    quantity = float(config["model_transition_shadow_position_size"])
+    quote_age = float(config["inverse_shadow_quote_max_age_seconds"])
+    close_time = field(market, "close_time", "expected_expiration_time")
+    previous = new_quote_paper_shadow(
+        strategy="previous_model_executable_quote_shadow_v1", side=previous_side, quantity=quantity,
+        market_close_time=close_time, quote_max_age_seconds=quote_age,
+        extra={
+            "model_run_id": previous_run,
+            "model_type": transition.get("previous_model_type"),
+            "probability_yes": transition.get("previous_probability_yes"),
+        },
+    )
+    current = new_quote_paper_shadow(
+        strategy="current_model_executable_quote_shadow_v1", side=current_side, quantity=quantity,
+        market_close_time=close_time, quote_max_age_seconds=quote_age,
+        extra={
+            "model_run_id": current_run,
+            "model_type": transition.get("current_model_type"),
+            "probability_yes": transition.get("current_probability_yes"),
+        },
+    )
+    pair = {
+        "strategy": "paired_model_transition_executable_quote_shadow_v1",
+        "mode": "paper_only_no_exchange_orders",
+        "status": "active",
+        "created_at": now_iso(),
+        "input_basis": transition.get("input_basis"),
+        "previous_model": previous,
+        "current_model": current,
+        "side_changed": previous_side != current_side,
+        "market_close_time": close_time,
+        "limitation": "Each model is an independent hypothetical ladder; neither creates an exchange order.",
+    }
+    record["ml_model_transition_shadow"] = pair
+    LOG.info(
+        "ML TRANSITION SHADOW STARTED | %s previous_run=%s side=%s current_run=%s side=%s qty=%.2f; "
+        "paired paper only, no exchange orders.",
+        record.get("ticker", "?"), previous_run, previous_side.upper(), current_run, current_side.upper(), quantity,
+    )
+    return pair
+
+
+def simulate_model_transition_shadow(record: dict[str, Any], feed: KalshiLiveFeed | None, config: dict[str, Any]) -> bool:
+    pair = record.get("ml_model_transition_shadow")
+    if not isinstance(pair, dict) or pair.get("status") != "active":
+        return False
+    changed = False
+    states: dict[str, Any] = {}
+    for role, label in (("previous_model", "PREVIOUS MODEL SHADOW"), ("current_model", "CURRENT MODEL SHADOW")):
+        shadow = pair.get(role)
+        if not isinstance(shadow, dict):
+            continue
+        changed = simulate_quote_paper_shadow(record, shadow, feed, label=label) or changed
+        states[role] = shadow.get("last_quote_state")
+    pair["last_quote_states"] = states
+    return changed
+
+
+def finalize_model_transition_shadow(record: dict[str, Any], result: str | None) -> bool:
+    pair = record.get("ml_model_transition_shadow")
+    if not isinstance(pair, dict) or pair.get("status") != "active":
+        return False
+    changed = False
+    for role, label in (("previous_model", "PREVIOUS MODEL SHADOW"), ("current_model", "CURRENT MODEL SHADOW")):
+        shadow = pair.get(role)
+        if isinstance(shadow, dict):
+            changed = finalize_quote_paper_shadow(record, shadow, result, label=label) or changed
+    if changed:
+        pair.update({"status": "finalized", "settled_at": now_iso(), "settlement_outcome": str(result).lower()})
+    return changed
 
 
 async def refresh_exchange_position(rest: KalshiREST, record: dict[str, Any]) -> float | None:
@@ -1917,6 +2049,7 @@ async def settle_or_cancel(rest: KalshiREST, record: dict[str, Any], market: Any
     market_status = str(field(market, "status") or "").lower()
     if result is not None and market_status == "finalized":
         finalize_inverse_shadow(record, result)
+        finalize_model_transition_shadow(record, result)
     if not record.get("candidate_side") and not orders_for_market(record):
         if result is None or market_status != "finalized":
             if prior_status != "closed_waiting_finalization":
@@ -2020,6 +2153,7 @@ async def consider_initial_entry(
     # fresh-market policy even if the live ladder is later blocked by balance,
     # capacity, or exchange recovery. It remains paper-only in all modes.
     ensure_inverse_shadow(record, market, config, ml_side)
+    ensure_model_transition_shadow(record, market, config)
     other_active = [candidate for candidate in active_strategy_records(state) if candidate is not record]
     if len(other_active) >= config["max_active_markets"]:
         return False
@@ -2459,6 +2593,112 @@ def inverse_shadow_performance(state: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def paper_shadow_summary(shadows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Return comparable settled paper metrics for any one-model shadow set."""
+    settled_signals = sorted(
+        [shadow for shadow in shadows
+         if str(shadow.get("settlement_outcome") or "").lower() in {"yes", "no"}
+         and str(shadow.get("side") or "").lower() in {"yes", "no"}],
+        key=lambda shadow: str(shadow.get("settled_at") or ""),
+    )
+    settled_fills = [shadow for shadow in settled_signals if float(shadow.get("contracts") or 0.0) > 0.004]
+    pnls = [float(shadow.get("net_profit_loss") or 0.0) for shadow in settled_fills]
+    costs = [float(shadow.get("total_cost") or 0.0) for shadow in settled_fills]
+    contracts = [float(shadow.get("contracts") or 0.0) for shadow in settled_fills]
+    directional_wins = sum(str(shadow.get("side")) == str(shadow.get("settlement_outcome")) for shadow in settled_signals)
+    filled_directional_wins = sum(str(shadow.get("side")) == str(shadow.get("settlement_outcome")) for shadow in settled_fills)
+    gross_win = sum(value for value in pnls if value > 0)
+    gross_loss = -sum(value for value in pnls if value < 0)
+    equity = peak = 0.0
+    drawdowns: list[float] = []
+    for value in pnls:
+        equity += value
+        peak = max(peak, equity)
+        drawdowns.append(peak - equity)
+    return {
+        "paper_markets_started": len(shadows),
+        "active_paper_markets": sum(str(shadow.get("status")) == "active" for shadow in shadows),
+        "settled_signal_markets": len(settled_signals),
+        "unfilled_shadow_markets": sum(str(shadow.get("status")) == "finalized_unfilled" for shadow in shadows),
+        "filled_market_trades": len(settled_fills),
+        "directional_wins": directional_wins,
+        "directional_losses": len(settled_signals) - directional_wins,
+        "directional_win_rate": round(directional_wins / len(settled_signals), 6) if settled_signals else None,
+        "filled_directional_wins": filled_directional_wins,
+        "filled_directional_losses": len(settled_fills) - filled_directional_wins,
+        "filled_directional_win_rate": round(filled_directional_wins / len(settled_fills), 6) if settled_fills else None,
+        "total_simulated_contracts": round(sum(contracts), 2),
+        "total_simulated_cost": round(sum(costs), 6),
+        "net_profit": round(sum(pnls), 6),
+        "return_on_simulated_capital": round(sum(pnls) / sum(costs), 6) if sum(costs) else None,
+        "profit_factor": round(gross_win / gross_loss, 6) if gross_loss else None,
+        "maximum_drawdown": round(max(drawdowns, default=0.0), 6),
+        "rung_performance": inverse_shadow_rung_performance([({}, shadow) for shadow in shadows]),
+    }
+
+
+def model_transition_shadow_performance(state: dict[str, Any]) -> dict[str, Any]:
+    """Compare retained predecessor and new-model quote shadows by transition."""
+    groups: dict[tuple[str, str], dict[str, Any]] = {}
+    for record in state.get("markets", {}).values():
+        if not isinstance(record, dict):
+            continue
+        pair = record.get("ml_model_transition_shadow")
+        if not isinstance(pair, dict):
+            continue
+        previous = pair.get("previous_model")
+        current = pair.get("current_model")
+        if not isinstance(previous, dict) or not isinstance(current, dict):
+            continue
+        previous_run = str(previous.get("model_run_id") or "")
+        current_run = str(current.get("model_run_id") or "")
+        if not previous_run or not current_run:
+            continue
+        group = groups.setdefault((previous_run, current_run), {
+            "previous_model_run_id": previous_run,
+            "current_model_run_id": current_run,
+            "input_basis": pair.get("input_basis"),
+            "paired_shadows_started": 0,
+            "same_side": 0,
+            "side_changed": 0,
+            "previous_shadows": [],
+            "current_shadows": [],
+        })
+        group["paired_shadows_started"] += 1
+        group["same_side"] += not bool(pair.get("side_changed"))
+        group["side_changed"] += bool(pair.get("side_changed"))
+        group["previous_shadows"].append(previous)
+        group["current_shadows"].append(current)
+    comparisons = []
+    for group in groups.values():
+        previous_metrics = paper_shadow_summary(group.pop("previous_shadows"))
+        current_metrics = paper_shadow_summary(group.pop("current_shadows"))
+        group.update({
+            "previous_model_paper": previous_metrics,
+            "current_model_paper": current_metrics,
+            "current_minus_previous_directional_wins": (
+                current_metrics["directional_wins"] - previous_metrics["directional_wins"]
+            ),
+            "current_minus_previous_paper_pnl": round(
+                current_metrics["net_profit"] - previous_metrics["net_profit"], 6
+            ),
+        })
+        comparisons.append(group)
+    return {
+        "strategy": "paired_model_transition_executable_quote_shadow_v1",
+        "mode": "paper_only_no_exchange_orders",
+        "fill_rule": "fresh top-of-book only: YES buy yes_ask <= rung; NO buy 1 - yes_bid <= rung; displayed depth >= rung quantity",
+        "fee_treatment": "excluded_no_exchange_fill",
+        "comparisons": sorted(comparisons, key=lambda item: (item["current_model_run_id"], item["previous_model_run_id"])),
+        "limitations": [
+            "The predecessor and new model score the same frozen pre-open feature vector.",
+            "Each model uses an independent hypothetical ladder; no exchange order is submitted or modified.",
+            "Quote hits require fresh displayed depth but do not model queue priority, cancellations, hidden liquidity, or fees.",
+        ],
+        "note": "Prospective transition evidence only; it is not a promotion rule or executable-P&L claim.",
+    }
+
+
 def performance_report(state: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
     settled = sorted((record for record in state.get("markets", {}).values()
                       if isinstance(record, dict) and record.get("status") == "finalized"
@@ -2509,6 +2749,7 @@ def performance_report(state: dict[str, Any], config: dict[str, Any]) -> dict[st
         "rung_order_activity": rung_order_activity(state),
         "ml_live_directional_performance": ml_live_directional_performance(settled),
         "ml_model_transition_side_comparison": model_transition_side_comparison(state),
+        "ml_model_transition_shadow_performance": model_transition_shadow_performance(state),
         "inverse_ml_shadow_performance": inverse_shadow_performance(state),
         "note": "Only finalized records with filled contracts count as trades. The pre-open ML side is an execution filter; this report is realized live-ledger data, not a profitability proof.",
     }
@@ -2606,6 +2847,20 @@ def log_performance_summary(report: dict[str, Any], context: str) -> None:
             "n/a" if transition["average_probability_yes_delta"] is None else f"{transition['average_probability_yes_delta']:+.4f}",
             transition["settled_markets"], transition["previous_directional_wins"],
             transition["current_directional_wins"], transition["current_minus_previous_directional_wins"],
+        )
+    transition_shadow_summary = report["ml_model_transition_shadow_performance"]
+    for transition in transition_shadow_summary["comparisons"]:
+        previous = transition["previous_model_paper"]
+        current = transition["current_model_paper"]
+        LOG.info(
+            "ML TRANSITION SHADOW PERFORMANCE | %s previous_run=%s current_run=%s paired=%d same_side=%d changed=%d "
+            "settled=%d previous=W%d/L%d net=$%+.4f current=W%d/L%d net=$%+.4f current_minus_previous=$%+.4f "
+            "| paper only; fresh quote/depth required; fees/queue excluded.",
+            context, transition["previous_model_run_id"], transition["current_model_run_id"],
+            transition["paired_shadows_started"], transition["same_side"], transition["side_changed"],
+            current["settled_signal_markets"], previous["directional_wins"], previous["directional_losses"], previous["net_profit"],
+            current["directional_wins"], current["directional_losses"], current["net_profit"],
+            transition["current_minus_previous_paper_pnl"],
         )
     shadow = report["inverse_ml_shadow_performance"]
     LOG.info(
@@ -2880,6 +3135,11 @@ async def run(args: argparse.Namespace) -> int:
         bool(config["inverse_shadow_enabled"]), config["inverse_shadow_position_size"], config["initial_position_size"],
     )
     LOG.info(
+        "ML TRANSITION SHADOW POLICY | paper_only=%s quantity_per_rung=%.2f; retained predecessor and current model "
+        "will be compared only on identical frozen inputs.",
+        bool(config["model_transition_shadow_enabled"]), config["model_transition_shadow_position_size"],
+    )
+    LOG.info(
         "ML SIDE FILTER | stored_model=%s feature_ledger=%s preopen_lead=%.0fs confidence_gate=%.2f fallback=disabled",
         args.ml_model_path, args.ml_training_csv, config["ml_preopen_lead_seconds"], config["ml_min_confidence"],
     )
@@ -2943,6 +3203,7 @@ async def run(args: argparse.Namespace) -> int:
             for record in state["markets"].values():
                 if isinstance(record, dict):
                     simulate_inverse_shadow(record, feed, config)
+                    simulate_model_transition_shadow(record, feed, config)
             monotonic_now = asyncio.get_running_loop().time()
             if monotonic_now - last_heartbeat_at >= config["status_log_seconds"]:
                 await log_heartbeat(rest, state, active_markets, config, dry_run, monotonic_now - started_at, feed)
