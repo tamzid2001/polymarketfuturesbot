@@ -5,6 +5,14 @@ name: Polymarket US MLB Historical ML Backtest
 on:
   workflow_dispatch:
     inputs:
+      mode:
+        description: "Research mode: market requires POLYMARKET_REPORT_JWT; team-only uses only the public MLB Stats API."
+        required: true
+        type: choice
+        options:
+          - market
+          - team-only
+        default: market
       max_games:
         description: "Optional small schema smoke-test limit; leave blank for all completed MLB moneylines."
         required: false
@@ -50,7 +58,11 @@ jobs:
           POLYMARKET_REPORT_JWT: ${{ secrets.POLYMARKET_REPORT_JWT }}
         run: |
           set -euo pipefail
-          args=(run-all --root .)
+          if [ "${{ inputs.mode }}" = "team-only" ]; then
+            args=(team-only --root . --team-start 2024-03-01)
+          else
+            args=(run-all --root .)
+          fi
           if [ "${{ inputs.refresh }}" = "true" ]; then args+=(--refresh); fi
           if [ -n "${{ inputs.max_games }}" ]; then args+=(--max-games "${{ inputs.max_games }}"); fi
           python polymarket_mlb_ml_backtest.py "${args[@]}"

@@ -12,6 +12,7 @@ from polymarket_mlb_ml_backtest import (
     is_full_game_moneyline,
     last_candle_at_or_before,
     market_outcome_from_settlement,
+    paired_accuracy_comparison,
     rolling_team_features,
     simulate_trading,
     snapshot_features,
@@ -158,6 +159,12 @@ class MlbBacktestTests(unittest.TestCase):
         self.assertEqual(summary["executable_trades"], 0)
         self.assertEqual(summary["unavailable_historical_ask"], 1)
         self.assertEqual(trades, [])
+
+    def test_paired_comparison_does_not_claim_small_accuracy_change_is_significant(self):
+        result = paired_accuracy_comparison([.6, .4, .6, .6], [.6, .6, .6, .4], [1, 0, 0, 0])
+        self.assertEqual(result["candidate_only_correct"], 1)
+        self.assertEqual(result["baseline_only_correct"], 1)
+        self.assertEqual(result["interpretation"], "not_statistically_significant")
 
     def test_fee_and_pnl_use_executable_ask_not_midpoint(self):
         row = {"scheduled_start": self.start.isoformat(), "event_finished_at": (self.start + timedelta(hours=3)).isoformat(),

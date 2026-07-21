@@ -122,6 +122,14 @@ It compares market implied probability, market favorite, always-home, historical
 
 Historical trade candles are not executable bid/ask quotes. The trading simulator therefore never converts a candle close or midpoint into a fill. It reports a no-trade result unless historical ask price, liquidity, fee assumption, and position-capacity information are present. This means a directional result may be valid while P&L remains unavailable; it is not evidence of profitability.
 
+If the scoped reporting token is not available, run the separately labelled public-data fallback instead:
+
+```bash
+python polymarket_mlb_ml_backtest.py team-only --root . --team-start 2024-03-01
+```
+
+It uses only completed MLB Stats API games and strictly prior rolling team/Elo features. It has chronological folds and a final untouched holdout, but it has **no Polymarket price comparison, no market-edge conclusion, and no trading simulation**. Its report explicitly includes an exact paired comparison with the always-home baseline so a small accuracy increase is not misrepresented as a meaningful improvement.
+
 The optional `ml_side_average_down` runner mode remains disabled by default:
 
 ```json

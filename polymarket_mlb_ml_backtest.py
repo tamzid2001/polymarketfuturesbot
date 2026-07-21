@@ -78,6 +78,7 @@ TEAM_FEATURES = (
     "elo_difference",
 )
 ALL_FEATURES = MARKET_FEATURES + TEAM_FEATURES
+TEAM_ONLY_FEATURES = TEAM_FEATURES
 
 
 def configure_logging() -> None:
@@ -894,6 +895,34 @@ def metrics(y_true: list[int], probabilities: list[float]) -> dict[str, Any]:
     }
 
 
+def paired_accuracy_comparison(candidate: list[float], baseline: list[float], targets: list[int]) -> dict[str, Any]:
+    """Exact paired sign test for two calls scored on identical games.
+
+    This is intentionally reported alongside overlapping confidence intervals:
+    a higher raw accuracy does not establish a meaningful improvement over a
+    simple baseline unless the discordant predictions support it.
+    """
+    candidate_calls = [int(value >= .5) for value in candidate]
+    baseline_calls = [int(value >= .5) for value in baseline]
+    candidate_only = sum(
+        candidate_call == target and baseline_call != target
+        for candidate_call, baseline_call, target in zip(candidate_calls, baseline_calls, targets, strict=True)
+    )
+    baseline_only = sum(
+        candidate_call != target and baseline_call == target
+        for candidate_call, baseline_call, target in zip(candidate_calls, baseline_calls, targets, strict=True)
+    )
+    discordant = candidate_only + baseline_only
+    tail = sum(math.comb(discordant, index) for index in range(min(candidate_only, baseline_only) + 1)) / (2 ** discordant) if discordant else 1.0
+    return {
+        "candidate_only_correct": candidate_only,
+        "baseline_only_correct": baseline_only,
+        "accuracy_difference": (candidate_only - baseline_only) / len(targets) if targets else None,
+        "two_sided_exact_p_value": min(1.0, 2 * tail),
+        "interpretation": "statistically_significant" if min(1.0, 2 * tail) < .05 else "not_statistically_significant",
+    }
+
+
 def feature_matrix(rows: list[dict[str, Any]], columns: tuple[str, ...]) -> list[list[float | None]]:
     return [[numeric(row, column) for column in columns] for row in rows]
 
@@ -907,12 +936,12 @@ def make_estimator(name: str) -> Any:
         from sklearn.preprocessing import StandardScaler
     except ImportError as exc:  # pragma: no cover
         raise RuntimeError("Install requirements_mlb_ml_backtest.txt before training") from exc
-    if name in {"price_only_logistic", "market_feature_logistic", "market_plus_team_logistic"}:
+    if name in {"price_only_logistic", "market_feature_logistic", "market_plus_team_logistic", "team_logistic"}:
         return Pipeline([
             ("imputer", SimpleImputer(strategy="median")), ("scale", StandardScaler()),
             ("model", LogisticRegression(C=0.5, max_iter=2000, random_state=7)),
         ])
-    if name == "gradient_boosting":
+    if name in {"gradient_boosting", "team_gradient_boosting"}:
         return Pipeline([
             ("imputer", SimpleImputer(strategy="median")),
             ("model", HistGradientBoostingClassifier(max_iter=150, max_leaf_nodes=7, l2_regularization=1.0, random_state=7)),
@@ -927,6 +956,8 @@ def columns_for(name: str) -> tuple[str, ...]:
         return MARKET_FEATURES
     if name in {"market_plus_team_logistic", "gradient_boosting"}:
         return ALL_FEATURES
+    if name in {"team_logistic", "team_gradient_boosting"}:
+        return TEAM_ONLY_FEATURES
     raise ValueError(name)
 
 
@@ -1024,6 +1055,8 @@ def baseline_probabilities(name: str, train: list[dict[str, Any]], test: list[di
     if name == "historical_home_rate":
         rate = sum(int(row["home_target"]) for row in train) / len(train)
         return [rate] * len(test)
+    if name == "elo_baseline":
+        return [1 / (1 + 10 ** (-float(row.get("elo_difference") or 0.0) / 400)) for row in test]
     raise ValueError(name)
 
 
@@ -1181,6 +1214,100 @@ def evaluate_horizon(paths: Paths, horizon: int, rows: list[dict[str, Any]], *, 
             "validation_mean_log_loss": eligible_models, "comparison": comparison, "fold_metrics": fold_metrics}
 
 
+def run_team_only_backtest(paths: Paths, *, start: datetime, end: datetime, refresh: bool = False) -> dict[str, Any]:
+    """Evaluate historical MLB-only features, without any Polymarket data.
+
+    This is intentionally a *separate* fallback.  It is useful for measuring
+    whether prior team form and an Elo state have directional information, but
+    it cannot compare against a Polymarket price, establish a market edge, or
+    simulate a Polymarket fill/P&L.
+    """
+    games = MlbStats(paths).schedule(start, end, refresh=refresh)
+    final_games = [result for game in games if (result := final_mlb_game(game))]
+    final_games.sort(key=lambda row: row["scheduled_start"])
+    prior = rolling_team_features(final_games)
+    rows = [
+        {
+            **game,
+            **prior[game["game_pk"]],
+            "home_target": int(game["home_won"]),
+            "feature_cutoff": game["scheduled_start"],
+            "feature_quality_flags": "mlb_stats_api_prior_games_only_no_polymarket_market_data",
+        }
+        for game in final_games
+        if game["game_pk"] in prior
+    ]
+    write_csv(paths.features / "team_only_features.csv", rows)
+    folds, development, holdout = chronological_splits(rows)
+    names = ("always_home", "historical_home_rate", "elo_baseline", "team_logistic", "team_gradient_boosting")
+    fold_metrics: list[dict[str, Any]] = []
+    validation_scores: dict[str, list[float]] = defaultdict(list)
+    baselines = {"always_home", "historical_home_rate", "elo_baseline"}
+    for label, train, test in folds:
+        for name in names:
+            try:
+                probability = baseline_probabilities(name, train, test) if name in baselines else calibrated_predictions(name, train, test)[0]
+                value = metrics([int(row["home_target"]) for row in test], probability)
+                value.update({
+                    "fold": label, "model": name,
+                    "train_start": train[0]["scheduled_start"], "train_end": train[-1]["scheduled_start"],
+                    "test_start": test[0]["scheduled_start"], "test_end": test[-1]["scheduled_start"],
+                    "train_games": len(train), "test_games": len(test),
+                })
+                fold_metrics.append(value)
+                if value.get("log_loss") is not None:
+                    validation_scores[name].append(float(value["log_loss"]))
+            except (ValueError, RuntimeError) as exc:
+                fold_metrics.append({"fold": label, "model": name, "error": str(exc), "train_games": len(train), "test_games": len(test)})
+    write_csv(paths.reports / "team_only_fold_metrics.csv", fold_metrics)
+    summary: dict[str, Any] = {
+        "mode": "team-only", "data_source": "MLB Stats API", "market_data": "not used", "trading_simulation": "not available without historical executable Polymarket asks",
+        "requested_start": iso(start), "requested_end": iso(end), "games_returned": len(games), "final_games": len(final_games),
+        "feature_rows": len(rows), "fold_metrics": fold_metrics,
+    }
+    if not holdout:
+        summary["status"] = "insufficient_for_untouched_holdout"
+        atomic_json(paths.reports / "team_only_performance_summary.json", summary)
+        return summary
+    validation_mean_log_loss = {name: statistics.mean(values) for name, values in validation_scores.items() if values}
+    selected = min(validation_mean_log_loss, key=validation_mean_log_loss.get) if validation_mean_log_loss else None
+    comparison: list[dict[str, Any]] = []
+    predictions: list[dict[str, Any]] = []
+    probabilities_by_model: dict[str, list[float]] = {}
+    for name in names:
+        try:
+            probability = baseline_probabilities(name, development, holdout) if name in baselines else calibrated_predictions(name, development, holdout)[0]
+            result = metrics([int(row["home_target"]) for row in holdout], probability)
+            result.update({"model": name, "final_holdout_games": len(holdout), "selected_by_validation": name == selected})
+            comparison.append(result)
+            probabilities_by_model[name] = probability
+            predictions.extend({
+                **row, "model": name, "probability_home": probability_home, "predicted_home": int(probability_home >= .5),
+                "actual_home": int(row["home_target"]), "validation_fold": "final_untouched_holdout",
+            } for row, probability_home in zip(holdout, probability, strict=True))
+        except (ValueError, RuntimeError) as exc:
+            comparison.append({"model": name, "error": str(exc), "final_holdout_games": len(holdout)})
+    write_csv(paths.reports / "team_only_holdout_predictions.csv", predictions)
+    write_csv(paths.reports / "team_only_model_comparison.csv", comparison)
+    selected_row = next((row for row in comparison if row.get("model") == selected), None)
+    if selected_row:
+        atomic_json(paths.reports / "team_only_calibration.json", {"model": selected, "calibration": selected_row.get("calibration")})
+    paired_vs_always_home = (
+        paired_accuracy_comparison(
+            probabilities_by_model[selected], probabilities_by_model["always_home"], [int(row["home_target"]) for row in holdout],
+        )
+        if selected in probabilities_by_model and "always_home" in probabilities_by_model else None
+    )
+    summary.update({
+        "development_games": len(development), "final_holdout_games": len(holdout), "selected_validation_model": selected,
+        "validation_mean_log_loss": validation_mean_log_loss, "comparison": comparison,
+        "selected_vs_always_home": paired_vs_always_home,
+        "conclusion": "This is a game-results prediction study only. It does not establish a Polymarket market edge or profitability.",
+    })
+    atomic_json(paths.reports / "team_only_performance_summary.json", summary)
+    return summary
+
+
 def render_report(summary: dict[str, Any]) -> str:
     lines = ["# Polymarket MLB ML backtest", "", "## Data integrity", ""]
     dataset = summary.get("dataset", {})
@@ -1240,9 +1367,28 @@ def print_terminal_summary(summary: dict[str, Any]) -> None:
     print("Conclusion: no model is described as market-beating or profitable without a valid untouched holdout and historical executable prices.")
 
 
+def print_team_only_terminal_summary(summary: dict[str, Any]) -> None:
+    print("MLB TEAM-ONLY OUT-OF-SAMPLE BACKTEST")
+    print(f"Completed MLB games: {summary.get('final_games', 0)}")
+    print(f"Feature rows: {summary.get('feature_rows', 0)}")
+    if summary.get("status"):
+        print(f"Final holdout: unavailable ({summary['status']})")
+    else:
+        selected = next((row for row in summary.get("comparison", []) if row.get("selected_by_validation")), None)
+        if selected and not selected.get("error"):
+            print(f"Best validation model: {selected['model']}")
+            print(f"Final untouched holdout games: {selected['final_holdout_games']}")
+            print(f"Holdout accuracy: {selected['accuracy']:.2%} ({selected['accuracy_ci_low']:.2%}-{selected['accuracy_ci_high']:.2%})")
+            print(f"Holdout log loss / Brier: {selected['log_loss']:.4f} / {selected['brier_score']:.4f}")
+        paired = summary.get("selected_vs_always_home")
+        if paired:
+            print(f"Selected vs always-home: {paired['accuracy_difference']:+.2%}; exact paired p={paired['two_sided_exact_p_value']:.4f} ({paired['interpretation']})")
+    print("Conclusion: team-only result; it is not a Polymarket market-baseline comparison and has no simulated Polymarket P&L.")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=("collect-history", "build-dataset", "train", "backtest", "report", "run-all", "dry-run", "live-monitor"))
+    parser.add_argument("mode", choices=("collect-history", "build-dataset", "train", "backtest", "report", "run-all", "team-only", "dry-run", "live-monitor"))
     parser.add_argument("--root", type=Path, default=Path("."), help="Project root containing data/, reports/, and models/.")
     parser.add_argument("--refresh", action="store_true", help="Refresh cached public/API responses.")
     parser.add_argument("--max-games", type=int, help="Bound collection for a schema smoke test; omit for all discovered markets.")
@@ -1250,6 +1396,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--slippage", type=float, default=0.0, help="Additional per-contract entry slippage, applied only to an actual historical ask.")
     parser.add_argument("--capital-cap", type=float, default=1000.0)
     parser.add_argument("--quantity", type=float, default=1.0)
+    parser.add_argument("--team-start", default="2024-03-01", help="UTC date/time for the public MLB Stats API fallback, default 2024-03-01.")
+    parser.add_argument("--team-end", help="UTC date/time for the public MLB Stats API fallback, default now.")
     return parser
 
 
@@ -1263,6 +1411,13 @@ def main(args: argparse.Namespace) -> int:
     if args.mode in {"build-dataset", "train", "backtest", "report", "run-all"}:
         summary = run_backtest(paths, fee_rate=args.fee_rate, slippage=args.slippage, capital_cap=args.capital_cap, quantity=args.quantity)
         print_terminal_summary(summary)
+    if args.mode == "team-only":
+        start = parse_time(args.team_start)
+        end = parse_time(args.team_end) if args.team_end else now_utc()
+        if start is None or end is None or start >= end:
+            raise SystemExit("team-start/team-end must be valid UTC ISO dates and team-start must precede team-end")
+        summary = run_team_only_backtest(paths, start=start, end=end, refresh=args.refresh)
+        print_team_only_terminal_summary(summary)
     if args.mode in {"dry-run", "live-monitor"}:
         print("MLB live integration is intentionally dry-run-only until a separately reviewed model artifact and live-trading approval exist.")
     return 0
