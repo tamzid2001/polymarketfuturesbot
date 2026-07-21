@@ -465,8 +465,9 @@ For every 15-minute Kalshi window:
    additionally freezes a selector side before each market. The selector
    compares only prior paired settled outcomes in trailing **3, 5, 7, 10, 25,
    and 50** signal windows. Each window votes for its higher directional
-   win-rate side; the majority wins. Ties and no history choose **inverse**, so
-   the selector starts inverse and never changes side after the market opens.
+   win-rate side; the majority wins. The first newly deployed selector market,
+   and any tied vote, choose **inverse**; later markets use the frozen vote and
+   never change side after the market opens.
 
 
 6. **Pre-post the locked ladder** — submit one `good_till_canceled` order at
@@ -515,6 +516,7 @@ Environment **variables** (not secrets) tune behavior:
 | `DRY_RUN` | `true` | **Live-money switch.** `false` → real orders |
 | `BET_AMOUNT_SHARES` | `1` | BTC contracts per each of the four fixed rungs (**shares — NOT dollars**) |
 | `PROPHET_SELECTOR_ENABLED` | `true` | Enables the paired trailing 3/5/7/10/25/50 win-rate selector. In paper mode it is a third paper ladder; in confirmed live mode it supplies the one actual locked side. |
+| `PROPHET_SELECTOR_START_INVERSE` | `true` | Forces the first selector market after deployment to inverse, then hands control to the frozen trailing-window vote. |
 | `HISTORY_MINUTES` | `500` | 1-minute candles fed to Prophet |
 | `FORECAST_MINUTES` | `17` | Fixed Prophet horizon in one-minute timesteps for every cached forecast |
 | `PREOPEN_FORECAST_LEAD_S` | `120` | Seconds before the next market opens to pre-compute its 17-step forecast |

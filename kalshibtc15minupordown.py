@@ -137,6 +137,11 @@ INVERSE_PROPHET_SHADOW_ENABLED = (
 PROPHET_SELECTOR_ENABLED = os.getenv("PROPHET_SELECTOR_ENABLED", "true").lower() in (
     "1", "true", "yes")
 PROPHET_SELECTOR_WINDOWS = (3, 5, 7, 10, 25, 50)
+# Explicit deployment bootstrap: the first selector market is inverse even if
+# a pre-existing baseline ledger is present.  Later markets use the frozen
+# trailing-window vote; the override is itself recorded in that first snapshot.
+PROPHET_SELECTOR_START_INVERSE = os.getenv("PROPHET_SELECTOR_START_INVERSE", "true").lower() in (
+    "1", "true", "yes")
 PROPHET_SELECTOR_HISTORY_FILE = os.getenv(
     "PROPHET_SELECTOR_HISTORY_FILE", "prophet_btc_selector_history.json")
 PROPHET_SELECTOR_REPORT_FILE = os.getenv(
@@ -1368,7 +1373,9 @@ def prophet_selector_decision(source_prophet_side: str) -> Optional[dict]:
     windows = prophet_selector_window_decisions(pairs)
     normal_votes = sum(item["leader"] == "normal" for item in windows.values())
     inverse_votes = len(windows) - normal_votes
-    selected_mode = "normal" if normal_votes > inverse_votes else "inverse"
+    bootstrap_inverse = PROPHET_SELECTOR_START_INVERSE and not selector_tracker.trades
+    selected_mode = "inverse" if bootstrap_inverse else (
+        "normal" if normal_votes > inverse_votes else "inverse")
     selected_side = source_side if selected_mode == "normal" else inverse_side
     return {
         "source_prophet_side": source_side.upper(),
@@ -1378,6 +1385,7 @@ def prophet_selector_decision(source_prophet_side: str) -> Optional[dict]:
         "normal_votes": normal_votes,
         "inverse_votes": inverse_votes,
         "tie_break": "inverse" if normal_votes == inverse_votes else None,
+        "bootstrap_inverse": bootstrap_inverse,
         "windows": windows,
         "frozen_at": datetime.now(tz=timezone.utc).isoformat(),
     }

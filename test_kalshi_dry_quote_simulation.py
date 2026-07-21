@@ -267,6 +267,7 @@ class ExecutableDryQuoteTests(unittest.TestCase):
                 assert selection is not None
                 self.assertEqual((selection["selected_mode"], selection["selected_side"]),
                                  ("inverse", "NO"))
+                self.assertTrue(selection["bootstrap_inverse"])
                 self.assertEqual(set(selection["windows"]), {"3", "5", "7", "10", "25", "50"})
 
                 selector = runner.create_prophet_selector_shadow(primary, selection)
@@ -299,11 +300,13 @@ class ExecutableDryQuoteTests(unittest.TestCase):
             }
             for index in range(6)
         ]
-        empty_history = SimpleNamespace(trades=[])
+        # A prior selector entry disables the deliberately inverse first-market
+        # bootstrap so this test isolates the rolling-window majority rule.
+        selector_history = SimpleNamespace(trades=[{"ticker": "already-started"}])
         inverse_history = SimpleNamespace(trades=records)
         with patch.object(runner, "inverse_shadow_tracker", inverse_history), \
-                patch.object(runner, "selector_tracker", empty_history), \
-                patch.object(runner, "tracker", empty_history):
+                patch.object(runner, "selector_tracker", selector_history), \
+                patch.object(runner, "tracker", SimpleNamespace(trades=[])):
             decision = runner.prophet_selector_decision("yes")
 
         self.assertIsNotNone(decision)
