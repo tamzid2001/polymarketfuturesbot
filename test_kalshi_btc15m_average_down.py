@@ -60,6 +60,7 @@ class MechanicalAverageDownTests(unittest.TestCase):
         self.assertEqual(config["order_reconcile_seconds"], 5.0)
         self.assertEqual(config["watch_start_grace_seconds"], 45.0)
         self.assertEqual(config["ml_min_confidence"], 0.5)
+        self.assertEqual(config["inverse_shadow_position_size"], 1.0)
 
     def test_ml_only_features_have_no_prophet_inputs(self):
         candles = pd.DataFrame({
@@ -174,11 +175,11 @@ class MechanicalAverageDownTests(unittest.TestCase):
         class FakeFeed:
             def __init__(self):
                 self.quotes = [
-                    ({"quote_id": "one", "economic_price": 0.19, "displayed_depth": 0.01,
-                      "yes_bid": 0.81, "yes_ask": 0.82, "yes_bid_size": 0.01, "yes_ask_size": 0.01,
+                    ({"quote_id": "one", "economic_price": 0.19, "displayed_depth": 1.0,
+                      "yes_bid": 0.81, "yes_ask": 0.82, "yes_bid_size": 1.0, "yes_ask_size": 1.0,
                       "received_at": "2026-07-21T16:00:00+00:00", "quote_age_seconds": 0.1}, "executable_top_of_book"),
-                    ({"quote_id": "two", "economic_price": 0.09, "displayed_depth": 0.03,
-                      "yes_bid": 0.91, "yes_ask": 0.92, "yes_bid_size": 0.03, "yes_ask_size": 0.01,
+                    ({"quote_id": "two", "economic_price": 0.09, "displayed_depth": 3.0,
+                      "yes_bid": 0.91, "yes_ask": 0.92, "yes_bid_size": 3.0, "yes_ask_size": 1.0,
                       "received_at": "2026-07-21T16:00:01+00:00", "quote_age_seconds": 0.1}, "executable_top_of_book"),
                 ]
 
@@ -195,16 +196,30 @@ class MechanicalAverageDownTests(unittest.TestCase):
         self.assertEqual((shadow["source_ml_side"], shadow["side"], record["orders"]), ("yes", "no", {}))
         feed = FakeFeed()
         self.assertTrue(simulate_inverse_shadow(record, feed, config))
-        self.assertEqual(shadow["rungs"]["0.4000"]["fill_count"], 0.01)
+        self.assertEqual(shadow["quantity_per_rung"], 1.0)
+        self.assertEqual(shadow["rungs"]["0.4000"]["fill_count"], 1.0)
         self.assertEqual(shadow["rungs"]["0.3000"]["fill_count"], 0.0)
         self.assertTrue(simulate_inverse_shadow(record, feed, config))
-        self.assertTrue(all(float(rung["fill_count"]) == 0.01 for rung in shadow["rungs"].values()))
+        self.assertTrue(all(float(rung["fill_count"]) == 1.0 for rung in shadow["rungs"].values()))
         self.assertTrue(finalize_inverse_shadow(record, "no"))
         summary = inverse_shadow_performance(state)
         self.assertEqual((summary["settled_signal_markets"], summary["signal_directional_wins"]), (1, 1))
-        self.assertEqual((summary["filled_market_trades"], summary["total_simulated_contracts"]), (1, 0.04))
-        self.assertEqual(summary["net_profit"], 0.03)
+        self.assertEqual((summary["filled_market_trades"], summary["total_simulated_contracts"]), (1, 4.0))
+        self.assertEqual(summary["net_profit"], 3.0)
         self.assertEqual(summary["rung_performance"]["0.40"]["simulated_quote_hits"], 1)
+
+    def test_inverse_shadow_rung_report_keeps_active_quote_hits_out_of_realized_pnl(self):
+        state = {"markets": {
+            "active": {"inverse_ml_shadow": {
+                "status": "active", "side": "yes", "rungs": {
+                    "0.4000": {"quantity": 1.0, "fill_count": 1.0, "average_fill_price": 0.40},
+                },
+            }},
+        }}
+        rung = inverse_shadow_performance(state)["rung_performance"]["0.40"]
+        self.assertEqual(rung["simulated_quote_hits"], 1)
+        self.assertEqual(rung["unsettled_quote_hits"], 1)
+        self.assertEqual((rung["winning_orders"], rung["losing_orders"], rung["net_profit"]), (0, 0, 0.0))
 
     def test_live_quote_overrides_discovery_snapshot(self):
         market = SimpleNamespace(yes_ask_dollars="0.70", no_ask_dollars="0.30")

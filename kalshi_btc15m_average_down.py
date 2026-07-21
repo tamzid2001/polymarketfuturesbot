@@ -58,7 +58,7 @@ except ImportError:  # pragma: no cover - exercised only in minimal local enviro
 LOG = logging.getLogger("kalshi_btc15m_average_down")
 SERIES_TICKER = "KXBTC15M"
 LADDER_LEVELS = (0.40, 0.30, 0.20, 0.10)
-CONFIG_VERSION = 8
+CONFIG_VERSION = 9
 STATE_VERSION = 7
 ORDER_NAMESPACE = uuid.UUID("4d85857e-4dc6-43ec-960f-0b342523bdb7")
 KALSHI_WS_URL = os.getenv(
@@ -115,6 +115,10 @@ DEFAULT_CONFIG = {
     # creates an exchange order. A simulated fill requires a fresh complete
     # top-of-book quote and displayed executable depth at the posted rung.
     "inverse_shadow_enabled": True,
+    # Paper-only size is intentionally independent of the 0.01-contract live
+    # ladder. It makes the counterfactual P&L readable without changing a
+    # single live order or risk limit.
+    "inverse_shadow_position_size": 1.0,
     "inverse_shadow_quote_max_age_seconds": 3.0,
     "status_log_seconds": 30.0,
 }
@@ -454,7 +458,7 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         "initial_position_size", "max_contracts_per_market", "max_total_capital",
         "fee_reserve", "poll_seconds", "market_refresh_seconds", "order_reconcile_seconds",
         "watch_start_grace_seconds", "ml_preopen_lead_seconds", "ml_min_confidence",
-        "inverse_shadow_quote_max_age_seconds", "status_log_seconds",
+        "inverse_shadow_position_size", "inverse_shadow_quote_max_age_seconds", "status_log_seconds",
     ):
         value = as_float(merged.get(name))
         if value is None or value <= 0:
@@ -1484,7 +1488,7 @@ def ensure_inverse_shadow(
     existing = record.get("inverse_ml_shadow")
     if isinstance(existing, dict):
         return existing
-    quantity = float(config["initial_position_size"])
+    quantity = float(config["inverse_shadow_position_size"])
     shadow = {
         "strategy": "inverse_ml_executable_quote_shadow_v1",
         "mode": "paper_only_no_exchange_orders",
@@ -2334,7 +2338,8 @@ def inverse_shadow_rung_performance(entries: list[tuple[dict[str, Any], dict[str
         f"{level:.2f}": {
             "rung_price": level, "paper_orders": 0, "paper_contracts": 0.0,
             "simulated_quote_hits": 0, "filled_contracts": 0.0,
-            "resting_or_unfilled": 0, "winning_orders": 0, "losing_orders": 0,
+            "resting_or_unfilled": 0, "unsettled_quote_hits": 0,
+            "winning_orders": 0, "losing_orders": 0,
             "net_profit": 0.0,
         }
         for level in LADDER_LEVELS
@@ -2356,9 +2361,15 @@ def inverse_shadow_rung_performance(entries: list[tuple[dict[str, Any], dict[str
                 item["resting_or_unfilled"] += 1
                 continue
             price = float(rung.get("average_fill_price") or rung.get("rung_price") or level)
-            pnl = (fill if shadow_side == outcome else 0.0) - fill * price
             item["simulated_quote_hits"] += 1
             item["filled_contracts"] += fill
+            # A quote-qualified rung remains open until the binary market is
+            # settled.  Do not treat its cost as a realized loss in a
+            # per-rung report merely because its outcome is still unknown.
+            if outcome not in {"yes", "no"} or shadow_side not in {"yes", "no"}:
+                item["unsettled_quote_hits"] += 1
+                continue
+            pnl = (fill if shadow_side == outcome else 0.0) - fill * price
             item["net_profit"] += pnl
             if pnl > 1e-9:
                 item["winning_orders"] += 1
@@ -2863,6 +2874,10 @@ async def run(args: argparse.Namespace) -> int:
         "DRY_RUN" if dry_run else "LIVE", args.run_seconds, config["initial_position_size"],
         config["max_contracts_per_market"], "/".join(f"${level:.2f}" for level in LADDER_LEVELS),
         config["max_total_capital"],
+    )
+    LOG.info(
+        "INVERSE ML SHADOW POLICY | paper_only=%s quantity_per_rung=%.2f; primary live quantity remains %.2f.",
+        bool(config["inverse_shadow_enabled"]), config["inverse_shadow_position_size"], config["initial_position_size"],
     )
     LOG.info(
         "ML SIDE FILTER | stored_model=%s feature_ledger=%s preopen_lead=%.0fs confidence_gate=%.2f fallback=disabled",

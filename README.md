@@ -13,7 +13,7 @@ The continuous runners use GitHub Actions for up to 5 h 45 min per job before se
 
 ## Kalshi BTC 15-minute mechanical average-down runner
 
-Use **Actions → “Kalshi BTC 15m ML-Side Average Down” → Run workflow**. It uses the persisted contract quantity (default **0.01 contract per rung**) and monitors only `KXBTC15M`. The ML-only runner accepts only the schema `ml_only_raw_candles_settled_outcomes_v1`: BTC candle returns/volatility/range, strike distance, clock, and previously settled outcomes. It does not fit, call, or consume Prophet or another price forecast. It rejects a saved model whose schema is not exactly ML-only; there is no fallback model or forecast path.
+Use **Actions → “Kalshi BTC 15m ML-Side Average Down” → Run workflow**. It uses the persisted contract quantity (default **0.01 contract per rung**) and monitors only `KXBTC15M`. Its separate inverse ML shadow uses **1.00 paper contract per rung** for readable counterfactual P&L; that value is stored independently and cannot change, reserve capital for, or submit a primary live order. The ML-only runner accepts only the schema `ml_only_raw_candles_settled_outcomes_v1`: BTC candle returns/volatility/range, strike distance, clock, and previously settled outcomes. It does not fit, call, or consume Prophet or another price forecast. It rejects a saved model whose schema is not exactly ML-only; there is no fallback model or forecast path.
 
 ### Deployed model, coverage, and evidence
 
