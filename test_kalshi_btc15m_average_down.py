@@ -23,7 +23,10 @@ from kalshi_btc15m_average_down import (
     exchange_outcome_side,
     ladder_principal,
     performance_report,
+    pause_error,
     reconcile_orders,
+    recover_exchange_state,
+    scheduled_trading_pause_active,
     settle_or_cancel,
     side_api_price,
     submit_ladder,
@@ -38,6 +41,7 @@ from kalshi_btc15m_average_down import (
     rung_order_activity,
     validate_config,
 )
+from datetime import datetime, timezone
 from kalshi_ml_features import FEATURE_SCHEMA, ML_ONLY_FEATURE_COLUMNS, feature_values
 
 
@@ -159,6 +163,65 @@ class MechanicalAverageDownTests(unittest.TestCase):
         owned = {"ticker": ticker, "client_order_id": client_order_id(ticker, "no", "0.3000")}
         self.assertEqual(managed_mechanical_order_role(owned), ("no", "0.3000"))
         self.assertIsNone(managed_mechanical_order_role({"ticker": ticker, "client_order_id": "manual-order"}))
+
+    def test_documented_thursday_maintenance_window_is_pause_aware(self):
+        self.assertTrue(scheduled_trading_pause_active(datetime(2026, 7, 23, 7, 0, tzinfo=timezone.utc)))
+        self.assertTrue(scheduled_trading_pause_active(datetime(2026, 7, 23, 8, 59, tzinfo=timezone.utc)))
+        self.assertFalse(scheduled_trading_pause_active(datetime(2026, 7, 23, 9, 0, tzinfo=timezone.utc)))
+        self.assertTrue(pause_error("Kalshi Exchange is paused for maintenance"))
+        self.assertFalse(pause_error("insufficient balance"))
+
+    def test_exchange_recovery_attaches_only_owned_same_side_rungs(self):
+        class FakeRest:
+            async def resting_mechanical_orders(self):
+                ticker = "KXBTC15M-TEST-RECOVERY"
+                order = {
+                    "ticker": ticker,
+                    "order_id": "recovered-order",
+                    "client_order_id": client_order_id(ticker, "no", "0.3000"),
+                    "status": "resting",
+                    "count": "1.00",
+                    "fill_count": "0.00",
+                    "remaining_count": "1.00",
+                }
+                return [(order, ("no", "0.3000"))]
+
+            async def get_market(self, _ticker):
+                return SimpleNamespace(
+                    open_time="2026-07-20T00:00:00Z", close_time="2099-07-20T00:15:00Z",
+                )
+
+            async def position_for_ticker(self, _ticker):
+                return 0.0
+
+        async def scenario():
+            state = default_state()
+            ok = await recover_exchange_state(FakeRest(), state, validate_config(DEFAULT_CONFIG), dry_run=False)
+            return ok, state["markets"]["KXBTC15M-TEST-RECOVERY"]
+
+        ok, record = asyncio.run(scenario())
+        self.assertTrue(ok)
+        self.assertEqual(record["locked_side"], "no")
+        self.assertEqual(record["status"], "ladder_active")
+        self.assertEqual(record["orders"]["0.3000"]["order_id"], "recovered-order")
+
+    def test_recovery_marks_mixed_side_orders_ambiguous(self):
+        class FakeRest:
+            async def resting_mechanical_orders(self):
+                ticker = "KXBTC15M-TEST-MIXED"
+                return [
+                    ({"ticker": ticker, "client_order_id": client_order_id(ticker, "yes", "initial")}, ("yes", "initial")),
+                    ({"ticker": ticker, "client_order_id": client_order_id(ticker, "no", "0.3000")}, ("no", "0.3000")),
+                ]
+
+        async def scenario():
+            state = default_state()
+            ok = await recover_exchange_state(FakeRest(), state, validate_config(DEFAULT_CONFIG), dry_run=False)
+            return ok, state["markets"]["KXBTC15M-TEST-MIXED"]
+
+        ok, record = asyncio.run(scenario())
+        self.assertTrue(ok)
+        self.assertEqual(record["status"], "recovery_blocked_ambiguous")
 
     def test_unfilled_ioc_is_never_reported_as_filled(self):
         self.assertEqual(

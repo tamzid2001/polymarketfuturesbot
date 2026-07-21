@@ -1,0 +1,54 @@
+name: Kalshi BTC 15m Live Trader Watchdog
+
+# A recovery safety net for the live ML-side trader. The trader's normal
+# 5h45m self-handoff remains primary. This runs every five minutes only to
+# dispatch a replacement when no trader is active/queued and the last success
+# has had time to enqueue its successor.
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: kalshi-btc15m-watchdog
+  cancel-in-progress: false
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  ensure-live-runner:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch only when the live runner is absent
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          runs="$(gh run list --repo "$REPOSITORY" \
+            --workflow kalshi_btc15m_average_down.yml --limit 20 \
+            --json databaseId,status,conclusion,completedAt)"
+          active="$(jq '[.[] | select(.status == "in_progress" or .status == "queued" or .status == "waiting")] | length' <<<"$runs")"
+          if [ "$active" -gt 0 ]; then
+            echo "WATCHDOG OK | active_or_queued_live_runs=$active"
+            exit 0
+          fi
+
+          latest="$(jq -c 'sort_by(.completedAt // "") | last // {}' <<<"$runs")"
+          conclusion="$(jq -r '.conclusion // "none"' <<<"$latest")"
+          completed="$(jq -r '.completedAt // ""' <<<"$latest")"
+          if [ "$conclusion" = "success" ] && [ -n "$completed" ]; then
+            completed_epoch="$(date -u -d "$completed" +%s)"
+            now_epoch="$(date -u +%s)"
+            age_seconds=$((now_epoch - completed_epoch))
+            if [ "$age_seconds" -lt 600 ]; then
+              echo "WATCHDOG WAIT | last successful runner completed ${age_seconds}s ago; allowing its normal handoff to appear."
+              exit 0
+            fi
+          fi
+
+          gh workflow run kalshi_btc15m_average_down.yml \
+            --repo "$REPOSITORY" --ref main -f live_trading=true
+          echo "WATCHDOG DISPATCHED | no active/queued live runner; replacement queued."

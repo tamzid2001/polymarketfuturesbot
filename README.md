@@ -7,7 +7,7 @@ The repository contains the original futures and Prophet runners, plus two separ
 3. **Kalshi BTC 15-Min ML-Side Mechanical Average-Down Bot** (`kalshi_btc15m_average_down.py`) — continuous KXBTC15M-only runner. A stored ML inference selects YES or NO before opening; when the market opens, it immediately posts that side's 40¢/30¢/20¢/10¢ economic GTC ladder through settlement. [Jump to docs ↓](#kalshi-btc-15-minute-mechanical-average-down-runner)
 4. **Polymarket US MLB Average-Down Bot** (`polymarket_mlb_average_down.py`) — continuous dry-monitoring runner for same-day MLB full-game moneylines. Its default `mechanical` mode takes no baseball prediction: it snapshots both team costs, waits for the first team to trade 10¢ below its own snapshot, and records the resulting mechanical ladder audit. An explicitly configured `ml_side_average_down` mode is available only after the separate leakage-safe research pipeline produces a versioned model artifact; it freezes one ML-selected team and never substitutes or reverses to the other team. Scheduled runs cannot place orders; a separate manual switch permits a one-off live run.
 
-The continuous runners use GitHub Actions for up to 5 h 45 min per job before self-triggering the next run. The Polymarket MLB mechanical runner is now a 24/7 **dry-monitoring** chain: scheduled and handoff jobs are explicitly dry, while live trading remains a separate manual choice.
+The continuous runners use GitHub Actions for up to 5 h 45 min per job before self-triggering the next run. The Kalshi ML-side runner also checkpoints material execution state, recovers owned exchange orders at startup, and has a five-minute watchdog for interrupted runs. The Polymarket MLB mechanical runner is now a 24/7 **dry-monitoring** chain: scheduled and handoff jobs are explicitly dry, while live trading remains a separate manual choice.
 
 ---
 
@@ -78,6 +78,16 @@ The runner uses Kalshi `good_till_canceled` with an **explicit market-close expi
 Pre-posting is intentional. If the frozen ML side opens around 20¢, the 40¢, 30¢, and 20¢ GTC buys can all be marketable and may fill immediately; that is the specified fixed 40/30/20/10 ladder, not a reversal or an accidental duplicate. The complete four-rung principal is reserved before any order is submitted, and the exchange-position guard rejects a ticker with an incompatible side, unexpected position, or position above the configured four-rung cap.
 
 Key persisted settings in `kalshi_btc15m_average_down_config.json` are `initial_position_size` (contracts per rung), `max_total_capital`, `max_active_markets`, and `watch_start_grace_seconds` (default 45; only for starting a watcher at a fresh open). When you change only `initial_position_size` in **Run workflow**, the full ladder scales automatically: `10` shares per rung becomes a `40`-contract per-market ceiling and a `$10` principal cap (before fees). Those values persist into later handoffs. You can still supply explicit caps in the same form if you intentionally want a stricter limit.
+
+### 24/7 handoff, recovery, and Kalshi pauses
+
+The normal chain is: run for 5 h 45 min → persist state/config/report → queue the next live run. Only one live ML runner may execute or queue at once. Existing market-close-expiring GTC rungs stay on Kalshi during the short handoff; the successor restores the active ticker's frozen ML side and reconciles the original orders instead of sending a second ladder.
+
+In addition to the end-of-run commit, the runner publishes a durable checkpoint after a **material** event: watcher creation, frozen ML side, accepted/rejected ladder change, fill/cancel status change, or settlement. High-frequency quote and lookup timestamps do not create commits. On every live startup it asks Kalshi for resting orders with this bot's deterministic client IDs, attaches known 40¢/30¢/20¢/10¢ rungs to the ledger, and checks the exchange position. A mixed-side, malformed, or position-mismatched recovery is quarantined: that ticker receives no new order.
+
+The **“Kalshi BTC 15m Live Trader Watchdog”** workflow runs every five minutes. It dispatches a replacement only when there is no active or queued live runner and allows ten minutes for a normally successful self-handoff to appear. This is a recovery safeguard, not a second trader.
+
+Kalshi has a scheduled trading pause every Thursday from **3:00–5:00 AM ET**. During it, the runner sends no new ladder; existing GTC orders are left unchanged (Kalshi's default is to keep them resting) and its WebSocket reconnects after a disconnect. It does not turn a pause into a late entry: if trading resumes after a new market's 45-second opening grace, that market is skipped and the next fresh market starts normally. An unscheduled API pause response uses the same fail-safe behavior. See [Kalshi maintenance and pauses](https://docs.kalshi.com/getting_started/maintenance_and_pauses).
 
 ---
 

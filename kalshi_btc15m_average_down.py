@@ -16,10 +16,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import logging
 import math
 import os
+import subprocess
 import time
 import uuid
 from dataclasses import dataclass
@@ -27,6 +29,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
+from zoneinfo import ZoneInfo
 
 from kalshi_ml_features import FEATURE_SCHEMA, ML_ONLY_FEATURE_COLUMNS
 
@@ -55,8 +58,8 @@ except ImportError:  # pragma: no cover - exercised only in minimal local enviro
 LOG = logging.getLogger("kalshi_btc15m_average_down")
 SERIES_TICKER = "KXBTC15M"
 LADDER_LEVELS = (0.40, 0.30, 0.20, 0.10)
-CONFIG_VERSION = 6
-STATE_VERSION = 4
+CONFIG_VERSION = 7
+STATE_VERSION = 5
 ORDER_NAMESPACE = uuid.UUID("4d85857e-4dc6-43ec-960f-0b342523bdb7")
 KALSHI_WS_URL = os.getenv(
     "KALSHI_WS_URL",
@@ -65,6 +68,19 @@ KALSHI_WS_URL = os.getenv(
     else "wss://external-api-ws.kalshi.com/trade-api/ws/v2",
 )
 QUOTE_STALE_SECONDS = 20.0
+MAINTENANCE_TIMEZONE = ZoneInfo("America/New_York")
+EXCHANGE_RECOVERY_RETRY_SECONDS = 60.0
+CHECKPOINT_RETRY_SECONDS = 60.0
+# Polling metadata changes every few seconds and must never turn the bot-state
+# branch into a stream of commits. Everything else is material trading state.
+CHECKPOINT_IGNORED_KEYS = {
+    "last_checked_at",
+    "checked_at",
+    "exchange_position_checked_at",
+    "generated_at",
+    "last_heartbeat_at",
+    "pause_blocked_at",
+}
 
 DEFAULT_CONFIG = {
     "format_version": CONFIG_VERSION,
@@ -178,6 +194,39 @@ def market_is_tradeable(market: Any) -> bool:
     )
 
 
+def scheduled_trading_pause_active(now: datetime | None = None) -> bool:
+    """Return whether Kalshi's documented Thursday maintenance window is open.
+
+    A scheduled trading pause is exchange-wide, so an individual market can
+    still look active in a market response while order creation is unavailable.
+    The official window is Thursday 03:00--05:00 America/New_York.
+    """
+    value = now or datetime.now(tz=timezone.utc)
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    eastern = value.astimezone(MAINTENANCE_TIMEZONE)
+    return eastern.weekday() == 3 and 3 <= eastern.hour < 5
+
+
+def pause_error(exc: Exception | str) -> bool:
+    """Recognize the documented global trading/exchange-pause API failures."""
+    message = str(exc).lower()
+    markers = (
+        "trading pause",
+        "exchange pause",
+        "exchange is paused",
+        "trading is paused",
+        "maintenance",
+    )
+    return any(marker in message for marker in markers)
+
+
+def rest_pause_active(rest: Any) -> bool:
+    """Ask a real REST adapter about a temporary pause; test doubles stay open."""
+    checker = getattr(rest, "trading_pause_active", None)
+    return bool(checker()) if callable(checker) else False
+
+
 def market_can_start_watcher(market: Any, start_grace_seconds: float) -> bool:
     """Start a market watcher only at the market's opening, never late.
 
@@ -282,6 +331,113 @@ def save_json(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, indent=2, sort_keys=True, default=str) + "\n", encoding="utf-8")
 
 
+def checkpoint_projection(value: Any) -> Any:
+    """Remove high-frequency audit timestamps before deciding to publish state."""
+    if isinstance(value, dict):
+        return {
+            str(key): checkpoint_projection(item)
+            for key, item in value.items()
+            if str(key) not in CHECKPOINT_IGNORED_KEYS
+        }
+    if isinstance(value, list):
+        return [checkpoint_projection(item) for item in value]
+    return value
+
+
+def checkpoint_fingerprint(state: dict[str, Any], config: dict[str, Any]) -> str:
+    """Hash material strategy state without writing secrets or quote noise."""
+    payload = {
+        "state": checkpoint_projection(state),
+        "config": checkpoint_projection(config),
+    }
+    encoded = json.dumps(payload, sort_keys=True, default=str, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+@dataclass
+class StateCheckpointPublisher:
+    """Durably publish material live-trading state from inside an Actions run.
+
+    The normal end-of-run workflow commit remains in place. This publisher
+    narrows the crash window by committing only meaningful events such as a
+    locked side, an accepted rung, a fill, or settlement. It is deliberately
+    disabled outside GitHub Actions and fails open with a warning: execution
+    continues, while the watchdog remains available to recover the runner.
+    """
+
+    config_path: Path
+    state_path: Path
+    report_path: Path
+    config: dict[str, Any]
+    last_fingerprint: str
+    enabled: bool
+    last_attempt_at: float = float("-inf")
+
+    @classmethod
+    def create(
+        cls, config_path: Path, state_path: Path, report_path: Path,
+        config: dict[str, Any], state: dict[str, Any],
+    ) -> "StateCheckpointPublisher":
+        enabled = (
+            os.getenv("GITHUB_ACTIONS", "").lower() == "true"
+            and os.getenv("KALSHI_CHECKPOINT_PUBLISH", "false").lower() in {"1", "true", "yes"}
+        )
+        return cls(
+            config_path=config_path,
+            state_path=state_path,
+            report_path=report_path,
+            config=config,
+            last_fingerprint=checkpoint_fingerprint(state, config),
+            enabled=enabled,
+        )
+
+    def publish_if_changed(self, state: dict[str, Any], reason: str) -> bool:
+        current = checkpoint_fingerprint(state, self.config)
+        if current == self.last_fingerprint:
+            return False
+        if not self.enabled:
+            self.last_fingerprint = current
+            return False
+        now = time.monotonic()
+        if now - self.last_attempt_at < CHECKPOINT_RETRY_SECONDS:
+            return False
+        self.last_attempt_at = now
+        try:
+            save_json(self.state_path, state)
+            save_json(self.report_path, performance_report(state, self.config))
+            repository = subprocess.run(
+                ["git", "rev-parse", "--show-toplevel"], check=True, capture_output=True, text=True,
+            ).stdout.strip()
+            root = Path(repository).resolve()
+            paths = [str(path.resolve().relative_to(root)) for path in (
+                self.config_path, self.state_path, self.report_path,
+            )]
+            subprocess.run(["git", "add", *paths], check=True, capture_output=True, text=True)
+            diff = subprocess.run(
+                ["git", "diff", "--cached", "--quiet"], capture_output=True, text=True,
+            )
+            if diff.returncode not in {0, 1}:
+                raise RuntimeError(diff.stderr.strip() or "git diff --cached failed")
+            if diff.returncode == 1:
+                subprocess.run(
+                    ["git", "commit", "-m", "chore: checkpoint BTC average-down state [skip ci]"],
+                    check=True, capture_output=True, text=True,
+                )
+            # A concurrent model-registry update should rebase cleanly because
+            # this publisher owns only configuration/state/report files.
+            subprocess.run(
+                ["git", "pull", "--rebase", "--autostash", "origin", "main"],
+                check=True, capture_output=True, text=True,
+            )
+            subprocess.run(["git", "push", "origin", "HEAD:main"], check=True, capture_output=True, text=True)
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning("STATE CHECKPOINT FAILED | reason=%s error=%s; retrying after a later material event.", reason, exc)
+            return False
+        self.last_fingerprint = current
+        LOG.info("STATE CHECKPOINTED | reason=%s fingerprint=%s", reason, current[:12])
+        return True
+
+
 def validate_config(config: dict[str, Any]) -> dict[str, Any]:
     merged = {**DEFAULT_CONFIG, **config, "format_version": CONFIG_VERSION}
     # Earlier versions used a short price-entry window. The persisted watcher
@@ -349,6 +505,17 @@ def order_fill_count(order: Any) -> float:
 
 def order_remaining_count(order: Any) -> float | None:
     return as_float(field(order, "remaining_count_fp", "remaining_count"))
+
+
+def order_quantity(order: Any) -> float | None:
+    """Read the original size, falling back to known filled plus resting size."""
+    explicit = as_float(field(order, "initial_count_fp", "initial_count", "count_fp", "count", "quantity"))
+    if explicit is not None and explicit > 0:
+        return round(explicit, 2)
+    filled = order_fill_count(order)
+    remaining = order_remaining_count(order)
+    reconstructed = filled + (remaining or 0.0)
+    return round(reconstructed, 2) if reconstructed > 0 else None
 
 
 def order_average_position_price(order: Any, side: str, fallback: float) -> float:
@@ -824,6 +991,8 @@ class KalshiREST:
         self.events = EventsApi(self.client)
         self.markets = MarketApi(self.client)
         self.orders = OrdersApi(self.client)
+        self.pause_until = 0.0
+        self.pause_reason: str | None = None
 
     async def close(self) -> None:
         await self.client.close()
@@ -860,6 +1029,32 @@ class KalshiREST:
         except Exception as exc:  # noqa: BLE001
             LOG.warning("Position lookup failed for %s: %s", ticker, exc)
             return None
+
+    def trading_pause_active(self) -> bool:
+        """Respect scheduled maintenance and a recently observed global pause."""
+        return scheduled_trading_pause_active() or time.time() < self.pause_until
+
+    def note_trading_pause(self, reason: str) -> None:
+        # An unscheduled pause has no fixed published end time. Back off for a
+        # minute, then retry only if the market is still inside its opening
+        # grace period. The regular Thursday pause is handled exactly above.
+        self.pause_until = max(self.pause_until, time.time() + EXCHANGE_RECOVERY_RETRY_SECONDS)
+        self.pause_reason = reason
+        LOG.warning("KALSHI PAUSE DETECTED | %s; new ladders are paused.", reason)
+
+    async def resting_mechanical_orders(self) -> list[tuple[Any, tuple[str, str]]]:
+        """Return only live orders whose deterministic IDs belong to this bot."""
+        try:
+            response = await self.orders.get_orders(status="resting", limit=1000)
+        except Exception as exc:  # noqa: BLE001
+            LOG.error("EXCHANGE RECOVERY ORDER LOOKUP FAILED | %s", exc)
+            raise
+        recovered: list[tuple[Any, tuple[str, str]]] = []
+        for order in field(response, "orders") or []:
+            role = managed_mechanical_order_role(order)
+            if role is not None:
+                recovered.append((order, role))
+        return recovered
 
     async def cancel_resting_mechanical_orders(self) -> int:
         """Cancel only this strategy's resting KXBTC15M orders for a handoff."""
@@ -934,6 +1129,11 @@ class KalshiREST:
         if dry_run:
             LOG.info("DRY RUN ORDER | %s %s @ $%.2f x %.2f (%s)", ticker, side.upper(), position_price, quantity, tif)
             return record
+        if self.trading_pause_active():
+            record["status"] = "paused"
+            record["error"] = self.pause_reason or "scheduled Kalshi trading pause"
+            LOG.info("ORDER DEFERRED FOR PAUSE | %s %s @ $%.2f", ticker, side.upper(), position_price)
+            return record
         kwargs = {
             "ticker": ticker,
             "side": side_book_side(side),
@@ -949,7 +1149,11 @@ class KalshiREST:
         try:
             response = await self.orders.create_order_v2(**kwargs)
         except Exception as exc:  # noqa: BLE001
-            record["status"] = "submit_failed"
+            if pause_error(exc):
+                self.note_trading_pause(str(exc))
+                record["status"] = "paused"
+            else:
+                record["status"] = "submit_failed"
             record["error"] = str(exc)
             LOG.error("ORDER REJECTED | %s %s @ $%.2f: %s", ticker, side.upper(), position_price, exc)
             return record
@@ -1160,6 +1364,140 @@ async def exchange_position_guard(rest: KalshiREST, record: dict[str, Any], conf
     return True
 
 
+def recovered_order_record(order: Any, side: str, role: str) -> dict[str, Any] | None:
+    """Convert a resting exchange order into the exact local rung ledger form."""
+    key = "0.4000" if role == "initial" else role
+    level = as_float(key)
+    quantity = order_quantity(order)
+    if level is None or quantity is None:
+        return None
+    fill_count = order_fill_count(order)
+    remaining = order_remaining_count(order)
+    if remaining is None:
+        return None
+    status = normalized_order_status(field(order, "status")) or classify_submission(
+        fill_count, remaining, quantity, "good_till_canceled",
+    )
+    ticker = str(field(order, "ticker") or "")
+    return {
+        "client_order_id": str(field(order, "client_order_id") or client_order_id(ticker, side, role)),
+        "ticker": ticker,
+        "side": side,
+        "expected_outcome_side": side,
+        "order_id": str(field(order, "order_id") or "") or None,
+        "order_type": "limit",
+        "position_price": round(level, 4),
+        "api_price": side_api_price(side, level),
+        "quantity": quantity,
+        "time_in_force": "good_till_canceled",
+        "fill_count": round(fill_count, 2),
+        "remaining_count": round(remaining, 2),
+        "average_fill_price": order_average_position_price(order, side, level),
+        "fees_paid": order_fee_total(order),
+        "status": status,
+        "ladder_level": level,
+        "recovered_from_exchange_at": now_iso(),
+    }
+
+
+async def recover_exchange_state(rest: KalshiREST, state: dict[str, Any], config: dict[str, Any], dry_run: bool) -> bool:
+    """Reattach deterministic resting GTC rungs before any new live order.
+
+    State is useful but Kalshi is authoritative after a runner interruption.
+    Recovery never creates a missing rung. A mixed-side, malformed, or
+    position-mismatched ticker is quarantined so the next process cannot turn
+    uncertainty into a duplicate order.
+    """
+    recovery = state.setdefault("exchange_recovery", {})
+    if dry_run:
+        recovery.update({"status": "dry_run", "checked_at": now_iso()})
+        return True
+    lookup = getattr(rest, "resting_mechanical_orders", None)
+    if not callable(lookup):
+        recovery.update({"status": "blocked", "checked_at": now_iso(), "reason": "order recovery unsupported"})
+        LOG.critical("EXCHANGE RECOVERY BLOCKED | adapter cannot inspect resting deterministic orders; no new ladders allowed.")
+        return False
+    try:
+        live_orders = await lookup()
+    except Exception as exc:  # noqa: BLE001
+        recovery.update({"status": "blocked", "checked_at": now_iso(), "reason": str(exc)})
+        LOG.critical("EXCHANGE RECOVERY BLOCKED | resting-order lookup failed; no new ladders allowed.")
+        return False
+
+    grouped: dict[str, list[tuple[Any, tuple[str, str]]]] = {}
+    for order, role in live_orders:
+        ticker = str(field(order, "ticker") or "")
+        if ticker:
+            grouped.setdefault(ticker, []).append((order, role))
+
+    recovered_count = 0
+    blocked_count = 0
+    for ticker, entries in grouped.items():
+        sides = {role[0] for _, role in entries}
+        keys = ["0.4000" if role[1] == "initial" else role[1] for _, role in entries]
+        records = [recovered_order_record(order, role[0], role[1]) for order, role in entries]
+        if len(sides) != 1 or len(set(keys)) != len(keys) or any(item is None for item in records):
+            record = market_record(state, ticker)
+            record.update({
+                "status": "recovery_blocked_ambiguous",
+                "exchange_recovery_blocked": "mixed side, duplicate role, or malformed resting order",
+                "recovered_at": now_iso(),
+            })
+            blocked_count += 1
+            LOG.critical("EXCHANGE RECOVERY QUARANTINE | %s has ambiguous owned resting orders; no new orders for this ticker.", ticker)
+            continue
+
+        side = next(iter(sides))
+        typed_orders = [item for item in records if item is not None]
+        quantities = {float(item["quantity"]) for item in typed_orders}
+        record = market_record(state, ticker)
+        existing_side = record.get("locked_side") or record.get("candidate_side")
+        if len(quantities) != 1 or existing_side not in {None, side}:
+            record.update({
+                "status": "recovery_blocked_ambiguous",
+                "exchange_recovery_blocked": "quantity or side conflicts with persisted ledger",
+                "recovered_at": now_iso(),
+            })
+            blocked_count += 1
+            LOG.critical("EXCHANGE RECOVERY QUARANTINE | %s conflicts with persisted side/quantity; no new orders.", ticker)
+            continue
+
+        market = await rest.get_market(ticker)
+        record.update({
+            "candidate_side": side,
+            "locked_side": side,
+            "quantity": quantities.pop(),
+            "status": "ladder_active",
+            "ladder_mode": "preposted_gtc_v2",
+            "reserved_principal": ladder_principal(float(typed_orders[0]["quantity"])),
+            "market_open_time": field(market, "open_time") if market is not None else record.get("market_open_time"),
+            "market_close_time": field(market, "close_time", "expected_expiration_time") if market is not None else record.get("market_close_time"),
+            "recovered_at": now_iso(),
+            "recovery_source": "Kalshi resting deterministic client-order IDs",
+        })
+        for item in typed_orders:
+            record.setdefault("orders", {})[f"{float(item['ladder_level']):.4f}"] = item
+        if not await exchange_position_guard(rest, record, config):
+            record["status"] = "recovery_blocked_exchange_position"
+            blocked_count += 1
+            LOG.critical("EXCHANGE RECOVERY QUARANTINE | %s exchange position does not match recovered rungs.", ticker)
+            continue
+        recovered_count += len(typed_orders)
+        LOG.info(
+            "EXCHANGE RECOVERY ATTACHED | %s side=%s resting_rungs=%s; no duplicate ladder will be sent.",
+            ticker, side.upper(), "/".join(f"${item['ladder_level']:.2f}" for item in typed_orders),
+        )
+
+    recovery.update({
+        "status": "ready",
+        "checked_at": now_iso(),
+        "resting_rungs_attached": recovered_count,
+        "quarantined_tickers": blocked_count,
+    })
+    LOG.info("EXCHANGE RECOVERY READY | attached_rungs=%d quarantined_tickers=%d", recovered_count, blocked_count)
+    return True
+
+
 def active_strategy_records(state: dict[str, Any]) -> list[dict[str, Any]]:
     active: list[dict[str, Any]] = []
     for record in state.get("markets", {}).values():
@@ -1338,27 +1676,41 @@ async def consider_initial_entry(
     ticker = str(field(market, "ticker") or "")
     if not ticker or not market_is_tradeable(market):
         return False
+    recovery_status = str(field(state.get("exchange_recovery", {}), "status") or "")
+    if not dry_run and recovery_status and recovery_status != "ready":
+        LOG.warning(
+            "ENTRY BLOCKED BY RECOVERY | %s exchange recovery status=%s; no new ladder will be sent.",
+            ticker, recovery_status or "unknown",
+        )
+        return False
     record = state.get("markets", {}).get(ticker)
     if not isinstance(record, dict):
         record = start_market_watcher(state, market, config)
     if not isinstance(record, dict) or record.get("status") != "watching":
+        return False
+    if rest_pause_active(rest):
+        record["pause_blocked_at"] = now_iso()
+        record["pause_blocked_reason"] = "scheduled or detected Kalshi trading pause"
+        LOG.info("ENTRY DEFERRED FOR PAUSE | %s no new GTC ladder during a Kalshi trading/exchange pause.", ticker)
         return False
     other_active = [candidate for candidate in active_strategy_records(state) if candidate is not record]
     if len(other_active) >= config["max_active_markets"]:
         return False
     if ml_side not in {"yes", "no"}:
         return False
-    if not record.get("ladder_mode") and not orders_for_market(record) and not market_can_start_watcher(
-        market, config["watch_start_grace_seconds"],
-    ):
-        # A watcher persisted by the retired quote-triggered version must not
-        # be converted into a brand-new pre-posted ladder mid-market during a
-        # deployment or Actions handoff. The next fresh market gets the new
-        # four-GTC behavior from its opening instead.
+    missing_or_rejected_rungs = any(
+        not isinstance(record.get("orders", {}).get(f"{level:.4f}"), dict)
+        or record["orders"][f"{level:.4f}"].get("status") in {"submit_failed", "paused"}
+        for level in LADDER_LEVELS
+    )
+    if missing_or_rejected_rungs and not market_can_start_watcher(market, config["watch_start_grace_seconds"]):
+        # Never let a scheduled/unscheduled pause (or a partial network/API
+        # failure) turn into a late mid-market ladder. Missing rungs may retry
+        # only in the original opening grace; the next market starts clean.
         record["status"] = "prepost_window_missed"
         record["prepost_window_missed_at"] = now_iso()
         LOG.warning(
-            "GTC LADDER SKIPPED | %s was not a fresh opening; refusing to pre-post a new ladder mid-market.", ticker,
+            "GTC LADDER SKIPPED | %s opening grace expired; refusing to pre-post a new ladder mid-market.", ticker,
         )
         return False
     # Quotes remain useful for heartbeat/audit output, but they do not gate
@@ -1434,6 +1786,11 @@ async def consider_initial_entry(
         order["ladder_level"] = level
         order["reason"] = "Frozen ML side; pre-posted fixed GTC ladder through market close."
         record["orders"][key] = order
+        if order.get("status") == "paused":
+            # Do not generate four rejected submissions or retry in a late
+            # market. The watcher remains safe and the next fresh market will
+            # receive a new frozen ML decision after trading resumes.
+            break
         if order.get("direction_verified") is False:
             record["status"] = "direction_mismatch"
             LOG.critical(
@@ -1443,14 +1800,14 @@ async def consider_initial_entry(
     record["ladder_preposted_at"] = now_iso()
     accepted_rungs = sum(
         isinstance(record["orders"].get(f"{level:.4f}"), dict)
-        and record["orders"][f"{level:.4f}"].get("status") != "submit_failed"
+        and record["orders"][f"{level:.4f}"].get("status") not in {"submit_failed", "paused"}
         for level in LADDER_LEVELS
     )
     record["ladder_preposted_rungs"] = accepted_rungs
     record["ladder_preposted_complete"] = accepted_rungs == len(LADDER_LEVELS)
     if not record["ladder_preposted_complete"] and record.get("status") != "direction_mismatch":
-        # Preserve the frozen ML side and any accepted rungs, then retry only
-        # missing/rejected submissions. This never changes or hedges the side.
+        # Preserve the frozen ML side and any accepted rungs. Missing/rejected
+        # submissions can retry only while the opening grace still applies.
         record["status"] = "watching"
         LOG.warning(
             "GTC LADDER INCOMPLETE | %s %s accepted=%d/%d; will retry only missing same-side rungs.",
@@ -1901,6 +2258,9 @@ async def run(args: argparse.Namespace) -> int:
     state = load_json(state_path, default_state())
     state["format_version"] = STATE_VERSION
     state.setdefault("markets", {})
+    checkpoint = StateCheckpointPublisher.create(
+        config_path, state_path, args.report.expanduser(), config, state,
+    )
     api_key = os.getenv("KALSHI_API_KEY_ID", "")
     pem_path = Path(os.getenv("KALSHI_PEM_PATH", "kalshi_private_key.pem"))
     if not api_key or not pem_path.exists():
@@ -1933,6 +2293,8 @@ async def run(args: argparse.Namespace) -> int:
     except Exception:
         await rest.close()
         raise
+    recovery_ready = await recover_exchange_state(rest, state, config, dry_run)
+    checkpoint.publish_if_changed(state, "startup_exchange_recovery")
     feed = KalshiLiveFeed(rest.auth)
     feed_task = asyncio.create_task(feed.run(), name="kalshi-average-down-ws")
     started_at = asyncio.get_running_loop().time()
@@ -1940,6 +2302,7 @@ async def run(args: argparse.Namespace) -> int:
     last_heartbeat_at = float("-inf")
     last_market_refresh_at = float("-inf")
     last_order_reconcile_at = float("-inf")
+    last_exchange_recovery_at = float("-inf")
     last_feed_update_count = feed.update_count
     last_private_update_count = 0
     active_markets: list[Any] = []
@@ -1960,6 +2323,9 @@ async def run(args: argparse.Namespace) -> int:
     try:
         while True:
             monotonic_now = asyncio.get_running_loop().time()
+            if not recovery_ready and monotonic_now - last_exchange_recovery_at >= EXCHANGE_RECOVERY_RETRY_SECONDS:
+                recovery_ready = await recover_exchange_state(rest, state, config, dry_run)
+                last_exchange_recovery_at = monotonic_now
             await ml_selector.maybe_prepare_next()
             # Discover the current KXBTC15M window periodically.  Once known,
             # the authenticated ticker stream—not REST polling—is the entry
@@ -2010,6 +2376,7 @@ async def run(args: argparse.Namespace) -> int:
                 last_heartbeat_at = monotonic_now
             save_json(state_path, state)
             save_json(args.report.expanduser(), performance_report(state, config))
+            checkpoint.publish_if_changed(state, "material_strategy_event")
             if monotonic_now >= deadline:
                 break
             next_due = min(
