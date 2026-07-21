@@ -1,0 +1,157 @@
+{
+  "generated_at": "2026-07-21T23:16:45.799405+00:00",
+  "strategy": "prophet_trailing_win_rate_side_selector_v1",
+  "mode": "paper_only_no_exchange_orders",
+  "fill_rule": "YES buy: yes_ask <= rung; NO buy: 1 - yes_bid <= rung; fresh complete top-of-book and displayed depth >= rung quantity",
+  "quote_max_age_seconds": 3.0,
+  "fee_treatment": "excluded_no_exchange_fill",
+  "limitations": [
+    "A quote hit is a paper fill, not a Kalshi exchange fill.",
+    "Queue position, quote cancellation, hidden liquidity, and fees are not modeled.",
+    "P&L uses the pre-posted rung limit rather than favorable price improvement."
+  ],
+  "shadow_signals_started": 3,
+  "active_shadow_markets": 1,
+  "settled_signal_markets": 2,
+  "unfilled_shadow_markets": 1,
+  "filled_market_trades": 1,
+  "directional_wins": 1,
+  "directional_losses": 1,
+  "directional_win_rate": 0.5,
+  "winning_trades": 0,
+  "losing_trades": 1,
+  "win_rate": 0.0,
+  "total_simulated_cost": 1.0,
+  "net_profit": -1.0,
+  "return_on_simulated_capital": -1.0,
+  "average_profit_per_filled_market": -1.0,
+  "largest_winning_trade": -1.0,
+  "largest_losing_trade": -1.0,
+  "profit_factor": 0.0,
+  "maximum_drawdown": 1.0,
+  "longest_winning_streak": 0,
+  "longest_losing_streak": 1,
+  "rung_performance": {
+    "0.40": {
+      "rung_price": 0.4,
+      "paper_orders": 3,
+      "quote_hits": 2,
+      "paper_contracts": 3.0,
+      "filled_contracts": 2.0,
+      "winning_hits": 0,
+      "losing_hits": 2,
+      "net_profit": -0.8
+    },
+    "0.30": {
+      "rung_price": 0.3,
+      "paper_orders": 3,
+      "quote_hits": 2,
+      "paper_contracts": 3.0,
+      "filled_contracts": 2.0,
+      "winning_hits": 0,
+      "losing_hits": 2,
+      "net_profit": -0.6
+    },
+    "0.20": {
+      "rung_price": 0.2,
+      "paper_orders": 3,
+      "quote_hits": 2,
+      "paper_contracts": 3.0,
+      "filled_contracts": 2.0,
+      "winning_hits": 0,
+      "losing_hits": 2,
+      "net_profit": -0.4
+    },
+    "0.10": {
+      "rung_price": 0.1,
+      "paper_orders": 3,
+      "quote_hits": 1,
+      "paper_contracts": 3.0,
+      "filled_contracts": 1.0,
+      "winning_hits": 0,
+      "losing_hits": 1,
+      "net_profit": -0.1
+    }
+  },
+  "selection_rule": "Before each market, each trailing window (3,5,7,10,25,50) votes for the higher directional win-rate side on prior paired settled signals; the majority wins and ties/no history select inverse.",
+  "selection_starts_with": "inverse",
+  "selection_counts": {
+    "normal": 2,
+    "inverse": 1
+  },
+  "paired_signals_available": 20,
+  "window_monitor": {
+    "3": {
+      "window": 3,
+      "sample_size": 3,
+      "normal_wins": 2,
+      "normal_losses": 1,
+      "normal_win_rate": 0.666667,
+      "inverse_wins": 1,
+      "inverse_losses": 2,
+      "inverse_win_rate": 0.333333,
+      "leader": "normal",
+      "tied": false
+    },
+    "5": {
+      "window": 5,
+      "sample_size": 5,
+      "normal_wins": 4,
+      "normal_losses": 1,
+      "normal_win_rate": 0.8,
+      "inverse_wins": 1,
+      "inverse_losses": 4,
+      "inverse_win_rate": 0.2,
+      "leader": "normal",
+      "tied": false
+    },
+    "7": {
+      "window": 7,
+      "sample_size": 7,
+      "normal_wins": 5,
+      "normal_losses": 2,
+      "normal_win_rate": 0.714286,
+      "inverse_wins": 2,
+      "inverse_losses": 5,
+      "inverse_win_rate": 0.285714,
+      "leader": "normal",
+      "tied": false
+    },
+    "10": {
+      "window": 10,
+      "sample_size": 10,
+      "normal_wins": 6,
+      "normal_losses": 4,
+      "normal_win_rate": 0.6,
+      "inverse_wins": 4,
+      "inverse_losses": 6,
+      "inverse_win_rate": 0.4,
+      "leader": "normal",
+      "tied": false
+    },
+    "25": {
+      "window": 25,
+      "sample_size": 20,
+      "normal_wins": 9,
+      "normal_losses": 11,
+      "normal_win_rate": 0.45,
+      "inverse_wins": 11,
+      "inverse_losses": 9,
+      "inverse_win_rate": 0.55,
+      "leader": "inverse",
+      "tied": false
+    },
+    "50": {
+      "window": 50,
+      "sample_size": 20,
+      "normal_wins": 9,
+      "normal_losses": 11,
+      "normal_win_rate": 0.45,
+      "inverse_wins": 11,
+      "inverse_losses": 9,
+      "inverse_win_rate": 0.55,
+      "leader": "inverse",
+      "tied": false
+    }
+  }
+}
