@@ -76,6 +76,16 @@ class ProphetLockedLadderStaticTests(unittest.TestCase):
         self.assertNotIn("_submit(", shadow)
         self.assertNotIn("_ladder_order_terms(", shadow)
 
+    def test_win_rate_selector_paper_ladder_never_calls_order_submission(self) -> None:
+        selector = ast.get_source_segment(
+            self.source, self.functions["create_prophet_selector_shadow"])
+        self.assertIn("PROPHET_SELECTOR_WINDOWS = (3, 5, 7, 10, 25, 50)", self.source)
+        self.assertIn("DRY_RUN and PROPHET_SELECTOR_ENABLED", selector)
+        self.assertIn("paper_only_no_exchange_orders", selector)
+        self.assertIn("paper-only Prophet selector", selector)
+        self.assertNotIn("_submit(", selector)
+        self.assertNotIn("_ladder_order_terms(", selector)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

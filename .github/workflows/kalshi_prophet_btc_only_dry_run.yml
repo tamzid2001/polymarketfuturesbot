@@ -1,8 +1,8 @@
-name: Kalshi Prophet BTC-only GTC Ladder — Dry Run
+name: Kalshi Prophet BTC-only GTC Ladder — Selector
 
-# This workflow is permanently paper-only. It uses a separate concurrency group
-# and state files from the live ML-side trader, then hands itself off every
-# 5h45m so the subscription and paper ledger run continuously.
+# Paper mode is the default.  A manual, typed confirmation can deliberately
+# switch the one locked primary ladder to the pre-open-frozen selector side.
+# The normal, inverse, and selector paper ledgers persist independently.
 on:
   workflow_dispatch:
     inputs:
@@ -16,6 +16,19 @@ on:
         required: true
         default: "1"
         type: string
+      execution_mode:
+        description: "paper keeps every ladder simulated; live submits only the selector's one frozen side."
+        required: true
+        default: "paper"
+        type: choice
+        options:
+          - paper
+          - live
+      live_confirmation:
+        description: "Required only for live: type LIVE_PROPHET_SELECTOR exactly."
+        required: false
+        default: ""
+        type: string
 
 concurrency:
   group: kalshi-prophet-btc-only-dry-run
@@ -26,7 +39,7 @@ permissions:
 
 jobs:
   paper-monitor:
-    name: Prophet BTC-only paper ladder
+    name: Prophet BTC-only selector
     runs-on: ubuntu-latest
     environment: "Kalshi"
     timeout-minutes: 370
@@ -57,22 +70,29 @@ jobs:
           chmod 600 kalshi_private_key.pem
           head -1 kalshi_private_key.pem
 
-      - name: Run Prophet BTC-only GTC ladder in paper mode
+      - name: Run Prophet BTC-only GTC ladder
         env:
           KALSHI_API_KEY_ID: ${{ secrets.KALSHI_PROD_API_KEY }}
           KALSHI_PEM_PATH: kalshi_private_key.pem
           KALSHI_DEMO: "false"
-          # Hard-coded safety boundary: this workflow cannot submit an order.
-          DRY_RUN: "true"
+          # Defaults to paper. Live requires the workflow input confirmation
+          # checked below and still submits only the selector's frozen side.
+          DRY_RUN: ${{ inputs.execution_mode == 'live' && 'false' || 'true' }}
+          EXECUTION_MODE: ${{ inputs.execution_mode }}
+          LIVE_CONFIRMATION: ${{ inputs.live_confirmation }}
           BET_AMOUNT_SHARES: ${{ inputs.bet_amount_shares }}
           RUNTIME_LIMIT_MIN: ${{ inputs.run_minutes }}
           TRADE_HISTORY_FILE: prophet_btc_only_trade_history.json
           TRADED_TICKERS_FILE: prophet_btc_only_traded_market_tickers.json
-          # Separate, paper-only opposite-side Prophet test. This runner
-          # never sends an exchange order for these shadow rungs.
+          # The inverse and selector ledgers are both paper-only in paper mode.
+          # In live mode, the inverse remains disabled while the primary runner
+          # uses only the selector's pre-open-frozen side.
           INVERSE_PROPHET_SHADOW_ENABLED: "true"
           INVERSE_PROPHET_SHADOW_HISTORY_FILE: prophet_btc_inverse_shadow_history.json
           INVERSE_PROPHET_SHADOW_REPORT_FILE: prophet_btc_inverse_shadow_report.json
+          PROPHET_SELECTOR_ENABLED: "true"
+          PROPHET_SELECTOR_HISTORY_FILE: prophet_btc_selector_history.json
+          PROPHET_SELECTOR_REPORT_FILE: prophet_btc_selector_report.json
         run: |
           set -euo pipefail
           case "$RUNTIME_LIMIT_MIN" in
@@ -81,7 +101,18 @@ jobs:
           if [ "$RUNTIME_LIMIT_MIN" -lt 300 ] || [ "$RUNTIME_LIMIT_MIN" -gt 345 ]; then
             echo "run_minutes must be between 300 and 345"; exit 2
           fi
-          echo "PAPER MODE CONFIRMED | DRY_RUN=$DRY_RUN shares_per_rung=$BET_AMOUNT_SHARES runtime=${RUNTIME_LIMIT_MIN}m"
+          case "$EXECUTION_MODE" in
+            paper)
+              test "$DRY_RUN" = "true"
+              echo "PAPER MODE CONFIRMED | DRY_RUN=$DRY_RUN shares_per_rung=$BET_AMOUNT_SHARES runtime=${RUNTIME_LIMIT_MIN}m"
+              ;;
+            live)
+              test "$DRY_RUN" = "false"
+              test "$LIVE_CONFIRMATION" = "LIVE_PROPHET_SELECTOR"
+              echo "LIVE SELECTOR CONFIRMED | one frozen selector side only; shares_per_rung=$BET_AMOUNT_SHARES runtime=${RUNTIME_LIMIT_MIN}m"
+              ;;
+            *) echo "execution_mode must be paper or live"; exit 2 ;;
+          esac
           python kalshi_btc15m_prophet_btc_only.py
 
       - name: Persist paper-monitor state
@@ -90,7 +121,8 @@ jobs:
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           for file in prophet_btc_only_trade_history.json prophet_btc_only_traded_market_tickers.json \
-                      prophet_btc_inverse_shadow_history.json prophet_btc_inverse_shadow_report.json; do
+                      prophet_btc_inverse_shadow_history.json prophet_btc_inverse_shadow_report.json \
+                      prophet_btc_selector_history.json prophet_btc_selector_report.json; do
             test ! -f "$file" || git add "$file"
           done
           git diff-index --quiet HEAD || \
@@ -102,14 +134,18 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GH_PAT || github.token }}
           BET_AMOUNT_SHARES: ${{ inputs.bet_amount_shares }}
+          EXECUTION_MODE: ${{ inputs.execution_mode }}
+          LIVE_CONFIRMATION: ${{ inputs.live_confirmation }}
         run: |
           set -euo pipefail
           gh workflow run kalshi_prophet_btc_only_dry_run.yml \
             --repo "$GITHUB_REPOSITORY" \
             --ref main \
             -f run_minutes=345 \
-            -f bet_amount_shares="$BET_AMOUNT_SHARES"
-          echo "DRY HANDOFF QUEUED | next 5h45m paper monitor uses the persisted ledger."
+            -f bet_amount_shares="$BET_AMOUNT_SHARES" \
+            -f execution_mode="$EXECUTION_MODE" \
+            -f live_confirmation="$LIVE_CONFIRMATION"
+          echo "SELECTOR HANDOFF QUEUED | next 5h45m run preserves mode and persisted ledgers."
 
       - name: Upload paper-monitor audit
         if: always()
@@ -121,5 +157,7 @@ jobs:
             prophet_btc_only_traded_market_tickers.json
             prophet_btc_inverse_shadow_history.json
             prophet_btc_inverse_shadow_report.json
+            prophet_btc_selector_history.json
+            prophet_btc_selector_report.json
           if-no-files-found: warn
           retention-days: 90

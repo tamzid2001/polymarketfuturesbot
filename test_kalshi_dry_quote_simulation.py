@@ -209,6 +209,110 @@ class ExecutableDryQuoteTests(unittest.TestCase):
         self.assertEqual(report["rung_performance"]["0.40"]["quote_hits"], 1)
         self.assertEqual(report["rung_performance"]["0.30"]["quote_hits"], 1)
 
+    def test_prophet_selector_starts_inverse_and_freezes_a_separate_paper_ladder(self) -> None:
+        class MemorySelectorLedger:
+            def __init__(self):
+                self.trades = []
+                self.saves = 0
+
+            def already_shadowed(self, ticker):
+                return any(rec.get("ticker") == ticker for rec in self.trades)
+
+            def record_open(self, rec):
+                self.trades.append(rec)
+                self.save()
+                return True
+
+            def find_pending(self):
+                return [rec for rec in self.trades if rec.get("result") == "pending"]
+
+            def save(self):
+                self.saves += 1
+
+            def settle(self, rec, result, pnl):
+                rec["result"] = result
+                rec["profit_loss"] = round(pnl, 4)
+                self.save()
+
+        class FakeRest:
+            async def get_market(self, _ticker):
+                return SimpleNamespace(result="no")
+
+        self.set_book(received_at=datetime.now(tz=timezone.utc))
+        primary = {
+            "ticker": TICKER,
+            "timestamp": NOW.isoformat(),
+            "settle_et": "2020-01-01T00:00:00-05:00",
+            "source_prophet_side": "YES",
+            "side": "YES",
+            "decision_basis": "prophet_p50_vs_live_strike_locked_side",
+            "btc_entry": 100_000.0,
+            "strike": 100_100.0,
+            "p50_prediction": 100_200.0,
+            "forecast_horizon_minutes": 17,
+            "bet_amount_shares": 0.01,
+        }
+        ledger = MemorySelectorLedger()
+        empty_history = SimpleNamespace(trades=[])
+        old_dry = runner.DRY_RUN
+        old_enabled = runner.PROPHET_SELECTOR_ENABLED
+        try:
+            runner.DRY_RUN = True
+            runner.PROPHET_SELECTOR_ENABLED = True
+            with patch.object(runner, "selector_tracker", ledger), \
+                    patch.object(runner, "inverse_shadow_tracker", empty_history), \
+                    patch.object(runner, "tracker", empty_history):
+                selection = runner.prophet_selector_decision("yes")
+                self.assertIsNotNone(selection)
+                assert selection is not None
+                self.assertEqual((selection["selected_mode"], selection["selected_side"]),
+                                 ("inverse", "NO"))
+                self.assertEqual(set(selection["windows"]), {"3", "5", "7", "10", "25", "50"})
+
+                selector = runner.create_prophet_selector_shadow(primary, selection)
+                self.assertIsNotNone(selector)
+                assert selector is not None
+                self.assertEqual((selector["source_prophet_side"], selector["side"]), ("YES", "NO"))
+                self.assertEqual(selector["order_submitted"], "none — paper-only Prophet selector")
+                self.assertTrue(all(rung["order_id"] is None for rung in selector["rungs"]))
+
+                runner._simulate_dry_ladder_fills(selector)
+                self.assertTrue(asyncio.run(runner._settle_record_if_ready(FakeRest(), selector)))
+                self.assertEqual((selector["market_result"], selector["result"]), ("no", "WIN"))
+        finally:
+            runner.DRY_RUN = old_dry
+            runner.PROPHET_SELECTOR_ENABLED = old_enabled
+
+    def test_selector_uses_each_requested_window_and_majority_vote(self) -> None:
+        # The newest six signals favor normal; the older six favor inverse.
+        # Four of six requested windows therefore vote normal, two vote inverse.
+        records = [
+            {
+                "ticker": f"old-{index}", "settle_et": f"2026-07-21T00:{index:02d}:00+00:00",
+                "source_prophet_side": "YES", "market_result": "no",
+            }
+            for index in range(6)
+        ] + [
+            {
+                "ticker": f"new-{index}", "settle_et": f"2026-07-21T01:{index:02d}:00+00:00",
+                "source_prophet_side": "YES", "market_result": "yes",
+            }
+            for index in range(6)
+        ]
+        empty_history = SimpleNamespace(trades=[])
+        inverse_history = SimpleNamespace(trades=records)
+        with patch.object(runner, "inverse_shadow_tracker", inverse_history), \
+                patch.object(runner, "selector_tracker", empty_history), \
+                patch.object(runner, "tracker", empty_history):
+            decision = runner.prophet_selector_decision("yes")
+
+        self.assertIsNotNone(decision)
+        assert decision is not None
+        self.assertEqual((decision["normal_votes"], decision["inverse_votes"]), (4, 2))
+        self.assertEqual((decision["selected_mode"], decision["selected_side"]), ("normal", "YES"))
+        self.assertEqual(decision["windows"]["3"]["leader"], "normal")
+        self.assertEqual(decision["windows"]["50"]["leader"], "inverse")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

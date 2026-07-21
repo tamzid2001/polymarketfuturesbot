@@ -418,9 +418,10 @@ forecast with **Facebook Prophet**. At the fresh market open it compares the
 forecast p50 with the live strike, locks exactly one BTC side, then immediately
 pre-posts four market-close-expiring GTC limits at **40¢, 30¢, 20¢, and 10¢
 economic cost** on that one side. Every rung uses `BET_AMOUNT_SHARES` (default
-**1 contract**, not dollars). It never submits the opposite side and has no ETH
-contract, hedge, multiplier, or loss-progression rule. Positions ride to
-settlement; there is no take-profit monitor.
+**1 contract**, not dollars). In paper mode it also keeps independent inverse
+and selector paper portfolios. It has no ETH contract, hedge, multiplier, or
+loss-progression rule. Positions ride to settlement; there is no take-profit
+monitor.
 
 > The previous version of this bot used an Alpaca price feed and a momentum
 > signal (delta vs a rolling 60-second average). That strategy — and the Alpaca
@@ -460,6 +461,13 @@ For every 15-minute Kalshi window:
    forecast p50 < live strike   →  BUY NO   (DOWN)
    ```
 
+   The default paper workflow keeps this as the normal Prophet baseline and
+   additionally freezes a selector side before each market. The selector
+   compares only prior paired settled outcomes in trailing **3, 5, 7, 10, 25,
+   and 50** signal windows. Each window votes for its higher directional
+   win-rate side; the majority wins. Ties and no history choose **inverse**, so
+   the selector starts inverse and never changes side after the market opens.
+
 
 6. **Pre-post the locked ladder** — submit one `good_till_canceled` order at
    each fixed economic cost `$0.40`, `$0.30`, `$0.20`, and `$0.10`, each with
@@ -477,13 +485,18 @@ For every 15-minute Kalshi window:
 
 ## Performance tracking
 
-Every portfolio report (every 30 s) prints the full BTC-only stats block from
-`prophet_btc_only_trade_history.json`: filled-ladder trades, wins/losses, win
-rate, total/average return, largest win/loss, current + longest win/loss
-streaks, and maximum drawdown. Every record identifies the locked side and its
-four rung states; no cross-market or loss-sizing state is persisted.
-The files are separate from the ML-side runner's history. A future dedicated
-workflow must persist them explicitly; this change does not start one.
+Every portfolio report (every 30 s) prints the normal BTC-only stats block, the
+independent inverse paper report, and a separate **BTC PROPHET WIN-RATE
+SELECTOR** report. The selector report includes frozen normal/inverse choices,
+directional and executable-quote paper P&L, drawdown, per-rung P&L, and one
+line for every requested window showing normal/inverse W/L, win rate, and the
+current leader. Its durable files are `prophet_btc_selector_history.json` and
+`prophet_btc_selector_report.json`.
+
+Selector comparisons use paired settled outcomes, not unrelated all-time
+ledgers. Its paper fills require fresh complete top-of-book and displayed-depth
+evidence, but exclude queue position, quote cancellation, hidden liquidity, and
+fees; they are not exchange-fill claims.
 
 ## Setup
 
@@ -501,6 +514,7 @@ Environment **variables** (not secrets) tune behavior:
 |---|---|---|
 | `DRY_RUN` | `true` | **Live-money switch.** `false` → real orders |
 | `BET_AMOUNT_SHARES` | `1` | BTC contracts per each of the four fixed rungs (**shares — NOT dollars**) |
+| `PROPHET_SELECTOR_ENABLED` | `true` | Enables the paired trailing 3/5/7/10/25/50 win-rate selector. In paper mode it is a third paper ladder; in confirmed live mode it supplies the one actual locked side. |
 | `HISTORY_MINUTES` | `500` | 1-minute candles fed to Prophet |
 | `FORECAST_MINUTES` | `17` | Fixed Prophet horizon in one-minute timesteps for every cached forecast |
 | `PREOPEN_FORECAST_LEAD_S` | `120` | Seconds before the next market opens to pre-compute its 17-step forecast |
@@ -508,9 +522,9 @@ Environment **variables** (not secrets) tune behavior:
 | `SETTLE_CHECK_S` | `2` | Settlement polling cadence (seconds), independent of the opening order path |
 | `UNCERTAINTY_SAMPLES` | `1000` | Prophet uncertainty samples (80% CI) |
 
-**One-run overrides** — the BTC-only code reads only `DRY_RUN` and
-`BET_AMOUNT_SHARES`. It deliberately ignores any legacy hedge or multiplier
-environment variable. There is no scheduled Prophet workflow configured.
+**One-run overrides** — the workflow exposes the mode, share count, and
+selector state paths. The code deliberately ignores legacy hedge or multiplier
+environment variables. There is no scheduled Prophet workflow configured.
 
 ## QA before launch
 
@@ -527,15 +541,21 @@ Exit code is non-zero on any critical failure.
 ## Workflow safety (Kalshi Prophet ladder)
 
 The old hedged Prophet execution workflow was removed so it cannot overlap the
-ML-side BTC runner. This BTC-only Prophet ladder has **no scheduled workflow
-and has a dedicated **“Kalshi Prophet BTC-only GTC Ladder — Dry Run”**
-workflow. That workflow hard-codes `DRY_RUN=true`, has its own concurrency
-group, self-handoffs every 5 h 45 min, and cannot submit an exchange order. It
-persists `prophet_btc_only_trade_history.json` and
-`prophet_btc_only_traded_market_tickers.json` and uploads them as an audit
-artifact. Each 5 h 45 min run is a quote-based paper monitor: `simulated quote
-hit` means the observed selected-side quote reached a rung, not that an order
-would have received a real fill or queue position.
+ML-side BTC runner. This BTC-only ladder has **no scheduled workflow** and a
+dedicated **“Kalshi Prophet BTC-only GTC Ladder — Selector”** workflow. It
+defaults to `execution_mode=paper`, has its own concurrency group, and
+self-handoffs every 5 h 45 min while persisting the normal, inverse, and
+selector ledgers as audit artifacts. A `simulated_executable_quote_hit` means
+the observed selected-side quote reached a rung with a fresh complete
+top-of-book and displayed depth; it is not an exchange fill or queue claim.
+
+To deliberately enable live selector execution, run the workflow manually with
+`execution_mode=live` and type `LIVE_PROPHET_SELECTOR` in
+`live_confirmation`. The workflow then sets `DRY_RUN=false` and submits only
+the selector side frozen before the market opens—never both normal and inverse.
+The inverse shadow remains disabled in live mode. The mode and confirmation
+carry to the next 5 h 45 min handoff, so cancel the run or restart in `paper`
+mode to return to paper trading.
 
 ## Running locally
 

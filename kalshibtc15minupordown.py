@@ -129,6 +129,18 @@ INVERSE_PROPHET_SHADOW_ENABLED = (
     DRY_RUN and os.getenv("INVERSE_PROPHET_SHADOW_ENABLED", "true").lower()
     in ("1", "true", "yes")
 )
+# The selector is a third, independently paper-filled ladder during a dry run.
+# It freezes its side before a market opens from *previously settled* paired
+# Prophet/inverse outcomes.  It never looks at the market it is about to trade.
+# In a deliberately-confirmed live workflow it instead supplies the one actual
+# locked side; the inverse shadow remains paper-only in every mode.
+PROPHET_SELECTOR_ENABLED = os.getenv("PROPHET_SELECTOR_ENABLED", "true").lower() in (
+    "1", "true", "yes")
+PROPHET_SELECTOR_WINDOWS = (3, 5, 7, 10, 25, 50)
+PROPHET_SELECTOR_HISTORY_FILE = os.getenv(
+    "PROPHET_SELECTOR_HISTORY_FILE", "prophet_btc_selector_history.json")
+PROPHET_SELECTOR_REPORT_FILE = os.getenv(
+    "PROPHET_SELECTOR_REPORT_FILE", "prophet_btc_selector_report.json")
 
 # ── Bet sizing ──────────────────────────────────────────────────────────────
 # Buy exactly this many contracts (shares) per ladder rung, independent of price.
@@ -1255,14 +1267,151 @@ class InverseProphetShadowTracker:
             log.warning("Could not write inverse Prophet shadow ledger/report: %s", exc)
 
 
+class ProphetSelectorTracker(InverseProphetShadowTracker):
+    """Durable paper ledger for the pre-open Prophet side selector.
+
+    This intentionally reuses the same quote-fill accounting as the inverse
+    shadow, but its side is whichever side was selected before that market
+    opened.  It is a separate counterfactual portfolio, never an extra order.
+    """
+
+    def save(self) -> None:
+        try:
+            with open(self.history_path, "w", encoding="utf-8") as fh:
+                json.dump(self.trades, fh, indent=2, default=str)
+            with open(self.report_path, "w", encoding="utf-8") as fh:
+                json.dump(prophet_selector_performance(self.trades), fh, indent=2,
+                          default=str)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Could not write Prophet selector ledger/report: %s", exc)
+
+
 # Module-level ledgers (created here so all coroutines share them).
 tracker = PerformanceTracker(TRADE_HISTORY_FILE, TRADED_TICKERS_FILE)
 inverse_shadow_tracker = InverseProphetShadowTracker(
     INVERSE_PROPHET_SHADOW_HISTORY_FILE, INVERSE_PROPHET_SHADOW_REPORT_FILE)
+selector_tracker = ProphetSelectorTracker(
+    PROPHET_SELECTOR_HISTORY_FILE, PROPHET_SELECTOR_REPORT_FILE)
+
+
+def paired_prophet_directional_records() -> list[dict]:
+    """Return chronological settled Prophet-versus-inverse directional pairs.
+
+    A paired record contains the original frozen Prophet side and the settled
+    market outcome.  It is independent of whether either paper ladder filled,
+    so comparing normal and inverse win rates cannot be distorted by a fill
+    on only one side.  Existing inverse-shadow records seed the history;
+    selector records replace them for subsequent dry markets, and live
+    selector records in the primary ledger extend it once explicitly enabled.
+    """
+    by_ticker: dict[str, dict] = {}
+
+    def add(records: list[dict]) -> None:
+        for rec in records:
+            ticker = str(rec.get("ticker") or "")
+            source_side = str(rec.get("source_prophet_side") or "").lower()
+            result = str(rec.get("market_result") or "").lower()
+            if (not ticker or source_side not in ("yes", "no")
+                    or result not in ("yes", "no")):
+                continue
+            by_ticker[ticker] = {
+                "ticker": ticker,
+                "source_prophet_side": source_side,
+                "market_result": result,
+                "sort_time": str(rec.get("settle_et") or rec.get("timestamp") or ticker),
+            }
+
+    # The order gives the newer selector/live record priority for a ticker
+    # while retaining the older inverse-only history as an initial sample.
+    add(inverse_shadow_tracker.trades)
+    add(selector_tracker.trades)
+    add([rec for rec in tracker.trades if rec.get("selector_applied")])
+    return sorted(by_ticker.values(), key=lambda rec: (rec["sort_time"], rec["ticker"]))
+
+
+def prophet_selector_window_decisions(pairs: list[dict]) -> dict[str, dict]:
+    """Evaluate each requested trailing window; ties and no history start inverse."""
+    decisions: dict[str, dict] = {}
+    for window in PROPHET_SELECTOR_WINDOWS:
+        sample = pairs[-window:]
+        sample_size = len(sample)
+        normal_wins = sum(rec["source_prophet_side"] == rec["market_result"] for rec in sample)
+        inverse_wins = sample_size - normal_wins
+        if normal_wins > inverse_wins:
+            leader = "normal"
+        else:
+            # An exact tie is deliberately deterministic: begin/stay inverse
+            # rather than inventing a mid-stream preference for normal.
+            leader = "inverse"
+        decisions[str(window)] = {
+            "window": window,
+            "sample_size": sample_size,
+            "normal_wins": normal_wins,
+            "normal_losses": sample_size - normal_wins,
+            "normal_win_rate": round(normal_wins / sample_size, 6) if sample_size else None,
+            "inverse_wins": inverse_wins,
+            "inverse_losses": normal_wins,
+            "inverse_win_rate": round(inverse_wins / sample_size, 6) if sample_size else None,
+            "leader": leader,
+            "tied": normal_wins == inverse_wins,
+        }
+    return decisions
+
+
+def prophet_selector_decision(source_prophet_side: str) -> Optional[dict]:
+    """Freeze the next selector side from only fully settled prior signals."""
+    source_side = str(source_prophet_side).lower()
+    inverse_side = opposite_position_side(source_side)
+    if source_side not in ("yes", "no") or inverse_side is None:
+        return None
+    pairs = paired_prophet_directional_records()
+    windows = prophet_selector_window_decisions(pairs)
+    normal_votes = sum(item["leader"] == "normal" for item in windows.values())
+    inverse_votes = len(windows) - normal_votes
+    selected_mode = "normal" if normal_votes > inverse_votes else "inverse"
+    selected_side = source_side if selected_mode == "normal" else inverse_side
+    return {
+        "source_prophet_side": source_side.upper(),
+        "selected_side": selected_side.upper(),
+        "selected_mode": selected_mode,
+        "paired_signals_available": len(pairs),
+        "normal_votes": normal_votes,
+        "inverse_votes": inverse_votes,
+        "tie_break": "inverse" if normal_votes == inverse_votes else None,
+        "windows": windows,
+        "frozen_at": datetime.now(tz=timezone.utc).isoformat(),
+    }
+
+
+def prophet_selector_performance(records: list[dict]) -> dict:
+    """Detailed paper P&L and the current side decision for the selector."""
+    report = inverse_shadow_performance(records)
+    pairs = paired_prophet_directional_records()
+    windows = prophet_selector_window_decisions(pairs)
+    normal_selected = sum(rec.get("selector_mode") == "normal" for rec in records)
+    inverse_selected = sum(rec.get("selector_mode") == "inverse" for rec in records)
+    report.update({
+        "strategy": "prophet_trailing_win_rate_side_selector_v1",
+        "mode": "paper_only_no_exchange_orders" if DRY_RUN else "live_selector_execution_ledger",
+        "selection_rule": (
+            "Before each market, each trailing window (3,5,7,10,25,50) votes for "
+            "the higher directional win-rate side on prior paired settled signals; "
+            "the majority wins and ties/no history select inverse."
+        ),
+        "selection_starts_with": "inverse",
+        "selection_counts": {"normal": normal_selected, "inverse": inverse_selected},
+        "paired_signals_available": len(pairs),
+        "window_monitor": windows,
+    })
+    return report
 
 
 def ledger_for_record(rec: dict):
-    return inverse_shadow_tracker if rec.get("trade_kind") == "BTC_PROPHET_INVERSE_SHADOW" else tracker
+    if rec.get("trade_kind") == "BTC_PROPHET_INVERSE_SHADOW":
+        return inverse_shadow_tracker
+    if rec.get("trade_kind") == "BTC_PROPHET_WIN_RATE_SELECTOR":
+        return selector_tracker
+    return tracker
 
 
 def print_performance() -> None:
@@ -1346,6 +1495,64 @@ def print_inverse_prophet_shadow_performance() -> None:
         )
 
 
+def print_prophet_selector_performance() -> None:
+    """Print the selector separately from both raw Prophet paper ledgers."""
+    report = prophet_selector_performance(selector_tracker.trades)
+    headline_mode = "PAPER ONLY" if DRY_RUN else "HISTORICAL PAPER BASELINE"
+    fill_note = (
+        "Side is frozen before open; no exchange order in paper mode"
+        if DRY_RUN else "Paper baseline only; current live primary uses the frozen selector side"
+    )
+    roi = (
+        "n/a" if report["return_on_simulated_capital"] is None
+        else f"{100 * report['return_on_simulated_capital']:.1f}%"
+    )
+    rate = (
+        "n/a" if report["directional_win_rate"] is None
+        else f"{100 * report['directional_win_rate']:.1f}%"
+    )
+    next_source_side = "YES"
+    next_decision = prophet_selector_decision(next_source_side)
+    next_mode = (next_decision or {}).get("selected_mode", "inverse").upper()
+    votes = (
+        f"N{(next_decision or {}).get('normal_votes', 0)}"
+        f"/I{(next_decision or {}).get('inverse_votes', len(PROPHET_SELECTOR_WINDOWS))}"
+    )
+    selected = report["selection_counts"]
+    log.info(
+        "\n"
+        f"╔═══ BTC PROPHET WIN-RATE SELECTOR — {headline_mode} ════════════\n"
+        f"║  Selector starts : INVERSE; windows {','.join(map(str, PROPHET_SELECTOR_WINDOWS))}\n"
+        f"║  Current vote    : {next_mode}  ({votes}; {report['paired_signals_available']} paired settled signals)\n"
+        f"║  Frozen choices  : normal {selected['normal']} / inverse {selected['inverse']}\n"
+        f"║  Active / Settled: {report['active_shadow_markets']} / {report['settled_signal_markets']}\n"
+        f"║  Directional W/L : {report['directional_wins']} / {report['directional_losses']}  ({rate})\n"
+        f"║  Quote-filled    : {report['filled_market_trades']} markets; unfilled {report['unfilled_shadow_markets']}\n"
+        f"║  Simulated P&L   : ${report['net_profit']:+,.4f}  (fees excluded)\n"
+        f"║  Simulated ROI   : {roi}\n"
+        f"║  Max Drawdown    : ${-report['maximum_drawdown']:,.4f}\n"
+        f"║  {fill_note}\n"
+        "╚════════════════════════════════════════════════════════════"
+    )
+    for window, item in report["window_monitor"].items():
+        normal_rate = "n/a" if item["normal_win_rate"] is None else f"{100 * item['normal_win_rate']:.1f}%"
+        inverse_rate = "n/a" if item["inverse_win_rate"] is None else f"{100 * item['inverse_win_rate']:.1f}%"
+        log.info(
+            "PROPHET SELECTOR WINDOW | trailing=%s paired=%d normal=%d/%d (%s) "
+            "inverse=%d/%d (%s) leader=%s%s",
+            window, item["sample_size"], item["normal_wins"], item["sample_size"], normal_rate,
+            item["inverse_wins"], item["sample_size"], inverse_rate,
+            item["leader"].upper(), " tie→INVERSE" if item["tied"] else "",
+        )
+    for level, rung in report["rung_performance"].items():
+        log.info(
+            "PROPHET SELECTOR RUNG | %sc paper_orders=%d quote_hits=%d contracts=%.2f "
+            "winners=%d losers=%d net=$%+.4f",
+            level, rung["paper_orders"], rung["quote_hits"], rung["filled_contracts"],
+            rung["winning_hits"], rung["losing_hits"], rung["net_profit"],
+        )
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Portfolio report  (Kalshi balance / positions)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1401,6 +1608,9 @@ async def report_portfolio(rest: KalshiREST) -> None:
     if INVERSE_PROPHET_SHADOW_ENABLED:
         print_inverse_prophet_shadow_performance()
         print_active_inverse_prophet_shadow_status()
+    if PROPHET_SELECTOR_ENABLED:
+        print_prophet_selector_performance()
+        print_active_prophet_selector_status()
 
 
 async def portfolio_reporter(rest: KalshiREST) -> None:
@@ -1457,8 +1667,13 @@ async def _settle_record_if_ready(rest: KalshiREST, rec: dict) -> bool:
         rec["profit_loss"] = 0.0
         rec["exit_method"] = "market_closed_without_fill"
         ledger.save()
+        kind = (
+            "INVERSE PROPHET SHADOW" if rec.get("trade_kind") == "BTC_PROPHET_INVERSE_SHADOW"
+            else "PROPHET SELECTOR" if rec.get("trade_kind") == "BTC_PROPHET_WIN_RATE_SELECTOR"
+            else "PRIMARY"
+        )
         log.info("%s UNFILLED | %s %s ladder had no filled contracts; excluded from win/loss P&L.",
-                 "INVERSE PROPHET SHADOW" if rec.get("trade_kind") == "BTC_PROPHET_INVERSE_SHADOW" else "PRIMARY",
+                 kind,
                  rec["ticker"], rec["side"])
         return True
     pnl = (count - cost) if win else -cost
@@ -1468,10 +1683,16 @@ async def _settle_record_if_ready(rest: KalshiREST, rec: dict) -> bool:
 
     outcome = "WIN" if pnl > 0 else "LOSS"
     ledger.settle(rec, outcome, pnl)
+    kind = (
+        "INVERSE PROPHET SHADOW" if rec.get("trade_kind") == "BTC_PROPHET_INVERSE_SHADOW"
+        else "PROPHET SELECTOR" if rec.get("trade_kind") == "BTC_PROPHET_WIN_RATE_SELECTOR"
+        else "PRIMARY"
+    )
     log.info("%s SETTLED | %s result=%s side=%s → %s simulated_P&L=$%+.4f%s",
-             "INVERSE PROPHET SHADOW" if rec.get("trade_kind") == "BTC_PROPHET_INVERSE_SHADOW" else "PRIMARY",
+             kind,
              rec["ticker"], result.upper(), rec["side"], outcome, pnl,
-             " (not an exchange fill; fees excluded)" if rec.get("trade_kind") == "BTC_PROPHET_INVERSE_SHADOW" else "")
+             " (not an exchange fill; fees excluded)" if rec.get("trade_kind") in (
+                 "BTC_PROPHET_INVERSE_SHADOW", "BTC_PROPHET_WIN_RATE_SELECTOR") else "")
     return True
 
 
@@ -1489,6 +1710,8 @@ async def settlement_checker(rest: KalshiREST) -> None:
         pending = tracker.find_pending()
         if DRY_RUN:
             pending += inverse_shadow_tracker.find_pending()
+            if PROPHET_SELECTOR_ENABLED:
+                pending += selector_tracker.find_pending()
         if not pending:
             continue
         for rec in pending:
@@ -1596,7 +1819,9 @@ def _simulate_dry_ladder_fills(rec: dict) -> None:
                 "%s | %s locked_%s %s=$%.4f depth=%.2f "
                 "age=%.3fs reached $%.2f; paper fill %.2f shares at limit "
                 "(not an exchange fill).",
-                "INVERSE PROPHET SHADOW RUNG HIT" if rec.get("trade_kind") == "BTC_PROPHET_INVERSE_SHADOW" else "DRY EXECUTABLE RUNG HIT",
+                "INVERSE PROPHET SHADOW RUNG HIT" if rec.get("trade_kind") == "BTC_PROPHET_INVERSE_SHADOW"
+                else "PROPHET SELECTOR RUNG HIT" if rec.get("trade_kind") == "BTC_PROPHET_WIN_RATE_SELECTOR"
+                else "DRY EXECUTABLE RUNG HIT",
                 rec["ticker"], rec["side"], quote["executable_field"],
                 quote["executable_yes_price"], quote["displayed_depth"],
                 quote["quote_age_seconds"], level, count)
@@ -1655,6 +1880,38 @@ def print_active_inverse_prophet_shadow_status() -> None:
             "INVERSE PROPHET SHADOW STATUS | ticker=%s source_prophet_side=%s shadow_side=%s "
             "executable_side_price=%s quote_state=%s quote_age_s=%s rungs=[%s] no exchange order.",
             rec["ticker"], rec.get("source_prophet_side", "?"), rec["side"],
+            f"${quote['economic_price']:.4f}" if quote is not None else "unavailable",
+            quote_state,
+            f"{quote['quote_age_seconds']:.3f}" if quote is not None else "unavailable",
+            rungs,
+        )
+
+
+def print_active_prophet_selector_status() -> None:
+    """Log the selector's frozen paper ladder without implying an order exists."""
+    pending = selector_tracker.find_pending()
+    if not pending:
+        log.info("PROPHET SELECTOR STATUS | no active selector paper ladder.")
+        return
+    for rec in pending:
+        unfilled = [
+            rung for rung in rec.get("rungs", [])
+            if _f(rung.get("fill_count"), 0.0) < _f(rung.get("count"), 0.0) - 0.005
+        ]
+        required_count = min(
+            (_f(rung.get("count"), bet_count()) for rung in unfilled), default=bet_count())
+        quote, quote_state = fresh_executable_dry_quote(rec["ticker"], rec["side"], required_count)
+        rungs = ", ".join(
+            f"${_f(rung.get('economic_price')):.2f}:{rung.get('status')}"
+            for rung in rec.get("rungs", [])) or "none"
+        snapshot = rec.get("selector_snapshot") or {}
+        log.info(
+            "PROPHET SELECTOR STATUS | ticker=%s source_prophet_side=%s selected_side=%s "
+            "mode=%s votes=N%s/I%s executable_side_price=%s quote_state=%s quote_age_s=%s "
+            "rungs=[%s] no exchange order.",
+            rec["ticker"], rec.get("source_prophet_side", "?"), rec["side"],
+            rec.get("selector_mode", "inverse").upper(), snapshot.get("normal_votes", 0),
+            snapshot.get("inverse_votes", len(PROPHET_SELECTOR_WINDOWS)),
             f"${quote['economic_price']:.4f}" if quote is not None else "unavailable",
             quote_state,
             f"{quote['quote_age_seconds']:.3f}" if quote is not None else "unavailable",
@@ -1758,6 +2015,79 @@ def create_inverse_prophet_shadow(primary: dict) -> Optional[dict]:
     return None
 
 
+def create_prophet_selector_shadow(primary: dict, selection: Optional[dict]) -> Optional[dict]:
+    """Paper-post the selector's pre-open-frozen side as a third ledger.
+
+    The normal and inverse paper ladders remain available as baselines.  This
+    ladder is the strategy that would have traded only the side selected by
+    the previous settled windows.  It must stay paper-only here: a dry runner
+    may never create an additional Kalshi order merely to evaluate a selector.
+    """
+    if not (DRY_RUN and PROPHET_SELECTOR_ENABLED and selection):
+        return None
+    ticker = str(primary.get("ticker") or "")
+    source_side = str(selection.get("source_prophet_side") or "").lower()
+    selected_side = str(selection.get("selected_side") or "").lower()
+    if (not ticker or source_side not in ("yes", "no") or selected_side not in ("yes", "no")
+            or selector_tracker.already_shadowed(ticker)):
+        return None
+    count = _f(primary.get("bet_amount_shares"), bet_count())
+    selector = {
+        "ticker": ticker,
+        "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+        "settle_et": primary.get("settle_et", ""),
+        "source_prophet_side": source_side.upper(),
+        "side": selected_side.upper(),
+        "selector_mode": selection.get("selected_mode", "inverse"),
+        "selector_snapshot": selection,
+        "decision_basis": "trailing_win_rate_prophet_side_selector_frozen_before_open",
+        "source_decision_basis": primary.get("decision_basis"),
+        "btc_entry": primary.get("btc_entry"),
+        "strike": primary.get("strike"),
+        "p50_prediction": primary.get("p50_prediction"),
+        "forecast_horizon_minutes": primary.get("forecast_horizon_minutes"),
+        "forecast_created_at": primary.get("forecast_created_at"),
+        "forecast_data_end": primary.get("forecast_data_end"),
+        "forecast_bands": primary.get("forecast_bands"),
+        "trade_kind": "BTC_PROPHET_WIN_RATE_SELECTOR",
+        "mode": "paper_only_no_exchange_orders",
+        "bet_amount_shares": round(count, 2),
+        "ladder_levels": list(LADDER_LEVELS),
+        "rungs": [
+            {
+                "economic_price": level,
+                "count": round(count, 2),
+                "fill_count": 0.0,
+                "fill_economic_price": None,
+                "status": "simulated_resting",
+                "order_id": None,
+                "time_in_force": "paper_only_no_order",
+            }
+            for level in LADDER_LEVELS
+        ],
+        "paper_posted_rungs": len(LADDER_LEVELS),
+        "count": 0.0,
+        "entry_price": 0.0,
+        "order_submitted": "none — paper-only Prophet selector",
+        "exit_method": "pending",
+        "dry_run": True,
+        "result": "pending",
+        "profit_loss": 0.0,
+    }
+    if selector_tracker.record_open(selector):
+        log.info(
+            "PROPHET SELECTOR STARTED | %s source_prophet=%s selected=%s mode=%s "
+            "votes=N%s/I%s paired=%s rungs=$0.40/$0.30/$0.20/$0.10 qty=%.2f; "
+            "paper only, no exchange order.",
+            ticker, source_side.upper(), selected_side.upper(),
+            str(selection.get("selected_mode", "inverse")).upper(),
+            selection.get("normal_votes", 0), selection.get("inverse_votes", 0),
+            selection.get("paired_signals_available", 0), count,
+        )
+        return selector
+    return None
+
+
 async def execute_locked_ladder(rest: KalshiREST, ct: str) -> None:
     """Lock the Prophet side once and pre-post exactly four same-side GTC buys."""
     market = None
@@ -1788,11 +2118,20 @@ async def execute_locked_ladder(rest: KalshiREST, ct: str) -> None:
         return
     forecast = forecast_rec["forecast"]
     strike = float(market["target"])
-    side, decision = decide_side_from_forecast(strike, forecast)
-    if side is None:
+    source_side, source_decision = decide_side_from_forecast(strike, forecast)
+    if source_side is None:
         log.info("Prophet P50 equals strike for %s; no side is locked.", ct)
         handled_windows.add(ct)
         return
+    selection = prophet_selector_decision(source_side) if PROPHET_SELECTOR_ENABLED else None
+    selector_applied = bool(not DRY_RUN and selection is not None)
+    side = str(selection["selected_side"]).lower() if selector_applied else source_side
+    decision = source_decision
+    if selector_applied:
+        decision = (
+            f"{source_decision}; live selector={selection['selected_mode'].upper()} "
+            f"from N{selection['normal_votes']}/I{selection['inverse_votes']} trailing-window votes"
+        )
     settle_et = market.get("settle_et")
     expiry = _market_close_epoch(settle_et)
     if expiry is None:
@@ -1800,9 +2139,10 @@ async def execute_locked_ladder(rest: KalshiREST, ct: str) -> None:
         handled_windows.add(ct)
         return
 
-    log.info("SIDE LOCKED | %s %s by Prophet (%s; p50=$%.2f strike=$%.2f). "
+    log.info("SIDE LOCKED | %s %s by %s (%s; p50=$%.2f strike=$%.2f). "
              "%s only $0.40/$0.30/$0.20/$0.10 GTC buys; no opposite-side order exists.",
-             ct, side.upper(), decision, forecast["p50"], strike,
+             ct, side.upper(), "Prophet selector" if selector_applied else "Prophet", decision,
+             forecast["p50"], strike,
              "Paper-posting" if DRY_RUN else "Posting")
     rungs = []
     for level in LADDER_LEVELS:
@@ -1836,7 +2176,16 @@ async def execute_locked_ladder(rest: KalshiREST, ct: str) -> None:
         "ticker": ct,
         "timestamp": datetime.now(tz=timezone.utc).isoformat(),
         "settle_et": settle_et.isoformat() if settle_et else "",
-        "side": side.upper(), "decision_basis": "prophet_p50_vs_live_strike_locked_side",
+        "source_prophet_side": source_side.upper(),
+        "side": side.upper(),
+        "decision_basis": (
+            "trailing_win_rate_prophet_selector_live_locked_side" if selector_applied
+            else "prophet_p50_vs_live_strike_locked_side"
+        ),
+        "source_decision_basis": "prophet_p50_vs_live_strike_locked_side",
+        "selector_applied": selector_applied,
+        "selector_mode": selection.get("selected_mode") if selector_applied else "normal_baseline",
+        "selector_snapshot": selection,
         "btc_entry": round(float(forecast_rec["btc_close"]), 2),
         "strike": round(strike, 2), "p50_prediction": round(float(forecast["p50"]), 2),
         "forecast_horizon_minutes": int(forecast_rec["horizon_minutes"]),
@@ -1855,6 +2204,7 @@ async def execute_locked_ladder(rest: KalshiREST, ct: str) -> None:
     # This must follow the primary record creation so it inherits exactly the
     # frozen Prophet decision. It never calls _submit or creates an order ID.
     create_inverse_prophet_shadow(rec)
+    create_prophet_selector_shadow(rec, selection)
     log.info("%s | %s %s accepted=%d/%d. The side remains locked through settlement.",
              "GTC LADDER PAPER-POSTED" if DRY_RUN else "GTC LADDER POSTED",
              ct, side.upper(), accepted_rungs, len(LADDER_LEVELS))
