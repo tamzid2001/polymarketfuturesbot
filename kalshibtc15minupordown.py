@@ -1097,6 +1097,7 @@ async def report_portfolio(rest: KalshiREST) -> None:
         "╚════════════════════════════════════════════════════════════"
     )
     print_performance()
+    print_active_ladder_status()
 
 
 async def portfolio_reporter(rest: KalshiREST) -> None:
@@ -1141,8 +1142,6 @@ async def _settle_record_if_ready(rest: KalshiREST, rec: dict) -> bool:
         return True
     win = (result == str(rec["side"]).lower())
     filled_rungs = [r for r in rec.get("rungs", []) if _f(r.get("fill_count"), 0.0) > 0.0]
-    if not filled_rungs and DRY_RUN:
-        filled_rungs = list(rec.get("rungs", []))
     count = sum(_f(r.get("fill_count"), bet_count()) for r in filled_rungs)
     cost = sum(
         _f(r.get("fill_count"), bet_count()) * _f(
@@ -1184,6 +1183,7 @@ async def settlement_checker(rest: KalshiREST) -> None:
             continue
         for rec in pending:
             try:
+                _simulate_dry_ladder_fills(rec)
                 await _settle_record_if_ready(rest, rec)
             except Exception as exc:  # noqa: BLE001
                 log.warning("Settlement check failed for %s: %s", rec.get("ticker"), exc)
@@ -1236,6 +1236,54 @@ async def _refresh_ladder_fills(rest: KalshiREST, rec: dict) -> None:
             log.warning("Ladder order lookup failed for %s: %s", order_id, exc)
     if changed:
         tracker.save()
+
+
+def _simulate_dry_ladder_fills(rec: dict) -> None:
+    """Paper-fill a rung only after an observed selected-side quote reaches it.
+
+    This is intentionally not an exchange-fill claim: a dry run has no queue
+    position, market depth, or partial-fill evidence. The report labels every
+    such event as a simulated quote hit.
+    """
+    if not DRY_RUN or rec.get("result") != "pending":
+        return
+    observed = quote_position_price(rec["ticker"], rec["side"])
+    if observed is None:
+        return
+    changed = False
+    for rung in rec.get("rungs", []):
+        if _f(rung.get("fill_count"), 0.0) >= _f(rung.get("count"), 0.0) - 0.005:
+            continue
+        level = _f(rung.get("economic_price"), 0.0)
+        if observed <= level + 1e-9:
+            rung["fill_count"] = round(_f(rung.get("count"), bet_count()), 2)
+            rung["fill_economic_price"] = round(min(observed, level), 4)
+            rung["status"] = "simulated_quote_hit"
+            rung["simulated_at"] = datetime.now(tz=timezone.utc).isoformat()
+            log.info("DRY RUNG HIT | %s locked_%s observed=$%.4f reached $%.2f; "
+                     "paper fill %.2f shares (not an exchange fill).",
+                     rec["ticker"], rec["side"], observed, level,
+                     _f(rung.get("count"), bet_count()))
+            changed = True
+    if changed:
+        tracker.save()
+
+
+def print_active_ladder_status() -> None:
+    """Log this runner's ticker, locked side, and every rung's paper state."""
+    pending = tracker.find_pending()
+    if not pending:
+        log.info("DRY LADDER STATUS | no active Prophet ladder; waiting for the next frozen forecast.")
+        return
+    for rec in pending:
+        quote = quote_position_price(rec["ticker"], rec["side"])
+        rungs = ", ".join(
+            f"${_f(r.get('economic_price')):.2f}:{r.get('status')}"
+            for r in rec.get("rungs", [])) or "none"
+        log.info("DRY LADDER STATUS | ticker=%s ws_channels=ticker,trade locked_side=%s "
+                 "observed_side_price=%s rungs=[%s]",
+                 rec["ticker"], rec["side"],
+                 f"${quote:.4f}" if quote is not None else "unavailable", rungs)
 
 
 async def _cancel_open_ladder_orders(rest: KalshiREST, rec: dict) -> None:
@@ -1303,20 +1351,22 @@ async def execute_locked_ladder(rest: KalshiREST, ct: str) -> None:
         return
 
     log.info("SIDE LOCKED | %s %s by Prophet (%s; p50=$%.2f strike=$%.2f). "
-             "Posting only $0.40/$0.30/$0.20/$0.10 GTC buys; no opposite-side order exists.",
-             ct, side.upper(), decision, forecast["p50"], strike)
+             "%s only $0.40/$0.30/$0.20/$0.10 GTC buys; no opposite-side order exists.",
+             ct, side.upper(), decision, forecast["p50"], strike,
+             "Paper-posting" if DRY_RUN else "Posting")
     rungs = []
     for level in LADDER_LEVELS:
         book_side, api_price = _ladder_order_terms(side, level)
         log.info("GTC LADDER LIMIT | %s %s economic=$%.2f api_yes=%s qty=%.2f expires=%d",
                  ct, side.upper(), level, api_price, bet_count(), expiry)
-        response, immediate_fill = await _submit(
+        response, _ = await _submit(
             rest, ticker=ct, side=book_side, price=api_price, count=bet_count(),
             reduce_only=False, tag=f"PROPHET {side.upper()} RUNG ${level:.2f}",
             tif=ORDER_TIF, expiration_time=expiry)
         accepted = DRY_RUN or response is not None
-        fill_count = (bet_count() if (DRY_RUN and immediate_fill)
-                      else _f(getattr(response, "fill_count", 0.0), 0.0))
+        # Dry runs begin as resting paper orders.  They become simulated quote
+        # hits later only when the observed selected-side price reaches a rung.
+        fill_count = 0.0 if DRY_RUN else _f(getattr(response, "fill_count", 0.0), 0.0)
         average_yes = _to_dollars(getattr(response, "average_fill_price", None))
         fill_cost = (level if average_yes is None
                      else (average_yes if side == "yes" else 1.0 - average_yes))
@@ -1325,7 +1375,8 @@ async def execute_locked_ladder(rest: KalshiREST, ct: str) -> None:
             "count": bet_count(), "fill_count": round(fill_count, 2),
             "fill_economic_price": round(fill_cost, 4),
             "order_id": getattr(response, "order_id", None) if response is not None else None,
-            "status": "accepted" if accepted else "submit_failed",
+            "status": "simulated_resting" if (accepted and DRY_RUN) else (
+                "accepted" if accepted else "submit_failed"),
             "time_in_force": ORDER_TIF, "expiration_time": expiry,
         })
 
@@ -1351,7 +1402,8 @@ async def execute_locked_ladder(rest: KalshiREST, ct: str) -> None:
         "result": "pending", "profit_loss": 0.0,
     }
     tracker.record_open(rec)
-    log.info("GTC LADDER POSTED | %s %s accepted=%d/%d. The side remains locked through settlement.",
+    log.info("%s | %s %s accepted=%d/%d. The side remains locked through settlement.",
+             "GTC LADDER PAPER-POSTED" if DRY_RUN else "GTC LADDER POSTED",
              ct, side.upper(), accepted_rungs, len(LADDER_LEVELS))
 
 

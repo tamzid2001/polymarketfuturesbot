@@ -514,10 +514,14 @@ Exit code is non-zero on any critical failure.
 
 The old hedged Prophet execution workflow was removed so it cannot overlap the
 ML-side BTC runner. This BTC-only Prophet ladder has **no scheduled workflow
-and is not started by this change**. If it is ever given a dedicated workflow,
-that workflow must persist `prophet_btc_only_trade_history.json` and
-`prophet_btc_only_traded_market_tickers.json`, use a unique concurrency group,
-and keep `DRY_RUN=true` unless live trading is explicitly authorized.
+and has a dedicated manual **“Kalshi Prophet BTC-only GTC Ladder — Dry Run”**
+workflow. That workflow hard-codes `DRY_RUN=true`, has its own concurrency
+group, never queues a follow-on run, and cannot submit an exchange order. It
+persists `prophet_btc_only_trade_history.json` and
+`prophet_btc_only_traded_market_tickers.json` and uploads them as an audit
+artifact. Its 20–55 minute run is a quote-based paper monitor: `simulated quote
+hit` means the observed selected-side quote reached a rung, not that an order
+would have received a real fill or queue position.
 
 ## Running locally
 
