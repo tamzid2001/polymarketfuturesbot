@@ -56,12 +56,13 @@ class ProphetLockedLadderStaticTests(unittest.TestCase):
         self.assertIn('BookSide.BID, f"{economic_price:.2f}"', function_source)
         self.assertIn('BookSide.ASK, f"{1.0 - economic_price:.2f}"', function_source)
 
-    def test_dry_run_records_quote_hits_not_fabricated_exchange_fills(self) -> None:
+    def test_dry_run_records_executable_quote_hits_not_fabricated_exchange_fills(self) -> None:
         simulation = ast.get_source_segment(
             self.source, self.functions["_simulate_dry_ladder_fills"])
         execution = ast.get_source_segment(
             self.source, self.functions["execute_locked_ladder"])
-        self.assertIn("simulated_quote_hit", simulation)
+        self.assertIn("simulated_executable_quote_hit", simulation)
+        self.assertIn("fresh_executable_dry_quote", simulation)
         self.assertIn("not an exchange fill", simulation)
         self.assertIn("fill_count = 0.0 if DRY_RUN", execution)
 

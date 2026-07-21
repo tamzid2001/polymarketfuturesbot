@@ -147,6 +147,10 @@ POLL_INTERVAL_S   = float(os.getenv("POLL_INTERVAL_S", "5"))       # window-watc
 SETTLE_CHECK_S    = float(os.getenv("SETTLE_CHECK_S", "2"))        # settlement poll cadence
 STRIKE_RETRIES    = int(float(os.getenv("STRIKE_RETRIES", "8")))   # strike-resolution retries
 KALSHI_WS_VERBOSE = os.getenv("KALSHI_WS_VERBOSE", "false").lower() in ("1", "true", "yes")
+# A dry fill may use only a recently received top-of-book quote.  A short
+# default intentionally errs on the side of leaving a paper rung unfilled when
+# the WebSocket has gone quiet or disconnected.
+DRY_QUOTE_MAX_AGE_S = max(0.1, float(os.getenv("DRY_QUOTE_MAX_AGE_S", "3")))
 
 TRADE_HISTORY_FILE  = os.getenv("TRADE_HISTORY_FILE", "prophet_btc_only_trade_history.json")
 TRADED_TICKERS_FILE = os.getenv("TRADED_TICKERS_FILE", "prophet_btc_only_traded_market_tickers.json")
@@ -509,6 +513,17 @@ def _to_dollars(val) -> Optional[float]:
     return f
 
 
+def _to_contract_count(val) -> Optional[float]:
+    """Parse a fixed-point contract count without applying price conversion."""
+    if val is None:
+        return None
+    try:
+        count = float(val)
+    except (TypeError, ValueError):
+        return None
+    return count if count >= 0.0 else None
+
+
 class KalshiMarketWS:
     """Async Kalshi market-data subscriber over aiohttp."""
 
@@ -525,6 +540,12 @@ class KalshiMarketWS:
     def set_tickers(self, tickers: tuple) -> None:
         self.desired = tuple(t for t in tickers if t)
 
+    @staticmethod
+    def _invalidate_quotes(tickers: tuple) -> None:
+        """Prevent a pre-disconnect book from qualifying a dry simulated fill."""
+        for ticker in tickers:
+            kalshi_quotes.pop(ticker, None)
+
     async def run(self) -> None:
         while True:
             try:
@@ -540,11 +561,15 @@ class KalshiMarketWS:
             except Exception as exc:  # noqa: BLE001
                 log.error("Kalshi WS error: %s", exc)
             self.connected = False
+            self._invalidate_quotes(self.subscribed)
             self.subscribed = ()
             log.info("Kalshi WS: reconnecting in 5s …")
             await asyncio.sleep(5)
 
     async def _subscribe(self, ws, tickers: tuple) -> None:
+        # Subscription changes and reconnects require a fresh top-of-book
+        # snapshot before a dry simulator can use it.
+        self._invalidate_quotes(tickers)
         self._cmd_id += 1
         await ws.send_json({
             "id": self._cmd_id, "cmd": "subscribe",
@@ -591,23 +616,40 @@ class KalshiMarketWS:
         if mtype == "ticker":
             yes_bid = _to_dollars(msg.get("yes_bid_dollars", msg.get("yes_bid")))
             yes_ask = _to_dollars(msg.get("yes_ask_dollars", msg.get("yes_ask")))
+            yes_bid_size = _to_contract_count(msg.get(
+                "yes_bid_size_fp", msg.get("yes_bid_size", msg.get(
+                    "bid_size_fp", msg.get("bid_size")))))
+            yes_ask_size = _to_contract_count(msg.get(
+                "yes_ask_size_fp", msg.get("yes_ask_size", msg.get(
+                    "ask_size_fp", msg.get("ask_size")))))
             last    = _to_dollars(msg.get("last_price_dollars",
                                   msg.get("price", msg.get("last_price"))))
             q = kalshi_quotes.setdefault(ticker, {})
+            received_at = datetime.now(tz=timezone.utc)
             if yes_bid is not None: q["yes_bid"] = yes_bid
             if yes_ask is not None: q["yes_ask"] = yes_ask
+            if yes_bid_size is not None: q["yes_bid_size"] = yes_bid_size
+            if yes_ask_size is not None: q["yes_ask_size"] = yes_ask_size
             if last    is not None: q["last"]    = last
-            q["ts"] = datetime.now(tz=timezone.utc)
+            # A partial ticker update may carry only a last trade or one side
+            # of the book.  It must not refresh a prior complete book snapshot
+            # for dry-fill purposes.
+            if None not in (yes_bid, yes_ask, yes_bid_size, yes_ask_size):
+                q["book_received_at"] = received_at
+                q["book_source_time"] = msg.get("time")
+                q["book_source_ts_ms"] = msg.get("ts_ms", msg.get("ts"))
+                q["book_sequence"] = int(q.get("book_sequence", 0)) + 1
             if KALSHI_WS_VERBOSE:
-                log.info("Kalshi WS ticker %s  yes_bid=%s yes_ask=%s last=%s",
-                         ticker, q.get("yes_bid"), q.get("yes_ask"), q.get("last"))
+                log.info("Kalshi WS ticker %s  yes_bid=%s x %.2f yes_ask=%s x %.2f last=%s",
+                         ticker, q.get("yes_bid"), q.get("yes_bid_size", 0.0),
+                         q.get("yes_ask"), q.get("yes_ask_size", 0.0), q.get("last"))
         elif mtype == "trade":
             last = _to_dollars(msg.get("yes_price_dollars",
                                msg.get("yes_price", msg.get("price"))))
             if last is not None:
                 q = kalshi_quotes.setdefault(ticker, {})
                 q["last"] = last
-                q["ts"]   = datetime.now(tz=timezone.utc)
+                q["last_received_at"] = datetime.now(tz=timezone.utc)
             if KALSHI_WS_VERBOSE:
                 log.info("Kalshi WS trade  %s  yes_price=%s count=%s",
                          ticker, last, msg.get("count"))
@@ -647,21 +689,79 @@ def position_price_from_yes(side: str, yes_price: float) -> float:
     return yes if str(side).lower() == "yes" else round(1.0 - yes, 4)
 
 
-def quote_position_price(ticker: str, side: str) -> Optional[float]:
-    """Current position-side price from WS quote for YES or NO."""
+def fresh_executable_dry_quote(
+    ticker: str,
+    side: str,
+    required_count: float,
+    *,
+    now: Optional[datetime] = None,
+) -> tuple[Optional[dict], str]:
+    """Return fresh, executable top-of-book evidence for one dry-rung fill.
+
+    A YES buy can take only the YES ask.  A NO buy is a YES ask, so it can
+    take only the YES bid and its economic NO cost is ``1 - yes_bid``.  Last
+    trade and midpoint data are intentionally excluded: neither proves that a
+    resting limit was executable.  Top-of-book size is necessary evidence but
+    still cannot prove queue position or an actual exchange execution.
+    """
     q = get_kalshi_quote(ticker)
     if not q:
-        return None
-    yes = q.get("last")
-    if yes is None:
-        b, a = q.get("yes_bid"), q.get("yes_ask")
-        if b is not None and a is not None:
-            yes = (b + a) / 2
-        else:
-            yes = a if a is not None else b
-    if yes is None:
-        return None
-    return position_price_from_yes(side, float(yes))
+        return None, "no_book_quote"
+    received_at = q.get("book_received_at")
+    if not isinstance(received_at, datetime):
+        return None, "missing_book_timestamp"
+    reference_time = now or datetime.now(tz=timezone.utc)
+    age_seconds = (reference_time - received_at).total_seconds()
+    if age_seconds < -0.5 or age_seconds > DRY_QUOTE_MAX_AGE_S:
+        return None, "stale_book_quote"
+
+    # Prices were converted from the WebSocket's dollar fields on ingestion.
+    # Do not run them through _to_dollars again: a valid stored value of 1.0
+    # must remain $1.00 rather than being interpreted as legacy one cent.
+    yes_bid = _to_contract_count(q.get("yes_bid"))
+    yes_ask = _to_contract_count(q.get("yes_ask"))
+    yes_bid_size = _to_contract_count(q.get("yes_bid_size"))
+    yes_ask_size = _to_contract_count(q.get("yes_ask_size"))
+    if None in (yes_bid, yes_ask, yes_bid_size, yes_ask_size):
+        return None, "incomplete_top_of_book"
+    if not (0.0 <= yes_bid <= yes_ask <= 1.0):
+        return None, "invalid_top_of_book"
+
+    required = float(required_count)
+    if required < 0.01 - 1e-9:
+        return None, "invalid_required_count"
+    normalized_side = str(side).lower()
+    if normalized_side == "yes":
+        executable_yes_price = yes_ask
+        displayed_depth = yes_ask_size
+        executable_field = "yes_ask"
+    elif normalized_side == "no":
+        executable_yes_price = yes_bid
+        displayed_depth = yes_bid_size
+        executable_field = "yes_bid"
+    else:
+        return None, "invalid_position_side"
+    if displayed_depth + 1e-9 < required:
+        return None, "insufficient_top_of_book_depth"
+
+    received_at_iso = received_at.isoformat()
+    return {
+        "quote_id": f"{ticker}:{q.get('book_sequence', 0)}:{received_at_iso}",
+        "side": normalized_side,
+        "economic_price": position_price_from_yes(normalized_side, executable_yes_price),
+        "executable_yes_price": round(executable_yes_price, 4),
+        "executable_field": executable_field,
+        "displayed_depth": round(displayed_depth, 2),
+        "required_count": round(required, 2),
+        "yes_bid": round(yes_bid, 4),
+        "yes_bid_size": round(yes_bid_size, 2),
+        "yes_ask": round(yes_ask, 4),
+        "yes_ask_size": round(yes_ask_size, 2),
+        "quote_received_at": received_at_iso,
+        "quote_source_time": q.get("book_source_time"),
+        "quote_source_ts_ms": q.get("book_source_ts_ms"),
+        "quote_age_seconds": round(max(0.0, age_seconds), 3),
+    }, "executable_top_of_book"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1239,33 +1339,59 @@ async def _refresh_ladder_fills(rest: KalshiREST, rec: dict) -> None:
 
 
 def _simulate_dry_ladder_fills(rec: dict) -> None:
-    """Paper-fill a rung only after an observed selected-side quote reaches it.
+    """Conservatively paper-fill only fresh, depth-supported executable quotes.
 
-    This is intentionally not an exchange-fill claim: a dry run has no queue
-    position, market depth, or partial-fill evidence. The report labels every
-    such event as a simulated quote hit.
+    This remains a simulation, not an exchange-fill claim: top-of-book depth
+    does not include the order's queue position or hidden/changed liquidity.
+    A single quote's displayed depth is consumed across the ladder so the same
+    evidence cannot manufacture multiple simulated fills on later polls.
     """
     if not DRY_RUN or rec.get("result") != "pending":
         return
-    observed = quote_position_price(rec["ticker"], rec["side"])
-    if observed is None:
+    unfilled = [
+        rung for rung in rec.get("rungs", [])
+        if _f(rung.get("fill_count"), 0.0) < _f(rung.get("count"), 0.0) - 0.005
+    ]
+    if not unfilled:
         return
+    minimum_count = min(_f(rung.get("count"), bet_count()) for rung in unfilled)
+    quote, quote_state = fresh_executable_dry_quote(
+        rec["ticker"], rec["side"], minimum_count)
+    if quote is None:
+        rec["last_dry_quote_state"] = quote_state
+        return
+
+    consumed_depth = rec.setdefault("dry_quote_depth_consumed", {})
+    quote_id = quote["quote_id"]
+    used_depth = _f(consumed_depth.get(quote_id), 0.0)
+    remaining_depth = max(0.0, quote["displayed_depth"] - used_depth)
     changed = False
-    for rung in rec.get("rungs", []):
-        if _f(rung.get("fill_count"), 0.0) >= _f(rung.get("count"), 0.0) - 0.005:
-            continue
+    # Highest economic cost has matching priority for the same selected side.
+    # A 40c rung therefore consumes available crossing liquidity before a 30c
+    # rung may use the same top-of-book evidence.
+    for rung in sorted(unfilled, key=lambda item: _f(item.get("economic_price"), 0.0), reverse=True):
         level = _f(rung.get("economic_price"), 0.0)
-        if observed <= level + 1e-9:
-            rung["fill_count"] = round(_f(rung.get("count"), bet_count()), 2)
-            rung["fill_economic_price"] = round(min(observed, level), 4)
-            rung["status"] = "simulated_quote_hit"
+        count = _f(rung.get("count"), bet_count())
+        if quote["economic_price"] <= level + 1e-9 and remaining_depth + 1e-9 >= count:
+            rung["fill_count"] = round(count, 2)
+            # These GTC rungs were pre-posted.  A later crossing order executes
+            # them at their resting limit, not with assumed price improvement.
+            rung["fill_economic_price"] = round(level, 4)
+            rung["status"] = "simulated_executable_quote_hit"
             rung["simulated_at"] = datetime.now(tz=timezone.utc).isoformat()
-            log.info("DRY RUNG HIT | %s locked_%s observed=$%.4f reached $%.2f; "
-                     "paper fill %.2f shares (not an exchange fill).",
-                     rec["ticker"], rec["side"], observed, level,
-                     _f(rung.get("count"), bet_count()))
+            rung["simulation_quote"] = dict(quote)
+            remaining_depth -= count
+            consumed_depth[quote_id] = round(quote["displayed_depth"] - remaining_depth, 2)
+            log.info(
+                "DRY EXECUTABLE RUNG HIT | %s locked_%s %s=$%.4f depth=%.2f "
+                "age=%.3fs reached $%.2f; paper fill %.2f shares at limit "
+                "(not an exchange fill).",
+                rec["ticker"], rec["side"], quote["executable_field"],
+                quote["executable_yes_price"], quote["displayed_depth"],
+                quote["quote_age_seconds"], level, count)
             changed = True
     if changed:
+        rec["last_dry_quote_state"] = quote_state
         tracker.save()
 
 
@@ -1276,14 +1402,25 @@ def print_active_ladder_status() -> None:
         log.info("DRY LADDER STATUS | no active Prophet ladder; waiting for the next frozen forecast.")
         return
     for rec in pending:
-        quote = quote_position_price(rec["ticker"], rec["side"])
+        unfilled = [
+            rung for rung in rec.get("rungs", [])
+            if _f(rung.get("fill_count"), 0.0) < _f(rung.get("count"), 0.0) - 0.005
+        ]
+        required_count = min(
+            (_f(rung.get("count"), bet_count()) for rung in unfilled),
+            default=bet_count())
+        quote, quote_state = fresh_executable_dry_quote(
+            rec["ticker"], rec["side"], required_count)
         rungs = ", ".join(
             f"${_f(r.get('economic_price')):.2f}:{r.get('status')}"
             for r in rec.get("rungs", [])) or "none"
         log.info("DRY LADDER STATUS | ticker=%s ws_channels=ticker,trade locked_side=%s "
-                 "observed_side_price=%s rungs=[%s]",
+                 "executable_side_price=%s quote_state=%s quote_age_s=%s rungs=[%s]",
                  rec["ticker"], rec["side"],
-                 f"${quote:.4f}" if quote is not None else "unavailable", rungs)
+                 f"${quote['economic_price']:.4f}" if quote is not None else "unavailable",
+                 quote_state,
+                 f"{quote['quote_age_seconds']:.3f}" if quote is not None else "unavailable",
+                 rungs)
 
 
 async def _cancel_open_ladder_orders(rest: KalshiREST, rec: dict) -> None:

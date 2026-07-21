@@ -58,8 +58,8 @@ except ImportError:  # pragma: no cover - exercised only in minimal local enviro
 LOG = logging.getLogger("kalshi_btc15m_average_down")
 SERIES_TICKER = "KXBTC15M"
 LADDER_LEVELS = (0.40, 0.30, 0.20, 0.10)
-CONFIG_VERSION = 7
-STATE_VERSION = 5
+CONFIG_VERSION = 8
+STATE_VERSION = 6
 ORDER_NAMESPACE = uuid.UUID("4d85857e-4dc6-43ec-960f-0b342523bdb7")
 KALSHI_WS_URL = os.getenv(
     "KALSHI_WS_URL",
@@ -80,6 +80,7 @@ CHECKPOINT_IGNORED_KEYS = {
     "generated_at",
     "last_heartbeat_at",
     "pause_blocked_at",
+    "last_quote_state",
 }
 
 DEFAULT_CONFIG = {
@@ -110,6 +111,11 @@ DEFAULT_CONFIG = {
     # Inclusive 50% confidence: every valid binary-model direction receives
     # the fixed GTC ladder once its market is active.
     "ml_min_confidence": 0.50,
+    # A paper-only counterfactual of the *opposite* frozen ML side. It never
+    # creates an exchange order. A simulated fill requires a fresh complete
+    # top-of-book quote and displayed executable depth at the posted rung.
+    "inverse_shadow_enabled": True,
+    "inverse_shadow_quote_max_age_seconds": 3.0,
     "status_log_seconds": 30.0,
 }
 
@@ -448,7 +454,7 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         "initial_position_size", "max_contracts_per_market", "max_total_capital",
         "fee_reserve", "poll_seconds", "market_refresh_seconds", "order_reconcile_seconds",
         "watch_start_grace_seconds", "ml_preopen_lead_seconds", "ml_min_confidence",
-        "status_log_seconds",
+        "inverse_shadow_quote_max_age_seconds", "status_log_seconds",
     ):
         value = as_float(merged.get(name))
         if value is None or value <= 0:
@@ -456,6 +462,10 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         merged[name] = value
     if merged["ml_min_confidence"] < 0.5 or merged["ml_min_confidence"] > 1.0:
         raise ValueError("ml_min_confidence must be between 0.5 and 1.0")
+    shadow_enabled = merged.get("inverse_shadow_enabled", True)
+    if isinstance(shadow_enabled, str):
+        shadow_enabled = shadow_enabled.strip().lower() in {"1", "true", "yes", "on"}
+    merged["inverse_shadow_enabled"] = bool(shadow_enabled)
     active = int(merged.get("max_active_markets", 0))
     if active < 1:
         raise ValueError("max_active_markets must be at least one")
@@ -594,6 +604,10 @@ class KalshiLiveFeed:
     def set_tickers(self, tickers: list[str] | set[str] | tuple[str, ...]) -> None:
         desired = {str(ticker) for ticker in tickers if ticker}
         if desired != self.desired_tickers:
+            # A quote from a previous subscription must never be considered
+            # executable for a newly watched ticker.
+            for ticker in desired - self.desired_tickers:
+                self.quotes.pop(ticker, None)
             self.desired_tickers = desired
             self._wake.set()
 
@@ -610,6 +624,58 @@ class KalshiLiveFeed:
         if not (0.0 < yes_ask < 1.0 and 0.0 < no_ask < 1.0):
             return None
         return {"yes": round(yes_ask, 4), "no": round(no_ask, 4)}
+
+    def executable_shadow_quote(
+        self, ticker: str, side: str, required_count: float, max_age_seconds: float,
+    ) -> tuple[dict[str, Any] | None, str]:
+        """Return auditable top-of-book evidence for one paper buy.
+
+        The shadow deliberately treats a quote as executable only when the
+        *same ticker message* supplied bid, ask, and both displayed sizes. It
+        never synthesizes a price from a last trade, midpoint, or stale delta.
+        """
+        normalized_side = str(side).lower()
+        if normalized_side not in {"yes", "no"}:
+            return None, "invalid_side"
+        quote = self.quotes.get(ticker)
+        book = quote.get("complete_book") if isinstance(quote, dict) else None
+        if not isinstance(book, dict):
+            return None, "missing_complete_top_of_book"
+        received = as_float(book.get("received_monotonic"))
+        age = time.monotonic() - received if received is not None else float("inf")
+        if age > max_age_seconds:
+            return None, "stale_top_of_book"
+        yes_bid = as_float(book.get("yes_bid"))
+        yes_ask = as_float(book.get("yes_ask"))
+        yes_bid_size = as_float(book.get("yes_bid_size"))
+        yes_ask_size = as_float(book.get("yes_ask_size"))
+        if any(value is None for value in (yes_bid, yes_ask, yes_bid_size, yes_ask_size)):
+            return None, "incomplete_top_of_book"
+        assert yes_bid is not None and yes_ask is not None
+        assert yes_bid_size is not None and yes_ask_size is not None
+        if not (0.0 < yes_bid <= yes_ask < 1.0 and yes_bid_size >= 0.0 and yes_ask_size >= 0.0):
+            return None, "invalid_top_of_book"
+        price = yes_ask if normalized_side == "yes" else 1.0 - yes_bid
+        displayed_depth = yes_ask_size if normalized_side == "yes" else yes_bid_size
+        if not (0.0 < price < 1.0):
+            return None, "invalid_executable_price"
+        if displayed_depth + 1e-9 < required_count:
+            return None, "insufficient_displayed_depth"
+        return {
+            "quote_id": str(book.get("quote_id")),
+            "ticker": ticker,
+            "side": normalized_side,
+            "economic_price": round(price, 4),
+            "displayed_depth": round(displayed_depth, 4),
+            "yes_bid": round(yes_bid, 4),
+            "yes_ask": round(yes_ask, 4),
+            "yes_bid_size": round(yes_bid_size, 4),
+            "yes_ask_size": round(yes_ask_size, 4),
+            "source_server_timestamp": book.get("source_server_timestamp"),
+            "source_timestamp_ms": book.get("source_timestamp_ms"),
+            "received_at": book.get("received_at"),
+            "quote_age_seconds": round(max(0.0, age), 6),
+        }, "executable_top_of_book"
 
     async def wait_for_update(self, timeout: float, observed_update_count: int) -> int:
         """Return the latest update sequence without losing a just-arrived event."""
@@ -675,11 +741,34 @@ class KalshiLiveFeed:
         quote = self.quotes.setdefault(ticker, {})
         yes_bid = as_float(message.get("yes_bid_dollars", message.get("yes_bid")))
         yes_ask = as_float(message.get("yes_ask_dollars", message.get("yes_ask")))
+        yes_bid_size = as_float(field(message, "yes_bid_size_fp", "yes_bid_size"))
+        yes_ask_size = as_float(field(message, "yes_ask_size_fp", "yes_ask_size"))
         if yes_bid is not None:
             quote["yes_bid"] = yes_bid
         if yes_ask is not None:
             quote["yes_ask"] = yes_ask
         quote["received_monotonic"] = time.monotonic()
+        # Preserve only a *complete snapshot* for executable-shadow fills.
+        # Delta updates and last-trade-only messages are useful operational
+        # signals, but cannot establish a displayed, executable quote.
+        if all(value is not None for value in (yes_bid, yes_ask, yes_bid_size, yes_ask_size)):
+            assert yes_bid is not None and yes_ask is not None
+            assert yes_bid_size is not None and yes_ask_size is not None
+            if 0.0 < yes_bid <= yes_ask < 1.0 and yes_bid_size >= 0.0 and yes_ask_size >= 0.0:
+                sequence = int(quote.get("book_sequence") or 0) + 1
+                received_at = now_iso()
+                quote["book_sequence"] = sequence
+                quote["complete_book"] = {
+                    "quote_id": f"{ticker}:{sequence}:{received_at}",
+                    "yes_bid": yes_bid,
+                    "yes_ask": yes_ask,
+                    "yes_bid_size": yes_bid_size,
+                    "yes_ask_size": yes_ask_size,
+                    "received_monotonic": time.monotonic(),
+                    "received_at": received_at,
+                    "source_server_timestamp": field(message, "time", "timestamp", "created_time"),
+                    "source_timestamp_ms": field(message, "ts_ms", "timestamp_ms"),
+                }
         self.update_count += 1
         self._wake.set()
 
@@ -707,6 +796,9 @@ class KalshiLiveFeed:
                     async with session.ws_connect(self.url, headers=headers, heartbeat=10) as ws:
                         self.connected = True
                         self.subscribed_tickers.clear()
+                        # New socket, new market-data sequence: do not reuse a
+                        # quote that was received before this subscription.
+                        self.quotes.clear()
                         LOG.info("WS CONNECTED | %s", self.url)
                         await self._session_loop(ws)
             except asyncio.CancelledError:
@@ -1311,6 +1403,157 @@ def filled_contracts(record: dict[str, Any]) -> float:
     return round(sum(float(order.get("fill_count") or 0.0) for order in orders_for_market(record)), 2)
 
 
+def opposite_side(side: str) -> str | None:
+    normalized = str(side).lower()
+    return "no" if normalized == "yes" else ("yes" if normalized == "no" else None)
+
+
+def ensure_inverse_shadow(
+    record: dict[str, Any], market: Any, config: dict[str, Any], ml_side: str,
+) -> dict[str, Any] | None:
+    """Start the paper-only opposite-side test for a frozen ML decision.
+
+    This has no order IDs, no REST submission path, and is deliberately kept
+    outside ``record['orders']`` so exchange reconciliation can never mistake
+    it for a live position.
+    """
+    if not config.get("inverse_shadow_enabled", True):
+        return None
+    inverse_side = opposite_side(ml_side)
+    if inverse_side is None:
+        return None
+    existing = record.get("inverse_ml_shadow")
+    if isinstance(existing, dict):
+        return existing
+    quantity = float(config["initial_position_size"])
+    shadow = {
+        "strategy": "inverse_ml_executable_quote_shadow_v1",
+        "mode": "paper_only_no_exchange_orders",
+        "status": "active",
+        "source_ml_side": str(ml_side).lower(),
+        "side": inverse_side,
+        "created_at": now_iso(),
+        "market_close_time": field(market, "close_time", "expected_expiration_time"),
+        "quantity_per_rung": quantity,
+        "quote_max_age_seconds": float(config["inverse_shadow_quote_max_age_seconds"]),
+        "rungs": {
+            f"{level:.4f}": {
+                "rung_price": level,
+                "quantity": quantity,
+                "fill_count": 0.0,
+                "average_fill_price": None,
+                "status": "simulated_resting",
+            }
+            for level in LADDER_LEVELS
+        },
+        # Consume displayed depth within the one market-data snapshot so a
+        # single 0.01 quote cannot falsely fill every rung on repeated loops.
+        "quote_depth_consumed": {},
+    }
+    record["inverse_ml_shadow"] = shadow
+    LOG.info(
+        "INVERSE SHADOW STARTED | %s ML=%s shadow=%s rungs=$0.40/$0.30/$0.20/$0.10 qty=%.2f; paper only, no exchange order.",
+        record.get("ticker", "?"), str(ml_side).upper(), inverse_side.upper(), quantity,
+    )
+    return shadow
+
+
+def simulate_inverse_shadow(
+    record: dict[str, Any], feed: KalshiLiveFeed | None, config: dict[str, Any],
+) -> bool:
+    """Simulate inverse GTC rung fills from fresh executable book evidence."""
+    shadow = record.get("inverse_ml_shadow")
+    if not isinstance(shadow, dict) or shadow.get("status") != "active":
+        return False
+    if feed is None:
+        shadow["last_quote_state"] = "websocket_unavailable"
+        return False
+    side = str(shadow.get("side") or "").lower()
+    ticker = str(record.get("ticker") or "")
+    quantity = as_float(shadow.get("quantity_per_rung"))
+    if not ticker or side not in {"yes", "no"} or quantity is None or quantity <= 0:
+        shadow["last_quote_state"] = "invalid_shadow_state"
+        return False
+    quote, quote_state = feed.executable_shadow_quote(
+        ticker, side, quantity, float(config["inverse_shadow_quote_max_age_seconds"]),
+    )
+    shadow["last_quote_state"] = quote_state
+    if quote is None:
+        return False
+    quote_id = str(quote["quote_id"])
+    consumed = as_float((shadow.setdefault("quote_depth_consumed", {})).get(quote_id)) or 0.0
+    available_depth = float(quote["displayed_depth"]) - consumed
+    changed = False
+    # A pre-posted buy limit at a higher rung would be eligible first. Use its
+    # own posted limit as the fill price—never quote price improvement—to keep
+    # paper P&L comparable to an actual limit order.
+    for level in LADDER_LEVELS:
+        key = f"{level:.4f}"
+        rung = (shadow.get("rungs") or {}).get(key)
+        if not isinstance(rung, dict) or float(rung.get("fill_count") or 0.0) > 0.004:
+            continue
+        if float(quote["economic_price"]) > level + 1e-9:
+            continue
+        rung_quantity = float(rung.get("quantity") or quantity)
+        if available_depth + 1e-9 < rung_quantity:
+            shadow["last_quote_state"] = "insufficient_remaining_displayed_depth"
+            break
+        rung.update({
+            "fill_count": round(rung_quantity, 2),
+            "average_fill_price": round(level, 4),
+            "status": "simulated_executable_quote_hit",
+            "filled_at": now_iso(),
+            "simulation_quote": dict(quote),
+        })
+        consumed += rung_quantity
+        available_depth -= rung_quantity
+        shadow["quote_depth_consumed"][quote_id] = round(consumed, 4)
+        changed = True
+        LOG.info(
+            "INVERSE SHADOW RUNG HIT | %s %s limit=$%.2f quote_price=$%.4f depth=%.2f quote_id=%s; paper fill %.2f, not an exchange fill.",
+            ticker, side.upper(), level, float(quote["economic_price"]), float(quote["displayed_depth"]),
+            quote_id, rung_quantity,
+        )
+    return changed
+
+
+def finalize_inverse_shadow(record: dict[str, Any], result: str | None) -> bool:
+    """Settle the paper-only inverse ladder once Kalshi finalizes the market."""
+    shadow = record.get("inverse_ml_shadow")
+    resolved = str(result or "").lower()
+    if not isinstance(shadow, dict) or shadow.get("status") != "active" or resolved not in {"yes", "no"}:
+        return False
+    rungs = shadow.get("rungs") if isinstance(shadow.get("rungs"), dict) else {}
+    contracts = sum(float(rung.get("fill_count") or 0.0) for rung in rungs.values() if isinstance(rung, dict))
+    cost = sum(
+        float(rung.get("fill_count") or 0.0) * float(rung.get("average_fill_price") or rung.get("rung_price") or 0.0)
+        for rung in rungs.values() if isinstance(rung, dict)
+    )
+    payout = contracts if str(shadow.get("side")) == resolved else 0.0
+    gross = payout - cost
+    shadow.update({
+        "status": "finalized" if contracts > 0.004 else "finalized_unfilled",
+        "settled_at": now_iso(),
+        "settlement_outcome": resolved,
+        "contracts": round(contracts, 2),
+        "total_cost": round(cost, 6),
+        "average_entry": round(cost / contracts, 6) if contracts > 0.004 else None,
+        "gross_payout": round(payout, 6),
+        "gross_profit_loss": round(gross, 6),
+        # This is an executable-quote simulator, not an exchange fill record.
+        # Fee/queue/hidden-liquidity effects must not be represented as known.
+        "estimated_fees": 0.0,
+        "fees_model": "excluded_no_exchange_fill",
+        "net_profit_loss": round(gross, 6),
+        "return_percentage": round(100.0 * gross / cost, 4) if cost > 0 else None,
+    })
+    LOG.info(
+        "INVERSE SHADOW SETTLED | %s %s result=%s contracts=%.2f simulated_net=$%.4f fees=excluded; no exchange fill.",
+        record.get("ticker", "?"), str(shadow.get("side") or "?").upper(), resolved.upper(), contracts, gross,
+    )
+    return True
+
+
 async def refresh_exchange_position(rest: KalshiREST, record: dict[str, Any]) -> float | None:
     """Read and persist the exchange's signed position without changing it."""
     lookup = getattr(rest, "position_for_ticker", None)
@@ -1607,10 +1850,12 @@ async def settle_or_cancel(rest: KalshiREST, record: dict[str, Any], market: Any
     prior_status = record.get("status")
     record["status"] = "closed_waiting_finalization"
     record["closed_at"] = now_iso()
+    result = market_result(market)
+    market_status = str(field(market, "status") or "").lower()
+    if result is not None and market_status == "finalized":
+        finalize_inverse_shadow(record, result)
     if not record.get("candidate_side") and not orders_for_market(record):
-        result = market_result(market)
-        status = str(field(market, "status") or "").lower()
-        if result is None or status != "finalized":
+        if result is None or market_status != "finalized":
             if prior_status != "closed_waiting_finalization":
                 LOG.info("WATCH CLOSED | %s no side reached $0.40; awaiting final market status.", record["ticker"])
             return
@@ -1625,9 +1870,7 @@ async def settle_or_cancel(rest: KalshiREST, record: dict[str, Any], market: Any
         return
     for order in orders_for_market(record):
         await rest.cancel_order(order, dry_run)
-    result = market_result(market)
-    status = str(field(market, "status") or "").lower()
-    if result is None or status != "finalized":
+    if result is None or market_status != "finalized":
         return
     side = record.get("locked_side") or record.get("candidate_side")
     quantity = filled_contracts(record)
@@ -1693,9 +1936,6 @@ async def consider_initial_entry(
         record["pause_blocked_reason"] = "scheduled or detected Kalshi trading pause"
         LOG.info("ENTRY DEFERRED FOR PAUSE | %s no new GTC ladder during a Kalshi trading/exchange pause.", ticker)
         return False
-    other_active = [candidate for candidate in active_strategy_records(state) if candidate is not record]
-    if len(other_active) >= config["max_active_markets"]:
-        return False
     if ml_side not in {"yes", "no"}:
         return False
     missing_or_rejected_rungs = any(
@@ -1712,6 +1952,13 @@ async def consider_initial_entry(
         LOG.warning(
             "GTC LADDER SKIPPED | %s opening grace expired; refusing to pre-post a new ladder mid-market.", ticker,
         )
+        return False
+    # The counterfactual begins from the exact frozen ML decision and same
+    # fresh-market policy even if the live ladder is later blocked by balance,
+    # capacity, or exchange recovery. It remains paper-only in all modes.
+    ensure_inverse_shadow(record, market, config, ml_side)
+    other_active = [candidate for candidate in active_strategy_records(state) if candidate is not record]
+    if len(other_active) >= config["max_active_markets"]:
         return False
     # Quotes remain useful for heartbeat/audit output, but they do not gate
     # this mode.  Once the frozen ML side is available, every fixed rung is a
@@ -1953,6 +2200,134 @@ def ml_live_directional_performance(settled: list[dict[str, Any]]) -> dict[str, 
     }
 
 
+def inverse_shadow_entries(state: dict[str, Any]) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+    return [
+        (record, record["inverse_ml_shadow"])
+        for record in state.get("markets", {}).values()
+        if isinstance(record, dict) and isinstance(record.get("inverse_ml_shadow"), dict)
+    ]
+
+
+def inverse_shadow_rung_performance(entries: list[tuple[dict[str, Any], dict[str, Any]]]) -> dict[str, dict[str, Any]]:
+    """Report every inverse shadow rung, including unfilled paper limits."""
+    stats = {
+        f"{level:.2f}": {
+            "rung_price": level, "paper_orders": 0, "paper_contracts": 0.0,
+            "simulated_quote_hits": 0, "filled_contracts": 0.0,
+            "resting_or_unfilled": 0, "winning_orders": 0, "losing_orders": 0,
+            "net_profit": 0.0,
+        }
+        for level in LADDER_LEVELS
+    }
+    for _record, shadow in entries:
+        outcome = str(shadow.get("settlement_outcome") or "").lower()
+        shadow_side = str(shadow.get("side") or "").lower()
+        rungs = shadow.get("rungs") if isinstance(shadow.get("rungs"), dict) else {}
+        for level in LADDER_LEVELS:
+            rung = rungs.get(f"{level:.4f}")
+            if not isinstance(rung, dict):
+                continue
+            item = stats[f"{level:.2f}"]
+            quantity = float(rung.get("quantity") or 0.0)
+            fill = float(rung.get("fill_count") or 0.0)
+            item["paper_orders"] += 1
+            item["paper_contracts"] += quantity
+            if fill <= 0.004:
+                item["resting_or_unfilled"] += 1
+                continue
+            price = float(rung.get("average_fill_price") or rung.get("rung_price") or level)
+            pnl = (fill if shadow_side == outcome else 0.0) - fill * price
+            item["simulated_quote_hits"] += 1
+            item["filled_contracts"] += fill
+            item["net_profit"] += pnl
+            if pnl > 1e-9:
+                item["winning_orders"] += 1
+            elif pnl < -1e-9:
+                item["losing_orders"] += 1
+    for item in stats.values():
+        denominator = item["winning_orders"] + item["losing_orders"]
+        item["paper_contracts"] = round(item["paper_contracts"], 2)
+        item["filled_contracts"] = round(item["filled_contracts"], 2)
+        item["net_profit"] = round(item["net_profit"], 6)
+        item["win_rate"] = round(item["winning_orders"] / denominator, 6) if denominator else None
+    return stats
+
+
+def inverse_shadow_performance(state: dict[str, Any]) -> dict[str, Any]:
+    """Detailed, separately labeled performance for the inverse ML shadow."""
+    entries = inverse_shadow_entries(state)
+    settled_signals = sorted(
+        [(record, shadow) for record, shadow in entries
+         if str(shadow.get("settlement_outcome") or "").lower() in {"yes", "no"}
+         and str(shadow.get("side") or "").lower() in {"yes", "no"}],
+        key=lambda pair: str(pair[1].get("settled_at") or ""),
+    )
+    settled_fills = [
+        (record, shadow) for record, shadow in settled_signals
+        if float(shadow.get("contracts") or 0.0) > 0.004
+    ]
+    pnls = [float(shadow.get("net_profit_loss") or 0.0) for _record, shadow in settled_fills]
+    costs = [float(shadow.get("total_cost") or 0.0) for _record, shadow in settled_fills]
+    contracts = [float(shadow.get("contracts") or 0.0) for _record, shadow in settled_fills]
+    signal_wins = sum(str(shadow.get("side")) == str(shadow.get("settlement_outcome"))
+                      for _record, shadow in settled_signals)
+    executed_wins = sum(str(shadow.get("side")) == str(shadow.get("settlement_outcome"))
+                        for _record, shadow in settled_fills)
+    wins = sum(value > 0 for value in pnls)
+    losses = sum(value < 0 for value in pnls)
+    gross_win = sum(value for value in pnls if value > 0)
+    gross_loss = -sum(value for value in pnls if value < 0)
+    equity = peak = 0.0
+    drawdowns: list[float] = []
+    for value in pnls:
+        equity += value
+        peak = max(peak, equity)
+        drawdowns.append(peak - equity)
+    mean = sum(pnls) / len(pnls) if pnls else 0.0
+    variance = sum((value - mean) ** 2 for value in pnls) / (len(pnls) - 1) if len(pnls) > 1 else 0.0
+    return {
+        "strategy": "inverse_ml_executable_quote_shadow_v1",
+        "mode": "paper_only_no_exchange_orders",
+        "fill_rule": "fresh top-of-book only: YES buy yes_ask <= rung; NO buy 1 - yes_bid <= rung; displayed depth >= rung quantity",
+        "quote_max_age_seconds": next((shadow.get("quote_max_age_seconds") for _record, shadow in entries), None),
+        "fee_treatment": "excluded_no_exchange_fill",
+        "limitations": [
+            "A quote hit is a paper fill, not a Kalshi exchange fill.",
+            "Displayed top-of-book depth is required, but queue priority, cancellations, hidden liquidity, and fees are not modeled.",
+            "P&L uses each pre-posted rung limit, not favorable quote-price improvement.",
+        ],
+        "shadow_signals_started": len(entries),
+        "active_shadow_markets": sum(str(shadow.get("status")) == "active" for _record, shadow in entries),
+        "settled_signal_markets": len(settled_signals),
+        "unfilled_shadow_markets": sum(str(shadow.get("status")) == "finalized_unfilled" for _record, shadow in entries),
+        "filled_market_trades": len(settled_fills),
+        "signal_directional_wins": signal_wins,
+        "signal_directional_losses": len(settled_signals) - signal_wins,
+        "signal_directional_win_rate": round(signal_wins / len(settled_signals), 6) if settled_signals else None,
+        "filled_directional_wins": executed_wins,
+        "filled_directional_losses": len(settled_fills) - executed_wins,
+        "filled_directional_win_rate": round(executed_wins / len(settled_fills), 6) if settled_fills else None,
+        "total_simulated_contracts": round(sum(contracts), 2),
+        "total_simulated_cost": round(sum(costs), 6),
+        "total_simulated_fees": 0.0,
+        "net_profit": round(sum(pnls), 6),
+        "return_on_simulated_capital": round(sum(pnls) / sum(costs), 6) if sum(costs) else None,
+        "average_profit_per_filled_market": round(mean, 6) if settled_fills else None,
+        "average_contracts_per_filled_market": round(sum(contracts) / len(settled_fills), 6) if settled_fills else None,
+        "average_entry_price": round(sum(costs) / sum(contracts), 6) if sum(contracts) else None,
+        "winning_trades": wins,
+        "losing_trades": losses,
+        "win_rate": round(wins / len(settled_fills), 6) if settled_fills else None,
+        "profit_factor": round(gross_win / gross_loss, 6) if gross_loss else None,
+        "maximum_drawdown": round(max(drawdowns, default=0.0), 6),
+        "longest_winning_streak": streak(pnls, True),
+        "longest_losing_streak": streak(pnls, False),
+        "largest_winning_trade": round(max(pnls, default=0.0), 6),
+        "largest_losing_trade": round(min(pnls, default=0.0), 6),
+        "rung_performance": inverse_shadow_rung_performance(entries),
+    }
+
+
 def performance_report(state: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
     settled = sorted((record for record in state.get("markets", {}).values()
                       if isinstance(record, dict) and record.get("status") == "finalized"
@@ -2002,6 +2377,7 @@ def performance_report(state: dict[str, Any], config: dict[str, Any]) -> dict[st
         "rung_performance": rung_performance(settled),
         "rung_order_activity": rung_order_activity(state),
         "ml_live_directional_performance": ml_live_directional_performance(settled),
+        "inverse_ml_shadow_performance": inverse_shadow_performance(state),
         "note": "Only finalized records with filled contracts count as trades. The pre-open ML side is an execution filter; this report is realized live-ledger data, not a profitability proof.",
     }
     if settled:
@@ -2085,6 +2461,24 @@ def log_performance_summary(report: dict[str, Any], context: str) -> None:
         "n/a" if model["average_model_confidence"] is None else f"{model['average_model_confidence']:.4f}",
         "n/a" if model["average_probability_yes"] is None else f"{model['average_probability_yes']:.4f}",
     )
+    shadow = report["inverse_ml_shadow_performance"]
+    LOG.info(
+        "INVERSE ML SHADOW PERFORMANCE | %s started=%d active=%d settled_signals=%d signal_wins=%d signal_losses=%d "
+        "signal_win_rate=%s filled_markets=%d net=$%.4f roi=%s max_drawdown=$%.4f | paper only; fees/queue excluded.",
+        context, shadow["shadow_signals_started"], shadow["active_shadow_markets"], shadow["settled_signal_markets"],
+        shadow["signal_directional_wins"], shadow["signal_directional_losses"],
+        "n/a" if shadow["signal_directional_win_rate"] is None else f"{100 * shadow['signal_directional_win_rate']:.2f}%",
+        shadow["filled_market_trades"], shadow["net_profit"],
+        "n/a" if shadow["return_on_simulated_capital"] is None else f"{100 * shadow['return_on_simulated_capital']:.2f}%",
+        shadow["maximum_drawdown"],
+    )
+    for level, rung in shadow["rung_performance"].items():
+        LOG.info(
+            "INVERSE SHADOW RUNG PERFORMANCE | %sc paper_orders=%d quote_hits=%d contracts=%.2f "
+            "resting_or_unfilled=%d winners=%d losers=%d net=$%.4f",
+            level, rung["paper_orders"], rung["simulated_quote_hits"], rung["filled_contracts"],
+            rung["resting_or_unfilled"], rung["winning_orders"], rung["losing_orders"], rung["net_profit"],
+        )
 
 
 def log_ml_deployment(
@@ -2193,6 +2587,24 @@ async def log_heartbeat(
     for record in state.get("markets", {}).values():
         if not isinstance(record, dict) or record.get("status") in FINAL_RECORD_STATUSES:
             continue
+        shadow = record.get("inverse_ml_shadow")
+        if isinstance(shadow, dict):
+            rungs = shadow.get("rungs") if isinstance(shadow.get("rungs"), dict) else {}
+            filled_rungs = sum(float(rung.get("fill_count") or 0.0) > 0.004 for rung in rungs.values() if isinstance(rung, dict))
+            quote_evidence = next(
+                (rung.get("simulation_quote") for rung in rungs.values()
+                 if isinstance(rung, dict) and isinstance(rung.get("simulation_quote"), dict)),
+                None,
+            )
+            LOG.info(
+                "INVERSE SHADOW STATUS | %s source_ml=%s side=%s status=%s quote_state=%s filled_rungs=%d/%d "
+                "last_quote=%s age=%s; no exchange order.",
+                record.get("ticker", "?"), str(shadow.get("source_ml_side") or "?").upper(),
+                str(shadow.get("side") or "?").upper(), shadow.get("status", "?"),
+                shadow.get("last_quote_state", "awaiting_quote"), filled_rungs, len(LADDER_LEVELS),
+                "none" if quote_evidence is None else f"${float(quote_evidence.get('economic_price') or 0.0):.4f}",
+                "none" if quote_evidence is None else f"{float(quote_evidence.get('quote_age_seconds') or 0.0):.3f}s",
+            )
         if record.get("status") == "watching":
             ml_signal = record.get("ml_inference") if isinstance(record.get("ml_inference"), dict) else {}
             ml_side = str(ml_signal.get("side") or "").upper()
@@ -2370,6 +2782,12 @@ async def run(args: argparse.Namespace) -> int:
                     rest, state, market, config, dry_run,
                     live_asks=feed.executable_asks(ticker), ml_side=ml_side,
                 )
+            # The counterfactual is intentionally driven only by the
+            # authenticated ticker stream. It is evaluated separately from
+            # live order reconciliation and cannot call any order endpoint.
+            for record in state["markets"].values():
+                if isinstance(record, dict):
+                    simulate_inverse_shadow(record, feed, config)
             monotonic_now = asyncio.get_running_loop().time()
             if monotonic_now - last_heartbeat_at >= config["status_log_seconds"]:
                 await log_heartbeat(rest, state, active_markets, config, dry_run, monotonic_now - started_at, feed)

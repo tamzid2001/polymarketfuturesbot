@@ -47,7 +47,7 @@ jobs:
       - name: Verify locked-ladder safety checks
         run: |
           python -m py_compile kalshibtc15minupordown.py kalshi_btc15m_prophet_btc_only.py
-          python -m unittest -v test_kalshi_bot.py
+          python -m unittest -v test_kalshi_bot.py test_kalshi_dry_quote_simulation.py
 
       - name: Write Kalshi RSA private key
         env:

@@ -19,6 +19,7 @@ from kalshi_btc15m_average_down import (
     choose_entry_side,
     consider_initial_entry,
     default_state,
+    ensure_inverse_shadow,
     exchange_position_guard,
     exchange_outcome_side,
     ladder_principal,
@@ -36,9 +37,12 @@ from kalshi_btc15m_average_down import (
     market_asks,
     managed_mechanical_order_role,
     ml_live_directional_performance,
+    inverse_shadow_performance,
     normalized_order_status,
     normalized_outcome_side,
     rung_order_activity,
+    simulate_inverse_shadow,
+    finalize_inverse_shadow,
     validate_config,
 )
 from datetime import datetime, timezone
@@ -144,6 +148,62 @@ class MechanicalAverageDownTests(unittest.TestCase):
             '"yes_bid_dollars":"0.7200","yes_ask_dollars":"0.7500"}}'
         )
         self.assertEqual(feed.executable_asks("KXBTC15M-TEST"), {"yes": 0.75, "no": 0.28})
+
+    def test_inverse_shadow_quote_requires_complete_fresh_book_and_displayed_depth(self):
+        feed = KalshiLiveFeed(auth=None)
+        ticker = "KXBTC15M-TEST-SHADOW-QUOTE"
+        feed._handle(
+            '{"type":"ticker","msg":{"market_ticker":"%s",'
+            '"yes_bid_dollars":"0.7200","yes_ask_dollars":"0.7500",'
+            '"yes_bid_size_fp":"0.0200","yes_ask_size_fp":"0.0100","ts_ms":123}}' % ticker
+        )
+        quote, reason = feed.executable_shadow_quote(ticker, "no", 0.01, 3.0)
+        self.assertEqual(reason, "executable_top_of_book")
+        self.assertIsNotNone(quote)
+        assert quote is not None
+        self.assertEqual((quote["economic_price"], quote["displayed_depth"]), (0.28, 0.02))
+        self.assertEqual((quote["yes_bid"], quote["yes_ask"]), (0.72, 0.75))
+        self.assertEqual((quote["yes_bid_size"], quote["yes_ask_size"]), (0.02, 0.01))
+        feed.quotes[ticker]["complete_book"]["received_monotonic"] -= 4.0
+        stale, stale_reason = feed.executable_shadow_quote(ticker, "no", 0.01, 3.0)
+        self.assertIsNone(stale)
+        self.assertEqual(stale_reason, "stale_top_of_book")
+
+    def test_inverse_shadow_uses_opposite_side_and_consumes_quote_depth(self):
+        class FakeFeed:
+            def __init__(self):
+                self.quotes = [
+                    ({"quote_id": "one", "economic_price": 0.19, "displayed_depth": 0.01,
+                      "yes_bid": 0.81, "yes_ask": 0.82, "yes_bid_size": 0.01, "yes_ask_size": 0.01,
+                      "received_at": "2026-07-21T16:00:00+00:00", "quote_age_seconds": 0.1}, "executable_top_of_book"),
+                    ({"quote_id": "two", "economic_price": 0.09, "displayed_depth": 0.03,
+                      "yes_bid": 0.91, "yes_ask": 0.92, "yes_bid_size": 0.03, "yes_ask_size": 0.01,
+                      "received_at": "2026-07-21T16:00:01+00:00", "quote_age_seconds": 0.1}, "executable_top_of_book"),
+                ]
+
+            def executable_shadow_quote(self, *_args):
+                return self.quotes.pop(0)
+
+        config = validate_config(DEFAULT_CONFIG)
+        state = default_state()
+        record = market_record(state, "KXBTC15M-TEST-INVERSE")
+        market = SimpleNamespace(close_time="2099-07-20T00:15:00Z")
+        shadow = ensure_inverse_shadow(record, market, config, "yes")
+        self.assertIsNotNone(shadow)
+        assert shadow is not None
+        self.assertEqual((shadow["source_ml_side"], shadow["side"], record["orders"]), ("yes", "no", {}))
+        feed = FakeFeed()
+        self.assertTrue(simulate_inverse_shadow(record, feed, config))
+        self.assertEqual(shadow["rungs"]["0.4000"]["fill_count"], 0.01)
+        self.assertEqual(shadow["rungs"]["0.3000"]["fill_count"], 0.0)
+        self.assertTrue(simulate_inverse_shadow(record, feed, config))
+        self.assertTrue(all(float(rung["fill_count"]) == 0.01 for rung in shadow["rungs"].values()))
+        self.assertTrue(finalize_inverse_shadow(record, "no"))
+        summary = inverse_shadow_performance(state)
+        self.assertEqual((summary["settled_signal_markets"], summary["signal_directional_wins"]), (1, 1))
+        self.assertEqual((summary["filled_market_trades"], summary["total_simulated_contracts"]), (1, 0.04))
+        self.assertEqual(summary["net_profit"], 0.03)
+        self.assertEqual(summary["rung_performance"]["0.40"]["simulated_quote_hits"], 1)
 
     def test_live_quote_overrides_discovery_snapshot(self):
         market = SimpleNamespace(yes_ask_dollars="0.70", no_ask_dollars="0.30")
