@@ -66,6 +66,16 @@ class ProphetLockedLadderStaticTests(unittest.TestCase):
         self.assertIn("not an exchange fill", simulation)
         self.assertIn("fill_count = 0.0 if DRY_RUN", execution)
 
+    def test_inverse_prophet_shadow_is_paper_only_and_never_calls_order_submission(self) -> None:
+        shadow = ast.get_source_segment(
+            self.source, self.functions["create_inverse_prophet_shadow"])
+        self.assertIn("INVERSE_PROPHET_SHADOW_ENABLED", self.source)
+        self.assertIn("DRY_RUN and", self.source)
+        self.assertIn("paper_only_no_exchange_orders", shadow)
+        self.assertIn("paper-only inverse shadow", shadow)
+        self.assertNotIn("_submit(", shadow)
+        self.assertNotIn("_ladder_order_terms(", shadow)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

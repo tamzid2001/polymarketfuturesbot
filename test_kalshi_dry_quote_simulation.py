@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 import json
 from types import SimpleNamespace
@@ -133,6 +134,80 @@ class ExecutableDryQuoteTests(unittest.TestCase):
             runner.DRY_RUN = dry_run
 
         self.assertEqual(len(saves), 2)
+
+    def test_inverse_prophet_shadow_is_separate_paper_ladder_with_own_summary(self) -> None:
+        class MemoryShadowLedger:
+            def __init__(self):
+                self.trades = []
+                self.saves = 0
+
+            def already_shadowed(self, ticker):
+                return any(rec.get("ticker") == ticker for rec in self.trades)
+
+            def record_open(self, rec):
+                self.trades.append(rec)
+                self.save()
+                return True
+
+            def find_pending(self):
+                return [rec for rec in self.trades if rec.get("result") == "pending"]
+
+            def save(self):
+                self.saves += 1
+
+            def settle(self, rec, result, pnl):
+                rec["result"] = result
+                rec["profit_loss"] = round(pnl, 4)
+                self.save()
+
+        class FakeRest:
+            async def get_market(self, _ticker):
+                return SimpleNamespace(result="no")
+
+        self.set_book(received_at=datetime.now(tz=timezone.utc))
+        primary = {
+            "ticker": TICKER,
+            "timestamp": NOW.isoformat(),
+            "settle_et": "2020-01-01T00:00:00-05:00",
+            "side": "YES",
+            "decision_basis": "prophet_p50_vs_live_strike_locked_side",
+            "btc_entry": 100_000.0,
+            "strike": 100_100.0,
+            "p50_prediction": 100_200.0,
+            "forecast_horizon_minutes": 17,
+            "bet_amount_shares": 0.01,
+        }
+        ledger = MemoryShadowLedger()
+        old_dry = runner.DRY_RUN
+        old_enabled = runner.INVERSE_PROPHET_SHADOW_ENABLED
+        try:
+            runner.DRY_RUN = True
+            runner.INVERSE_PROPHET_SHADOW_ENABLED = True
+            with patch.object(runner, "inverse_shadow_tracker", ledger):
+                shadow = runner.create_inverse_prophet_shadow(primary)
+                self.assertIsNotNone(shadow)
+                assert shadow is not None
+                self.assertEqual((shadow["source_prophet_side"], shadow["side"]), ("YES", "NO"))
+                self.assertEqual(shadow["order_submitted"], "none — paper-only inverse shadow")
+                self.assertTrue(all(rung["order_id"] is None for rung in shadow["rungs"]))
+
+                runner._simulate_dry_ladder_fills(shadow)
+                self.assertEqual(
+                    [rung["status"] for rung in shadow["rungs"][:2]],
+                    ["simulated_executable_quote_hit", "simulated_executable_quote_hit"],
+                )
+                self.assertTrue(asyncio.run(runner._settle_record_if_ready(FakeRest(), shadow)))
+                self.assertEqual((shadow["market_result"], shadow["result"]), ("no", "WIN"))
+
+                report = runner.inverse_shadow_performance(ledger.trades)
+        finally:
+            runner.DRY_RUN = old_dry
+            runner.INVERSE_PROPHET_SHADOW_ENABLED = old_enabled
+
+        self.assertEqual((report["settled_signal_markets"], report["directional_wins"]), (1, 1))
+        self.assertEqual((report["filled_market_trades"], report["winning_trades"]), (1, 1))
+        self.assertEqual(report["rung_performance"]["0.40"]["quote_hits"], 1)
+        self.assertEqual(report["rung_performance"]["0.30"]["quote_hits"], 1)
 
 
 if __name__ == "__main__":

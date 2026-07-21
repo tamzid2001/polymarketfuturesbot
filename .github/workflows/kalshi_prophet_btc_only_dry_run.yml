@@ -68,6 +68,11 @@ jobs:
           RUNTIME_LIMIT_MIN: ${{ inputs.run_minutes }}
           TRADE_HISTORY_FILE: prophet_btc_only_trade_history.json
           TRADED_TICKERS_FILE: prophet_btc_only_traded_market_tickers.json
+          # Separate, paper-only opposite-side Prophet test. This runner
+          # never sends an exchange order for these shadow rungs.
+          INVERSE_PROPHET_SHADOW_ENABLED: "true"
+          INVERSE_PROPHET_SHADOW_HISTORY_FILE: prophet_btc_inverse_shadow_history.json
+          INVERSE_PROPHET_SHADOW_REPORT_FILE: prophet_btc_inverse_shadow_report.json
         run: |
           set -euo pipefail
           case "$RUNTIME_LIMIT_MIN" in
@@ -84,7 +89,8 @@ jobs:
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          for file in prophet_btc_only_trade_history.json prophet_btc_only_traded_market_tickers.json; do
+          for file in prophet_btc_only_trade_history.json prophet_btc_only_traded_market_tickers.json \
+                      prophet_btc_inverse_shadow_history.json prophet_btc_inverse_shadow_report.json; do
             test ! -f "$file" || git add "$file"
           done
           git diff-index --quiet HEAD || \
@@ -113,5 +119,7 @@ jobs:
           path: |
             prophet_btc_only_trade_history.json
             prophet_btc_only_traded_market_tickers.json
+            prophet_btc_inverse_shadow_history.json
+            prophet_btc_inverse_shadow_report.json
           if-no-files-found: warn
           retention-days: 90

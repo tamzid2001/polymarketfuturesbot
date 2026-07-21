@@ -59,7 +59,7 @@ LOG = logging.getLogger("kalshi_btc15m_average_down")
 SERIES_TICKER = "KXBTC15M"
 LADDER_LEVELS = (0.40, 0.30, 0.20, 0.10)
 CONFIG_VERSION = 8
-STATE_VERSION = 6
+STATE_VERSION = 7
 ORDER_NAMESPACE = uuid.UUID("4d85857e-4dc6-43ec-960f-0b342523bdb7")
 KALSHI_WS_URL = os.getenv(
     "KALSHI_WS_URL",
@@ -831,6 +831,9 @@ class MLDirectionSelector:
         model_metadata: dict[str, Any] | None = None,
         model_run_id: str = "",
         training_run_id: str = "",
+        previous_model_path: Path | None = None,
+        previous_model_metadata: dict[str, Any] | None = None,
+        previous_model_run_id: str = "",
     ) -> None:
         if not training_csv.is_file():
             raise FileNotFoundError(f"Missing ML feature ledger: {training_csv}")
@@ -843,6 +846,11 @@ class MLDirectionSelector:
         self.model_metadata = model_metadata or {}
         self.model_run_id = model_run_id
         self.training_run_id = training_run_id
+        self.previous_model_path = previous_model_path if previous_model_path and previous_model_path.is_file() else None
+        self.previous_model_metadata = previous_model_metadata or {}
+        self.previous_model_run_id = previous_model_run_id
+        self.previous_model: Any | None = None
+        self.previous_model_load_failed = False
         self.tasks: dict[str, asyncio.Task[Any]] = {}
         # The exact instant at which each task's input is frozen.  A task may
         # finish after the market opens, but remains causal when this timestamp
@@ -1020,6 +1028,16 @@ class MLDirectionSelector:
             "prepared_at": str(cached.get("as_of") or ""),
             "training_rows": int(len(training_rows)) if training_rows is not None else 0,
         }
+        transition = self._model_transition_comparison(ml, vector, probability_yes, side)
+        if transition is not None:
+            record["ml_model_transition"] = transition
+            LOG.info(
+                "ML MODEL TRANSITION | %s prior_run=%s prior_side=%s prior_p_yes=%.4f current_run=%s "
+                "current_side=%s current_p_yes=%.4f side_changed=%s.",
+                ticker, transition["previous_model_run_id"], transition["previous_side"].upper(),
+                transition["previous_probability_yes"], transition["current_model_run_id"],
+                transition["current_side"].upper(), transition["current_probability_yes"], transition["side_changed"],
+            )
         self._log_once(
             record, "ready",
             "ML SIDE READY | %s model=%s run=%s side=%s p_yes=%.4f confidence=%.4f "
@@ -1028,6 +1046,47 @@ class MLDirectionSelector:
             side.upper(), probability_yes, confidence, self.min_confidence,
         )
         return side
+
+    def _model_transition_comparison(
+        self, ml: Any, vector: Any, current_probability_yes: float, current_side: str,
+    ) -> dict[str, Any] | None:
+        """Score the predecessor on the identical causal feature vector.
+
+        A retrain never changes a running market. This audit starts only when
+        the registry identifies a distinct previous artifact and the new
+        runner has downloaded it alongside the active model.
+        """
+        if self.previous_model_path is None or not self.previous_model_run_id:
+            return None
+        if self.previous_model_run_id == self.model_run_id or self.previous_model_load_failed:
+            return None
+        try:
+            if self.previous_model is None:
+                self.previous_model = ml.load_saved_model(self.previous_model_path)
+            previous_probability_yes = float(self.previous_model.predict_proba(vector)[0][1])
+        except Exception as exc:  # noqa: BLE001
+            self.previous_model_load_failed = True
+            LOG.warning(
+                "ML MODEL TRANSITION UNAVAILABLE | previous_run=%s path=%s error=%s; current model continues unchanged.",
+                self.previous_model_run_id, self.previous_model_path, exc,
+            )
+            return None
+        previous_side = "yes" if previous_probability_yes >= 0.5 else "no"
+        return {
+            "strategy": "same_frozen_input_model_transition_comparison_v1",
+            "previous_model_run_id": self.previous_model_run_id,
+            "previous_model_type": self.previous_model_metadata.get("model_type"),
+            "previous_probability_yes": round(previous_probability_yes, 6),
+            "previous_side": previous_side,
+            "current_model_run_id": self.model_run_id or None,
+            "current_model_type": self.model_metadata.get("model_type"),
+            "current_probability_yes": round(current_probability_yes, 6),
+            "current_side": current_side,
+            "probability_yes_delta": round(current_probability_yes - previous_probability_yes, 6),
+            "side_changed": previous_side != current_side,
+            "input_basis": "identical frozen pre-open raw-candle/settled-outcome features",
+            "compared_at": now_iso(),
+        }
 
     def _harvest_completion(self, ml: Any) -> None:
         """Mark whether each completed task used a causal frozen snapshot."""
@@ -2200,6 +2259,67 @@ def ml_live_directional_performance(settled: list[dict[str, Any]]) -> dict[str, 
     }
 
 
+def model_transition_side_comparison(state: dict[str, Any]) -> dict[str, Any]:
+    """Aggregate predecessor/current decisions made on identical frozen inputs."""
+    groups: dict[tuple[str, str], dict[str, Any]] = {}
+    for record in state.get("markets", {}).values():
+        if not isinstance(record, dict):
+            continue
+        comparison = record.get("ml_model_transition")
+        if not isinstance(comparison, dict):
+            continue
+        previous_run = str(comparison.get("previous_model_run_id") or "")
+        current_run = str(comparison.get("current_model_run_id") or "")
+        previous_side = str(comparison.get("previous_side") or "").lower()
+        current_side = str(comparison.get("current_side") or "").lower()
+        if not previous_run or not current_run or previous_side not in {"yes", "no"} or current_side not in {"yes", "no"}:
+            continue
+        item = groups.setdefault((previous_run, current_run), {
+            "previous_model_run_id": previous_run,
+            "current_model_run_id": current_run,
+            "compared_markets": 0,
+            "same_side": 0,
+            "side_changed": 0,
+            "yes_to_no": 0,
+            "no_to_yes": 0,
+            "probability_yes_delta_sum": 0.0,
+            "settled_markets": 0,
+            "previous_directional_wins": 0,
+            "current_directional_wins": 0,
+        })
+        item["compared_markets"] += 1
+        changed = previous_side != current_side
+        item["same_side"] += not changed
+        item["side_changed"] += changed
+        if previous_side == "yes" and current_side == "no":
+            item["yes_to_no"] += 1
+        elif previous_side == "no" and current_side == "yes":
+            item["no_to_yes"] += 1
+        item["probability_yes_delta_sum"] += float(comparison.get("probability_yes_delta") or 0.0)
+        outcome = str(record.get("settlement_outcome") or "").lower()
+        if outcome in {"yes", "no"}:
+            item["settled_markets"] += 1
+            item["previous_directional_wins"] += previous_side == outcome
+            item["current_directional_wins"] += current_side == outcome
+    comparisons = []
+    for item in groups.values():
+        count = item["compared_markets"]
+        settled_count = item["settled_markets"]
+        item["side_change_rate"] = round(item["side_changed"] / count, 6) if count else None
+        item["average_probability_yes_delta"] = round(item.pop("probability_yes_delta_sum") / count, 6) if count else None
+        item["previous_directional_win_rate"] = round(item["previous_directional_wins"] / settled_count, 6) if settled_count else None
+        item["current_directional_win_rate"] = round(item["current_directional_wins"] / settled_count, 6) if settled_count else None
+        item["current_minus_previous_directional_wins"] = (
+            item["current_directional_wins"] - item["previous_directional_wins"]
+        )
+        comparisons.append(item)
+    return {
+        "method": "same_frozen_input_model_transition_comparison_v1",
+        "comparisons": sorted(comparisons, key=lambda item: (item["current_model_run_id"], item["previous_model_run_id"])),
+        "note": "This is prospective deployment-transition tracking. It compares model sides on the same frozen feature vector; it is not a retraining promotion test or executable P&L estimate.",
+    }
+
+
 def inverse_shadow_entries(state: dict[str, Any]) -> list[tuple[dict[str, Any], dict[str, Any]]]:
     return [
         (record, record["inverse_ml_shadow"])
@@ -2377,6 +2497,7 @@ def performance_report(state: dict[str, Any], config: dict[str, Any]) -> dict[st
         "rung_performance": rung_performance(settled),
         "rung_order_activity": rung_order_activity(state),
         "ml_live_directional_performance": ml_live_directional_performance(settled),
+        "ml_model_transition_side_comparison": model_transition_side_comparison(state),
         "inverse_ml_shadow_performance": inverse_shadow_performance(state),
         "note": "Only finalized records with filled contracts count as trades. The pre-open ML side is an execution filter; this report is realized live-ledger data, not a profitability proof.",
     }
@@ -2461,6 +2582,20 @@ def log_performance_summary(report: dict[str, Any], context: str) -> None:
         "n/a" if model["average_model_confidence"] is None else f"{model['average_model_confidence']:.4f}",
         "n/a" if model["average_probability_yes"] is None else f"{model['average_probability_yes']:.4f}",
     )
+    transition_summary = report["ml_model_transition_side_comparison"]
+    for transition in transition_summary["comparisons"]:
+        LOG.info(
+            "ML MODEL TRANSITION PERFORMANCE | %s previous_run=%s current_run=%s compared=%d same_side=%d "
+            "changed=%d (Y→N=%d N→Y=%d) change_rate=%s avg_p_yes_delta=%s settled=%d "
+            "previous_wins=%d current_wins=%d current_minus_previous=%+d.",
+            context, transition["previous_model_run_id"], transition["current_model_run_id"],
+            transition["compared_markets"], transition["same_side"], transition["side_changed"],
+            transition["yes_to_no"], transition["no_to_yes"],
+            "n/a" if transition["side_change_rate"] is None else f"{100 * transition['side_change_rate']:.2f}%",
+            "n/a" if transition["average_probability_yes_delta"] is None else f"{transition['average_probability_yes_delta']:+.4f}",
+            transition["settled_markets"], transition["previous_directional_wins"],
+            transition["current_directional_wins"], transition["current_minus_previous_directional_wins"],
+        )
     shadow = report["inverse_ml_shadow_performance"]
     LOG.info(
         "INVERSE ML SHADOW PERFORMANCE | %s started=%d active=%d settled_signals=%d signal_wins=%d signal_losses=%d "
@@ -2696,11 +2831,16 @@ async def run(args: argparse.Namespace) -> int:
         raise SystemExit("ML-side execution requires --ml-training-csv and --ml-model-path; refusing a price-only fallback")
     model_metadata = load_json(args.ml_model_metadata.expanduser(), {}) if args.ml_model_metadata else {}
     validation_report = load_json(args.ml_validation_report.expanduser(), {}) if args.ml_validation_report else {}
+    previous_model_metadata = load_json(args.previous_ml_model_metadata.expanduser(), {}) if args.previous_ml_model_metadata else {}
     try:
         preflight_ml_deployment(args.ml_model_path.expanduser(), model_metadata)
+        if args.previous_ml_model_path is not None:
+            preflight_ml_deployment(args.previous_ml_model_path.expanduser(), previous_model_metadata)
         ml_selector = MLDirectionSelector(
             args.ml_training_csv.expanduser(), args.ml_model_path.expanduser(), config["ml_preopen_lead_seconds"],
             config["ml_min_confidence"], model_metadata, args.ml_model_run_id, args.ml_training_run_id,
+            args.previous_ml_model_path.expanduser() if args.previous_ml_model_path else None,
+            previous_model_metadata, args.previous_ml_model_run_id,
         )
     except Exception:
         await rest.close()
@@ -2850,6 +2990,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ml-validation-report", type=Path, help="Optional immutable validation report for startup audit logging.")
     parser.add_argument("--ml-model-run-id", default="", help="Actions run ID that produced the exact stored model artifact.")
     parser.add_argument("--ml-training-run-id", default="", help="Actions run ID that produced the feature ledger artifact.")
+    parser.add_argument("--previous-ml-model-path", type=Path, help="Prior active ML model, compared only on the same frozen input after a retrain transition.")
+    parser.add_argument("--previous-ml-model-metadata", type=Path, help="Metadata paired with --previous-ml-model-path.")
+    parser.add_argument("--previous-ml-model-run-id", default="", help="Actions run ID of the prior active model being compared.")
     parser.add_argument("--status-log-seconds", type=float)
     return parser
 

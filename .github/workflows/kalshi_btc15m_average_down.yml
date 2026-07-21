@@ -81,6 +81,8 @@ jobs:
             LEDGER_ARTIFACT="kalshi-kxbtc15m-ml-model-$TRAINING_RUN_ID"
             LEDGER_PATH="training_data/kxbtc15m_ml_only_feature_ledger.csv"
             MODEL_SOURCE="manual_override"
+            PREVIOUS_MODEL_RUN_ID=""
+            PREVIOUS_MODEL_ARTIFACT=""
           else
             test -s kalshi_ml_model_registry.json
             FEATURE_SCHEMA="$(jq -er '.feature_schema' kalshi_ml_model_registry.json)"
@@ -91,6 +93,8 @@ jobs:
             LEDGER_ARTIFACT="$(jq -er '.active_ledger_artifact_name' kalshi_ml_model_registry.json)"
             LEDGER_PATH="$(jq -er '.active_ledger_path' kalshi_ml_model_registry.json)"
             MODEL_SOURCE="validated_registry"
+            PREVIOUS_MODEL_RUN_ID="$(jq -r '.previous_model_run_id // empty' kalshi_ml_model_registry.json)"
+            PREVIOUS_MODEL_ARTIFACT="$(jq -r '.previous_model_artifact_name // empty' kalshi_ml_model_registry.json)"
           fi
           {
             echo "MODEL_RUN_ID=$MODEL_RUN_ID"
@@ -99,6 +103,8 @@ jobs:
             echo "LEDGER_ARTIFACT=$LEDGER_ARTIFACT"
             echo "LEDGER_PATH=$LEDGER_PATH"
             echo "MODEL_SOURCE=$MODEL_SOURCE"
+            echo "PREVIOUS_MODEL_RUN_ID=$PREVIOUS_MODEL_RUN_ID"
+            echo "PREVIOUS_MODEL_ARTIFACT=$PREVIOUS_MODEL_ARTIFACT"
           } >> "$GITHUB_ENV"
           echo "ML MODEL RESOLVED | source=$MODEL_SOURCE model_run=$MODEL_RUN_ID ledger_run=$TRAINING_RUN_ID ledger_path=$LEDGER_PATH"
 
@@ -126,6 +132,15 @@ jobs:
             -n "$MODEL_ARTIFACT" -D stored_model
           gh run download "$TRAINING_RUN_ID" -R "$GITHUB_REPOSITORY" \
             -n "$LEDGER_ARTIFACT" -D training_data
+          if [ -n "$PREVIOUS_MODEL_RUN_ID" ] && [ "$PREVIOUS_MODEL_RUN_ID" != "$MODEL_RUN_ID" ] && [ -n "$PREVIOUS_MODEL_ARTIFACT" ]; then
+            gh run download "$PREVIOUS_MODEL_RUN_ID" -R "$GITHUB_REPOSITORY" \
+              -n "$PREVIOUS_MODEL_ARTIFACT" -D previous_model
+            test -s previous_model/kxbtc15m_ml_model.joblib
+            test -s previous_model/kxbtc15m_ml_model_metadata.json
+            echo "ML TRANSITION COMPARATOR READY | prior_run=$PREVIOUS_MODEL_RUN_ID current_run=$MODEL_RUN_ID"
+          else
+            echo "ML TRANSITION COMPARATOR | no distinct predecessor registered for this model."
+          fi
           test -s stored_model/kxbtc15m_ml_model.joblib
           test -s stored_model/kxbtc15m_ml_model_metadata.json
           test -s stored_model/holdout_backtest.json
@@ -173,6 +188,11 @@ jobs:
           [ -z "$MAX_ACTIVE_MARKETS" ] || args+=(--max-active-markets "$MAX_ACTIVE_MARKETS")
           [ -z "$MAX_CONTRACTS_PER_MARKET" ] || args+=(--max-contracts-per-market "$MAX_CONTRACTS_PER_MARKET")
           [ -z "$MAX_TOTAL_CAPITAL" ] || args+=(--max-total-capital "$MAX_TOTAL_CAPITAL")
+          if [ -s previous_model/kxbtc15m_ml_model.joblib ]; then
+            args+=(--previous-ml-model-path previous_model/kxbtc15m_ml_model.joblib
+                   --previous-ml-model-metadata previous_model/kxbtc15m_ml_model_metadata.json
+                   --previous-ml-model-run-id "$PREVIOUS_MODEL_RUN_ID")
+          fi
           if [ "$LIVE_TRADING" = "true" ]; then
             DRY_RUN=false python kalshi_btc15m_average_down.py "${args[@]}" --submit --allow-live
           else

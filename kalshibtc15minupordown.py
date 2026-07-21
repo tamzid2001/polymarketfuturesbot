@@ -123,6 +123,12 @@ KALSHI_API_KEY_ID = os.getenv("KALSHI_API_KEY_ID", "")
 KALSHI_PEM_PATH   = os.getenv("KALSHI_PEM_PATH",   "kalshi_private_key.pem")
 KALSHI_DEMO       = os.getenv("KALSHI_DEMO", "false").lower() in ("1", "true", "yes")
 DRY_RUN           = os.getenv("DRY_RUN", "true").lower() in ("1", "true", "yes")
+# The inverse Prophet experiment is deliberately confined to DRY_RUN. It
+# creates no Kalshi order and is not a switch for live opposite-side trading.
+INVERSE_PROPHET_SHADOW_ENABLED = (
+    DRY_RUN and os.getenv("INVERSE_PROPHET_SHADOW_ENABLED", "true").lower()
+    in ("1", "true", "yes")
+)
 
 # ── Bet sizing ──────────────────────────────────────────────────────────────
 # Buy exactly this many contracts (shares) per ladder rung, independent of price.
@@ -154,6 +160,10 @@ DRY_QUOTE_MAX_AGE_S = max(0.1, float(os.getenv("DRY_QUOTE_MAX_AGE_S", "3")))
 
 TRADE_HISTORY_FILE  = os.getenv("TRADE_HISTORY_FILE", "prophet_btc_only_trade_history.json")
 TRADED_TICKERS_FILE = os.getenv("TRADED_TICKERS_FILE", "prophet_btc_only_traded_market_tickers.json")
+INVERSE_PROPHET_SHADOW_HISTORY_FILE = os.getenv(
+    "INVERSE_PROPHET_SHADOW_HISTORY_FILE", "prophet_btc_inverse_shadow_history.json")
+INVERSE_PROPHET_SHADOW_REPORT_FILE = os.getenv(
+    "INVERSE_PROPHET_SHADOW_REPORT_FILE", "prophet_btc_inverse_shadow_report.json")
 
 ORDER_TIF      = "good_till_canceled"    # resting limit through market close
 SERIES_TICKER  = "KXBTC15M"
@@ -1095,8 +1105,164 @@ class PerformanceTracker:
         }
 
 
-# Module-level tracker (created here so all coroutines share one instance).
+def inverse_shadow_rung_performance(records: list[dict]) -> dict[str, dict]:
+    """Summarize paper quote hits for the Prophet inverse shadow only."""
+    stats = {
+        f"{level:.2f}": {
+            "rung_price": level, "paper_orders": 0, "quote_hits": 0,
+            "paper_contracts": 0.0, "filled_contracts": 0.0,
+            "winning_hits": 0, "losing_hits": 0, "net_profit": 0.0,
+        }
+        for level in LADDER_LEVELS
+    }
+    for rec in records:
+        market_result = str(rec.get("market_result") or "").lower()
+        side = str(rec.get("side") or "").lower()
+        for rung in rec.get("rungs", []):
+            level = round(_f(rung.get("economic_price")), 2)
+            item = stats.get(f"{level:.2f}")
+            if item is None:
+                continue
+            count = _f(rung.get("count"), 0.0)
+            fill = _f(rung.get("fill_count"), 0.0)
+            item["paper_orders"] += 1
+            item["paper_contracts"] += count
+            if fill <= 0.005:
+                continue
+            entry = _f(rung.get("fill_economic_price"), level)
+            pnl = (fill - fill * entry) if side == market_result else -fill * entry
+            item["quote_hits"] += 1
+            item["filled_contracts"] += fill
+            item["net_profit"] += pnl
+            if pnl > 0.0:
+                item["winning_hits"] += 1
+            elif pnl < 0.0:
+                item["losing_hits"] += 1
+    for item in stats.values():
+        item["paper_contracts"] = round(item["paper_contracts"], 2)
+        item["filled_contracts"] = round(item["filled_contracts"], 2)
+        item["net_profit"] = round(item["net_profit"], 6)
+    return stats
+
+
+def inverse_shadow_performance(records: list[dict]) -> dict:
+    """Detailed independent summary; quote hits are never exchange fills."""
+    directional = [
+        rec for rec in records
+        if str(rec.get("market_result") or "").lower() in ("yes", "no")
+    ]
+    filled = [rec for rec in records if rec.get("result") in ("WIN", "LOSS")]
+    wins = sum(rec.get("result") == "WIN" for rec in filled)
+    pnls = [_f(rec.get("profit_loss")) for rec in filled]
+    costs = [
+        sum(_f(rung.get("fill_count")) * _f(rung.get("fill_economic_price"), _f(rung.get("economic_price")))
+            for rung in rec.get("rungs", []))
+        for rec in filled
+    ]
+    directional_wins = sum(
+        str(rec.get("side") or "").lower() == str(rec.get("market_result") or "").lower()
+        for rec in directional
+    )
+    equity = peak = max_drawdown = 0.0
+    for pnl in pnls:
+        equity += pnl
+        peak = max(peak, equity)
+        max_drawdown = max(max_drawdown, peak - equity)
+    gross_win = sum(pnl for pnl in pnls if pnl > 0.0)
+    gross_loss = -sum(pnl for pnl in pnls if pnl < 0.0)
+    streaks = PerformanceTracker._streak_metrics(filled)
+    return {
+        "generated_at": datetime.now(tz=timezone.utc).isoformat(),
+        "strategy": "inverse_prophet_executable_quote_shadow_v1",
+        "mode": "paper_only_no_exchange_orders",
+        "fill_rule": "YES buy: yes_ask <= rung; NO buy: 1 - yes_bid <= rung; fresh complete top-of-book and displayed depth >= rung quantity",
+        "quote_max_age_seconds": DRY_QUOTE_MAX_AGE_S,
+        "fee_treatment": "excluded_no_exchange_fill",
+        "limitations": [
+            "A quote hit is a paper fill, not a Kalshi exchange fill.",
+            "Queue position, quote cancellation, hidden liquidity, and fees are not modeled.",
+            "P&L uses the pre-posted rung limit rather than favorable price improvement.",
+        ],
+        "shadow_signals_started": len(records),
+        "active_shadow_markets": sum(rec.get("result") == "pending" for rec in records),
+        "settled_signal_markets": len(directional),
+        "unfilled_shadow_markets": sum(rec.get("result") == "UNFILLED" for rec in records),
+        "filled_market_trades": len(filled),
+        "directional_wins": directional_wins,
+        "directional_losses": len(directional) - directional_wins,
+        "directional_win_rate": round(directional_wins / len(directional), 6) if directional else None,
+        "winning_trades": wins,
+        "losing_trades": len(filled) - wins,
+        "win_rate": round(wins / len(filled), 6) if filled else None,
+        "total_simulated_cost": round(sum(costs), 6),
+        "net_profit": round(sum(pnls), 6),
+        "return_on_simulated_capital": round(sum(pnls) / sum(costs), 6) if sum(costs) else None,
+        "average_profit_per_filled_market": round(sum(pnls) / len(pnls), 6) if pnls else None,
+        "largest_winning_trade": round(max(pnls, default=0.0), 6),
+        "largest_losing_trade": round(min(pnls, default=0.0), 6),
+        "profit_factor": round(gross_win / gross_loss, 6) if gross_loss else None,
+        "maximum_drawdown": round(max_drawdown, 6),
+        "longest_winning_streak": streaks["longest_win"],
+        "longest_losing_streak": streaks["longest_loss"],
+        "rung_performance": inverse_shadow_rung_performance(records),
+    }
+
+
+class InverseProphetShadowTracker:
+    """Separate durable ledger for paper-only inverse Prophet ladders."""
+
+    def __init__(self, history_path: str, report_path: str):
+        self.history_path = history_path
+        self.report_path = report_path
+        self.trades: list[dict] = []
+        self._load()
+
+    def _load(self) -> None:
+        if not os.path.exists(self.history_path):
+            return
+        try:
+            with open(self.history_path, "r", encoding="utf-8") as fh:
+                payload = json.load(fh)
+            self.trades = payload if isinstance(payload, list) else []
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Could not read inverse Prophet shadow ledger %s: %s", self.history_path, exc)
+
+    def already_shadowed(self, ticker: str) -> bool:
+        return any(str(rec.get("ticker")) == ticker for rec in self.trades)
+
+    def find_pending(self) -> list[dict]:
+        return [rec for rec in self.trades if rec.get("result") == "pending"]
+
+    def record_open(self, rec: dict) -> bool:
+        if self.already_shadowed(str(rec.get("ticker") or "")):
+            return False
+        self.trades.append(rec)
+        self.save()
+        return True
+
+    def settle(self, rec: dict, result: str, pnl: float) -> None:
+        rec["result"] = result
+        rec["profit_loss"] = round(float(pnl), 4)
+        self.save()
+
+    def save(self) -> None:
+        try:
+            with open(self.history_path, "w", encoding="utf-8") as fh:
+                json.dump(self.trades, fh, indent=2, default=str)
+            with open(self.report_path, "w", encoding="utf-8") as fh:
+                json.dump(inverse_shadow_performance(self.trades), fh, indent=2, default=str)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Could not write inverse Prophet shadow ledger/report: %s", exc)
+
+
+# Module-level ledgers (created here so all coroutines share them).
 tracker = PerformanceTracker(TRADE_HISTORY_FILE, TRADED_TICKERS_FILE)
+inverse_shadow_tracker = InverseProphetShadowTracker(
+    INVERSE_PROPHET_SHADOW_HISTORY_FILE, INVERSE_PROPHET_SHADOW_REPORT_FILE)
+
+
+def ledger_for_record(rec: dict):
+    return inverse_shadow_tracker if rec.get("trade_kind") == "BTC_PROPHET_INVERSE_SHADOW" else tracker
 
 
 def print_performance() -> None:
@@ -1144,6 +1310,40 @@ def print_performance() -> None:
         f"{last_block}"
         "╚════════════════════════════════════════════════════════════"
     )
+
+
+def print_inverse_prophet_shadow_performance() -> None:
+    """Log the inverse experiment independently from Prophet's primary P&L."""
+    report = inverse_shadow_performance(inverse_shadow_tracker.trades)
+    directional_rate = (
+        "n/a" if report["directional_win_rate"] is None
+        else f"{100 * report['directional_win_rate']:.1f}%"
+    )
+    roi = (
+        "n/a" if report["return_on_simulated_capital"] is None
+        else f"{100 * report['return_on_simulated_capital']:.1f}%"
+    )
+    log.info(
+        "\n"
+        "╔═══ BTC PROPHET INVERSE SHADOW — PAPER ONLY ════════════════\n"
+        f"║  Signals Started : {report['shadow_signals_started']}\n"
+        f"║  Active / Settled: {report['active_shadow_markets']} / {report['settled_signal_markets']}\n"
+        f"║  Directional W/L : {report['directional_wins']} / {report['directional_losses']}\n"
+        f"║  Directional Rate: {directional_rate}\n"
+        f"║  Quote-filled    : {report['filled_market_trades']} markets; unfilled {report['unfilled_shadow_markets']}\n"
+        f"║  Simulated P&L   : ${report['net_profit']:+,.4f}  (fees excluded)\n"
+        f"║  Simulated ROI   : {roi}\n"
+        f"║  Max Drawdown    : ${-report['maximum_drawdown']:,.4f}\n"
+        "║  Fill evidence   : fresh complete top-of-book + displayed depth only\n"
+        "╚════════════════════════════════════════════════════════════"
+    )
+    for level, rung in report["rung_performance"].items():
+        log.info(
+            "INVERSE PROPHET SHADOW RUNG | %sc paper_orders=%d quote_hits=%d contracts=%.2f "
+            "winners=%d losers=%d net=$%+.4f",
+            level, rung["paper_orders"], rung["quote_hits"], rung["filled_contracts"],
+            rung["winning_hits"], rung["losing_hits"], rung["net_profit"],
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1198,6 +1398,9 @@ async def report_portfolio(rest: KalshiREST) -> None:
     )
     print_performance()
     print_active_ladder_status()
+    if INVERSE_PROPHET_SHADOW_ENABLED:
+        print_inverse_prophet_shadow_performance()
+        print_active_inverse_prophet_shadow_status()
 
 
 async def portfolio_reporter(rest: KalshiREST) -> None:
@@ -1240,6 +1443,8 @@ async def _settle_record_if_ready(rest: KalshiREST, rec: dict) -> bool:
     # Another task can settle while this coroutine awaits get_market.
     if rec.get("result") != "pending":
         return True
+    ledger = ledger_for_record(rec)
+    rec["market_result"] = result
     win = (result == str(rec["side"]).lower())
     filled_rungs = [r for r in rec.get("rungs", []) if _f(r.get("fill_count"), 0.0) > 0.0]
     count = sum(_f(r.get("fill_count"), bet_count()) for r in filled_rungs)
@@ -1251,8 +1456,9 @@ async def _settle_record_if_ready(rest: KalshiREST, rec: dict) -> bool:
         rec["result"] = "UNFILLED"
         rec["profit_loss"] = 0.0
         rec["exit_method"] = "market_closed_without_fill"
-        tracker.save()
-        log.info("UNFILLED | %s %s ladder had no filled contracts; excluded from win/loss P&L.",
+        ledger.save()
+        log.info("%s UNFILLED | %s %s ladder had no filled contracts; excluded from win/loss P&L.",
+                 "INVERSE PROPHET SHADOW" if rec.get("trade_kind") == "BTC_PROPHET_INVERSE_SHADOW" else "PRIMARY",
                  rec["ticker"], rec["side"])
         return True
     pnl = (count - cost) if win else -cost
@@ -1261,9 +1467,11 @@ async def _settle_record_if_ready(rest: KalshiREST, rec: dict) -> bool:
     rec["exit_method"] = "settlement"
 
     outcome = "WIN" if pnl > 0 else "LOSS"
-    tracker.settle(rec, outcome, pnl)
-    log.info("SETTLED %s  result=%s  our side=%s → %s  P&L $%+.4f",
-             rec["ticker"], result.upper(), rec["side"], outcome, pnl)
+    ledger.settle(rec, outcome, pnl)
+    log.info("%s SETTLED | %s result=%s side=%s → %s simulated_P&L=$%+.4f%s",
+             "INVERSE PROPHET SHADOW" if rec.get("trade_kind") == "BTC_PROPHET_INVERSE_SHADOW" else "PRIMARY",
+             rec["ticker"], result.upper(), rec["side"], outcome, pnl,
+             " (not an exchange fill; fees excluded)" if rec.get("trade_kind") == "BTC_PROPHET_INVERSE_SHADOW" else "")
     return True
 
 
@@ -1279,6 +1487,8 @@ async def settlement_checker(rest: KalshiREST) -> None:
     while True:
         await asyncio.sleep(SETTLE_CHECK_S)
         pending = tracker.find_pending()
+        if DRY_RUN:
+            pending += inverse_shadow_tracker.find_pending()
         if not pending:
             continue
         for rec in pending:
@@ -1335,7 +1545,7 @@ async def _refresh_ladder_fills(rest: KalshiREST, rec: dict) -> None:
         except Exception as exc:  # noqa: BLE001
             log.warning("Ladder order lookup failed for %s: %s", order_id, exc)
     if changed:
-        tracker.save()
+        ledger_for_record(rec).save()
 
 
 def _simulate_dry_ladder_fills(rec: dict) -> None:
@@ -1383,16 +1593,17 @@ def _simulate_dry_ladder_fills(rec: dict) -> None:
             remaining_depth -= count
             consumed_depth[quote_id] = round(quote["displayed_depth"] - remaining_depth, 2)
             log.info(
-                "DRY EXECUTABLE RUNG HIT | %s locked_%s %s=$%.4f depth=%.2f "
+                "%s | %s locked_%s %s=$%.4f depth=%.2f "
                 "age=%.3fs reached $%.2f; paper fill %.2f shares at limit "
                 "(not an exchange fill).",
+                "INVERSE PROPHET SHADOW RUNG HIT" if rec.get("trade_kind") == "BTC_PROPHET_INVERSE_SHADOW" else "DRY EXECUTABLE RUNG HIT",
                 rec["ticker"], rec["side"], quote["executable_field"],
                 quote["executable_yes_price"], quote["displayed_depth"],
                 quote["quote_age_seconds"], level, count)
             changed = True
     if changed:
         rec["last_dry_quote_state"] = quote_state
-        tracker.save()
+        ledger_for_record(rec).save()
 
 
 def print_active_ladder_status() -> None:
@@ -1423,6 +1634,34 @@ def print_active_ladder_status() -> None:
                  rungs)
 
 
+def print_active_inverse_prophet_shadow_status() -> None:
+    """Log the opposite-side paper ladder without confusing it with primary fills."""
+    pending = inverse_shadow_tracker.find_pending()
+    if not pending:
+        log.info("INVERSE PROPHET SHADOW STATUS | no active paper inverse ladder.")
+        return
+    for rec in pending:
+        unfilled = [
+            rung for rung in rec.get("rungs", [])
+            if _f(rung.get("fill_count"), 0.0) < _f(rung.get("count"), 0.0) - 0.005
+        ]
+        required_count = min(
+            (_f(rung.get("count"), bet_count()) for rung in unfilled), default=bet_count())
+        quote, quote_state = fresh_executable_dry_quote(rec["ticker"], rec["side"], required_count)
+        rungs = ", ".join(
+            f"${_f(rung.get('economic_price')):.2f}:{rung.get('status')}"
+            for rung in rec.get("rungs", [])) or "none"
+        log.info(
+            "INVERSE PROPHET SHADOW STATUS | ticker=%s source_prophet_side=%s shadow_side=%s "
+            "executable_side_price=%s quote_state=%s quote_age_s=%s rungs=[%s] no exchange order.",
+            rec["ticker"], rec.get("source_prophet_side", "?"), rec["side"],
+            f"${quote['economic_price']:.4f}" if quote is not None else "unavailable",
+            quote_state,
+            f"{quote['quote_age_seconds']:.3f}" if quote is not None else "unavailable",
+            rungs,
+        )
+
+
 async def _cancel_open_ladder_orders(rest: KalshiREST, rec: dict) -> None:
     """Cancel only this market's remaining GTC orders after close."""
     if rec.get("ladder_cancel_attempted"):
@@ -1442,7 +1681,81 @@ async def _cancel_open_ladder_orders(rest: KalshiREST, rec: dict) -> None:
         except Exception as exc:  # noqa: BLE001
             # It is normal for an already-filled/expired order to reject cancel.
             log.info("GTC ladder cancel skipped for %s: %s", order_id, exc)
-    tracker.save()
+    ledger_for_record(rec).save()
+
+
+def opposite_position_side(side: str) -> Optional[str]:
+    normalized = str(side).lower()
+    if normalized == "yes":
+        return "no"
+    if normalized == "no":
+        return "yes"
+    return None
+
+
+def create_inverse_prophet_shadow(primary: dict) -> Optional[dict]:
+    """Paper-post the opposite frozen Prophet side without an order request.
+
+    The primary record already contains the causal pre-open forecast, strike,
+    and locked side. Reusing that immutable snapshot prevents the shadow from
+    creating a late or price-selected opposite signal.
+    """
+    if not INVERSE_PROPHET_SHADOW_ENABLED:
+        return None
+    ticker = str(primary.get("ticker") or "")
+    source_side = str(primary.get("side") or "").lower()
+    shadow_side = opposite_position_side(source_side)
+    if not ticker or shadow_side is None or inverse_shadow_tracker.already_shadowed(ticker):
+        return None
+    count = _f(primary.get("bet_amount_shares"), bet_count())
+    shadow = {
+        "ticker": ticker,
+        "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+        "settle_et": primary.get("settle_et", ""),
+        "source_prophet_side": source_side.upper(),
+        "side": shadow_side.upper(),
+        "decision_basis": "paper_only_inverse_of_frozen_prophet_side",
+        "source_decision_basis": primary.get("decision_basis"),
+        "btc_entry": primary.get("btc_entry"),
+        "strike": primary.get("strike"),
+        "p50_prediction": primary.get("p50_prediction"),
+        "forecast_horizon_minutes": primary.get("forecast_horizon_minutes"),
+        "forecast_created_at": primary.get("forecast_created_at"),
+        "forecast_data_end": primary.get("forecast_data_end"),
+        "forecast_bands": primary.get("forecast_bands"),
+        "trade_kind": "BTC_PROPHET_INVERSE_SHADOW",
+        "mode": "paper_only_no_exchange_orders",
+        "bet_amount_shares": round(count, 2),
+        "ladder_levels": list(LADDER_LEVELS),
+        "rungs": [
+            {
+                "economic_price": level,
+                "count": round(count, 2),
+                "fill_count": 0.0,
+                "fill_economic_price": None,
+                "status": "simulated_resting",
+                "order_id": None,
+                "time_in_force": "paper_only_no_order",
+            }
+            for level in LADDER_LEVELS
+        ],
+        "paper_posted_rungs": len(LADDER_LEVELS),
+        "count": 0.0,
+        "entry_price": 0.0,
+        "order_submitted": "none — paper-only inverse shadow",
+        "exit_method": "pending",
+        "dry_run": True,
+        "result": "pending",
+        "profit_loss": 0.0,
+    }
+    if inverse_shadow_tracker.record_open(shadow):
+        log.info(
+            "INVERSE PROPHET SHADOW STARTED | %s source_prophet=%s shadow=%s rungs=$0.40/$0.30/$0.20/$0.10 "
+            "qty=%.2f; paper only, no exchange order.",
+            ticker, source_side.upper(), shadow_side.upper(), count,
+        )
+        return shadow
+    return None
 
 
 async def execute_locked_ladder(rest: KalshiREST, ct: str) -> None:
@@ -1539,6 +1852,9 @@ async def execute_locked_ladder(rest: KalshiREST, ct: str) -> None:
         "result": "pending", "profit_loss": 0.0,
     }
     tracker.record_open(rec)
+    # This must follow the primary record creation so it inherits exactly the
+    # frozen Prophet decision. It never calls _submit or creates an order ID.
+    create_inverse_prophet_shadow(rec)
     log.info("%s | %s %s accepted=%d/%d. The side remains locked through settlement.",
              "GTC LADDER PAPER-POSTED" if DRY_RUN else "GTC LADDER POSTED",
              ct, side.upper(), accepted_rungs, len(LADDER_LEVELS))

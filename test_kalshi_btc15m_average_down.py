@@ -36,6 +36,7 @@ from kalshi_btc15m_average_down import (
     market_record,
     market_asks,
     managed_mechanical_order_role,
+    model_transition_side_comparison,
     ml_live_directional_performance,
     inverse_shadow_performance,
     normalized_order_status,
@@ -354,6 +355,54 @@ class MechanicalAverageDownTests(unittest.TestCase):
         self.assertEqual((summary["settled_markets"], summary["directional_wins"], summary["directional_losses"]), (2, 1, 1))
         self.assertEqual(summary["directional_win_rate"], 0.5)
         self.assertEqual(summary["average_model_confidence"], 0.6)
+
+    def test_model_transition_summary_counts_same_and_changed_frozen_sides(self):
+        state = {"markets": {
+            "changed": {
+                "settlement_outcome": "no",
+                "ml_model_transition": {
+                    "previous_model_run_id": "old", "current_model_run_id": "new",
+                    "previous_side": "yes", "current_side": "no", "probability_yes_delta": -0.24,
+                },
+            },
+            "same": {
+                "settlement_outcome": "no",
+                "ml_model_transition": {
+                    "previous_model_run_id": "old", "current_model_run_id": "new",
+                    "previous_side": "no", "current_side": "no", "probability_yes_delta": 0.03,
+                },
+            },
+        }}
+        summary = model_transition_side_comparison(state)
+        self.assertEqual(len(summary["comparisons"]), 1)
+        comparison = summary["comparisons"][0]
+        self.assertEqual((comparison["compared_markets"], comparison["same_side"], comparison["side_changed"]), (2, 1, 1))
+        self.assertEqual((comparison["yes_to_no"], comparison["no_to_yes"]), (1, 0))
+        self.assertEqual((comparison["previous_directional_wins"], comparison["current_directional_wins"]), (1, 2))
+        self.assertEqual(comparison["current_minus_previous_directional_wins"], 1)
+
+    def test_transition_comparator_scores_predecessor_on_the_same_vector(self):
+        class PreviousModel:
+            def predict_proba(self, _vector):
+                return [[0.63, 0.37]]
+
+        selector = object.__new__(MLDirectionSelector)
+        selector.previous_model_path = "previous-model.joblib"
+        selector.previous_model_run_id = "old-model"
+        selector.model_run_id = "new-model"
+        selector.previous_model = None
+        selector.previous_model_load_failed = False
+        selector.previous_model_metadata = {"model_type": "logistic_regression"}
+        selector.model_metadata = {"model_type": "logistic_regression"}
+        comparison = selector._model_transition_comparison(
+            SimpleNamespace(load_saved_model=lambda _path: PreviousModel()),
+            [[1.0] * 16], 0.62, "yes",
+        )
+        self.assertIsNotNone(comparison)
+        assert comparison is not None
+        self.assertEqual((comparison["previous_side"], comparison["current_side"]), ("no", "yes"))
+        self.assertTrue(comparison["side_changed"])
+        self.assertEqual(comparison["probability_yes_delta"], 0.25)
 
     def test_zero_contract_finalization_is_excluded_from_performance(self):
         state = {"markets": {
