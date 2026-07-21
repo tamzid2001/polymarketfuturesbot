@@ -3,7 +3,7 @@
 The repository contains the original futures and Prophet runners, plus two separately controlled mechanical average-down strategies:
 
 1. **Polymarket Futures Bot** (`polymarket_bot.py`) — WebSocket-driven take-profit and re-entry bot for Polymarket US Futures markets (MLB World Series 2026 focus).
-2. **Kalshi BTC 15-Min Prophet Bot** (`kalshibtc15minupordown.py`) — pre-forecasts BTC two minutes before each new Kalshi market opens with a fixed 17-minute horizon, then compares the cached p50 with the live strike immediately at the open. [Jump to docs ↓](#kalshi-btc-15-minute-prophet-bot)
+2. **Kalshi BTC 15-Min Prophet BTC-Only Ladder** (`kalshibtc15minupordown.py`, alias `kalshi_btc15m_prophet_btc_only.py`) — pre-forecasts BTC two minutes before each new Kalshi market opens, locks one forecast-selected side, and pre-posts that side's fixed 40¢/30¢/20¢/10¢ GTC ladder. It contains no ETH contract, hedge, multiplier, or loss-progression path. [Jump to docs ↓](#kalshi-btc-15-minute-prophet-bot)
 3. **Kalshi BTC 15-Min ML-Side Mechanical Average-Down Bot** (`kalshi_btc15m_average_down.py`) — continuous KXBTC15M-only runner. A stored ML inference selects YES or NO before opening; when the market opens, it immediately posts that side's 40¢/30¢/20¢/10¢ economic GTC ladder through settlement. [Jump to docs ↓](#kalshi-btc-15-minute-mechanical-average-down-runner)
 4. **Polymarket US MLB Average-Down Bot** (`polymarket_mlb_average_down.py`) — continuous dry-monitoring runner for same-day MLB full-game moneylines. Its default `mechanical` mode takes no baseball prediction: it snapshots both team costs, waits for the first team to trade 10¢ below its own snapshot, and records the resulting mechanical ladder audit. An explicitly configured `ml_side_average_down` mode is available only after the separate leakage-safe research pipeline produces a versioned model artifact; it freezes one ML-selected team and never substitutes or reverses to the other team. Scheduled runs cannot place orders; a separate manual switch permits a one-off live run.
 
@@ -365,13 +365,14 @@ polymarketfuturesbot/
 ├── markets.json                # Polymarket source of truth: markets to track/enter
 ├── state.json                  # Polymarket persisted state
 ├── requirements.txt            # Polymarket pip dependencies
-├── kalshibtc15minupordown.py   # Kalshi bot: Prophet 15-min BTC forecast strategy
-├── test_kalshi_bot.py          # Kalshi QA: data, forecast, auth, order build (no orders)
+├── kalshibtc15minupordown.py   # Kalshi bot: Prophet BTC-only locked GTC ladder
+├── kalshi_btc15m_prophet_btc_only.py # Explicit BTC-only entry-point alias
+├── test_kalshi_bot.py          # Static safety checks: locked side, GTC rungs, no active ETH/multiplier path
 ├── kalshi_btc15m_backtest.py   # Read-only historical KXBTC15M Prophet + ML backtest
 ├── test_kalshi_backtest.py     # Offline tests for the historical backtest helpers
 ├── requirements_kalshi.txt     # Kalshi pip dependencies (prophet, yfinance, ...)
-├── trade_history.json          # Kalshi trade journal (committed back by the workflow)
-├── traded_market_tickers.json  # Kalshi one-order-per-window dedupe store
+├── prophet_btc_only_trade_history.json          # Prophet BTC-only ladder journal, when created
+├── prophet_btc_only_traded_market_tickers.json  # Prophet BTC-only dedupe store, when created
 └── .github/
     └── workflows/
         ├── polymarket_monitor.yml   # Polymarket continuous bot (5h45m loop, daily cron)
@@ -396,19 +397,16 @@ polymarketfuturesbot/
 
 # Kalshi BTC 15-Minute Prophet Bot
 
-`kalshibtc15minupordown.py` — fully async. Two minutes before each new
-`KXBTC15M` market opens (for example, `xx:43` before the `xx:45` open), it
-creates a fixed **17-step** BTC forecast with **Facebook Prophet**. As soon as
-the market opens, it compares the forecast p50 with the live Kalshi strike and
-places exactly **one BTC entry per 15-minute window**, sized in **shares**
-(`BET_AMOUNT_SHARES`, default 2 contracts — NOT dollars). A settled BTC-primary
-loss activates the next BTC entry's BTC/ETH hedge protocol: paired shares start
-at `ARBITRAGE_SHARES` (default 10). They scale by `LOSS_MULTIPLIER` only when
-the preceding paired BTC trade also lost **and** zero ETH shares filled; a BTC
-win resets the escalation. Immediately after the BTC fill, the bot
-submits a resting opposite-side limit in the matching `KXETH15M` market, with
-an expiry at settlement, that keeps BTC entry + ETH hedge at 90 cents or less.
-Positions ride to settlement; there is no take-profit monitor.
+`kalshibtc15minupordown.py` — fully async. The explicit
+`kalshi_btc15m_prophet_btc_only.py` alias has the same behavior. Two minutes
+before each new `KXBTC15M` market opens, it creates a fixed **17-step** BTC
+forecast with **Facebook Prophet**. At the fresh market open it compares the
+forecast p50 with the live strike, locks exactly one BTC side, then immediately
+pre-posts four market-close-expiring GTC limits at **40¢, 30¢, 20¢, and 10¢
+economic cost** on that one side. Every rung uses `BET_AMOUNT_SHARES` (default
+**1 contract**, not dollars). It never submits the opposite side and has no ETH
+contract, hedge, multiplier, or loss-progression rule. Positions ride to
+settlement; there is no take-profit monitor.
 
 > The previous version of this bot used an Alpaca price feed and a momentum
 > signal (delta vs a rolling 60-second average). That strategy — and the Alpaca
@@ -440,47 +438,38 @@ For every 15-minute Kalshi window:
 5. **At market open**, resolve the newly-live `KXBTC15M` market and its strike
    (`floor_strike`), then immediately use the cached forecast to **decide**.
    A missing cache skips the market rather than running a slow live forecast
-   (one order, never re-entered — deduped via
-   `traded_market_tickers.json`, which survives restarts):
+   (one locked side, never reversed — deduped via
+   `prophet_btc_only_traded_market_tickers.json`, which survives restarts):
 
    ```
    forecast p50 > live strike   →  BUY YES  (UP)
    forecast p50 < live strike   →  BUY NO   (DOWN)
    ```
 
-   If the preceding BTC market's result arrives just after the opening, the
-   bot does not delay or skip the live entry. It reconciles that same BTC
-   record as soon as the loss is published, topping it up to the required pair
-   size and then submitting the matched ETH limit.
 
-6. **ETH hedge after a settled BTC loss** — the next BTC entry uses the
-   `ARBITRAGE_SHARES` base of 10 contracts. It multiplies that paired amount
-   only when the prior paired BTC bet lost and zero ETH shares filled. A BTC
-   profit clears escalation, and normal BTC-only bets always stay at
-   `BET_AMOUNT_SHARES`. Immediately after BTC fills, the bot submits a
-   settlement-expiring limit in the matching `KXETH15M` ticker for the
-   opposite ETH side, at a price that keeps paired cost at or below `$0.90`.
-   Example: BTC YES fills at `$0.60`; ETH NO target is
-   `1 - 0.60 - 0.10 = $0.30`. For BTC NO, the bot submits ETH YES the same way.
-7. **Log everything**: forecast-time BTC close vs strike vs p50, p50 vs the
-   live strike, the 80% CI bands, the interpolated percentile of both the
-   forecast-time close and the live strike within the forecast distribution,
-   and ETH hedge submission/fill lines when hedge mode is active.
-8. **Settle**: a background task polls settled markets and records WIN/LOSS +
-   P&L into `trade_history.json`. BTC-primary and ETH-hedge fills settle as
-   independent records.
+6. **Pre-post the locked ladder** — submit one `good_till_canceled` order at
+   each fixed economic cost `$0.40`, `$0.30`, `$0.20`, and `$0.10`, each with
+   the market's explicit close as expiry. YES uses the matching YES bid. NO is
+   represented by an equivalent YES ask (`NO 40¢` appears as `YES sell 60¢` in
+   Kalshi's dashboard); economically it is still the locked NO contract, not a
+   hedge or reversal.
+7. **Log everything**: forecast-time BTC close vs strike vs p50, the locked
+   side, all four GTC order IDs/fills, and the fixed rung costs. The current
+   market has no ETH-related log or order.
+8. **Settle**: at close the runner explicitly cancels remaining owned GTC
+   orders, refreshes the four fill counts, and records WIN/LOSS plus P&L only
+   for filled BTC contracts. A fully unfilled ladder is recorded as
+   `UNFILLED`, not a loss.
 
 ## Performance tracking
 
-Every portfolio report (every 30 s) prints the full stats block from
-`trade_history.json`: total trades, wins/losses, win rate, total/average
-return, largest win/loss, current + longest win/loss streaks, and max drawdown
-from the equity curve. It also prints a separate **BTC-primary** win/loss and
-streak block, so ETH hedge outcomes cannot obscure the BTC sequence controlling
-the next pair size, plus a leg breakdown with BTC-primary vs ETH-hedge P&L. Every trade records its
-`trade_kind` (`BTC_PRIMARY` / `ETH_HEDGE`) and settlement result.
-Both JSON state files are **committed back to the repo by the workflow after
-every run**, so statistics accumulate across the 5 h 45 m restart chain.
+Every portfolio report (every 30 s) prints the full BTC-only stats block from
+`prophet_btc_only_trade_history.json`: filled-ladder trades, wins/losses, win
+rate, total/average return, largest win/loss, current + longest win/loss
+streaks, and maximum drawdown. Every record identifies the locked side and its
+four rung states; no cross-market or loss-sizing state is persisted.
+The files are separate from the ML-side runner's history. A future dedicated
+workflow must persist them explicitly; this change does not start one.
 
 ## Setup
 
@@ -497,22 +486,17 @@ Environment **variables** (not secrets) tune behavior:
 | Variable | Default | Description |
 |---|---|---|
 | `DRY_RUN` | `true` | **Live-money switch.** `false` → real orders |
-| `BET_AMOUNT_SHARES` | `2` | BTC-only contracts (**shares — NOT dollars**) bought per order; this base is never multiplied |
-| `ARBITRAGE_SHARES` | `10` | Base paired BTC/ETH hedge contracts used after a settled BTC loss |
-| `LOSS_MULTIPLIER` | `2` | Multiplies `ARBITRAGE_SHARES` only after a paired BTC loss where zero ETH shares filled |
-| `ETH_HEDGE_POLL_S` | `5` | ETH order-fill reconciliation cadence (seconds) |
+| `BET_AMOUNT_SHARES` | `1` | BTC contracts per each of the four fixed rungs (**shares — NOT dollars**) |
 | `HISTORY_MINUTES` | `500` | 1-minute candles fed to Prophet |
 | `FORECAST_MINUTES` | `17` | Fixed Prophet horizon in one-minute timesteps for every cached forecast |
 | `PREOPEN_FORECAST_LEAD_S` | `120` | Seconds before the next market opens to pre-compute its 17-step forecast |
-| `OPEN_TRADE_GRACE_S` | `15` | Max seconds after a market opens to place the entry. Every manual, scheduled, and handoff run skips an older market and waits for the next live opening. |
+| `OPEN_TRADE_GRACE_S` | `45` | Max seconds after a market opens to start the locked GTC ladder. An older market is skipped rather than receiving late orders. |
 | `SETTLE_CHECK_S` | `2` | Settlement polling cadence (seconds), independent of the opening order path |
 | `UNCERTAINTY_SAMPLES` | `1000` | Prophet uncertainty samples (80% CI) |
 
-**One-run overrides** — the **Run workflow** dialog on `kalshi_monitor.yml`
-accepts four optional inputs: `dry_run`, `bet_amount_shares`,
-`arbitrage_shares`, `loss_multiplier`. The 5 h 45 m handoff re-dispatches with
-the effective values so manual overrides persist through the chained runs;
-scheduled fallback runs use the GitHub environment variables/defaults above.
+**One-run overrides** — the BTC-only code reads only `DRY_RUN` and
+`BET_AMOUNT_SHARES`. It deliberately ignores any legacy hedge or multiplier
+environment variable. There is no scheduled Prophet workflow configured.
 
 ## QA before launch
 
@@ -521,26 +505,19 @@ Build"** → Run workflow.
 
 The suite runs checks against live credentials — Kalshi auth/balance, a real
 yfinance download + validation, a real Prophet fit with band sanity checks,
-order construction, the tracker round-trip, and the ETH hedge price/side math —
-and **force-overrides DRY_RUN in-process so it can never submit an order**.
+and static verification that the active path locks one side and posts the four
+GTC rungs — and **force-overrides DRY_RUN in-process so it can never submit an
+order**.
 Exit code is non-zero on any critical failure.
 
-## Workflow continuity (Kalshi)
+## Workflow safety (Kalshi Prophet ladder)
 
-`kalshi_monitor.yml` mirrors the Polymarket chain:
-
-1. Bot exits cleanly at **5 h 45 min** (`RUNTIME_LIMIT_MIN=345`).
-2. **Persist State** commits `trade_history.json` + `traded_market_tickers.json`
-   back to `main` (`[skip ci]`) — runs even if the bot crashed.
-3. **Re-trigger** dispatches the next run via `GH_PAT`; the fresh checkout
-   already contains the persisted state, so a restart mid-window can never
-   double-trade (the dedupe store blocks it) and pending trades are settled by
-   the next run.
-4. The `kalshi-bot-singleton` concurrency group keeps at most one run active.
-5. If a run fails, the every-6-hours cron (`11 */6 * * *`) restarts the chain.
-   A restart may begin mid-window, but the bot only enters a market with Kalshi
-   status `active` during its first `OPEN_TRADE_GRACE_S` seconds; otherwise it
-   pre-forecasts and waits for the next opening.
+The old hedged Prophet execution workflow was removed so it cannot overlap the
+ML-side BTC runner. This BTC-only Prophet ladder has **no scheduled workflow
+and is not started by this change**. If it is ever given a dedicated workflow,
+that workflow must persist `prophet_btc_only_trade_history.json` and
+`prophet_btc_only_traded_market_tickers.json`, use a unique concurrency group,
+and keep `DRY_RUN=true` unless live trading is explicitly authorized.
 
 ## Running locally
 

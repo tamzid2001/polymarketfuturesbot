@@ -18,19 +18,15 @@ STRATEGY  (Prophet 15-minute BTC forecast)
        timesteps forward. The settlement median (yhat, back-transformed with
        exp) is the "p50".
     4. As soon as the new market is live, detects its live strike
-       (floor_strike) and decides ONE trade for the window:
+       (floor_strike) and locks ONE side for the full window:
             p50 forecast  >  live strike   →  BUY YES  (UP)
             p50 forecast  <  live strike   →  BUY NO   (DOWN)
-    5. A settled BTC loss activates the next BTC/ETH hedge protocol at
-       ARBITRAGE_SHARES. It scales that paired size only after a BTC/ETH
-       protocol trade itself settles as a BTC loss and zero ETH shares filled.
-       A BTC win resets this escalation. Immediately after the BTC fill,
-       the bot submits a resting opposite-side KXETH15M limit that expires at
-       that market's settlement and keeps BTC entry + ETH hedge <= $0.90 per
-       paired contract. Example: BTC YES fills at $0.60, so ETH NO is targeted
-       at $0.30 (1 - 0.60 - 0.10).
-    6. Records filled BTC entries and filled ETH hedges, then lets positions
-       ride to settlement. There is no take-profit monitor.
+    5. Immediately pre-posts four same-side, market-close-expiring GTC limits
+       at the fixed economic costs $0.40, $0.30, $0.20, and $0.10.  The
+       opposite side is never submitted, and the four rungs use the same fixed
+       BET_AMOUNT_SHARES count.  Remaining orders are canceled at close.
+    6. Records BTC fills and lets positions ride to settlement. There is no
+       ETH contract, hedge, loss progression, multiplier, or take-profit path.
 
   Exactly one BTC entry per 15-minute window (never re-enters the same BTC
   contract). Prophet also yields the 80% confidence interval (p10/p90) around
@@ -42,7 +38,7 @@ DATA SOURCES
   • Yahoo Finance (yfinance) → 1-minute BTC-USD OHLC history (24/7)
   • Kalshi market WebSocket  → live ticker/trade for the active contract
   • Kalshi REST (kalshi-python-async, V2) → market metadata (strike/result),
-                               balance, MARKET orders
+                               balance, GTC limit orders
 
 TICKER FORMAT  (US EASTERN time, auto-DST — NOT UTC)
 ─────────────────────────────────────────────────────
@@ -62,27 +58,24 @@ CREDENTIALS / SETTINGS (env vars)
     KALSHI_API_KEY_ID / KALSHI_PEM_PATH (or KALSHI_PRIVATE_KEY content)
     KALSHI_DEMO            "true" for sandbox (default false)
     DRY_RUN               "true" (default) — log orders, do not submit
-    BET_AMOUNT_SHARES     BTC-only contracts (shares) bought per order, fractional
-                          at 0.01 granularity (default 2)
-    ARBITRAGE_SHARES     base paired BTC/ETH hedge contracts after a settled
-                          BTC loss (default 10)
-    LOSS_MULTIPLIER       multiplies ARBITRAGE_SHARES only after an unfilled
-                          ETH hedge and BTC loss in the BTC/ETH protocol (default 2)
-    ETH_HEDGE_POLL_S      ETH hedge monitor cadence (default 5s)
+    BET_AMOUNT_SHARES     BTC contracts (shares) per each of the four fixed
+                          same-side ladder rungs, fractional at 0.01 granularity
+                          (default 1; not dollars)
     HISTORY_MINUTES       1-min candles pulled per forecast (default 500)
     FORECAST_MINUTES      fixed Prophet forecast horizon in minutes (default 17)
     PREOPEN_FORECAST_LEAD_S
                           seconds before the next window opens to pre-compute
                           its settlement forecast (default 120)
-    OPEN_TRADE_GRACE_S    max seconds after a window opens to submit its entry
-                          (default 15; only enter a newly-live market)
+    OPEN_TRADE_GRACE_S    max seconds after a window opens to start the fresh
+                          locked-side ladder (default 45; never start late)
     UNCERTAINTY_SAMPLES   Prophet uncertainty samples (default 1000)
     DATA_MAX_STALE_S      max age of newest candle before SKIP (default 600)
     YF_PERIOD             yfinance download period (default "2d")
     RUNTIME_LIMIT_MIN     clean-exit after N minutes (default 345 = 5h45m)
     REPORT_INTERVAL_S     performance/portfolio report cadence (default 30)
-    TRADE_HISTORY_FILE    settled-trade journal (default trade_history.json)
-    TRADED_TICKERS_FILE   per-window dedupe store (default traded_market_tickers.json)
+    TRADE_HISTORY_FILE    BTC-only ladder journal (default prophet_btc_only_trade_history.json)
+    TRADED_TICKERS_FILE   BTC-only per-window dedupe store
+                          (default prophet_btc_only_traded_market_tickers.json)
     KALSHI_WS_VERBOSE     "true" — log every Kalshi WS message
 """
 
@@ -132,25 +125,12 @@ KALSHI_DEMO       = os.getenv("KALSHI_DEMO", "false").lower() in ("1", "true", "
 DRY_RUN           = os.getenv("DRY_RUN", "true").lower() in ("1", "true", "yes")
 
 # ── Bet sizing ──────────────────────────────────────────────────────────────
-# Buy exactly this many contracts (shares) per order, independent of price.
+# Buy exactly this many contracts (shares) per ladder rung, independent of price.
 # Kalshi's fixed-point API supports FRACTIONAL contract counts at 0.01
 # granularity (count_fp, sent as a 0–2 decimal string), so 0.01 — the exchange
 # minimum — is a valid order. See docs.kalshi.com fixed_point_migration.
-BET_AMOUNT_SHARES = float(os.getenv("BET_AMOUNT_SHARES", "2"))
-
-# ── BTC/ETH hedge protocol ──────────────────────────────────────────────────
-# Only after a settled BTC loss does the next BTC trade enter the paired hedge
-# path. That first paired trade uses ARBITRAGE_SHARES. The size escalates only
-# when a prior paired BTC trade loses and zero ETH shares filled; a BTC win
-# clears the escalation. The normal BTC-only BET_AMOUNT_SHARES is never
-# multiplied. Immediately after the BTC fill, it submits a resting opposite-side
-# KXETH15M limit through that market's settlement. The target keeps BTC entry +
-# ETH hedge <= ARBITRAGE_MAX_PAIR_COST.
-ARBITRAGE_SHARES      = float(os.getenv("ARBITRAGE_SHARES", "10"))
-LOSS_MULTIPLIER   = float(os.getenv("LOSS_MULTIPLIER", "2"))
-ARBITRAGE_DISCOUNT_USD = float(os.getenv("ARBITRAGE_DISCOUNT_USD", "0.10"))
-ARBITRAGE_MAX_PAIR_COST = float(os.getenv("ARBITRAGE_MAX_PAIR_COST", "0.90"))
-ETH_HEDGE_POLL_S      = float(os.getenv("ETH_HEDGE_POLL_S", "5"))
+BET_AMOUNT_SHARES = float(os.getenv("BET_AMOUNT_SHARES", "1"))
+LADDER_LEVELS = (0.40, 0.30, 0.20, 0.10)
 
 # ── Prophet / data settings ───────────────────────────────────────────────────
 HISTORY_MINUTES     = int(float(os.getenv("HISTORY_MINUTES", "500")))
@@ -159,7 +139,7 @@ UNCERTAINTY_SAMPLES = int(float(os.getenv("UNCERTAINTY_SAMPLES", "1000")))
 DATA_MAX_STALE_S    = float(os.getenv("DATA_MAX_STALE_S", "600"))   # newest candle age
 YF_PERIOD           = os.getenv("YF_PERIOD", "2d")
 PREOPEN_FORECAST_LEAD_S = float(os.getenv("PREOPEN_FORECAST_LEAD_S", "120"))
-OPEN_TRADE_GRACE_S      = float(os.getenv("OPEN_TRADE_GRACE_S", "15"))
+OPEN_TRADE_GRACE_S      = float(os.getenv("OPEN_TRADE_GRACE_S", "45"))
 
 RUNTIME_LIMIT_MIN = float(os.getenv("RUNTIME_LIMIT_MIN", "345"))
 REPORT_INTERVAL_S = float(os.getenv("REPORT_INTERVAL_S", "30"))    # report cadence
@@ -168,18 +148,12 @@ SETTLE_CHECK_S    = float(os.getenv("SETTLE_CHECK_S", "2"))        # settlement 
 STRIKE_RETRIES    = int(float(os.getenv("STRIKE_RETRIES", "8")))   # strike-resolution retries
 KALSHI_WS_VERBOSE = os.getenv("KALSHI_WS_VERBOSE", "false").lower() in ("1", "true", "yes")
 
-TRADE_HISTORY_FILE  = os.getenv("TRADE_HISTORY_FILE", "trade_history.json")
-TRADED_TICKERS_FILE = os.getenv("TRADED_TICKERS_FILE", "traded_market_tickers.json")
+TRADE_HISTORY_FILE  = os.getenv("TRADE_HISTORY_FILE", "prophet_btc_only_trade_history.json")
+TRADED_TICKERS_FILE = os.getenv("TRADED_TICKERS_FILE", "prophet_btc_only_traded_market_tickers.json")
 
-ORDER_TIF      = "immediate_or_cancel"   # marketable IOC == market order
-ETH_HEDGE_TIF  = "good_till_canceled"    # resting opposite limit until settlement
+ORDER_TIF      = "good_till_canceled"    # resting limit through market close
 SERIES_TICKER  = "KXBTC15M"
-ETH_SERIES_TICKER = "KXETH15M"
 YF_SYMBOL      = os.getenv("BTC_YF_SYMBOL", "BTC-USD")
-
-# Marketable buy prices (ensure the IOC crosses so a position actually opens).
-YES_BUY_PRICE  = "0.99"    # buy YES (BID) at the top of the book
-NO_BUY_PRICE   = "0.01"    # buy NO (ASK / sell YES) at the bottom of the book
 
 KALSHI_BASE_URL = (
     "https://demo-api.kalshi.co/trade-api/v2"
@@ -198,9 +172,8 @@ _QMAP = [("p10", 0.10), ("p50", 0.50), ("p90", 0.90)]
 
 
 def bet_count(bet_shares: Optional[float] = None) -> float:
-    """Contract count for one buy: the share amount itself, independent of
-    price (default BET_AMOUNT_SHARES; the strategy may pass a paired
-    arbitrage size). Kalshi's fixed-point API accepts fractional
+    """Contract count for one BTC ladder rung, independent of economic price.
+    Kalshi's fixed-point API accepts fractional
     counts at 0.01 granularity, so the count is floored to 0.01 steps and
     clamped to the 0.01 exchange minimum."""
     bet = BET_AMOUNT_SHARES if bet_shares is None else float(bet_shares)
@@ -691,27 +664,6 @@ def quote_position_price(ticker: str, side: str) -> Optional[float]:
     return position_price_from_yes(side, float(yes))
 
 
-def eth_hedge_target_price(btc_entry_price: float) -> Optional[float]:
-    """Max ETH opposite-side price that keeps paired cost <= configured cap."""
-    raw = min(
-        1.0 - float(btc_entry_price) - ARBITRAGE_DISCOUNT_USD,
-        ARBITRAGE_MAX_PAIR_COST - float(btc_entry_price),
-    )
-    target = math.floor(raw * 100 + 1e-9) / 100.0
-    if target < 0.01:
-        return None
-    return min(0.99, target)
-
-
-def eth_hedge_order(side: str, target_price: float) -> tuple[str, BookSide, str]:
-    """Return (ETH position side, Kalshi book side, API YES-term price)."""
-    eth_side = "no" if str(side).lower() == "yes" else "yes"
-    if eth_side == "yes":
-        return eth_side, BookSide.BID, f"{float(target_price):.2f}"
-    yes_price = min(0.99, max(0.01, round(1.0 - float(target_price), 2)))
-    return eth_side, BookSide.ASK, f"{yes_price:.2f}"
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Kalshi async REST wrapper
 # ─────────────────────────────────────────────────────────────────────────────
@@ -969,91 +921,6 @@ class PerformanceTracker:
     def find_pending(self) -> list:
         return [t for t in self.trades if t.get("result") == "pending"]
 
-    def current_loss_streak(self, series: str = SERIES_TICKER) -> int:
-        """Consecutive LOSSes at the tail of settled primary BTC history.
-
-        ETH hedge records are ignored; only BTC_PRIMARY records in the selected
-        series can activate or extend the BTC/ETH hedge protocol.
-        """
-        streak = 0
-        for t in reversed(self.trades):
-            if not str(t.get("ticker", "")).startswith(series):
-                continue
-            if t.get("trade_kind", "BTC_PRIMARY") != "BTC_PRIMARY":
-                continue
-            result = t.get("result")
-            if result == "LOSS":
-                streak += 1
-            elif result == "WIN":
-                break
-            else:
-                # An unbooked prior BTC result must not activate a hedge based
-                # on older history while the settlement checker is still polling.
-                break
-        return streak
-
-    def next_eth_hedge_state(self, series: str = SERIES_TICKER) -> dict:
-        """Return sizing state for the next BTC entry's optional ETH hedge.
-
-        A settled BTC loss arms the next BTC/ETH trade at ARBITRAGE_SHARES.
-        Escalation is deliberately narrower than a BTC loss streak: it occurs
-        only when the immediately preceding BTC/ETH trade lost and zero ETH
-        shares filled. A BTC win (or no settled BTC result) leaves the
-        next entry as the normal BTC-only base order.
-        """
-        latest = None
-        for rec in reversed(self.trades):
-            if not str(rec.get("ticker", "")).startswith(series):
-                continue
-            if rec.get("trade_kind", "BTC_PRIMARY") != "BTC_PRIMARY":
-                continue
-            latest = rec
-            break
-
-        state = {
-            "active": False,
-            "multiplier": 1.0,
-            "reason": "no_settled_btc_loss",
-            "previous_ticker": None,
-            "previous_result": None,
-            "previous_hedge_status": None,
-            "previous_hedge_filled_count": 0.0,
-        }
-        if latest is None:
-            return state
-
-        state["previous_ticker"] = latest.get("ticker")
-        result = str(latest.get("result", "pending")).upper()
-        state["previous_result"] = result
-        if result != "LOSS":
-            state["reason"] = (
-                "btc_win_resets_hedge_escalation" if result == "WIN"
-                else "previous_btc_not_settled"
-            )
-            return state
-
-        hedge = latest.get("eth_hedge")
-        hedge_status = hedge.get("status") if isinstance(hedge, dict) else None
-        hedge_filled_count = (_f(hedge.get("recorded_fill_count"), 0.0)
-                              if isinstance(hedge, dict) else 0.0)
-        state["previous_hedge_status"] = hedge_status
-        state["previous_hedge_filled_count"] = hedge_filled_count
-        state["active"] = True
-        state["reason"] = "settled_btc_loss_starts_eth_hedge"
-
-        # The first loss only starts the protocol. Subsequent multiplication
-        # needs a BTC/ETH-protocol loss and a completely unfilled ETH order.
-        # A partial ETH fill counts as a fill and therefore does not multiply.
-        eth_has_zero_fills = (hedge_status != "filled" and hedge_filled_count < 0.005)
-        if bool(latest.get("arbitrage_active")) and eth_has_zero_fills:
-            prior_multiplier = max(1.0, _f(latest.get("bet_multiplier"), 1.0))
-            state["multiplier"] = prior_multiplier * LOSS_MULTIPLIER
-            state["reason"] = "btc_loss_with_zero_fill_eth_hedge_escalates"
-        elif bool(latest.get("arbitrage_active")):
-            state["reason"] = "btc_loss_with_eth_fill_uses_arb_base"
-
-        return state
-
     def save(self) -> None:
         """Persist in-place record mutations from monitor tasks."""
         self._save_history()
@@ -1111,19 +978,6 @@ class PerformanceTracker:
 
         streaks = self._streak_metrics(settled)
 
-        # BTC-primary streaks are the trading sequence. ETH outcomes remain in
-        # aggregate figures, but never hide the BTC loss/win run used by sizing.
-        btc_settled = [
-            t for t in settled
-            if t.get("trade_kind", "BTC_PRIMARY") == "BTC_PRIMARY"
-            and str(t.get("ticker", "")).startswith(SERIES_TICKER)
-        ]
-        btc_total = len(btc_settled)
-        btc_wins = sum(1 for t in btc_settled if t["result"] == "WIN")
-        btc_losses = btc_total - btc_wins
-        btc_win_rate = (btc_wins / btc_total * 100.0) if btc_total else 0.0
-        btc_streaks = self._streak_metrics(btc_settled)
-
         # equity curve + max drawdown (starting balance 0)
         eq = peak = max_dd = 0.0
         for p in pnls:
@@ -1131,27 +985,11 @@ class PerformanceTracker:
             peak = max(peak, eq)
             max_dd = max(max_dd, peak - eq)
 
-        kinds = {"BTC_PRIMARY": 0, "ETH_HEDGE": 0, "OTHER": 0}
-        kind_pnl = {k: 0.0 for k in kinds}
-        for t in settled:
-            k = str(t.get("trade_kind") or "BTC_PRIMARY")
-            if k not in kinds:
-                k = "OTHER"
-            kinds[k] += 1
-            kind_pnl[k] += float(t.get("profit_loss", 0.0))
-
         return {
-            "kinds": kinds, "kind_pnl": kind_pnl,
             "total": total, "wins": wins, "losses": losses, "win_rate": win_rate,
             "total_return": total_return, "avg_return": avg_return,
             "largest_win": largest_win, "largest_loss": largest_loss,
             **streaks,
-            "btc_total": btc_total, "btc_wins": btc_wins,
-            "btc_losses": btc_losses, "btc_win_rate": btc_win_rate,
-            "btc_current_streak": btc_streaks["current_streak"],
-            "btc_current_kind": btc_streaks["current_kind"],
-            "btc_longest_win": btc_streaks["longest_win"],
-            "btc_longest_loss": btc_streaks["longest_loss"],
             "max_drawdown": max_dd,
             "last": settled[-1] if settled else None,
         }
@@ -1169,25 +1007,6 @@ def print_performance() -> None:
         streak_s = f"{s['current_streak']} losses"
     else:
         streak_s = "none"
-
-    if s["btc_current_kind"] == "WIN":
-        btc_streak_s = f"{s['btc_current_streak']} wins"
-    elif s["btc_current_kind"] == "LOSS":
-        btc_streak_s = f"{s['btc_current_streak']} losses"
-    else:
-        btc_streak_s = "none"
-
-    k, kp = s["kinds"], s["kind_pnl"]
-    leg_block = (
-        f"║  Legs\n"
-        f"║    BTC Primary  : {k['BTC_PRIMARY']}  (W {s['btc_wins']} / L {s['btc_losses']}, "
-        f"{s['btc_win_rate']:.1f}%, P&L ${kp['BTC_PRIMARY']:+,.2f})\n"
-        f"║    BTC Streak   : {btc_streak_s}  "
-        f"(longest W {s['btc_longest_win']} / L {s['btc_longest_loss']})\n"
-        f"║    ETH Hedge    : {k['ETH_HEDGE']}  (P&L ${kp['ETH_HEDGE']:+,.2f})\n"
-    )
-    if k["OTHER"]:
-        leg_block += f"║    Other        : {k['OTHER']}  (P&L ${kp['OTHER']:+,.2f})\n"
 
     last = s["last"]
     if last:
@@ -1222,7 +1041,6 @@ def print_performance() -> None:
         f"║  Longest Win    : {s['longest_win']}\n"
         f"║  Longest Loss   : {s['longest_loss']}\n"
         f"║  Max Drawdown   : ${-s['max_drawdown']:,.2f}\n"
-        f"{leg_block}"
         f"{last_block}"
         "╚════════════════════════════════════════════════════════════"
     )
@@ -1291,26 +1109,8 @@ async def portfolio_reporter(rest: KalshiREST) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Settlement checker  (resolve pending trades → win/loss + P&L)
+# Settlement checker  (resolve pending BTC ladder → win/loss + P&L)
 # ─────────────────────────────────────────────────────────────────────────────
-def latest_closed_pending_btc() -> Optional[dict]:
-    """Return the immediately prior BTC trade if its market has just closed."""
-    now = datetime.now(tz=timezone.utc)
-    for rec in reversed(tracker.trades):
-        if rec.get("trade_kind", "BTC_PRIMARY") != "BTC_PRIMARY":
-            continue
-        if rec.get("result") != "pending":
-            return None
-        try:
-            settle = datetime.fromisoformat(rec["settle_et"])
-        except Exception:  # noqa: BLE001
-            return None
-        if settle.tzinfo is None:
-            settle = settle.replace(tzinfo=ET)
-        return rec if settle.astimezone(timezone.utc) <= now else None
-    return None
-
-
 async def _settle_record_if_ready(rest: KalshiREST, rec: dict) -> bool:
     """Settle one closed record if Kalshi has published its result yet."""
     if rec.get("result") != "pending":
@@ -1324,6 +1124,8 @@ async def _settle_record_if_ready(rest: KalshiREST, rec: dict) -> bool:
     if datetime.now(tz=timezone.utc) < settle.astimezone(timezone.utc):
         return False
 
+    await _refresh_ladder_fills(rest, rec)
+    await _cancel_open_ladder_orders(rest, rec)
     market = await rest.get_market(rec["ticker"])
     if market is None:
         return False
@@ -1338,29 +1140,31 @@ async def _settle_record_if_ready(rest: KalshiREST, rec: dict) -> bool:
     if rec.get("result") != "pending":
         return True
     win = (result == str(rec["side"]).lower())
-    entry = _f(rec.get("entry_price"), 0.5)
-    count = _f(rec.get("count"), bet_count())
-    pnl = (1.0 - entry) * count if win else -entry * count
+    filled_rungs = [r for r in rec.get("rungs", []) if _f(r.get("fill_count"), 0.0) > 0.0]
+    if not filled_rungs and DRY_RUN:
+        filled_rungs = list(rec.get("rungs", []))
+    count = sum(_f(r.get("fill_count"), bet_count()) for r in filled_rungs)
+    cost = sum(
+        _f(r.get("fill_count"), bet_count()) * _f(
+            r.get("fill_economic_price"), _f(r.get("economic_price"), 0.0))
+        for r in filled_rungs)
+    if count <= 0.005:
+        rec["result"] = "UNFILLED"
+        rec["profit_loss"] = 0.0
+        rec["exit_method"] = "market_closed_without_fill"
+        tracker.save()
+        log.info("UNFILLED | %s %s ladder had no filled contracts; excluded from win/loss P&L.",
+                 rec["ticker"], rec["side"])
+        return True
+    pnl = (count - cost) if win else -cost
+    rec["count"] = round(count, 2)
+    rec["entry_price"] = round(cost / count, 4) if count > 0 else 0.0
     rec["exit_method"] = "settlement"
-
-    hedge = rec.get("eth_hedge")
-    if isinstance(hedge, dict) and hedge.get("status") in ("open", "partially_filled"):
-        try:
-            await _monitor_eth_hedge(rest, rec)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("Final ETH hedge fill check failed for %s: %s", rec["ticker"], exc)
-        hedge = rec.get("eth_hedge")
-    if (isinstance(hedge, dict)
-            and hedge.get("status") in ("pending_submission", "open", "partially_filled")):
-        hedge["status"] = "expired"
-        hedge["expired_at"] = datetime.now(tz=timezone.utc).isoformat()
 
     outcome = "WIN" if pnl > 0 else "LOSS"
     tracker.settle(rec, outcome, pnl)
     log.info("SETTLED %s  result=%s  our side=%s → %s  P&L $%+.4f",
              rec["ticker"], result.upper(), rec["side"], outcome, pnl)
-    if rec.get("trade_kind", "BTC_PRIMARY") == "BTC_PRIMARY":
-        await _reconcile_entries_waiting_on_btc_result(rest, rec)
     return True
 
 
@@ -1370,8 +1174,8 @@ async def settlement_checker(rest: KalshiREST) -> None:
     Win/loss uses the Kalshi market `result` field ("yes"/"no"). P&L per contract:
         win  →  (1 - entry_price) * count
         loss →  -entry_price * count
-    BTC-primary and ETH-hedge records settle independently. ETH hedge records
-    are created only for contracts that fill against the opening limit order.
+    Each record holds just one locked YES/NO BTC ladder. P&L is calculated from
+    the actual filled same-side rungs; unfilled rungs have no settlement P&L.
     """
     while True:
         await asyncio.sleep(SETTLE_CHECK_S)
@@ -1383,6 +1187,172 @@ async def settlement_checker(rest: KalshiREST) -> None:
                 await _settle_record_if_ready(rest, rec)
             except Exception as exc:  # noqa: BLE001
                 log.warning("Settlement check failed for %s: %s", rec.get("ticker"), exc)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Locked-side BTC GTC ladder
+# ─────────────────────────────────────────────────────────────────────────────
+def _ladder_order_terms(side: str, economic_price: float) -> tuple[BookSide, str]:
+    """Translate a YES/NO contract cost into Kalshi's YES-book order terms."""
+    if side == "yes":
+        return BookSide.BID, f"{economic_price:.2f}"
+    # A NO buy at cost c is a YES ask at 1-c.  This is still a NO position,
+    # not an opposite-side hedge or a reversal.
+    return BookSide.ASK, f"{1.0 - economic_price:.2f}"
+
+
+def _market_close_epoch(settle_et: Optional[datetime]) -> Optional[int]:
+    if settle_et is None:
+        return None
+    return int(settle_et.astimezone(timezone.utc).timestamp())
+
+
+async def _refresh_ladder_fills(rest: KalshiREST, rec: dict) -> None:
+    """Refresh actual fills for the four orders; missing lookup is non-fatal."""
+    if DRY_RUN:
+        return
+    changed = False
+    for rung in rec.get("rungs", []):
+        order_id = rung.get("order_id")
+        if not order_id:
+            continue
+        try:
+            response = await rest.orders.get_order(order_id)
+            order = getattr(response, "order", None)
+            if order is None:
+                continue
+            fill = _f(_field(order, "fill_count_fp", "fill_count"), 0.0)
+            average_yes = _to_dollars(
+                _field(order, "average_fill_price", "average_fill_price_dollars"))
+            if abs(fill - _f(rung.get("fill_count"), 0.0)) >= 0.005:
+                rung["fill_count"] = round(fill, 2)
+                rung["status"] = str(_field(order, "status") or "unknown")
+                if average_yes is not None:
+                    rung["fill_economic_price"] = round(
+                        average_yes if rec["side"].lower() == "yes" else 1.0 - average_yes,
+                        4)
+                changed = True
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Ladder order lookup failed for %s: %s", order_id, exc)
+    if changed:
+        tracker.save()
+
+
+async def _cancel_open_ladder_orders(rest: KalshiREST, rec: dict) -> None:
+    """Cancel only this market's remaining GTC orders after close."""
+    if rec.get("ladder_cancel_attempted"):
+        return
+    rec["ladder_cancel_attempted"] = True
+    for rung in rec.get("rungs", []):
+        if _f(rung.get("fill_count"), 0.0) >= _f(rung.get("count"), 0.0) - 0.005:
+            continue
+        order_id = rung.get("order_id")
+        if not order_id or DRY_RUN:
+            continue
+        try:
+            await rest.orders.cancel_order_v2(order_id)
+            rung["cancel_requested_at"] = datetime.now(tz=timezone.utc).isoformat()
+            log.info("GTC LADDER CANCEL | %s %s @ $%.2f id=%s",
+                     rec["ticker"], rec["side"], _f(rung.get("economic_price")), order_id)
+        except Exception as exc:  # noqa: BLE001
+            # It is normal for an already-filled/expired order to reject cancel.
+            log.info("GTC ladder cancel skipped for %s: %s", order_id, exc)
+    tracker.save()
+
+
+async def execute_locked_ladder(rest: KalshiREST, ct: str) -> None:
+    """Lock the Prophet side once and pre-post exactly four same-side GTC buys."""
+    market = None
+    for _ in range(STRIKE_RETRIES):
+        market = await resolve_active_market(rest)
+        if market and market.get("target") is not None:
+            break
+        await asyncio.sleep(2)
+    if market is None or market.get("target") is None:
+        log.warning("No live BTC market/strike for %s; will not post a ladder.", ct)
+        return
+
+    ct = market["ticker"]
+    age = seconds_since_ticker_open(ct)
+    if not is_within_open_trade_grace(age):
+        log.info("LADDER SKIPPED | %s discovered %.1fs after open (grace %.1fs).",
+                 ct, age if age is not None else -1, OPEN_TRADE_GRACE_S)
+        handled_windows.add(ct)
+        return
+    if tracker.already_traded(ct):
+        handled_windows.add(ct)
+        return
+
+    forecast_rec = preopen_forecasts.get(ct)
+    if not forecast_rec:
+        log.warning("No cached Prophet forecast for %s; no side is locked and no order is sent.", ct)
+        handled_windows.add(ct)
+        return
+    forecast = forecast_rec["forecast"]
+    strike = float(market["target"])
+    side, decision = decide_side_from_forecast(strike, forecast)
+    if side is None:
+        log.info("Prophet P50 equals strike for %s; no side is locked.", ct)
+        handled_windows.add(ct)
+        return
+    settle_et = market.get("settle_et")
+    expiry = _market_close_epoch(settle_et)
+    if expiry is None:
+        log.error("LADDER BLOCKED | %s has no parsed market close; refusing GTC orders.", ct)
+        handled_windows.add(ct)
+        return
+
+    log.info("SIDE LOCKED | %s %s by Prophet (%s; p50=$%.2f strike=$%.2f). "
+             "Posting only $0.40/$0.30/$0.20/$0.10 GTC buys; no opposite-side order exists.",
+             ct, side.upper(), decision, forecast["p50"], strike)
+    rungs = []
+    for level in LADDER_LEVELS:
+        book_side, api_price = _ladder_order_terms(side, level)
+        log.info("GTC LADDER LIMIT | %s %s economic=$%.2f api_yes=%s qty=%.2f expires=%d",
+                 ct, side.upper(), level, api_price, bet_count(), expiry)
+        response, immediate_fill = await _submit(
+            rest, ticker=ct, side=book_side, price=api_price, count=bet_count(),
+            reduce_only=False, tag=f"PROPHET {side.upper()} RUNG ${level:.2f}",
+            tif=ORDER_TIF, expiration_time=expiry)
+        accepted = DRY_RUN or response is not None
+        fill_count = (bet_count() if (DRY_RUN and immediate_fill)
+                      else _f(getattr(response, "fill_count", 0.0), 0.0))
+        average_yes = _to_dollars(getattr(response, "average_fill_price", None))
+        fill_cost = (level if average_yes is None
+                     else (average_yes if side == "yes" else 1.0 - average_yes))
+        rungs.append({
+            "economic_price": level, "api_yes_price": api_price,
+            "count": bet_count(), "fill_count": round(fill_count, 2),
+            "fill_economic_price": round(fill_cost, 4),
+            "order_id": getattr(response, "order_id", None) if response is not None else None,
+            "status": "accepted" if accepted else "submit_failed",
+            "time_in_force": ORDER_TIF, "expiration_time": expiry,
+        })
+
+    handled_windows.add(ct)
+    accepted_rungs = sum(1 for rung in rungs if rung["status"] == "accepted")
+    rec = {
+        "ticker": ct,
+        "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+        "settle_et": settle_et.isoformat() if settle_et else "",
+        "side": side.upper(), "decision_basis": "prophet_p50_vs_live_strike_locked_side",
+        "btc_entry": round(float(forecast_rec["btc_close"]), 2),
+        "strike": round(strike, 2), "p50_prediction": round(float(forecast["p50"]), 2),
+        "forecast_horizon_minutes": int(forecast_rec["horizon_minutes"]),
+        "forecast_created_at": forecast_rec.get("created_at"),
+        "forecast_data_end": str(forecast_rec["data_end"]),
+        "forecast_bands": {k: round(forecast[k], 2) for k, _ in _QMAP},
+        "trade_kind": "BTC_PROPHET_LOCKED_LADDER", "bet_amount_shares": bet_count(),
+        "ladder_levels": list(LADDER_LEVELS), "rungs": rungs,
+        "ladder_preposted_complete": accepted_rungs == len(LADDER_LEVELS),
+        "count": round(sum(_f(r["fill_count"]) for r in rungs), 2),
+        "entry_price": 0.0, "order_submitted": f"{accepted_rungs}/{len(LADDER_LEVELS)} accepted",
+        "exit_method": "pending", "dry_run": DRY_RUN,
+        "result": "pending", "profit_loss": 0.0,
+    }
+    tracker.record_open(rec)
+    log.info("GTC LADDER POSTED | %s %s accepted=%d/%d. The side remains locked through settlement.",
+             ct, side.upper(), accepted_rungs, len(LADDER_LEVELS))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1685,7 +1655,12 @@ async def _reconcile_entries_waiting_on_btc_result(rest: KalshiREST, settled_btc
 # Trade execution for a single 15-minute window
 # ─────────────────────────────────────────────────────────────────────────────
 async def execute_window_trade(rest: KalshiREST, ct: str, nt: str) -> None:
-    """Use the pre-open Prophet forecast and place ONE order for this window."""
+    """Compatibility entry point for the locked-side BTC-only GTC ladder."""
+    del nt
+    await execute_locked_ladder(rest, ct)
+    return
+
+    """Legacy unreachable execution path retained temporarily for source diff context."""
 
     # 1) Resolve the active market + strike (retry — a just-opened market can be
     #    missing floor_strike for a few seconds).
@@ -1896,8 +1871,8 @@ async def execute_window_trade(rest: KalshiREST, ct: str, nt: str) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 async def strategy_loop(rest: KalshiREST, market_ws: KalshiMarketWS,
                         started_at: float) -> None:
-    log.info("Prophet strategy loop started — pre-open forecast, one open-time "
-             "order per 15-min window.")
+    log.info("Prophet strategy loop started — pre-open forecast, one locked-side "
+             "BTC GTC ladder per fresh 15-min window.")
     while True:
         if (time.time() - started_at) / 60.0 >= RUNTIME_LIMIT_MIN:
             log.info("Runtime limit (%.0f min) reached — clean exit. "
@@ -1905,8 +1880,7 @@ async def strategy_loop(rest: KalshiREST, market_ws: KalshiMarketWS,
             return
 
         ct, nt = current_and_next_tickers()
-        eth_ct, eth_nt = current_and_next_tickers(ETH_SERIES_TICKER)
-        market_ws.set_tickers((ct, nt, eth_ct, eth_nt))
+        market_ws.set_tickers((ct, nt))
         await maybe_prepare_next_window_forecast(ct, nt)
 
         # Trade this window exactly once (skip if handled this run or already
@@ -1915,7 +1889,7 @@ async def strategy_loop(rest: KalshiREST, market_ws: KalshiMarketWS,
             seconds_since_open = seconds_since_ticker_open(ct)
             if not is_within_open_trade_grace(seconds_since_open):
                 log.info("Window %s opened %.0fs ago (> %.0fs grace) — skip late "
-                         "entry and wait to pre-forecast the next market.",
+                         "ladder and wait to pre-forecast the next market.",
                          ct, seconds_since_open if seconds_since_open is not None else -1,
                          OPEN_TRADE_GRACE_S)
                 handled_windows.add(ct)
@@ -1942,26 +1916,13 @@ async def main_async() -> None:
     log.info("  Current window  : %s", ct)
     log.info("  Kalshi REST/WS  : %s", KALSHI_BASE_URL)
     log.info("  Demo / DRY_RUN  : %s / %s", KALSHI_DEMO, DRY_RUN)
-    log.info("  BTC base bet    : %.2f contracts/order  (shares, fractional "
+    log.info("  BTC rung size   : %.2f contracts/rung  (shares, fractional "
              "at 0.01 granularity — NOT dollars)", BET_AMOUNT_SHARES)
-    _streak = tracker.current_loss_streak()
-    _hedge_state = tracker.next_eth_hedge_state()
-    _arb_next = (bet_count(ARBITRAGE_SHARES * _hedge_state["multiplier"])
-                 if _hedge_state["active"] else 0.0)
-    log.info("  ETH hedge       : BTC loss streak %d → %s; arb shares %.2f, "
-             "next multiplier ×%.6g, paired count %.2f (%s)",
-             _streak, "ACTIVE" if _hedge_state["active"] else "inactive",
-             ARBITRAGE_SHARES, _hedge_state["multiplier"], _arb_next,
-             _hedge_state["reason"])
-    log.info("  Hedge pricing   : opposite ETH target = 1 - BTC entry - $%.2f; "
-             "paired cost cap $%.2f; poll %.0fs",
-             ARBITRAGE_DISCOUNT_USD, ARBITRAGE_MAX_PAIR_COST, ETH_HEDGE_POLL_S)
-    log.info("  Loss multiplier : applies only after a BTC/ETH loss with zero "
-             "ETH shares filled; standalone BTC base remains %.2f shares.",
-             BET_AMOUNT_SHARES)
+    log.info("  Locked ladder   : exactly $0.40/$0.30/$0.20/$0.10 on the one "
+             "Prophet-selected BTC side; no ETH, hedge, or loss multiplier.")
     log.info("  Data / horizon  : %d 1-min candles → fixed %d-min forecast",
              HISTORY_MINUTES, FORECAST_MINUTES)
-    log.info("  Pre-open timing : forecast %.0fs before next open; entry grace %.0fs",
+    log.info("  Pre-open timing : forecast %.0fs before next open; ladder-start grace %.0fs",
              PREOPEN_FORECAST_LEAD_S, OPEN_TRADE_GRACE_S)
     log.info("  Uncertainty     : %d samples", UNCERTAINTY_SAMPLES)
     log.info("  Runtime limit   : %.0f min", RUNTIME_LIMIT_MIN)
@@ -1987,16 +1948,14 @@ async def main_async() -> None:
 
     market_ws = KalshiMarketWS(rest.auth)
     btc_tickers = current_and_next_tickers()
-    eth_tickers = current_and_next_tickers(ETH_SERIES_TICKER)
-    market_ws.set_tickers(btc_tickers + eth_tickers)
+    market_ws.set_tickers(btc_tickers)
     ws_task  = asyncio.create_task(market_ws.run(), name="kalshi-ws")
     set_task = asyncio.create_task(settlement_checker(rest), name="settlement-checker")
     rpt_task = asyncio.create_task(portfolio_reporter(rest), name="portfolio-reporter")
-    eth_task = asyncio.create_task(eth_hedge_monitor(rest), name="eth-hedge-monitor")
     try:
         await strategy_loop(rest, market_ws, started_at=time.time())
     finally:
-        for t in (ws_task, set_task, rpt_task, eth_task):
+        for t in (ws_task, set_task, rpt_task):
             t.cancel()
             try:
                 await t
