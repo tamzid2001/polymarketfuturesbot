@@ -2,7 +2,7 @@
   {
     "strategy": "normal_prophet_weighted_1234_fixed_stop_loss_shadow_v1",
     "mode": "paper_only_no_exchange_orders",
-    "status": "active",
+    "status": "scalp_exited",
     "ticker": "KXBTC15M-26JUL220030-30",
     "side": "no",
     "created_at": "2026-07-22T04:15:04.005863+00:00",
@@ -62,21 +62,24 @@
         "quantity": 2.0,
         "fill_count": 0.0,
         "average_fill_price": null,
-        "status": "simulated_resting"
+        "status": "paper_canceled_after_scalp_exit",
+        "paper_canceled_at": "2026-07-22T04:16:15.507727+00:00"
       },
       "0.2000": {
         "rung_price": 0.2,
         "quantity": 3.0,
         "fill_count": 0.0,
         "average_fill_price": null,
-        "status": "simulated_resting"
+        "status": "paper_canceled_after_scalp_exit",
+        "paper_canceled_at": "2026-07-22T04:16:15.507731+00:00"
       },
       "0.1000": {
         "rung_price": 0.1,
         "quantity": 4.0,
         "fill_count": 0.0,
         "average_fill_price": null,
-        "status": "simulated_resting"
+        "status": "paper_canceled_after_scalp_exit",
+        "paper_canceled_at": "2026-07-22T04:16:15.507734+00:00"
       }
     },
     "entry_quote_depth_consumed": {
@@ -122,7 +125,9 @@
         },
         "target_hits": {},
         "max_recorded_at": "2026-07-22T04:15:59.497998+00:00",
-        "fixed_stop_loss_bid": 0.35
+        "fixed_stop_loss_bid": 0.35,
+        "ended_at": "2026-07-22T04:16:15.507737+00:00",
+        "ended_by": "fixed_stop_loss"
       }
     ],
     "events": [
@@ -226,6 +231,36 @@
           "quote_source_ts_ms": 1784693758868,
           "quote_age_seconds": 0.539
         }
+      },
+      {
+        "kind": "paper_scalp_fixed_stop_loss_exit",
+        "at": "2026-07-22T04:16:15.507737+00:00",
+        "exit_quote": {
+          "quote_id": "KXBTC15M-26JUL220030-30:73:2026-07-22T04:16:14.959300+00:00",
+          "side": "no",
+          "economic_price": 0.35,
+          "executable_yes_price": 0.65,
+          "executable_field": "yes_ask",
+          "displayed_depth": 5762.1,
+          "required_count": 0.0,
+          "yes_bid": 0.64,
+          "yes_bid_size": 6271.05,
+          "yes_ask": 0.65,
+          "yes_ask_size": 5762.1,
+          "quote_received_at": "2026-07-22T04:16:14.959300+00:00",
+          "quote_source_time": "2026-07-22T04:16:14.850662Z",
+          "quote_source_ts_ms": 1784693774850,
+          "quote_age_seconds": 0.548
+        },
+        "filled_contracts": 1.0,
+        "average_entry_price": 0.4,
+        "exit_price": 0.35,
+        "entry_cost": 0.4,
+        "exit_proceeds": 0.35,
+        "gross_profit_loss": -0.05,
+        "fees_model": "excluded_no_exchange_fill",
+        "fixed_stop_loss_per_contract": 0.05,
+        "fixed_stop_loss_bid": 0.35
       }
     ],
     "limitation": "Paper-only. Entry and exit require a fresh complete top-of-book and displayed depth, but queue priority, latency, cancellations, hidden liquidity, partial fills, and fees are excluded.",
@@ -242,6 +277,47 @@
       "entry_cost": 0.4,
       "average_entry_price": 0.4,
       "take_profit_bid": 0.41
-    }
+    },
+    "scalp_exit": {
+      "kind": "paper_scalp_fixed_stop_loss_exit",
+      "at": "2026-07-22T04:16:15.507737+00:00",
+      "exit_quote": {
+        "quote_id": "KXBTC15M-26JUL220030-30:73:2026-07-22T04:16:14.959300+00:00",
+        "side": "no",
+        "economic_price": 0.35,
+        "executable_yes_price": 0.65,
+        "executable_field": "yes_ask",
+        "displayed_depth": 5762.1,
+        "required_count": 0.0,
+        "yes_bid": 0.64,
+        "yes_bid_size": 6271.05,
+        "yes_ask": 0.65,
+        "yes_ask_size": 5762.1,
+        "quote_received_at": "2026-07-22T04:16:14.959300+00:00",
+        "quote_source_time": "2026-07-22T04:16:14.850662Z",
+        "quote_source_ts_ms": 1784693774850,
+        "quote_age_seconds": 0.548
+      },
+      "filled_contracts": 1.0,
+      "average_entry_price": 0.4,
+      "exit_price": 0.35,
+      "entry_cost": 0.4,
+      "exit_proceeds": 0.35,
+      "gross_profit_loss": -0.05,
+      "fees_model": "excluded_no_exchange_fill",
+      "fixed_stop_loss_per_contract": 0.05,
+      "fixed_stop_loss_bid": 0.35
+    },
+    "settled_at": "2026-07-22T04:16:15.507737+00:00",
+    "contracts": 1.0,
+    "total_cost": 0.4,
+    "average_entry": 0.4,
+    "gross_payout": 0.35,
+    "gross_profit_loss": -0.05,
+    "net_profit_loss": -0.05,
+    "estimated_fees": 0.0,
+    "fees_model": "excluded_no_exchange_fill",
+    "return_percentage": -12.5,
+    "exit_method": "fresh_executable_bid_fixed_stop_loss"
   }
 ]
