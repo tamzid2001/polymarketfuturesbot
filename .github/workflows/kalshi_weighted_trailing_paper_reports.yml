@@ -212,9 +212,19 @@ jobs:
           TRADE_HISTORY_FILE: paper_reports/prophet_hold_gate_primary_history.json
           TRADED_TICKERS_FILE: paper_reports/prophet_hold_gate_primary_tickers.json
           INVERSE_PROPHET_SHADOW_ENABLED: "false"
+          INVERSE_PROPHET_SHADOW_HISTORY_FILE: paper_reports/disabled_inverse_shadow_history.json
+          INVERSE_PROPHET_SHADOW_REPORT_FILE: paper_reports/disabled_inverse_shadow_report.json
+          PROPHET_SELECTOR_HISTORY_FILE: paper_reports/disabled_selector_history.json
+          PROPHET_SELECTOR_REPORT_FILE: paper_reports/disabled_selector_report.json
           PROPHET_LADDER_SCALP_SHADOW_ENABLED: "false"
+          PROPHET_LADDER_SCALP_SHADOW_HISTORY_FILE: paper_reports/disabled_ladder_scalp_history.json
+          PROPHET_LADDER_SCALP_SHADOW_REPORT_FILE: paper_reports/disabled_ladder_scalp_report.json
           PROPHET_WEIGHTED_TRAILING_SHADOW_ENABLED: "false"
           PROPHET_WEIGHTED_FIXED_STOP_SHADOW_ENABLED: "false"
+          PROPHET_WEIGHTED_FIXED_STOP_NORMAL_HISTORY_FILE: paper_reports/disabled_fixed_stop_normal_history.json
+          PROPHET_WEIGHTED_FIXED_STOP_NORMAL_REPORT_FILE: paper_reports/disabled_fixed_stop_normal_report.json
+          PROPHET_WEIGHTED_FIXED_STOP_INVERSE_HISTORY_FILE: paper_reports/disabled_fixed_stop_inverse_history.json
+          PROPHET_WEIGHTED_FIXED_STOP_INVERSE_REPORT_FILE: paper_reports/disabled_fixed_stop_inverse_report.json
           PROPHET_WEIGHTED_ACTIVATION_COMPARISON_ENABLED: "true"
           WEIGHTED_TRAILING_MONITOR_ONLY: "true"
           PROPHET_WEIGHTED_TRAILING_SHADOW_NORMAL_HISTORY_FILE: paper_reports/prophet_weighted_trailing_normal_ledger.json
@@ -233,21 +243,28 @@ jobs:
           set -euo pipefail
           mkdir -p paper_reports
           sync_paper_ledgers() {
+            # If a previous rebase raced a different checkpoint publisher,
+            # abort it before staging again. This paper Action owns only
+            # paper_reports and must never leave unmerged files behind.
+            if git diff --name-only --diff-filter=U | grep -q .; then
+              git rebase --abort 2>/dev/null || true
+            fi
+            if git diff --name-only --diff-filter=U | grep -q .; then
+              echo "::warning::Paper-ledger checkpoint still has unmerged files; retrying without a commit."
+              return 0
+            fi
             # The source envelope contains no rungs/orders in monitor mode;
             # it is retained only so a later report action can settle a market
             # that was still open when this run ended.
-            for file in paper_reports/prophet_hold_gate_primary_history.json \
-                        paper_reports/prophet_hold_gate_primary_tickers.json \
-                        paper_reports/prophet_hold_gate_normal_ledger.json \
-                        paper_reports/prophet_hold_gate_normal_report.json \
-                        paper_reports/prophet_hold_gate_inverse_ledger.json \
-                        paper_reports/prophet_hold_gate_inverse_report.json; do
-              test ! -f "$file" || git add "$file"
-            done
+            git add -A paper_reports
             if ! git diff --cached --quiet; then
               git commit -m "chore: checkpoint Prophet weighted paper report [skip ci]"
             fi
-            git pull --rebase --autostash origin main || return 0
+            if ! git pull --rebase --autostash origin main; then
+              git rebase --abort 2>/dev/null || true
+              echo "::warning::Paper-ledger checkpoint rebase failed; aborted cleanly and will retry."
+              return 0
+            fi
             git push origin HEAD:main || true
           }
           python kalshi_btc15m_prophet_btc_only.py &

@@ -267,6 +267,47 @@ class LadderScalpShadowTests(unittest.TestCase):
         ))
         self.assertEqual(0.34, events[-1]["trailing_stop_bid"])
 
+    def test_later_average_down_records_fresh_targets_without_dearming_trail(self) -> None:
+        shadow = new_ladder_average_entry_scalp_shadow(
+            strategy="new-average-targets", ticker="KXBTC15M-TEST", side="yes", quantity_per_rung=1.0,
+            profit_target_per_contract=0.01, quote_max_age_seconds=3.0, market_close_time="later",
+            profit_targets_per_contract=EXTENDED_PROFIT_TARGETS,
+            rung_quantities={0.40: 1.0, 0.30: 2.0, 0.20: 3.0, 0.10: 4.0},
+            absolute_stop_price=0.05, trailing_stop_per_contract=0.10,
+            trailing_activation_gain_per_contract=0.01,
+        )
+        # The 40c position hits its 1c activation and arms the market trail.
+        simulate_ladder_average_entry_scalp(
+            shadow, entry_quote=quote(0.40, 1.0, "entry-40"), entry_quote_state="fresh",
+            exit_quote=quote(0.42, 1.0, "first-target"), exit_quote_state="fresh",
+        )
+        first_arm = shadow["market_trailing_armed_at"]
+        self.assertEqual(0.32, shadow["position_epochs"][0]["trailing_stop_bid"])
+
+        # Two 30c fills lower the average to 33.3333c. The old 32c market
+        # trail remains, but this new 3-contract epoch gets its own 34.3333c
+        # target and records the later fresh quote that reaches it.
+        simulate_ladder_average_entry_scalp(
+            shadow, entry_quote=quote(0.30, 2.0, "entry-30"), entry_quote_state="fresh",
+            exit_quote=quote(0.34, 3.0, "new-average-not-yet"), exit_quote_state="fresh",
+        )
+        self.assertEqual("active", shadow["status"])
+        self.assertEqual(2, len(shadow["position_epochs"]))
+        new_epoch = shadow["position_epochs"][-1]
+        self.assertEqual(0.343333, new_epoch["trailing_activation_bid"])
+        self.assertNotIn("trailing_activation_hit_at", new_epoch)
+
+        events = simulate_ladder_average_entry_scalp(
+            shadow, entry_quote=None, entry_quote_state="fresh",
+            exit_quote=quote(0.35, 3.0, "new-average-target"), exit_quote_state="fresh",
+        )
+        self.assertEqual("active", shadow["status"])
+        self.assertEqual(first_arm, shadow["market_trailing_armed_at"])
+        self.assertEqual(0.343333, new_epoch["trailing_activation_bid"])
+        self.assertEqual(0.35, new_epoch["trailing_activation_hit_bid"])
+        self.assertTrue(new_epoch["trailing_activation_market_previously_armed"])
+        self.assertTrue(any(event["kind"] == "paper_scalp_trailing_activation_target_hit" for event in events))
+
 
 if __name__ == "__main__":
     unittest.main()

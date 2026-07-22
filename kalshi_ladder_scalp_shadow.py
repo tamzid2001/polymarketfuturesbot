@@ -19,7 +19,12 @@ from typing import Any
 
 LADDER_LEVELS = (0.40, 0.30, 0.20, 0.10)
 DEFAULT_PROFIT_TARGETS = (0.01, 0.02, 0.03, 0.05, 0.10)
-EXTENDED_PROFIT_TARGETS = DEFAULT_PROFIT_TARGETS + (0.20, 0.30, 0.40, 0.50, 0.60)
+# The paper hold-gate comparison needs every configured gate observable again
+# after an additional average-down rung changes the weighted entry price.
+EXTENDED_PROFIT_TARGETS = (
+    0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.09,
+    0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80,
+)
 EPSILON = 0.004
 
 
@@ -340,10 +345,12 @@ def _simulate_trailing_stop(
     stop_gap = float(shadow.get("trailing_stop_per_contract") or 0.0)
     if depth + 1e-9 < contracts or stop_gap <= 0.0:
         return events
-    # Once an activation gate is reached, the trail remains armed for the
-    # market.  Later averaging fills may change the current average/size, but
-    # never de-arm the paper stop.  An exit still needs a *current* fresh bid
-    # with depth for the entire then-current position.
+    # A later average-down fill starts an epoch with a new weighted entry.
+    # Its targets are observed independently, while an already-armed market
+    # trail remains armed. That means a 40c entry can arm a trail, then two
+    # 30c fills can create a lower average and fresh targets without erasing
+    # the original market-wide protective trail.
+    epoch_high_bid = float(epoch.get("max_executable_exit_bid") or 0.0)
     if shadow.get("market_trailing_armed_at"):
         market_high = shadow.get("market_trailing_high_bid")
         if market_high is None or bid > float(market_high) + 1e-9:
@@ -352,10 +359,10 @@ def _simulate_trailing_stop(
             shadow["market_trailing_high_at"] = now_iso()
         high_bid = float(market_high)
     else:
-        # Before arming, a gain must be observed after the current weighted
-        # position formed; a high from before a later averaging fill cannot
-        # arm its new average entry.
-        high_bid = float(epoch.get("max_executable_exit_bid") or 0.0)
+        # Before market arming, a gain must be observed after the current
+        # weighted position formed; a high from before a later averaging fill
+        # cannot arm a lower, newly averaged position.
+        high_bid = epoch_high_bid
     fixed_loss_gap = float(shadow.get("fixed_stop_loss_per_contract") or 0.0)
     absolute_stop_price = shadow.get("absolute_stop_price")
     if absolute_stop_price is not None or fixed_loss_gap > 0.0:
@@ -381,17 +388,41 @@ def _simulate_trailing_stop(
     activation_gain = float(shadow.get("trailing_activation_gain_per_contract") or 0.0)
     activation_bid = float(average) + activation_gain
     epoch["trailing_activation_bid"] = round(activation_bid, 6)
+    # Always audit the current epoch's target against its own new average,
+    # even when the market trail was armed by an earlier, more expensive
+    # position. This makes each 40c -> 30c -> 20c average-down sequence
+    # inspectable rather than treating the first arm as the only target.
+    if epoch_high_bid + 1e-9 >= activation_bid and not epoch.get("trailing_activation_hit_at"):
+        activation_hit_at = now_iso()
+        epoch.update({
+            "trailing_activation_hit_at": activation_hit_at,
+            "trailing_activation_hit_bid": round(epoch_high_bid, 6),
+            "trailing_activation_market_previously_armed": bool(shadow.get("market_trailing_armed_at")),
+        })
+        event = {
+            "kind": "paper_scalp_trailing_activation_target_hit",
+            "at": activation_hit_at,
+            "filled_contracts": round(contracts, 4),
+            "average_entry_price": round(float(average), 6),
+            "trailing_activation_gain_per_contract": round(activation_gain, 6),
+            "trailing_activation_bid": round(activation_bid, 6),
+            "observed_bid": round(epoch_high_bid, 6),
+            "market_trailing_previously_armed": bool(shadow.get("market_trailing_armed_at")),
+            "exit_quote": dict(exit_quote),
+        }
+        _record_event(shadow, event)
+        events.append(event)
     if not shadow.get("market_trailing_armed_at"):
-        if high_bid + 1e-9 < activation_bid:
+        if epoch_high_bid + 1e-9 < activation_bid:
             return events
         shadow["market_trailing_armed_at"] = now_iso()
         shadow["market_trailing_activation_bid"] = round(activation_bid, 6)
-        shadow["market_trailing_armed_high_bid"] = round(high_bid, 6)
-        shadow["market_trailing_high_bid"] = round(high_bid, 6)
+        shadow["market_trailing_armed_high_bid"] = round(epoch_high_bid, 6)
+        shadow["market_trailing_high_bid"] = round(epoch_high_bid, 6)
         shadow["market_trailing_high_at"] = shadow["market_trailing_armed_at"]
     epoch["trailing_armed_at"] = shadow["market_trailing_armed_at"]
     epoch["trailing_armed_high_bid"] = shadow.get("market_trailing_armed_high_bid")
-    epoch["trailing_activation_bid"] = shadow.get("market_trailing_activation_bid", round(activation_bid, 6))
+    epoch["market_trailing_activation_bid"] = shadow.get("market_trailing_activation_bid")
     epoch["market_trailing_high_bid"] = round(high_bid, 6)
     stop_bid = max(0.0, high_bid - stop_gap)
     epoch["trailing_stop_bid"] = round(stop_bid, 6)
