@@ -527,12 +527,24 @@ class StateCheckpointPublisher:
                     ["git", "commit", "-m", "chore: checkpoint BTC average-down state [skip ci]"],
                     check=True, capture_output=True, text=True,
                 )
-            # A concurrent model-registry update should rebase cleanly because
-            # this publisher owns only configuration/state/report files.
-            subprocess.run(
+            # A concurrent checkpoint can advance main while this isolated
+            # paper job is writing. Abort a failed rebase immediately so it
+            # cannot strand the runner with unmerged files on every later
+            # event. Include Git's diagnostic in the warning for audit.
+            pull = subprocess.run(
                 ["git", "pull", "--rebase", "--autostash", "origin", "main"],
-                check=True, capture_output=True, text=True,
+                check=False, capture_output=True, text=True,
             )
+            if pull.returncode:
+                abort = subprocess.run(
+                    ["git", "rebase", "--abort"], check=False, capture_output=True, text=True,
+                )
+                diagnostic = (pull.stderr or pull.stdout).strip()
+                abort_diagnostic = (abort.stderr or abort.stdout).strip()
+                raise RuntimeError(
+                    f"git pull --rebase failed (exit {pull.returncode}): {diagnostic or 'no diagnostic'}"
+                    + (f"; rebase abort: {abort_diagnostic}" if abort.returncode else "")
+                )
             subprocess.run(["git", "push", "origin", "HEAD:main"], check=True, capture_output=True, text=True)
         except Exception as exc:  # noqa: BLE001
             LOG.warning("STATE CHECKPOINT FAILED | reason=%s error=%s; retrying after a later material event.", reason, exc)
