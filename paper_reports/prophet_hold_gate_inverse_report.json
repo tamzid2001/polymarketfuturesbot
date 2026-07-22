@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-07-22T21:04:43.101815+00:00",
+  "generated_at": "2026-07-22T21:05:02.909570+00:00",
   "strategy": "inverse_prophet_weighted_1234_hold_gate_trailing_comparison_v3",
   "source": "opposite_frozen_prophet_side",
   "locked_side_policy": "side is fixed before open and never changes on later quotes",
@@ -54450,25 +54450,25 @@
         "The full simulated position is closed at the observed bid; no favorable price improvement is assumed."
       ],
       "paper_markets_started": 24,
-      "active_paper_markets": 5,
+      "active_paper_markets": 4,
       "scalp_exits": 0,
-      "trailing_stop_exits": 14,
+      "trailing_stop_exits": 15,
       "fixed_stop_loss_exits": 5,
       "settlement_exits_without_take_profit": 0,
       "unfilled_markets": 0,
-      "filled_market_trades": 19,
+      "filled_market_trades": 20,
       "winning_trades": 12,
-      "losing_trades": 6,
-      "win_rate": 0.631579,
-      "current_streak_kind": "win",
-      "current_streak": 7,
+      "losing_trades": 7,
+      "win_rate": 0.6,
+      "current_streak_kind": "loss",
+      "current_streak": 1,
       "longest_winning_streak": 7,
       "longest_losing_streak": 2,
-      "total_simulated_contracts": 77.0,
-      "total_entry_cost": 19.2,
-      "total_exit_proceeds": 13.66,
-      "net_profit": -5.54,
-      "return_on_simulated_capital": -0.288542,
+      "total_simulated_contracts": 78.0,
+      "total_entry_cost": 19.6,
+      "total_exit_proceeds": 14.05,
+      "net_profit": -5.55,
+      "return_on_simulated_capital": -0.283163,
       "maximum_drawdown": 6.87,
       "pnl_time_series": [
         {
@@ -59780,19 +59780,350 @@
             "selected_side_executable_bid": 0.38,
             "selected_side_executable_ask": 0.39
           }
+        },
+        {
+          "sequence": 20,
+          "ticker": "KXBTC15M-26JUL221715-15",
+          "settled_at": "2026-07-22T21:04:55.230068+00:00",
+          "source_signal_side": "yes",
+          "locked_study_side": "no",
+          "side": "no",
+          "settlement_outcome": null,
+          "status": "scalp_exited",
+          "exit_method": "fresh_executable_bid_trailing_stop",
+          "trade_outcome": "loss",
+          "filled_contracts": 1.0,
+          "average_entry_price": 0.4,
+          "entry_cost": 0.4,
+          "exit_proceeds": 0.39,
+          "net_profit": -0.01,
+          "cumulative_net_profit": -5.55,
+          "running_drawdown": 5.56,
+          "current_streak_kind": "loss",
+          "current_streak": 1,
+          "rungs": [
+            {
+              "rung_price": 0.4,
+              "quantity": 1.0,
+              "filled_contracts": 1.0,
+              "average_fill_price": 0.4,
+              "status": "simulated_executable_quote_hit",
+              "filled_at": "2026-07-22T21:00:58.238285+00:00"
+            },
+            {
+              "rung_price": 0.3,
+              "quantity": 2.0,
+              "filled_contracts": 0.0,
+              "average_fill_price": null,
+              "status": "paper_canceled_after_scalp_exit",
+              "filled_at": null
+            },
+            {
+              "rung_price": 0.2,
+              "quantity": 3.0,
+              "filled_contracts": 0.0,
+              "average_fill_price": null,
+              "status": "paper_canceled_after_scalp_exit",
+              "filled_at": null
+            },
+            {
+              "rung_price": 0.1,
+              "quantity": 4.0,
+              "filled_contracts": 0.0,
+              "average_fill_price": null,
+              "status": "paper_canceled_after_scalp_exit",
+              "filled_at": null
+            }
+          ],
+          "trailing_stop": {
+            "highest_executable_bid": 0.55,
+            "trailing_activation_bid": 0.5,
+            "trailing_armed_at": "2026-07-22T21:01:52.999835+00:00",
+            "trailing_stop_bid": 0.45,
+            "observed_exit_bid": 0.39
+          },
+          "fixed_stop_loss": {
+            "fixed_stop_loss_bid": 0.05,
+            "observed_exit_bid": 0.39
+          },
+          "target_hits": {
+            "0.01": {
+              "at": "2026-07-22T21:01:28.091740+00:00",
+              "target_per_contract": 0.01,
+              "target_bid": 0.41,
+              "observed_bid": 0.43,
+              "observed_gross_per_contract": 0.03,
+              "observed_gross_total": 0.03,
+              "exit_quote": {
+                "quote_id": "KXBTC15M-26JUL221715-15:84:2026-07-22T21:01:27.976424+00:00",
+                "side": "no",
+                "economic_price": 0.43,
+                "executable_yes_price": 0.57,
+                "executable_field": "yes_ask",
+                "displayed_depth": 994.85,
+                "required_count": 0.0,
+                "yes_bid": 0.56,
+                "yes_bid_size": 1323.07,
+                "yes_ask": 0.57,
+                "yes_ask_size": 994.85,
+                "quote_received_at": "2026-07-22T21:01:27.976424+00:00",
+                "quote_source_time": "2026-07-22T21:01:27.868049Z",
+                "quote_source_ts_ms": 1784754087868,
+                "quote_age_seconds": 0.115
+              }
+            },
+            "0.02": {
+              "at": "2026-07-22T21:01:28.091748+00:00",
+              "target_per_contract": 0.02,
+              "target_bid": 0.42,
+              "observed_bid": 0.43,
+              "observed_gross_per_contract": 0.03,
+              "observed_gross_total": 0.03,
+              "exit_quote": {
+                "quote_id": "KXBTC15M-26JUL221715-15:84:2026-07-22T21:01:27.976424+00:00",
+                "side": "no",
+                "economic_price": 0.43,
+                "executable_yes_price": 0.57,
+                "executable_field": "yes_ask",
+                "displayed_depth": 994.85,
+                "required_count": 0.0,
+                "yes_bid": 0.56,
+                "yes_bid_size": 1323.07,
+                "yes_ask": 0.57,
+                "yes_ask_size": 994.85,
+                "quote_received_at": "2026-07-22T21:01:27.976424+00:00",
+                "quote_source_time": "2026-07-22T21:01:27.868049Z",
+                "quote_source_ts_ms": 1784754087868,
+                "quote_age_seconds": 0.115
+              }
+            },
+            "0.03": {
+              "at": "2026-07-22T21:01:28.091755+00:00",
+              "target_per_contract": 0.03,
+              "target_bid": 0.43,
+              "observed_bid": 0.43,
+              "observed_gross_per_contract": 0.03,
+              "observed_gross_total": 0.03,
+              "exit_quote": {
+                "quote_id": "KXBTC15M-26JUL221715-15:84:2026-07-22T21:01:27.976424+00:00",
+                "side": "no",
+                "economic_price": 0.43,
+                "executable_yes_price": 0.57,
+                "executable_field": "yes_ask",
+                "displayed_depth": 994.85,
+                "required_count": 0.0,
+                "yes_bid": 0.56,
+                "yes_bid_size": 1323.07,
+                "yes_ask": 0.57,
+                "yes_ask_size": 994.85,
+                "quote_received_at": "2026-07-22T21:01:27.976424+00:00",
+                "quote_source_time": "2026-07-22T21:01:27.868049Z",
+                "quote_source_ts_ms": 1784754087868,
+                "quote_age_seconds": 0.115
+              }
+            },
+            "0.04": {
+              "at": "2026-07-22T21:01:33.176860+00:00",
+              "target_per_contract": 0.04,
+              "target_bid": 0.44,
+              "observed_bid": 0.44,
+              "observed_gross_per_contract": 0.04,
+              "observed_gross_total": 0.04,
+              "exit_quote": {
+                "quote_id": "KXBTC15M-26JUL221715-15:89:2026-07-22T21:01:32.976292+00:00",
+                "side": "no",
+                "economic_price": 0.44,
+                "executable_yes_price": 0.56,
+                "executable_field": "yes_ask",
+                "displayed_depth": 2771.19,
+                "required_count": 0.0,
+                "yes_bid": 0.55,
+                "yes_bid_size": 5713.34,
+                "yes_ask": 0.56,
+                "yes_ask_size": 2771.19,
+                "quote_received_at": "2026-07-22T21:01:32.976292+00:00",
+                "quote_source_time": "2026-07-22T21:01:32.864127Z",
+                "quote_source_ts_ms": 1784754092864,
+                "quote_age_seconds": 0.201
+              }
+            },
+            "0.05": {
+              "at": "2026-07-22T21:01:52.999782+00:00",
+              "target_per_contract": 0.05,
+              "target_bid": 0.45,
+              "observed_bid": 0.5,
+              "observed_gross_per_contract": 0.1,
+              "observed_gross_total": 0.1,
+              "exit_quote": {
+                "quote_id": "KXBTC15M-26JUL221715-15:109:2026-07-22T21:01:52.976362+00:00",
+                "side": "no",
+                "economic_price": 0.5,
+                "executable_yes_price": 0.5,
+                "executable_field": "yes_ask",
+                "displayed_depth": 1317.01,
+                "required_count": 0.0,
+                "yes_bid": 0.48,
+                "yes_bid_size": 1242.49,
+                "yes_ask": 0.5,
+                "yes_ask_size": 1317.01,
+                "quote_received_at": "2026-07-22T21:01:52.976362+00:00",
+                "quote_source_time": "2026-07-22T21:01:52.893364Z",
+                "quote_source_ts_ms": 1784754112893,
+                "quote_age_seconds": 0.023
+              }
+            },
+            "0.06": {
+              "at": "2026-07-22T21:01:52.999790+00:00",
+              "target_per_contract": 0.06,
+              "target_bid": 0.46,
+              "observed_bid": 0.5,
+              "observed_gross_per_contract": 0.1,
+              "observed_gross_total": 0.1,
+              "exit_quote": {
+                "quote_id": "KXBTC15M-26JUL221715-15:109:2026-07-22T21:01:52.976362+00:00",
+                "side": "no",
+                "economic_price": 0.5,
+                "executable_yes_price": 0.5,
+                "executable_field": "yes_ask",
+                "displayed_depth": 1317.01,
+                "required_count": 0.0,
+                "yes_bid": 0.48,
+                "yes_bid_size": 1242.49,
+                "yes_ask": 0.5,
+                "yes_ask_size": 1317.01,
+                "quote_received_at": "2026-07-22T21:01:52.976362+00:00",
+                "quote_source_time": "2026-07-22T21:01:52.893364Z",
+                "quote_source_ts_ms": 1784754112893,
+                "quote_age_seconds": 0.023
+              }
+            },
+            "0.07": {
+              "at": "2026-07-22T21:01:52.999797+00:00",
+              "target_per_contract": 0.07,
+              "target_bid": 0.47,
+              "observed_bid": 0.5,
+              "observed_gross_per_contract": 0.1,
+              "observed_gross_total": 0.1,
+              "exit_quote": {
+                "quote_id": "KXBTC15M-26JUL221715-15:109:2026-07-22T21:01:52.976362+00:00",
+                "side": "no",
+                "economic_price": 0.5,
+                "executable_yes_price": 0.5,
+                "executable_field": "yes_ask",
+                "displayed_depth": 1317.01,
+                "required_count": 0.0,
+                "yes_bid": 0.48,
+                "yes_bid_size": 1242.49,
+                "yes_ask": 0.5,
+                "yes_ask_size": 1317.01,
+                "quote_received_at": "2026-07-22T21:01:52.976362+00:00",
+                "quote_source_time": "2026-07-22T21:01:52.893364Z",
+                "quote_source_ts_ms": 1784754112893,
+                "quote_age_seconds": 0.023
+              }
+            },
+            "0.08": {
+              "at": "2026-07-22T21:01:52.999803+00:00",
+              "target_per_contract": 0.08,
+              "target_bid": 0.48,
+              "observed_bid": 0.5,
+              "observed_gross_per_contract": 0.1,
+              "observed_gross_total": 0.1,
+              "exit_quote": {
+                "quote_id": "KXBTC15M-26JUL221715-15:109:2026-07-22T21:01:52.976362+00:00",
+                "side": "no",
+                "economic_price": 0.5,
+                "executable_yes_price": 0.5,
+                "executable_field": "yes_ask",
+                "displayed_depth": 1317.01,
+                "required_count": 0.0,
+                "yes_bid": 0.48,
+                "yes_bid_size": 1242.49,
+                "yes_ask": 0.5,
+                "yes_ask_size": 1317.01,
+                "quote_received_at": "2026-07-22T21:01:52.976362+00:00",
+                "quote_source_time": "2026-07-22T21:01:52.893364Z",
+                "quote_source_ts_ms": 1784754112893,
+                "quote_age_seconds": 0.023
+              }
+            },
+            "0.09": {
+              "at": "2026-07-22T21:01:52.999809+00:00",
+              "target_per_contract": 0.09,
+              "target_bid": 0.49,
+              "observed_bid": 0.5,
+              "observed_gross_per_contract": 0.1,
+              "observed_gross_total": 0.1,
+              "exit_quote": {
+                "quote_id": "KXBTC15M-26JUL221715-15:109:2026-07-22T21:01:52.976362+00:00",
+                "side": "no",
+                "economic_price": 0.5,
+                "executable_yes_price": 0.5,
+                "executable_field": "yes_ask",
+                "displayed_depth": 1317.01,
+                "required_count": 0.0,
+                "yes_bid": 0.48,
+                "yes_bid_size": 1242.49,
+                "yes_ask": 0.5,
+                "yes_ask_size": 1317.01,
+                "quote_received_at": "2026-07-22T21:01:52.976362+00:00",
+                "quote_source_time": "2026-07-22T21:01:52.893364Z",
+                "quote_source_ts_ms": 1784754112893,
+                "quote_age_seconds": 0.023
+              }
+            },
+            "0.10": {
+              "at": "2026-07-22T21:01:52.999815+00:00",
+              "target_per_contract": 0.1,
+              "target_bid": 0.5,
+              "observed_bid": 0.5,
+              "observed_gross_per_contract": 0.1,
+              "observed_gross_total": 0.1,
+              "exit_quote": {
+                "quote_id": "KXBTC15M-26JUL221715-15:109:2026-07-22T21:01:52.976362+00:00",
+                "side": "no",
+                "economic_price": 0.5,
+                "executable_yes_price": 0.5,
+                "executable_field": "yes_ask",
+                "displayed_depth": 1317.01,
+                "required_count": 0.0,
+                "yes_bid": 0.48,
+                "yes_bid_size": 1242.49,
+                "yes_ask": 0.5,
+                "yes_ask_size": 1317.01,
+                "quote_received_at": "2026-07-22T21:01:52.976362+00:00",
+                "quote_source_time": "2026-07-22T21:01:52.893364Z",
+                "quote_source_ts_ms": 1784754112893,
+                "quote_age_seconds": 0.023
+              }
+            }
+          },
+          "last_actual_top_of_book": {
+            "observed_at": "2026-07-22T21:04:54.976432+00:00",
+            "quote_id": "KXBTC15M-26JUL221715-15:291:2026-07-22T21:04:54.976432+00:00",
+            "quote_age_seconds": 0.254,
+            "yes_bid": 0.6,
+            "yes_ask": 0.61,
+            "yes_bid_size": 846.01,
+            "yes_ask_size": 761.0,
+            "no_bid": 0.39,
+            "no_ask": 0.4,
+            "selected_side_executable_bid": 0.39,
+            "selected_side_executable_ask": 0.4
+          }
         }
       ],
       "average_entry_profiles": {
         "0.4": {
           "average_entry_price": 0.4,
           "observed_positions": 19,
-          "active_positions": 1,
-          "completed_position_states": 18,
+          "active_positions": 0,
+          "completed_position_states": 19,
           "scalp_exits": 0,
-          "trailing_stop_exits": 9,
+          "trailing_stop_exits": 10,
           "fixed_stop_loss_exits": 0,
           "settlement_exits": 0,
-          "net_profit": 0.79,
+          "net_profit": 0.78,
           "depth_observed_positions": 19,
           "median_maximum_gross_per_contract": 0.12,
           "p75_maximum_gross_per_contract": 0.165,
@@ -59860,134 +60191,134 @@
         "enabled": true,
         "method": "records the maximum later fresh executable bid with displayed depth for each unchanged filled-average/size; range shadows do not select an exit, trailing shadows may close on their configured retracement, and fixed-stop shadows may close at their configured loss threshold",
         "unit": "gross dollars per contract; fees, queue position, latency, and price impact excluded",
-        "completed_position_states": 39,
-        "depth_observed_position_states": 39,
+        "completed_position_states": 40,
+        "depth_observed_position_states": 40,
         "maximum_gross_per_contract": {
           "minimum": -0.105,
-          "p25": -0.038333,
-          "median": 0.03,
-          "p75": 0.138333,
-          "p90": 0.251334,
+          "p25": -0.035833,
+          "median": 0.031667,
+          "p75": 0.15,
+          "p90": 0.249,
           "maximum": 0.39,
-          "average": 0.063889
+          "average": 0.066042
         },
         "target_opportunities": {
           "0.01": {
             "target_per_contract": 0.01,
-            "completed_position_states": 39,
-            "depth_observed_position_states": 39,
-            "hit_position_states": 21,
-            "hit_rate_given_depth_observation": 0.538462
+            "completed_position_states": 40,
+            "depth_observed_position_states": 40,
+            "hit_position_states": 22,
+            "hit_rate_given_depth_observation": 0.55
           },
           "0.02": {
             "target_per_contract": 0.02,
-            "completed_position_states": 39,
-            "depth_observed_position_states": 39,
-            "hit_position_states": 21,
-            "hit_rate_given_depth_observation": 0.538462
+            "completed_position_states": 40,
+            "depth_observed_position_states": 40,
+            "hit_position_states": 22,
+            "hit_rate_given_depth_observation": 0.55
           },
           "0.03": {
             "target_per_contract": 0.03,
-            "completed_position_states": 39,
-            "depth_observed_position_states": 39,
-            "hit_position_states": 20,
-            "hit_rate_given_depth_observation": 0.512821
+            "completed_position_states": 40,
+            "depth_observed_position_states": 40,
+            "hit_position_states": 21,
+            "hit_rate_given_depth_observation": 0.525
           },
           "0.04": {
             "target_per_contract": 0.04,
-            "completed_position_states": 39,
-            "depth_observed_position_states": 39,
-            "hit_position_states": 18,
-            "hit_rate_given_depth_observation": 0.461538
+            "completed_position_states": 40,
+            "depth_observed_position_states": 40,
+            "hit_position_states": 19,
+            "hit_rate_given_depth_observation": 0.475
           },
           "0.05": {
             "target_per_contract": 0.05,
-            "completed_position_states": 39,
-            "depth_observed_position_states": 39,
-            "hit_position_states": 16,
-            "hit_rate_given_depth_observation": 0.410256
+            "completed_position_states": 40,
+            "depth_observed_position_states": 40,
+            "hit_position_states": 17,
+            "hit_rate_given_depth_observation": 0.425
           },
           "0.06": {
             "target_per_contract": 0.06,
-            "completed_position_states": 39,
-            "depth_observed_position_states": 39,
-            "hit_position_states": 16,
-            "hit_rate_given_depth_observation": 0.410256
+            "completed_position_states": 40,
+            "depth_observed_position_states": 40,
+            "hit_position_states": 17,
+            "hit_rate_given_depth_observation": 0.425
           },
           "0.07": {
             "target_per_contract": 0.07,
-            "completed_position_states": 39,
-            "depth_observed_position_states": 39,
-            "hit_position_states": 15,
-            "hit_rate_given_depth_observation": 0.384615
+            "completed_position_states": 40,
+            "depth_observed_position_states": 40,
+            "hit_position_states": 16,
+            "hit_rate_given_depth_observation": 0.4
           },
           "0.08": {
             "target_per_contract": 0.08,
-            "completed_position_states": 39,
-            "depth_observed_position_states": 39,
-            "hit_position_states": 14,
-            "hit_rate_given_depth_observation": 0.358974
+            "completed_position_states": 40,
+            "depth_observed_position_states": 40,
+            "hit_position_states": 15,
+            "hit_rate_given_depth_observation": 0.375
           },
           "0.09": {
             "target_per_contract": 0.09,
-            "completed_position_states": 39,
-            "depth_observed_position_states": 39,
-            "hit_position_states": 14,
-            "hit_rate_given_depth_observation": 0.358974
+            "completed_position_states": 40,
+            "depth_observed_position_states": 40,
+            "hit_position_states": 15,
+            "hit_rate_given_depth_observation": 0.375
           },
           "0.10": {
             "target_per_contract": 0.1,
-            "completed_position_states": 39,
-            "depth_observed_position_states": 39,
-            "hit_position_states": 14,
-            "hit_rate_given_depth_observation": 0.358974
+            "completed_position_states": 40,
+            "depth_observed_position_states": 40,
+            "hit_position_states": 15,
+            "hit_rate_given_depth_observation": 0.375
           },
           "0.20": {
             "target_per_contract": 0.2,
-            "completed_position_states": 39,
-            "depth_observed_position_states": 39,
+            "completed_position_states": 40,
+            "depth_observed_position_states": 40,
             "hit_position_states": 6,
-            "hit_rate_given_depth_observation": 0.153846
+            "hit_rate_given_depth_observation": 0.15
           },
           "0.30": {
             "target_per_contract": 0.3,
-            "completed_position_states": 39,
-            "depth_observed_position_states": 39,
+            "completed_position_states": 40,
+            "depth_observed_position_states": 40,
             "hit_position_states": 3,
-            "hit_rate_given_depth_observation": 0.076923
+            "hit_rate_given_depth_observation": 0.075
           },
           "0.40": {
             "target_per_contract": 0.4,
-            "completed_position_states": 39,
-            "depth_observed_position_states": 39,
+            "completed_position_states": 40,
+            "depth_observed_position_states": 40,
             "hit_position_states": 0,
             "hit_rate_given_depth_observation": 0.0
           },
           "0.50": {
             "target_per_contract": 0.5,
-            "completed_position_states": 39,
-            "depth_observed_position_states": 39,
+            "completed_position_states": 40,
+            "depth_observed_position_states": 40,
             "hit_position_states": 0,
             "hit_rate_given_depth_observation": 0.0
           },
           "0.60": {
             "target_per_contract": 0.6,
-            "completed_position_states": 39,
-            "depth_observed_position_states": 39,
+            "completed_position_states": 40,
+            "depth_observed_position_states": 40,
             "hit_position_states": 0,
             "hit_rate_given_depth_observation": 0.0
           },
           "0.70": {
             "target_per_contract": 0.7,
-            "completed_position_states": 39,
-            "depth_observed_position_states": 39,
+            "completed_position_states": 40,
+            "depth_observed_position_states": 40,
             "hit_position_states": 0,
             "hit_rate_given_depth_observation": 0.0
           },
           "0.80": {
             "target_per_contract": 0.8,
-            "completed_position_states": 39,
-            "depth_observed_position_states": 39,
+            "completed_position_states": 40,
+            "depth_observed_position_states": 40,
             "hit_position_states": 0,
             "hit_rate_given_depth_observation": 0.0
           }
@@ -60001,7 +60332,7 @@
         "configured_activation_gains_per_contract": [
           0.1
         ],
-        "trailing_stop_exits": 14,
+        "trailing_stop_exits": 15,
         "execution_rule": "after a fresh full-depth bid first reaches average filled entry plus the configured activation gain, a later fresh full-depth bid at or below the maximum minus the configured gap exits the whole paper position at that observed bid"
       },
       "fixed_stop_loss": {
@@ -78920,20 +79251,20 @@
       "average_entry_profiles": {
         "0.4": {
           "average_entry_price": 0.4,
-          "observed_positions": 18,
-          "active_positions": 5,
+          "observed_positions": 19,
+          "active_positions": 6,
           "completed_position_states": 13,
           "scalp_exits": 0,
           "trailing_stop_exits": 0,
           "fixed_stop_loss_exits": 0,
           "settlement_exits": 2,
           "net_profit": 1.2,
-          "depth_observed_positions": 18,
-          "median_maximum_gross_per_contract": 0.075,
+          "depth_observed_positions": 19,
+          "median_maximum_gross_per_contract": 0.04,
           "p75_maximum_gross_per_contract": 0.19,
           "p90_maximum_gross_per_contract": 0.599,
           "maximum_gross_per_contract": 0.599,
-          "average_maximum_gross_per_contract": 0.158167,
+          "average_maximum_gross_per_contract": 0.149842,
           "median_filled_contracts": 1.0
         },
         "0.3333": {
@@ -80850,20 +81181,20 @@
       "average_entry_profiles": {
         "0.4": {
           "average_entry_price": 0.4,
-          "observed_positions": 18,
-          "active_positions": 7,
+          "observed_positions": 19,
+          "active_positions": 8,
           "completed_position_states": 11,
           "scalp_exits": 0,
           "trailing_stop_exits": 0,
           "fixed_stop_loss_exits": 0,
           "settlement_exits": 0,
           "net_profit": 0.0,
-          "depth_observed_positions": 18,
-          "median_maximum_gross_per_contract": 0.075,
+          "depth_observed_positions": 19,
+          "median_maximum_gross_per_contract": 0.04,
           "p75_maximum_gross_per_contract": 0.19,
           "p90_maximum_gross_per_contract": 0.599,
           "maximum_gross_per_contract": 0.599,
-          "average_maximum_gross_per_contract": 0.154278,
+          "average_maximum_gross_per_contract": 0.146158,
           "median_filled_contracts": 1.0
         },
         "0.3333": {
@@ -82299,20 +82630,20 @@
       "average_entry_profiles": {
         "0.4": {
           "average_entry_price": 0.4,
-          "observed_positions": 18,
-          "active_positions": 7,
+          "observed_positions": 19,
+          "active_positions": 8,
           "completed_position_states": 11,
           "scalp_exits": 0,
           "trailing_stop_exits": 0,
           "fixed_stop_loss_exits": 0,
           "settlement_exits": 0,
           "net_profit": 0.0,
-          "depth_observed_positions": 18,
-          "median_maximum_gross_per_contract": 0.035,
+          "depth_observed_positions": 19,
+          "median_maximum_gross_per_contract": 0.03,
           "p75_maximum_gross_per_contract": 0.19,
           "p90_maximum_gross_per_contract": 0.599,
           "maximum_gross_per_contract": 0.599,
-          "average_maximum_gross_per_contract": 0.140389,
+          "average_maximum_gross_per_contract": 0.132474,
           "median_filled_contracts": 1.0
         },
         "0.3333": {
