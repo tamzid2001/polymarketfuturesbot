@@ -57,12 +57,13 @@
     "unit": "gross dollars per contract; fees, queue position, latency, and price impact excluded"
   },
   "fee_treatment": "excluded_no_exchange_fill",
-  "fill_rule": "buy at a fresh actual executable ask <= rung with displayed ask depth; maintains the latest fresh YES and NO top-of-book snapshot, requires displayed bid depth for the whole filled position on every exit, closes a fixed loss only at average filled entry minus its configured gap, and closes a trailing stop only after its average-filled-entry gain activation and later configured retracement",
+  "fill_rule": "buy at a fresh actual executable ask <= rung with displayed ask depth; maintains the latest fresh YES and NO top-of-book snapshot, requires displayed bid depth for the whole filled position on every exit, closes an absolute stop only at its configured selected-side price, and closes a trailing stop only after its average-filled-entry gain activation and later configured retracement",
   "filled_market_trades": 0,
   "fixed_stop_loss": {
+    "configured_absolute_prices": [],
     "configured_gaps_per_contract": [],
     "enabled": false,
-    "execution_rule": "after a weighted position forms, a fresh full-depth executable bid at or below average entry minus the configured gap exits the whole paper position at that observed bid",
+    "execution_rule": "a fresh full-depth selected-side bid at or below the configured absolute price exits the whole paper position at that observed bid; legacy average-entry-gap records remain distinguishable in configured_gaps_per_contract",
     "fixed_stop_loss_exits": 0
   },
   "fixed_stop_loss_exits": 0,
