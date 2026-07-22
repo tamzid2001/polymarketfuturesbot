@@ -127,10 +127,10 @@ DEFAULT_CONFIG = {
     # single live order or risk limit.
     "inverse_shadow_position_size": 1.0,
     "inverse_shadow_quote_max_age_seconds": 3.0,
-    # An alternate paper-only exit study for the frozen ML side.  It mirrors
-    # the 40c/30c/20c/10c entries at one share each, then exits only when a
-    # fresh bid has enough displayed depth to close the entire paper position
-    # one cent above its current VWAP.  It cannot touch live orders.
+    # An alternate paper-only range study for the frozen ML side. It mirrors
+    # the 40c/30c/20c/10c entries at one share each and records the full
+    # depth-supported favorable excursion at each held VWAP/size. It tracks
+    # 1c/2c/3c/5c/10c targets but never submits an exchange close.
     "scalp_shadow_enabled": True,
     "scalp_shadow_position_size": 1.0,
     "scalp_shadow_profit_target": 0.01,
@@ -1734,7 +1734,7 @@ def finalize_inverse_shadow(record: dict[str, Any], result: str | None) -> bool:
 def ensure_ml_scalp_shadow(
     record: dict[str, Any], market: Any, config: dict[str, Any], ml_side: str,
 ) -> dict[str, Any] | None:
-    """Start the normal-ML, one-round-trip paper scalp study.
+    """Start the normal-ML paper range study.
 
     The live GTC ladder remains completely independent.  This shadow is an
     alternative paper scenario with readable one-share rungs, created from the
@@ -1752,14 +1752,14 @@ def ensure_ml_scalp_shadow(
         profit_target_per_contract=float(config["scalp_shadow_profit_target"]),
         quote_max_age_seconds=float(config["scalp_shadow_quote_max_age_seconds"]),
         market_close_time=field(market, "close_time", "expected_expiration_time"),
+        observation_only=True,
         extra={"source_ml_side": ml_side, "source_model_run_id": record.get("ml_inference", {}).get("model_run_id")},
     )
     record["ml_ladder_scalp_shadow"] = shadow
     LOG.info(
-        "ML LADDER SCALP SHADOW STARTED | %s side=%s rungs=$0.40/$0.30/$0.20/$0.10 qty=%.2f "
-        "take_profit=average_entry+$%.2f; paper only, no exchange order or close.",
+        "ML LADDER SCALP RANGE STUDY STARTED | %s side=%s rungs=$0.40/$0.30/$0.20/$0.10 qty=%.2f "
+        "observes depth-supported 1c/2c/3c/5c/10c exits and maximum excursion; paper only, no exchange order or close.",
         record.get("ticker", "?"), ml_side.upper(), float(config["scalp_shadow_position_size"]),
-        float(config["scalp_shadow_profit_target"]),
     )
     return shadow
 
@@ -1798,12 +1798,19 @@ def simulate_ml_scalp_shadow(
                 ticker, side.upper(), float(event["rung_price"]),
                 float(event["entry_quote"]["economic_price"]), float(event["entry_quote"]["displayed_depth"]),
             )
-        elif event.get("kind") == "paper_scalp_take_profit_exit":
+        elif event.get("kind") == "paper_scalp_maximum_update":
             LOG.info(
-                "ML SCALP PAPER EXIT | %s %s contracts=%.2f avg=$%.4f target_bid=$%.4f bid=$%.4f "
-                "gross=$%+.4f; fresh depth evidence only, no exchange close.",
+                "ML SCALP RANGE MAX | %s %s contracts=%.2f avg=$%.4f bid=$%.4f "
+                "gross_per_contract=$%+.4f gross_total=$%+.4f; fresh full-depth evidence only, no exchange close.",
                 ticker, side.upper(), float(event["filled_contracts"]), float(event["average_entry_price"]),
-                float(event["take_profit_bid"]), float(event["exit_price"]), float(event["gross_profit_loss"]),
+                float(event["exit_price"]), float(event["gross_per_contract"]), float(event["gross_total"]),
+            )
+        elif event.get("kind") == "paper_scalp_target_hit":
+            LOG.info(
+                "ML SCALP RANGE TARGET HIT | %s %s contracts=%.2f avg=$%.4f target=+$%.2f bid=$%.4f "
+                "gross_total=$%+.4f; observation only, no exchange close.",
+                ticker, side.upper(), float(event["filled_contracts"]), float(event["average_entry_price"]),
+                float(event["target_per_contract"]), float(event["observed_bid"]), float(event["observed_gross_total"]),
             )
     return bool(events)
 
@@ -3065,21 +3072,35 @@ def log_performance_summary(report: dict[str, Any], context: str) -> None:
             rung["resting_or_unfilled"], rung["winning_orders"], rung["losing_orders"], rung["net_profit"],
         )
     scalp = report["ml_ladder_scalp_shadow_performance"]
+    excursion = scalp["excursion_observer"]
+    maximum = excursion["maximum_gross_per_contract"]
     LOG.info(
-        "ML LADDER SCALP SHADOW PERFORMANCE | %s started=%d active=%d scalp_exits=%d settlement_exits=%d "
-        "filled_markets=%d wins=%d losses=%d net=$%+.4f roi=%s max_drawdown=$%.4f "
-        "| paper only; fresh bid/ask/depth required; fees/queue excluded.",
-        context, scalp["paper_markets_started"], scalp["active_paper_markets"], scalp["scalp_exits"],
-        scalp["settlement_exits_without_take_profit"], scalp["filled_market_trades"],
-        scalp["winning_trades"], scalp["losing_trades"], scalp["net_profit"],
-        "n/a" if scalp["return_on_simulated_capital"] is None else f"{100 * scalp['return_on_simulated_capital']:.2f}%",
-        scalp["maximum_drawdown"],
+        "ML LADDER SCALP RANGE PERFORMANCE | %s started=%d active=%d completed_states=%d depth_observed=%d "
+        "mfe_gross_per_contract median=%s p75=%s p90=%s max=%s "
+        "| paper only; no exit selected; fresh full-depth bid/ask evidence; fees/queue excluded.",
+        context, scalp["paper_markets_started"], scalp["active_paper_markets"],
+        excursion["completed_position_states"], excursion["depth_observed_position_states"],
+        "n/a" if maximum["median"] is None else f"${maximum['median']:+.4f}",
+        "n/a" if maximum["p75"] is None else f"${maximum['p75']:+.4f}",
+        "n/a" if maximum["p90"] is None else f"${maximum['p90']:+.4f}",
+        "n/a" if maximum["maximum"] is None else f"${maximum['maximum']:+.4f}",
     )
+    for target, opportunity in excursion["target_opportunities"].items():
+        rate = opportunity["hit_rate_given_depth_observation"]
+        LOG.info(
+            "ML SCALP RANGE TARGET | +%sc completed_states=%d depth_observed=%d hits=%d hit_rate=%s",
+            target, opportunity["completed_position_states"], opportunity["depth_observed_position_states"],
+            opportunity["hit_position_states"], "n/a" if rate is None else f"{100 * rate:.1f}%",
+        )
     for average, profile in scalp["average_entry_profiles"].items():
         LOG.info(
-            "ML SCALP AVG ENTRY | avg=%sc observed=%d active=%d scalp_exits=%d settlement_exits=%d net=$%+.4f",
-            average, profile["observed_positions"], profile["active_positions"], profile["scalp_exits"],
-            profile["settlement_exits"], profile["net_profit"],
+            "ML SCALP AVG ENTRY RANGE | avg=%sc states=%d completed=%d depth_observed=%d "
+            "mfe_median=%s mfe_p75=%s mfe_p90=%s",
+            average, profile["observed_positions"], profile["completed_position_states"],
+            profile["depth_observed_positions"],
+            "n/a" if profile["median_maximum_gross_per_contract"] is None else f"${profile['median_maximum_gross_per_contract']:+.4f}",
+            "n/a" if profile["p75_maximum_gross_per_contract"] is None else f"${profile['p75_maximum_gross_per_contract']:+.4f}",
+            "n/a" if profile["p90_maximum_gross_per_contract"] is None else f"${profile['p90_maximum_gross_per_contract']:+.4f}",
         )
 
 
@@ -3210,13 +3231,18 @@ async def log_heartbeat(
         scalp = record.get("ml_ladder_scalp_shadow")
         if isinstance(scalp, dict):
             position = scalp_entry_summary(scalp)
+            epochs = scalp.get("position_epochs") if isinstance(scalp.get("position_epochs"), list) else []
+            epoch = epochs[-1] if epochs and isinstance(epochs[-1], dict) else {}
+            maximum = epoch.get("max_executable_gross_per_contract")
+            target_hits = epoch.get("target_hits") if isinstance(epoch.get("target_hits"), dict) else {}
             LOG.info(
-                "ML SCALP SHADOW STATUS | %s side=%s status=%s filled=%.2f avg_entry=%s target_bid=%s "
-                "entry_quote_state=%s exit_quote_state=%s; no exchange order or close.",
+                "ML SCALP RANGE STATUS | %s side=%s status=%s filled=%.2f avg_entry=%s max_gross_per_contract=%s "
+                "targets_hit=%s entry_quote_state=%s exit_quote_state=%s; no exchange order or close.",
                 record.get("ticker", "?"), str(scalp.get("side") or "?").upper(), scalp.get("status", "?"),
                 float(position["filled_contracts"] or 0.0),
                 "none" if position["average_entry_price"] is None else f"${float(position['average_entry_price']):.4f}",
-                "none" if position["take_profit_bid"] is None else f"${float(position['take_profit_bid']):.4f}",
+                "none" if maximum is None else f"${float(maximum):+.4f}",
+                "/".join(sorted(target_hits)) if target_hits else "none",
                 scalp.get("last_entry_quote_state", "awaiting_quote"),
                 scalp.get("last_exit_quote_state", "awaiting_quote"),
             )

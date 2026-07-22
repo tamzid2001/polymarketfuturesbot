@@ -1,9 +1,10 @@
 """Auditable paper-only scalp simulation for a fixed Kalshi ladder.
 
 The simulator is deliberately isolated from the live order paths.  It mirrors
-a 40c/30c/20c/10c pre-posted purchase ladder at a readable paper size, then
-closes the *entire* hypothetical position only when a fresh, depth-supported
-best bid is at least one configurable cent above its volume-weighted entry.
+a 40c/30c/20c/10c pre-posted purchase ladder at a readable paper size.  It can
+either model one fixed take-profit exit or, for the production paper audit,
+observe the full later excursion and report which pre-specified exits were
+actually supported by a fresh bid and sufficient displayed depth.
 
 It is not an exchange-fill model: queue priority, latency, cancellations,
 hidden liquidity, partial fills, and fees are all excluded and retained as
@@ -17,6 +18,7 @@ from typing import Any
 
 
 LADDER_LEVELS = (0.40, 0.30, 0.20, 0.10)
+DEFAULT_PROFIT_TARGETS = (0.01, 0.02, 0.03, 0.05, 0.10)
 EPSILON = 0.004
 
 
@@ -33,9 +35,11 @@ def new_ladder_average_entry_scalp_shadow(
     profit_target_per_contract: float,
     quote_max_age_seconds: float,
     market_close_time: Any,
+    observation_only: bool = False,
+    profit_targets_per_contract: tuple[float, ...] = DEFAULT_PROFIT_TARGETS,
     extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Return a one-round-trip paper ladder with a VWAP take-profit exit."""
+    """Return a paper ladder with either a fixed exit or a range observer."""
     normalized_side = str(side).lower()
     if normalized_side not in {"yes", "no"}:
         raise ValueError("side must be yes or no")
@@ -43,6 +47,9 @@ def new_ladder_average_entry_scalp_shadow(
         raise ValueError("quantity_per_rung must be positive")
     if not 0.0 < profit_target_per_contract < 1.0:
         raise ValueError("profit_target_per_contract must be between zero and one")
+    targets = tuple(sorted({round(float(target), 6) for target in profit_targets_per_contract}))
+    if not targets or any(not 0.0 < target < 1.0 for target in targets):
+        raise ValueError("profit_targets_per_contract must contain valid probabilities")
     return {
         "strategy": strategy,
         "mode": "paper_only_no_exchange_orders",
@@ -53,6 +60,8 @@ def new_ladder_average_entry_scalp_shadow(
         "market_close_time": market_close_time,
         "quantity_per_rung": round(float(quantity_per_rung), 4),
         "profit_target_per_contract": round(float(profit_target_per_contract), 4),
+        "observation_only": bool(observation_only),
+        "profit_targets_per_contract": list(targets),
         "quote_max_age_seconds": round(float(quote_max_age_seconds), 4),
         "rungs": {
             f"{level:.4f}": {
@@ -65,6 +74,11 @@ def new_ladder_average_entry_scalp_shadow(
             for level in LADDER_LEVELS
         },
         "entry_quote_depth_consumed": {},
+        # Each epoch starts after a change in the filled position.  It captures
+        # the maximum *executable* bid thereafter for that exact VWAP/size,
+        # rather than incorrectly applying a later lower average to an earlier
+        # bid that could not have closed the eventual larger position.
+        "position_epochs": [],
         "events": [],
         "limitation": (
             "Paper-only. Entry and exit require a fresh complete top-of-book and displayed depth, "
@@ -99,6 +113,94 @@ def entry_summary(shadow: dict[str, Any]) -> dict[str, float | None]:
 
 def _record_event(shadow: dict[str, Any], event: dict[str, Any]) -> None:
     shadow.setdefault("events", []).append(event)
+
+
+def _observation_epoch(shadow: dict[str, Any], position: dict[str, float | None]) -> dict[str, Any] | None:
+    """Get or start the audit segment for the currently filled VWAP/size."""
+    contracts = float(position["filled_contracts"] or 0.0)
+    average = position["average_entry_price"]
+    if contracts <= EPSILON or average is None:
+        return None
+    signature = (round(contracts, 4), round(float(average), 6))
+    epochs = shadow.setdefault("position_epochs", [])
+    if epochs:
+        previous = epochs[-1]
+        if (float(previous.get("filled_contracts") or 0.0), float(previous.get("average_entry_price") or 0.0)) == signature:
+            return previous
+        previous["ended_at"] = now_iso()
+    epoch = {
+        "started_at": now_iso(),
+        "filled_contracts": signature[0],
+        "average_entry_price": signature[1],
+        "entry_cost": round(float(position["entry_cost"] or 0.0), 6),
+        "target_bids": {f"{target:.2f}": round(signature[1] + target, 6)
+                        for target in shadow.get("profit_targets_per_contract", DEFAULT_PROFIT_TARGETS)},
+        "max_executable_exit_bid": None,
+        "max_executable_gross_per_contract": None,
+        "max_executable_gross_total": None,
+        "max_exit_quote": None,
+        "target_hits": {},
+    }
+    epochs.append(epoch)
+    return epoch
+
+
+def _observe_executable_exit(
+    shadow: dict[str, Any], position: dict[str, float | None], exit_quote: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """Record MFE and pre-specified target hits without selecting an exit."""
+    epoch = _observation_epoch(shadow, position)
+    contracts = float(position["filled_contracts"] or 0.0)
+    average = position["average_entry_price"]
+    if epoch is None or average is None or contracts <= EPSILON or exit_quote is None:
+        return []
+    bid = float(exit_quote.get("economic_price") or 0.0)
+    depth = float(exit_quote.get("displayed_depth") or 0.0)
+    if depth + 1e-9 < contracts:
+        return []
+    gross_per_contract = bid - float(average)
+    events: list[dict[str, Any]] = []
+    prior_maximum = epoch.get("max_executable_gross_per_contract")
+    if prior_maximum is None or gross_per_contract > float(prior_maximum) + 1e-9:
+        epoch.update({
+            "max_executable_exit_bid": round(bid, 6),
+            "max_executable_gross_per_contract": round(gross_per_contract, 6),
+            "max_executable_gross_total": round(gross_per_contract * contracts, 6),
+            "max_exit_quote": dict(exit_quote),
+            "max_recorded_at": now_iso(),
+        })
+        event = {
+            "kind": "paper_scalp_maximum_update",
+            "at": epoch["max_recorded_at"],
+            "filled_contracts": round(contracts, 4),
+            "average_entry_price": round(float(average), 6),
+            "exit_price": round(bid, 6),
+            "gross_per_contract": round(gross_per_contract, 6),
+            "gross_total": round(gross_per_contract * contracts, 6),
+            "exit_quote": dict(exit_quote),
+        }
+        _record_event(shadow, event)
+        events.append(event)
+    for target in shadow.get("profit_targets_per_contract", DEFAULT_PROFIT_TARGETS):
+        target = float(target)
+        key = f"{target:.2f}"
+        if gross_per_contract + 1e-9 < target or key in epoch["target_hits"]:
+            continue
+        hit = {
+            "at": now_iso(),
+            "target_per_contract": target,
+            "target_bid": round(float(average) + target, 6),
+            "observed_bid": round(bid, 6),
+            "observed_gross_per_contract": round(gross_per_contract, 6),
+            "observed_gross_total": round(gross_per_contract * contracts, 6),
+            "exit_quote": dict(exit_quote),
+        }
+        epoch["target_hits"][key] = hit
+        event = {"kind": "paper_scalp_target_hit", "filled_contracts": round(contracts, 4),
+                 "average_entry_price": round(float(average), 6), **hit}
+        _record_event(shadow, event)
+        events.append(event)
+    return events
 
 
 def simulate_ladder_average_entry_scalp(
@@ -160,6 +262,8 @@ def simulate_ladder_average_entry_scalp(
     shadow["entry_summary"] = position
     contracts = float(position["filled_contracts"] or 0.0)
     target_bid = position["take_profit_bid"]
+    if shadow.get("observation_only"):
+        return events + _observe_executable_exit(shadow, position, exit_quote)
     if contracts <= EPSILON or target_bid is None or exit_quote is None:
         return events
     bid = float(exit_quote.get("economic_price") or 0.0)
@@ -217,13 +321,19 @@ def finalize_ladder_average_entry_scalp(shadow: dict[str, Any], result: str | No
     if outcome not in {"yes", "no"}:
         return False
     position = entry_summary(shadow)
+    finalized_at = now_iso()
+    if shadow.get("observation_only"):
+        for epoch in shadow.get("position_epochs", []):
+            if isinstance(epoch, dict) and not epoch.get("ended_at"):
+                epoch["ended_at"] = finalized_at
+                epoch["ended_by"] = "settlement"
     contracts = float(position["filled_contracts"] or 0.0)
     cost = float(position["entry_cost"] or 0.0)
     shadow["entry_summary"] = position
     if contracts <= EPSILON:
         shadow.update({
             "status": "finalized_unfilled",
-            "settled_at": now_iso(),
+            "settled_at": finalized_at,
             "settlement_outcome": outcome,
             "contracts": 0.0,
             "total_cost": 0.0,
@@ -235,7 +345,7 @@ def finalize_ladder_average_entry_scalp(shadow: dict[str, Any], result: str | No
     gross = payout - cost
     shadow.update({
         "status": "finalized_settlement",
-        "settled_at": now_iso(),
+        "settled_at": finalized_at,
         "settlement_outcome": outcome,
         "contracts": round(contracts, 4),
         "total_cost": round(cost, 6),
@@ -283,13 +393,37 @@ def scalp_performance(shadows: list[dict[str, Any]]) -> dict[str, Any]:
             "average_entry_price": price,
             "observed_positions": 0,
             "active_positions": 0,
+            "completed_position_states": 0,
             "scalp_exits": 0,
             "settlement_exits": 0,
             "net_profit": 0.0,
+            "depth_observed_positions": 0,
+            "maximum_gross_per_contract_values": [],
         }
         for price in (0.40, 0.35, 0.30, 0.25)
     }
+    observation_epochs: list[tuple[dict[str, Any], dict[str, Any]]] = []
     for shadow in shadows:
+        # The observation audit reports every VWAP/size state actually held.
+        # A state that is immediately superseded by another rung gets no later
+        # quote attribution; it has no executable holding interval to study.
+        if shadow.get("observation_only"):
+            for epoch in shadow.get("position_epochs", []):
+                if not isinstance(epoch, dict):
+                    continue
+                key = f"{float(epoch.get('average_entry_price') or 0.0):.2f}"
+                profile = profiles.get(key)
+                if profile is None:
+                    continue
+                profile["observed_positions"] += 1
+                profile["active_positions"] += str(shadow.get("status")) == "active"
+                profile["completed_position_states"] += str(shadow.get("status")) != "active"
+                maximum = epoch.get("max_executable_gross_per_contract")
+                if maximum is not None:
+                    profile["depth_observed_positions"] += 1
+                    profile["maximum_gross_per_contract_values"].append(float(maximum))
+                observation_epochs.append((shadow, epoch))
+            continue
         position = entry_summary(shadow)
         average = position["average_entry_price"]
         if average is None:
@@ -305,10 +439,43 @@ def scalp_performance(shadows: list[dict[str, Any]]) -> dict[str, Any]:
         profile["net_profit"] += float(shadow.get("net_profit_loss") or 0.0)
     for profile in profiles.values():
         profile["net_profit"] = round(profile["net_profit"], 6)
+    # Excursion statistics use only completed markets, preventing an active
+    # position from overstating the typical maximum it could ultimately reach.
+    completed_observers = {
+        id(shadow) for shadow in finalized if shadow.get("observation_only")
+    }
+    completed_epochs = [epoch for shadow, epoch in observation_epochs if id(shadow) in completed_observers]
+    maxima = [float(epoch["max_executable_gross_per_contract"])
+              for epoch in completed_epochs if epoch.get("max_executable_gross_per_contract") is not None]
+    observation_targets = sorted({
+        round(float(target), 6)
+        for shadow in shadows if shadow.get("observation_only")
+        for target in shadow.get("profit_targets_per_contract", DEFAULT_PROFIT_TARGETS)
+        if 0.0 < float(target) < 1.0
+    }) or list(DEFAULT_PROFIT_TARGETS)
+    target_summary = {}
+    for target in observation_targets:
+        key = f"{target:.2f}"
+        eligible = [epoch for epoch in completed_epochs if epoch.get("max_executable_gross_per_contract") is not None]
+        hits = [epoch for epoch in eligible if key in (epoch.get("target_hits") or {})]
+        target_summary[key] = {
+            "target_per_contract": target,
+            "completed_position_states": len(completed_epochs),
+            "depth_observed_position_states": len(eligible),
+            "hit_position_states": len(hits),
+            "hit_rate_given_depth_observation": round(len(hits) / len(eligible), 6) if eligible else None,
+        }
+    for profile in profiles.values():
+        values = profile.pop("maximum_gross_per_contract_values")
+        profile["median_maximum_gross_per_contract"] = _quantile(values, 0.50)
+        profile["p75_maximum_gross_per_contract"] = _quantile(values, 0.75)
+        profile["p90_maximum_gross_per_contract"] = _quantile(values, 0.90)
+        profile["maximum_gross_per_contract"] = _quantile(values, 1.0)
+        profile["average_maximum_gross_per_contract"] = round(sum(values) / len(values), 6) if values else None
     return {
         "strategy": "ladder_average_entry_scalp_executable_quote_shadow_v1",
         "mode": "paper_only_no_exchange_orders",
-        "fill_rule": "buy at fresh executable ask <= rung with displayed ask depth; close all filled rungs only at fresh executable bid >= average entry + target with displayed bid depth >= full position",
+        "fill_rule": "buy at fresh executable ask <= rung with displayed ask depth; fixed-exit shadows close all filled rungs at their target, while observation shadows record later executable bids with displayed bid depth >= the full position",
         "fee_treatment": "excluded_no_exchange_fill",
         "limitations": [
             "A quote hit or exit is a paper event, not a Kalshi exchange fill.",
@@ -331,4 +498,35 @@ def scalp_performance(shadows: list[dict[str, Any]]) -> dict[str, Any]:
         "return_on_simulated_capital": round(sum(pnls) / sum(costs), 6) if sum(costs) else None,
         "maximum_drawdown": round(drawdown, 6),
         "average_entry_profiles": profiles,
+        "excursion_observer": {
+            "enabled": any(bool(shadow.get("observation_only")) for shadow in shadows),
+            "method": "records the maximum later fresh executable bid with displayed depth for each unchanged filled VWAP/size; it does not select or simulate one exit target",
+            "unit": "gross dollars per contract; fees, queue position, latency, and price impact excluded",
+            "completed_position_states": len(completed_epochs),
+            "depth_observed_position_states": len(maxima),
+            "maximum_gross_per_contract": {
+                "minimum": _quantile(maxima, 0.0),
+                "p25": _quantile(maxima, 0.25),
+                "median": _quantile(maxima, 0.50),
+                "p75": _quantile(maxima, 0.75),
+                "p90": _quantile(maxima, 0.90),
+                "maximum": _quantile(maxima, 1.0),
+                "average": round(sum(maxima) / len(maxima), 6) if maxima else None,
+            },
+            "target_opportunities": target_summary,
+        },
     }
+
+
+def _quantile(values: list[float], probability: float) -> float | None:
+    """Small dependency-free linear-interpolated quantile helper."""
+    if not values:
+        return None
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return round(ordered[0], 6)
+    position = (len(ordered) - 1) * probability
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    fraction = position - lower
+    return round(ordered[lower] + (ordered[upper] - ordered[lower]) * fraction, 6)

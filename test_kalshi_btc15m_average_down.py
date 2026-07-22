@@ -50,6 +50,7 @@ from kalshi_btc15m_average_down import (
     simulate_ml_scalp_shadow,
     simulate_model_transition_shadow,
     finalize_inverse_shadow,
+    finalize_ml_scalp_shadow,
     finalize_model_transition_shadow,
     validate_config,
 )
@@ -229,7 +230,7 @@ class MechanicalAverageDownTests(unittest.TestCase):
         self.assertEqual(rung["unsettled_quote_hits"], 1)
         self.assertEqual((rung["winning_orders"], rung["losing_orders"], rung["net_profit"]), (0, 0, 0.0))
 
-    def test_ml_scalp_shadow_exits_only_after_a_depth_supported_vwap_profit(self):
+    def test_ml_scalp_range_shadow_records_depth_supported_excursion_without_exit(self):
         class FakeFeed:
             def __init__(self):
                 self.entry = [
@@ -259,10 +260,14 @@ class MechanicalAverageDownTests(unittest.TestCase):
         self.assertTrue(simulate_ml_scalp_shadow(record, feed, config))
         self.assertEqual((shadow["status"], shadow["entry_summary"]["average_entry_price"]), ("active", 0.35))
         self.assertTrue(simulate_ml_scalp_shadow(record, feed, config))
-        self.assertEqual((shadow["status"], shadow["net_profit_loss"]), ("scalp_exited", 0.02))
+        self.assertEqual("active", shadow["status"])
+        self.assertEqual(0.01, shadow["position_epochs"][0]["max_executable_gross_per_contract"])
+        self.assertIn("0.01", shadow["position_epochs"][0]["target_hits"])
+        self.assertTrue(finalize_ml_scalp_shadow(record, "yes"))
         summary = ml_scalp_shadow_performance(state)
-        self.assertEqual((summary["scalp_exits"], summary["total_entry_cost"], summary["net_profit"]), (1, 0.7, 0.02))
-        self.assertEqual(summary["average_entry_profiles"]["0.35"]["scalp_exits"], 1)
+        self.assertEqual(0, summary["scalp_exits"])
+        self.assertEqual(0.01, summary["excursion_observer"]["maximum_gross_per_contract"]["median"])
+        self.assertEqual(1, summary["excursion_observer"]["target_opportunities"]["0.01"]["hit_position_states"])
 
     def test_model_transition_shadow_paper_tests_predecessor_and_current_model_separately(self):
         class FakeFeed:

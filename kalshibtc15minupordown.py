@@ -1741,50 +1741,65 @@ def print_inverse_prophet_shadow_performance() -> None:
 
 
 def print_prophet_ladder_scalp_shadow_performance() -> None:
-    """Print the normal-side, average-entry take-profit paper audit."""
+    """Print the normal-side, average-entry paper range audit."""
     report = prophet_ladder_scalp_shadow_performance(prophet_ladder_scalp_tracker.trades)
-    roi = (
-        "n/a" if report["return_on_simulated_capital"] is None
-        else f"{100 * report['return_on_simulated_capital']:.1f}%"
-    )
+    excursion = report["excursion_observer"]
+    maximum = excursion["maximum_gross_per_contract"]
+    median_mfe = "n/a" if maximum["median"] is None else f"${maximum['median']:+.4f}"
+    p75_mfe = "n/a" if maximum["p75"] is None else f"${maximum['p75']:+.4f}"
+    p90_mfe = "n/a" if maximum["p90"] is None else f"${maximum['p90']:+.4f}"
+    max_mfe = "n/a" if maximum["maximum"] is None else f"${maximum['maximum']:+.4f}"
     log.info(
         "\n"
-        "╔═══ BTC PROPHET LADDER SCALP SHADOW — PAPER ONLY ═══════════\n"
+        "╔═══ BTC PROPHET LADDER SCALP RANGE — PAPER ONLY ════════════\n"
         f"║  Signals Started : {report['paper_markets_started']}\n"
-        f"║  Active / Filled : {report['active_paper_markets']} / {report['filled_market_trades']}\n"
-        f"║  Take-profit exits: {report['scalp_exits']}  (avg entry + $0.01 bid)\n"
-        f"║  Settlement exits : {report['settlement_exits_without_take_profit']}\n"
-        f"║  W / L            : {report['winning_trades']} / {report['losing_trades']}\n"
-        f"║  Cash flow        : spent ${report['total_entry_cost']:.4f} → proceeds ${report['total_exit_proceeds']:.4f}\n"
-        f"║  Simulated P&L    : ${report['net_profit']:+,.4f}  (fees excluded)\n"
-        f"║  Simulated ROI    : {roi}\n"
-        f"║  Max Drawdown     : ${-report['maximum_drawdown']:,.4f}\n"
-        "║  Exit evidence    : fresh complete bid + displayed depth for the full paper position\n"
+        f"║  Active / States  : {report['active_paper_markets']} / {excursion['completed_position_states']} settled\n"
+        f"║  Depth observed   : {excursion['depth_observed_position_states']} position states\n"
+        f"║  MFE / contract   : median {median_mfe}  p75 {p75_mfe}\n"
+        f"║  P90 / Maximum    : {p90_mfe} / {max_mfe}\n"
+        "║  Exit is not selected; this observes 1c/2c/3c/5c/10c opportunities\n"
+        "║  Evidence         : fresh complete bid + displayed depth for the full paper position\n"
         "╚════════════════════════════════════════════════════════════"
     )
+    for target, opportunity in excursion["target_opportunities"].items():
+        rate = opportunity["hit_rate_given_depth_observation"]
+        log.info(
+            "PROPHET SCALP RANGE TARGET | +%sc completed_states=%d depth_observed=%d hits=%d hit_rate=%s",
+            target, opportunity["completed_position_states"], opportunity["depth_observed_position_states"],
+            opportunity["hit_position_states"], "n/a" if rate is None else f"{100 * rate:.1f}%",
+        )
     for average, profile in report["average_entry_profiles"].items():
         log.info(
-            "PROPHET SCALP AVG ENTRY | avg=%sc observed=%d active=%d scalp_exits=%d settlement_exits=%d net=$%+.4f",
-            average, profile["observed_positions"], profile["active_positions"], profile["scalp_exits"],
-            profile["settlement_exits"], profile["net_profit"],
+            "PROPHET SCALP AVG ENTRY RANGE | avg=%sc states=%d completed=%d depth_observed=%d "
+            "mfe_median=%s mfe_p75=%s mfe_p90=%s",
+            average, profile["observed_positions"], profile["completed_position_states"],
+            profile["depth_observed_positions"],
+            "n/a" if profile["median_maximum_gross_per_contract"] is None else f"${profile['median_maximum_gross_per_contract']:+.4f}",
+            "n/a" if profile["p75_maximum_gross_per_contract"] is None else f"${profile['p75_maximum_gross_per_contract']:+.4f}",
+            "n/a" if profile["p90_maximum_gross_per_contract"] is None else f"${profile['p90_maximum_gross_per_contract']:+.4f}",
         )
 
 
 def print_active_prophet_ladder_scalp_shadow_status() -> None:
-    """Log the current 40c/35c/30c/25c average-entry take-profit level."""
+    """Log the current 40c/35c/30c/25c average-entry range state."""
     pending = prophet_ladder_scalp_tracker.find_active()
     if not pending:
         log.info("PROPHET LADDER SCALP SHADOW STATUS | no active paper scalp position.")
         return
     for shadow in pending:
         position = scalp_entry_summary(shadow)
+        epochs = shadow.get("position_epochs") if isinstance(shadow.get("position_epochs"), list) else []
+        epoch = epochs[-1] if epochs and isinstance(epochs[-1], dict) else {}
+        maximum = epoch.get("max_executable_gross_per_contract")
+        target_hits = epoch.get("target_hits") if isinstance(epoch.get("target_hits"), dict) else {}
         log.info(
-            "PROPHET SCALP SHADOW STATUS | ticker=%s side=%s filled=%.2f avg_entry=%s target_bid=%s "
-            "entry_quote_state=%s exit_quote_state=%s; no exchange order or close.",
+            "PROPHET SCALP RANGE STATUS | ticker=%s side=%s filled=%.2f avg_entry=%s max_gross_per_contract=%s "
+            "targets_hit=%s entry_quote_state=%s exit_quote_state=%s; no exchange order or close.",
             shadow.get("ticker", "?"), str(shadow.get("side") or "?").upper(),
             _f(position.get("filled_contracts")),
             "none" if position.get("average_entry_price") is None else f"${_f(position['average_entry_price']):.4f}",
-            "none" if position.get("take_profit_bid") is None else f"${_f(position['take_profit_bid']):.4f}",
+            "none" if maximum is None else f"${_f(maximum):+.4f}",
+            "/".join(sorted(target_hits)) if target_hits else "none",
             shadow.get("last_entry_quote_state", "awaiting_quote"),
             shadow.get("last_exit_quote_state", "awaiting_quote"),
         )
@@ -1961,7 +1976,7 @@ async def portfolio_reporter(rest: KalshiREST) -> None:
 
 
 def create_prophet_ladder_scalp_shadow(primary: dict) -> Optional[dict]:
-    """Create a normal-Prophet-side, paper-only VWAP scalp alternative."""
+    """Create a normal-Prophet-side, paper-only VWAP range observer."""
     if not PROPHET_LADDER_SCALP_SHADOW_ENABLED:
         return None
     ticker = str(primary.get("ticker") or "")
@@ -1976,6 +1991,7 @@ def create_prophet_ladder_scalp_shadow(primary: dict) -> Optional[dict]:
         profit_target_per_contract=PROPHET_LADDER_SCALP_SHADOW_PROFIT_TARGET,
         quote_max_age_seconds=DRY_QUOTE_MAX_AGE_S,
         market_close_time=primary.get("settle_et"),
+        observation_only=True,
         extra={
             "source_prophet_side": str(primary.get("source_prophet_side") or side).lower(),
             "source_decision_basis": primary.get("source_decision_basis"),
@@ -1985,10 +2001,9 @@ def create_prophet_ladder_scalp_shadow(primary: dict) -> Optional[dict]:
     )
     if prophet_ladder_scalp_tracker.record_open(shadow):
         log.info(
-            "PROPHET LADDER SCALP SHADOW STARTED | %s side=%s rungs=$0.40/$0.30/$0.20/$0.10 qty=%.2f "
-            "take_profit=average_entry+$%.2f; paper only, no exchange order or close.",
+            "PROPHET LADDER SCALP RANGE STUDY STARTED | %s side=%s rungs=$0.40/$0.30/$0.20/$0.10 qty=%.2f "
+            "observes depth-supported 1c/2c/3c/5c/10c exits and maximum excursion; paper only, no exchange order or close.",
             ticker, side.upper(), PROPHET_LADDER_SCALP_SHADOW_POSITION_SIZE,
-            PROPHET_LADDER_SCALP_SHADOW_PROFIT_TARGET,
         )
         return shadow
     return None
@@ -2020,12 +2035,19 @@ def simulate_prophet_ladder_scalp_shadow(shadow: dict) -> bool:
                 _f((event.get("entry_quote") or {}).get("economic_price")),
                 _f((event.get("entry_quote") or {}).get("displayed_depth")),
             )
-        elif event.get("kind") == "paper_scalp_take_profit_exit":
+        elif event.get("kind") == "paper_scalp_maximum_update":
             log.info(
-                "PROPHET SCALP PAPER EXIT | %s %s contracts=%.2f avg=$%.4f target_bid=$%.4f bid=$%.4f "
-                "gross=$%+.4f; fresh depth evidence only, no exchange close.",
+                "PROPHET SCALP RANGE MAX | %s %s contracts=%.2f avg=$%.4f bid=$%.4f "
+                "gross_per_contract=$%+.4f gross_total=$%+.4f; fresh full-depth evidence only, no exchange close.",
                 ticker, side.upper(), _f(event.get("filled_contracts")), _f(event.get("average_entry_price")),
-                _f(event.get("take_profit_bid")), _f(event.get("exit_price")), _f(event.get("gross_profit_loss")),
+                _f(event.get("exit_price")), _f(event.get("gross_per_contract")), _f(event.get("gross_total")),
+            )
+        elif event.get("kind") == "paper_scalp_target_hit":
+            log.info(
+                "PROPHET SCALP RANGE TARGET HIT | %s %s contracts=%.2f avg=$%.4f target=+$%.2f bid=$%.4f "
+                "gross_total=$%+.4f; observation only, no exchange close.",
+                ticker, side.upper(), _f(event.get("filled_contracts")), _f(event.get("average_entry_price")),
+                _f(event.get("target_per_contract")), _f(event.get("observed_bid")), _f(event.get("observed_gross_total")),
             )
     if events:
         prophet_ladder_scalp_tracker.save()
