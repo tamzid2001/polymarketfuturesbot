@@ -648,6 +648,39 @@ class MechanicalAverageDownTests(unittest.TestCase):
         self.assertEqual(len({request["expiration_time"] for request in requests}), 1)
         self.assertTrue(all(request["side"] == "yes" for request in requests))
 
+    def test_weighted_paper_monitor_locks_ml_side_without_primary_order_or_balance_call(self):
+        class NoOrderRest:
+            async def balance_dollars(self):
+                raise AssertionError("paper monitor must not check an executable balance")
+
+            async def create_order(self, **_kwargs):
+                raise AssertionError("paper monitor must not create an order")
+
+        async def scenario():
+            config = validate_config(DEFAULT_CONFIG)
+            state = default_state()
+            market = SimpleNamespace(
+                ticker="KXBTC15M-TEST-WEIGHTED-MONITOR", status="active",
+                open_time=time.time() - 5, close_time=time.time() + 895,
+            )
+            record = market_record(state, market.ticker)
+            record.update({"status": "watching", "market_open_time": market.open_time})
+            entered = await consider_initial_entry(
+                NoOrderRest(), state, market, config, dry_run=True, ml_side="yes", paper_monitor_only=True,
+            )
+            return entered, record
+
+        entered, record = asyncio.run(scenario())
+        self.assertTrue(entered)
+        self.assertEqual(("paper_monitor_active", "yes", 0.0, {}), (
+            record["status"], record["locked_side"], record["quantity"], record["orders"],
+        ))
+        self.assertTrue(record["paper_monitor_only"])
+        self.assertIn("ml_weighted_trailing_scalp_shadow", record)
+        self.assertIn("inverse_ml_weighted_trailing_scalp_shadow", record)
+        self.assertNotIn("inverse_ml_shadow", record)
+        self.assertNotIn("ml_ladder_scalp_shadow", record)
+
     def test_preposted_ladder_never_switches_sides_after_a_later_opposite_quote(self):
         class FakeRest:
             def __init__(self):

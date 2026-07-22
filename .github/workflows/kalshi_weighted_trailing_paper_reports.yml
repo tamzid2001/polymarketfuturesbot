@@ -1,0 +1,253 @@
+name: Kalshi BTC Weighted Trailing Paper Reports
+
+# An isolated research run for the four frozen-side weighted studies:
+# normal ML, inverse ML, normal Prophet, and inverse Prophet.  It never
+# shares live state/history files or an Action concurrency group with either
+# executable trader, and it uploads the resulting ledgers as artifacts.
+on:
+  workflow_dispatch:
+    inputs:
+      run_minutes:
+        description: "Paper-monitor duration in minutes (15-60; default 30)."
+        required: true
+        default: "30"
+        type: string
+
+concurrency:
+  group: kalshi-weighted-trailing-paper-reports
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  ml-weighted-paper:
+    name: ML normal + inverse weighted paper study
+    runs-on: ubuntu-latest
+    environment: "Kalshi"
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Configure live paper-ledger publisher
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Validate requested paper duration
+        env:
+          RUN_MINUTES: ${{ inputs.run_minutes }}
+        run: |
+          set -euo pipefail
+          case "$RUN_MINUTES" in
+            ''|*[!0-9]*) echo "run_minutes must be a whole number"; exit 2 ;;
+          esac
+          if [ "$RUN_MINUTES" -lt 15 ] || [ "$RUN_MINUTES" -gt 60 ]; then
+            echo "run_minutes must be between 15 and 60"
+            exit 2
+          fi
+
+      - name: Install and verify isolated ML paper runner
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install -r requirements_kalshi_average_down.txt
+          python -m py_compile kalshi_ladder_scalp_shadow.py kalshi_btc15m_average_down.py
+          python -m unittest -v test_kalshi_btc15m_average_down.py test_kalshi_ladder_scalp_shadow.py
+
+      - name: Resolve validated ML model and feature ledger
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test -s kalshi_ml_model_registry.json
+          test "$(jq -er '.feature_schema' kalshi_ml_model_registry.json)" = "ml_only_raw_candles_settled_outcomes_v1"
+          model_run_id="$(jq -er '.active_model_run_id' kalshi_ml_model_registry.json)"
+          model_artifact="$(jq -er '.active_model_artifact_name' kalshi_ml_model_registry.json)"
+          ledger_run_id="$(jq -er '.active_ledger_run_id' kalshi_ml_model_registry.json)"
+          ledger_artifact="$(jq -er '.active_ledger_artifact_name' kalshi_ml_model_registry.json)"
+          ledger_path="$(jq -er '.active_ledger_path' kalshi_ml_model_registry.json)"
+          previous_model_run_id="$(jq -r '.previous_model_run_id // empty' kalshi_ml_model_registry.json)"
+          previous_model_artifact="$(jq -r '.previous_model_artifact_name // empty' kalshi_ml_model_registry.json)"
+          gh run download "$model_run_id" -R "$GITHUB_REPOSITORY" -n "$model_artifact" -D stored_model
+          gh run download "$ledger_run_id" -R "$GITHUB_REPOSITORY" -n "$ledger_artifact" -D training_data
+          if [ -n "$previous_model_run_id" ] && [ "$previous_model_run_id" != "$model_run_id" ] && [ -n "$previous_model_artifact" ]; then
+            gh run download "$previous_model_run_id" -R "$GITHUB_REPOSITORY" -n "$previous_model_artifact" -D previous_model
+          fi
+          test -s stored_model/kxbtc15m_ml_model.joblib
+          test -s stored_model/kxbtc15m_ml_model_metadata.json
+          test -s "training_data/$ledger_path"
+          {
+            echo "MODEL_RUN_ID=$model_run_id"
+            echo "LEDGER_RUN_ID=$ledger_run_id"
+            echo "LEDGER_PATH=$ledger_path"
+            echo "PREVIOUS_MODEL_RUN_ID=$previous_model_run_id"
+          } >> "$GITHUB_ENV"
+
+      - name: Write Kalshi RSA private key
+        env:
+          KALSHI_PRIVATE_KEY: ${{ secrets.KALSHI_PRIVATE_KEY }}
+        run: |
+          printf '%s\n' "$KALSHI_PRIVATE_KEY" > kalshi_private_key.pem
+          chmod 600 kalshi_private_key.pem
+
+      - name: Run normal and inverse ML weighted paper study
+        env:
+          DRY_RUN: "true"
+          # Every material paper event commits only this action's isolated
+          # report files, so the ledger can be viewed while the job runs.
+          KALSHI_CHECKPOINT_PUBLISH: "true"
+          KALSHI_CHECKPOINT_RETRY_SECONDS: "10"
+          GITHUB_TOKEN: ${{ github.token }}
+          KALSHI_API_KEY_ID: ${{ secrets.KALSHI_PROD_API_KEY }}
+          KALSHI_PEM_PATH: kalshi_private_key.pem
+          KALSHI_DEMO: "false"
+          RUN_MINUTES: ${{ inputs.run_minutes }}
+        run: |
+          set -euo pipefail
+          mkdir -p paper_reports
+          cp kalshi_btc15m_average_down_config.json paper_reports/ml_config.json
+          args=(--config paper_reports/ml_config.json
+                --state-file paper_reports/ml_state.json
+                --report paper_reports/ml_primary_paper_report.json
+                --weighted-trailing-normal-ledger paper_reports/ml_weighted_trailing_normal_ledger.json
+                --weighted-trailing-normal-report paper_reports/ml_weighted_trailing_normal_report.json
+                --weighted-trailing-inverse-ledger paper_reports/ml_weighted_trailing_inverse_ledger.json
+                --weighted-trailing-inverse-report paper_reports/ml_weighted_trailing_inverse_report.json
+                --ml-model-path stored_model/kxbtc15m_ml_model.joblib
+                --ml-model-metadata stored_model/kxbtc15m_ml_model_metadata.json
+                --ml-validation-report stored_model/holdout_backtest.json
+                --ml-model-run-id "$MODEL_RUN_ID"
+                --ml-training-run-id "$LEDGER_RUN_ID"
+                --ml-training-csv "training_data/$LEDGER_PATH"
+                --paper-monitor-only
+                --run-seconds "$((RUN_MINUTES * 60))")
+          if [ -s previous_model/kxbtc15m_ml_model.joblib ]; then
+            args+=(--previous-ml-model-path previous_model/kxbtc15m_ml_model.joblib
+                   --previous-ml-model-metadata previous_model/kxbtc15m_ml_model_metadata.json
+                   --previous-ml-model-run-id "$PREVIOUS_MODEL_RUN_ID")
+          fi
+          python kalshi_btc15m_average_down.py "${args[@]}"
+
+      - name: Upload ML normal and inverse paper ledgers
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kalshi-ml-weighted-trailing-paper-${{ github.run_id }}
+          path: paper_reports/
+          if-no-files-found: warn
+          retention-days: 90
+
+  prophet-weighted-paper:
+    name: Prophet normal + inverse weighted paper study
+    runs-on: ubuntu-latest
+    environment: "Kalshi"
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Configure live paper-ledger publisher
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Validate requested paper duration
+        env:
+          RUN_MINUTES: ${{ inputs.run_minutes }}
+        run: |
+          set -euo pipefail
+          case "$RUN_MINUTES" in
+            ''|*[!0-9]*) echo "run_minutes must be a whole number"; exit 2 ;;
+          esac
+          if [ "$RUN_MINUTES" -lt 15 ] || [ "$RUN_MINUTES" -gt 60 ]; then
+            echo "run_minutes must be between 15 and 60"
+            exit 2
+          fi
+
+      - name: Install and verify isolated Prophet paper runner
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install -r requirements_kalshi.txt
+          python -m py_compile kalshi_ladder_scalp_shadow.py kalshibtc15minupordown.py kalshi_btc15m_prophet_btc_only.py
+          python -m unittest -v test_kalshi_bot.py test_kalshi_dry_quote_simulation.py test_kalshi_ladder_scalp_shadow.py
+
+      - name: Write Kalshi RSA private key
+        env:
+          KALSHI_PRIVATE_KEY: ${{ secrets.KALSHI_PRIVATE_KEY }}
+        run: |
+          printf '%s\n' "$KALSHI_PRIVATE_KEY" > kalshi_private_key.pem
+          chmod 600 kalshi_private_key.pem
+
+      - name: Run normal and inverse Prophet weighted paper study
+        env:
+          DRY_RUN: "true"
+          KALSHI_API_KEY_ID: ${{ secrets.KALSHI_PROD_API_KEY }}
+          KALSHI_PEM_PATH: kalshi_private_key.pem
+          KALSHI_DEMO: "false"
+          RUNTIME_LIMIT_MIN: ${{ inputs.run_minutes }}
+          BET_AMOUNT_SHARES: "1"
+          TRADE_HISTORY_FILE: paper_reports/prophet_primary_history.json
+          TRADED_TICKERS_FILE: paper_reports/prophet_primary_tickers.json
+          INVERSE_PROPHET_SHADOW_ENABLED: "false"
+          PROPHET_LADDER_SCALP_SHADOW_ENABLED: "false"
+          PROPHET_WEIGHTED_TRAILING_SHADOW_ENABLED: "true"
+          WEIGHTED_TRAILING_MONITOR_ONLY: "true"
+          PROPHET_WEIGHTED_TRAILING_SHADOW_NORMAL_HISTORY_FILE: paper_reports/prophet_weighted_trailing_normal_ledger.json
+          PROPHET_WEIGHTED_TRAILING_SHADOW_NORMAL_REPORT_FILE: paper_reports/prophet_weighted_trailing_normal_report.json
+          PROPHET_WEIGHTED_TRAILING_SHADOW_INVERSE_HISTORY_FILE: paper_reports/prophet_weighted_trailing_inverse_ledger.json
+          PROPHET_WEIGHTED_TRAILING_SHADOW_INVERSE_REPORT_FILE: paper_reports/prophet_weighted_trailing_inverse_report.json
+          PROPHET_WEIGHTED_TRAILING_STOP_PER_CONTRACT: "0.10"
+          PROPHET_SELECTOR_ENABLED: "false"
+        run: |
+          set -euo pipefail
+          mkdir -p paper_reports
+          sync_paper_ledgers() {
+            # The source envelope contains no rungs/orders in monitor mode;
+            # it is retained only so a later report action can settle a market
+            # that was still open when this run ended.
+            for file in paper_reports/prophet_primary_history.json \
+                        paper_reports/prophet_primary_tickers.json \
+                        paper_reports/prophet_weighted_trailing_normal_ledger.json \
+                        paper_reports/prophet_weighted_trailing_normal_report.json \
+                        paper_reports/prophet_weighted_trailing_inverse_ledger.json \
+                        paper_reports/prophet_weighted_trailing_inverse_report.json; do
+              test ! -f "$file" || git add "$file"
+            done
+            if ! git diff --cached --quiet; then
+              git commit -m "chore: checkpoint Prophet weighted paper report [skip ci]"
+            fi
+            git pull --rebase --autostash origin main || return 0
+            git push origin HEAD:main || true
+          }
+          python kalshi_btc15m_prophet_btc_only.py &
+          runner_pid=$!
+          while kill -0 "$runner_pid" 2>/dev/null; do
+            sync_paper_ledgers
+            sleep 10
+          done
+          if wait "$runner_pid"; then
+            runner_status=0
+          else
+            runner_status=$?
+          fi
+          sync_paper_ledgers
+          exit "$runner_status"
+
+      - name: Upload Prophet normal and inverse paper ledgers
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kalshi-prophet-weighted-trailing-paper-${{ github.run_id }}
+          path: paper_reports/
+          if-no-files-found: warn
+          retention-days: 90

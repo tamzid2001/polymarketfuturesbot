@@ -149,6 +149,14 @@ PROPHET_WEIGHTED_TRAILING_SHADOW_ENABLED = (
     DRY_RUN and os.getenv("PROPHET_WEIGHTED_TRAILING_SHADOW_ENABLED", "true").lower()
     in ("1", "true", "yes")
 )
+# Dedicated report Actions use the same causal pre-open Prophet signal and
+# WebSocket quote simulator but never create even a primary paper ladder.  The
+# primary record exists solely as a settlement/source envelope for the normal
+# and inverse weighted monitors; it has no rungs or order IDs.
+WEIGHTED_TRAILING_MONITOR_ONLY = (
+    DRY_RUN and os.getenv("WEIGHTED_TRAILING_MONITOR_ONLY", "false").lower()
+    in ("1", "true", "yes")
+)
 # The selector is a third, independently paper-filled ladder during a dry run.
 # It freezes its side before a market opens from *previously settled* paired
 # Prophet/inverse outcomes.  It never looks at the market it is about to trade.
@@ -1131,15 +1139,13 @@ class PerformanceTracker:
 
     def _save_history(self) -> None:
         try:
-            with open(self.history_path, "w") as fh:
-                json.dump(self.trades, fh, indent=2, default=str)
+            write_json_atomically(self.history_path, self.trades)
         except Exception as exc:  # noqa: BLE001
             log.warning("Could not write %s: %s", self.history_path, exc)
 
     def _save_traded(self) -> None:
         try:
-            with open(self.traded_path, "w") as fh:
-                json.dump(self.traded_tickers, fh, indent=2, default=str)
+            write_json_atomically(self.traded_path, self.traded_tickers)
         except Exception as exc:  # noqa: BLE001
             log.warning("Could not write %s: %s", self.traded_path, exc)
 
@@ -1445,6 +1451,15 @@ def prophet_weighted_trailing_shadow_performance(records: list[dict], *, inverse
     return report
 
 
+def write_json_atomically(path: str, payload: object) -> None:
+    """Replace a ledger/report in one operation for concurrent Action publishing."""
+    temporary_path = f"{path}.tmp"
+    with open(temporary_path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2, default=str)
+        fh.write("\n")
+    os.replace(temporary_path, path)
+
+
 class InverseProphetShadowTracker:
     """Separate durable ledger for paper-only inverse Prophet ladders."""
 
@@ -1551,10 +1566,8 @@ class ProphetLadderScalpShadowTracker:
 
     def save(self) -> None:
         try:
-            with open(self.history_path, "w", encoding="utf-8") as fh:
-                json.dump(self.trades, fh, indent=2, default=str)
-            with open(self.report_path, "w", encoding="utf-8") as fh:
-                json.dump(self.report_builder(self.trades), fh, indent=2, default=str)
+            write_json_atomically(self.history_path, self.trades)
+            write_json_atomically(self.report_path, self.report_builder(self.trades))
         except Exception as exc:  # noqa: BLE001
             log.warning("Could not write Prophet scalp shadow ledger/report: %s", exc)
 
@@ -2844,36 +2857,38 @@ async def execute_locked_ladder(rest: KalshiREST, ct: str) -> None:
         handled_windows.add(ct)
         return
 
-    log.info("SIDE LOCKED | %s %s by %s (%s; p50=$%.2f strike=$%.2f). "
-             "%s only $0.40/$0.30/$0.20/$0.10 GTC buys; no opposite-side order exists.",
+    log.info("SIDE LOCKED | %s %s by %s (%s; p50=$%.2f strike=$%.2f). %s",
              ct, side.upper(), "Prophet selector" if selector_applied else "Prophet", decision,
              forecast["p50"], strike,
-             "Paper-posting" if DRY_RUN else "Posting")
+             ("Weighted trailing monitor only: quote subscription, paper VWAP/fills, and trailing exits; no order exists."
+              if WEIGHTED_TRAILING_MONITOR_ONLY else
+              f"{'Paper-posting' if DRY_RUN else 'Posting'} only $0.40/$0.30/$0.20/$0.10 GTC buys; no opposite-side order exists."))
     rungs = []
-    for level in LADDER_LEVELS:
-        book_side, api_price = _ladder_order_terms(side, level)
-        log.info("GTC LADDER LIMIT | %s %s economic=$%.2f api_yes=%s qty=%.2f expires=%d",
-                 ct, side.upper(), level, api_price, bet_count(), expiry)
-        response, _ = await _submit(
-            rest, ticker=ct, side=book_side, price=api_price, count=bet_count(),
-            reduce_only=False, tag=f"PROPHET {side.upper()} RUNG ${level:.2f}",
-            tif=ORDER_TIF, expiration_time=expiry)
-        accepted = DRY_RUN or response is not None
-        # Dry runs begin as resting paper orders.  They become simulated quote
-        # hits later only when the observed selected-side price reaches a rung.
-        fill_count = 0.0 if DRY_RUN else _f(getattr(response, "fill_count", 0.0), 0.0)
-        average_yes = _to_dollars(getattr(response, "average_fill_price", None))
-        fill_cost = (level if average_yes is None
-                     else (average_yes if side == "yes" else 1.0 - average_yes))
-        rungs.append({
-            "economic_price": level, "api_yes_price": api_price,
-            "count": bet_count(), "fill_count": round(fill_count, 2),
-            "fill_economic_price": round(fill_cost, 4),
-            "order_id": getattr(response, "order_id", None) if response is not None else None,
-            "status": "simulated_resting" if (accepted and DRY_RUN) else (
-                "accepted" if accepted else "submit_failed"),
-            "time_in_force": ORDER_TIF, "expiration_time": expiry,
-        })
+    if not WEIGHTED_TRAILING_MONITOR_ONLY:
+        for level in LADDER_LEVELS:
+            book_side, api_price = _ladder_order_terms(side, level)
+            log.info("GTC LADDER LIMIT | %s %s economic=$%.2f api_yes=%s qty=%.2f expires=%d",
+                     ct, side.upper(), level, api_price, bet_count(), expiry)
+            response, _ = await _submit(
+                rest, ticker=ct, side=book_side, price=api_price, count=bet_count(),
+                reduce_only=False, tag=f"PROPHET {side.upper()} RUNG ${level:.2f}",
+                tif=ORDER_TIF, expiration_time=expiry)
+            accepted = DRY_RUN or response is not None
+            # Dry runs begin as resting paper orders.  They become simulated quote
+            # hits later only when the observed selected-side price reaches a rung.
+            fill_count = 0.0 if DRY_RUN else _f(getattr(response, "fill_count", 0.0), 0.0)
+            average_yes = _to_dollars(getattr(response, "average_fill_price", None))
+            fill_cost = (level if average_yes is None
+                         else (average_yes if side == "yes" else 1.0 - average_yes))
+            rungs.append({
+                "economic_price": level, "api_yes_price": api_price,
+                "count": bet_count(), "fill_count": round(fill_count, 2),
+                "fill_economic_price": round(fill_cost, 4),
+                "order_id": getattr(response, "order_id", None) if response is not None else None,
+                "status": "simulated_resting" if (accepted and DRY_RUN) else (
+                    "accepted" if accepted else "submit_failed"),
+                "time_in_force": ORDER_TIF, "expiration_time": expiry,
+            })
 
     handled_windows.add(ct)
     accepted_rungs = sum(1 for rung in rungs if rung["status"] == "accepted")
@@ -2899,9 +2914,14 @@ async def execute_locked_ladder(rest: KalshiREST, ct: str) -> None:
         "forecast_bands": {k: round(forecast[k], 2) for k, _ in _QMAP},
         "trade_kind": "BTC_PROPHET_LOCKED_LADDER", "bet_amount_shares": bet_count(),
         "ladder_levels": list(LADDER_LEVELS), "rungs": rungs,
-        "ladder_preposted_complete": accepted_rungs == len(LADDER_LEVELS),
+        "ladder_preposted_complete": (not WEIGHTED_TRAILING_MONITOR_ONLY
+                                        and accepted_rungs == len(LADDER_LEVELS)),
         "count": round(sum(_f(r["fill_count"]) for r in rungs), 2),
-        "entry_price": 0.0, "order_submitted": f"{accepted_rungs}/{len(LADDER_LEVELS)} accepted",
+        "entry_price": 0.0,
+        "order_submitted": ("none — weighted trailing monitor only"
+                            if WEIGHTED_TRAILING_MONITOR_ONLY
+                            else f"{accepted_rungs}/{len(LADDER_LEVELS)} accepted"),
+        "weighted_trailing_monitor_only": WEIGHTED_TRAILING_MONITOR_ONLY,
         "exit_method": "pending", "dry_run": DRY_RUN,
         "result": "pending", "profit_loss": 0.0,
     }
@@ -2912,9 +2932,13 @@ async def execute_locked_ladder(rest: KalshiREST, ct: str) -> None:
     create_prophet_ladder_scalp_shadow(rec)
     create_prophet_weighted_trailing_shadows(rec)
     create_prophet_selector_shadow(rec, selection)
-    log.info("%s | %s %s accepted=%d/%d. The side remains locked through settlement.",
-             "GTC LADDER PAPER-POSTED" if DRY_RUN else "GTC LADDER POSTED",
-             ct, side.upper(), accepted_rungs, len(LADDER_LEVELS))
+    if WEIGHTED_TRAILING_MONITOR_ONLY:
+        log.info("WEIGHTED TRAILING PROPHET MONITOR STARTED | %s frozen_side=%s; normal and inverse quote monitors only.",
+                 ct, source_side.upper())
+    else:
+        log.info("%s | %s %s accepted=%d/%d. The side remains locked through settlement.",
+                 "GTC LADDER PAPER-POSTED" if DRY_RUN else "GTC LADDER POSTED",
+                 ct, side.upper(), accepted_rungs, len(LADDER_LEVELS))
 
 
 # ─────────────────────────────────────────────────────────────────────────────

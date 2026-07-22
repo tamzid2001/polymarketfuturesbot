@@ -78,7 +78,7 @@ KALSHI_WS_URL = os.getenv(
 QUOTE_STALE_SECONDS = 20.0
 MAINTENANCE_TIMEZONE = ZoneInfo("America/New_York")
 EXCHANGE_RECOVERY_RETRY_SECONDS = 60.0
-CHECKPOINT_RETRY_SECONDS = 60.0
+CHECKPOINT_RETRY_SECONDS = max(1.0, float(os.getenv("KALSHI_CHECKPOINT_RETRY_SECONDS", "60")))
 # Polling metadata changes every few seconds and must never turn the bot-state
 # branch into a stream of commits. Everything else is material trading state.
 CHECKPOINT_IGNORED_KEYS = {
@@ -2445,6 +2445,7 @@ async def settle_or_cancel(rest: KalshiREST, record: dict[str, Any], market: Any
 async def consider_initial_entry(
     rest: KalshiREST, state: dict[str, Any], market: Any, config: dict[str, Any], dry_run: bool,
     live_asks: dict[str, float | None] | None = None, ml_side: str | None = None,
+    paper_monitor_only: bool = False,
 ) -> bool:
     """Post the complete fixed GTC ladder for one frozen ML side.
 
@@ -2469,7 +2470,7 @@ async def consider_initial_entry(
         record = start_market_watcher(state, market, config)
     if not isinstance(record, dict) or record.get("status") != "watching":
         return False
-    if rest_pause_active(rest):
+    if not paper_monitor_only and rest_pause_active(rest):
         record["pause_blocked_at"] = now_iso()
         record["pause_blocked_reason"] = "scheduled or detected Kalshi trading pause"
         LOG.info("ENTRY DEFERRED FOR PAUSE | %s no new GTC ladder during a Kalshi trading/exchange pause.", ticker)
@@ -2494,9 +2495,31 @@ async def consider_initial_entry(
     # The counterfactual begins from the exact frozen ML decision and same
     # fresh-market policy even if the live ladder is later blocked by balance,
     # capacity, or exchange recovery. It remains paper-only in all modes.
+    ensure_ml_weighted_trailing_scalp_shadows(record, market, config, ml_side)
+    if paper_monitor_only:
+        # The isolated report Action keeps the exact frozen ML side and uses
+        # the authenticated quote stream only for its normal/inverse weighted
+        # paper studies.  It has no primary ladder, reservation, balance
+        # check, exchange-position check, or order endpoint call.
+        record.update({
+            "candidate_side": ml_side,
+            "locked_side": ml_side,
+            "locked_at": now_iso(),
+            "quantity": 0.0,
+            "status": "paper_monitor_active",
+            "paper_monitor_only": True,
+            "ladder_mode": "weighted_trailing_quote_monitor_only",
+            "reserved_principal": 0.0,
+            "market_close_time": field(market, "close_time", "expected_expiration_time"),
+        })
+        LOG.info(
+            "WEIGHTED TRAILING ML MONITOR STARTED | %s frozen_side=%s; subscribing only for normal/inverse "
+            "1x$0.40/2x$0.30/3x$0.20/4x$0.10 paper fills and full-depth trailing exits. No order exists.",
+            ticker, ml_side.upper(),
+        )
+        return True
     ensure_inverse_shadow(record, market, config, ml_side)
     ensure_ml_scalp_shadow(record, market, config, ml_side)
-    ensure_ml_weighted_trailing_scalp_shadows(record, market, config, ml_side)
     ensure_model_transition_shadow(record, market, config)
     other_active = [candidate for candidate in active_strategy_records(state) if candidate is not record]
     if len(other_active) >= config["max_active_markets"]:
@@ -3618,6 +3641,8 @@ async def run(args: argparse.Namespace) -> int:
     dry_run = os.getenv("DRY_RUN", "true").lower() in {"1", "true", "yes"}
     live_allowed = not dry_run and args.submit and args.allow_live
     control_only = args.cancel_open_orders or args.cancel_all_resting_mechanical_orders
+    if args.paper_monitor_only and not dry_run:
+        raise SystemExit("--paper-monitor-only requires DRY_RUN=true and can never be used for live orders")
     if not dry_run and not live_allowed and not control_only:
         raise SystemExit("Refusing live orders: pass both --submit and --allow-live with DRY_RUN=false")
     state_path = args.state_file.expanduser()
@@ -3747,7 +3772,7 @@ async def run(args: argparse.Namespace) -> int:
                         continue
                     await reconcile_orders(rest, record, dry_run)
                     await settle_or_cancel(rest, record, market, dry_run)
-                    if market_is_tradeable(market):
+                    if market_is_tradeable(market) and not record.get("paper_monitor_only"):
                         await submit_ladder(rest, record, market, config, dry_run)
                 last_order_reconcile_at = monotonic_now
                 last_private_update_count = feed.private_update_count
@@ -3763,6 +3788,7 @@ async def run(args: argparse.Namespace) -> int:
                 await consider_initial_entry(
                     rest, state, market, config, dry_run,
                     live_asks=feed.executable_asks(ticker), ml_side=ml_side,
+                    paper_monitor_only=args.paper_monitor_only,
                 )
             # The counterfactual is intentionally driven only by the
             # authenticated ticker stream. It is evaluated separately from
@@ -3847,6 +3873,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Compact inverse-ML weighted trailing paper report JSON.",
     )
     parser.add_argument("--run-seconds", type=float, default=840.0)
+    parser.add_argument(
+        "--paper-monitor-only", action="store_true",
+        help="Dry-run only: create no primary ladder; track only normal/inverse weighted quote monitors.",
+    )
     parser.add_argument("--cancel-open-orders", action="store_true")
     parser.add_argument(
         "--cancel-all-resting-mechanical-orders", action="store_true",
