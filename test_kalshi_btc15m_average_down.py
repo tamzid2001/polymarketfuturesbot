@@ -26,6 +26,7 @@ from kalshi_btc15m_average_down import (
     ensure_inverse_shadow,
     ensure_ml_scalp_shadow,
     ensure_ml_weighted_trailing_scalp_shadows,
+    ensure_ml_weighted_fixed_stop_loss_shadows,
     exchange_position_guard,
     exchange_outcome_side,
     ladder_principal,
@@ -48,6 +49,8 @@ from kalshi_btc15m_average_down import (
     ml_scalp_shadow_performance,
     ml_weighted_trailing_ledger,
     save_ml_weighted_trailing_outputs,
+    ml_weighted_fixed_stop_loss_ledger,
+    save_ml_weighted_fixed_stop_outputs,
     model_transition_shadow_performance,
     normalized_order_status,
     normalized_outcome_side,
@@ -312,6 +315,39 @@ class MechanicalAverageDownTests(unittest.TestCase):
             payload = json.loads((root / "normal-ledger.json").read_text(encoding="utf-8"))
             self.assertEqual("ml_weighted_1234_trailing_paper_ledger_v1", payload["schema"])
             self.assertEqual("yes", payload["records"][0]["locked_study_side"])
+
+    def test_ml_weighted_fixed_stop_studies_lock_normal_and_inverse_sides_before_quotes(self):
+        config = validate_config(DEFAULT_CONFIG)
+        state = default_state()
+        record = market_record(state, "KXBTC15M-TEST-WEIGHTED-FIXED")
+        record["ml_inference"] = {"side": "yes", "model_run_id": "test-model"}
+        ensure_ml_weighted_fixed_stop_loss_shadows(
+            record, SimpleNamespace(close_time="2099-07-20T00:15:00Z"), config, "yes")
+        normal = record["ml_weighted_fixed_stop_loss_shadow"]
+        inverse = record["inverse_ml_weighted_fixed_stop_loss_shadow"]
+        self.assertEqual(("yes", "no"), (normal["side"], inverse["side"]))
+        self.assertEqual(0.05, normal["fixed_stop_loss_per_contract"])
+        self.assertNotIn("trailing_stop_per_contract", {
+            key: value for key, value in normal.items() if value is not None
+        })
+        normal_ledger = ml_weighted_fixed_stop_loss_ledger(state, config, inverse=False)
+        inverse_ledger = ml_weighted_fixed_stop_loss_ledger(state, config, inverse=True)
+        self.assertEqual(("normal_ml", "inverse_ml"), (
+            normal_ledger["model_variant"], inverse_ledger["model_variant"],
+        ))
+        self.assertEqual(0.05, normal_ledger["strategy_definition"]["fixed_stop_loss_per_contract"])
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            save_ml_weighted_fixed_stop_outputs(
+                state, config,
+                normal_ledger_path=root / "normal-ledger.json",
+                normal_report_path=root / "normal-report.json",
+                inverse_ledger_path=root / "inverse-ledger.json",
+                inverse_report_path=root / "inverse-report.json",
+            )
+            payload = json.loads((root / "inverse-ledger.json").read_text(encoding="utf-8"))
+            self.assertEqual("ml_weighted_1234_fixed_stop_loss_paper_ledger_v1", payload["schema"])
+            self.assertEqual("no", payload["records"][0]["locked_study_side"])
 
     def test_model_transition_shadow_paper_tests_predecessor_and_current_model_separately(self):
         class FakeFeed:
@@ -678,6 +714,8 @@ class MechanicalAverageDownTests(unittest.TestCase):
         self.assertTrue(record["paper_monitor_only"])
         self.assertIn("ml_weighted_trailing_scalp_shadow", record)
         self.assertIn("inverse_ml_weighted_trailing_scalp_shadow", record)
+        self.assertIn("ml_weighted_fixed_stop_loss_shadow", record)
+        self.assertIn("inverse_ml_weighted_fixed_stop_loss_shadow", record)
         self.assertNotIn("inverse_ml_shadow", record)
         self.assertNotIn("ml_ladder_scalp_shadow", record)
 

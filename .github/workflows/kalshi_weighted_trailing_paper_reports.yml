@@ -1,7 +1,8 @@
-name: Kalshi BTC Weighted Trailing Paper Reports
+name: Kalshi BTC Weighted Exit-Protection Paper Reports
 
 # An isolated research run for the four frozen-side weighted studies:
-# normal ML, inverse ML, normal Prophet, and inverse Prophet.  It never
+# normal ML, inverse ML, normal Prophet, and inverse Prophet—each compared
+# under a 10c trailing stop and a regular 5c fixed stop. It never
 # shares live state/history files or an Action concurrency group with either
 # executable trader, and it uploads the resulting ledgers as artifacts.
 on:
@@ -124,6 +125,10 @@ jobs:
                 --weighted-trailing-normal-report paper_reports/ml_weighted_trailing_normal_report.json
                 --weighted-trailing-inverse-ledger paper_reports/ml_weighted_trailing_inverse_ledger.json
                 --weighted-trailing-inverse-report paper_reports/ml_weighted_trailing_inverse_report.json
+                --weighted-fixed-stop-normal-ledger paper_reports/ml_weighted_fixed_stop_normal_ledger.json
+                --weighted-fixed-stop-normal-report paper_reports/ml_weighted_fixed_stop_normal_report.json
+                --weighted-fixed-stop-inverse-ledger paper_reports/ml_weighted_fixed_stop_inverse_ledger.json
+                --weighted-fixed-stop-inverse-report paper_reports/ml_weighted_fixed_stop_inverse_report.json
                 --ml-model-path stored_model/kxbtc15m_ml_model.joblib
                 --ml-model-metadata stored_model/kxbtc15m_ml_model_metadata.json
                 --ml-validation-report stored_model/holdout_backtest.json
@@ -206,12 +211,18 @@ jobs:
           INVERSE_PROPHET_SHADOW_ENABLED: "false"
           PROPHET_LADDER_SCALP_SHADOW_ENABLED: "false"
           PROPHET_WEIGHTED_TRAILING_SHADOW_ENABLED: "true"
+          PROPHET_WEIGHTED_FIXED_STOP_SHADOW_ENABLED: "true"
           WEIGHTED_TRAILING_MONITOR_ONLY: "true"
           PROPHET_WEIGHTED_TRAILING_SHADOW_NORMAL_HISTORY_FILE: paper_reports/prophet_weighted_trailing_normal_ledger.json
           PROPHET_WEIGHTED_TRAILING_SHADOW_NORMAL_REPORT_FILE: paper_reports/prophet_weighted_trailing_normal_report.json
           PROPHET_WEIGHTED_TRAILING_SHADOW_INVERSE_HISTORY_FILE: paper_reports/prophet_weighted_trailing_inverse_ledger.json
           PROPHET_WEIGHTED_TRAILING_SHADOW_INVERSE_REPORT_FILE: paper_reports/prophet_weighted_trailing_inverse_report.json
           PROPHET_WEIGHTED_TRAILING_STOP_PER_CONTRACT: "0.10"
+          PROPHET_WEIGHTED_FIXED_STOP_NORMAL_HISTORY_FILE: paper_reports/prophet_weighted_fixed_stop_normal_ledger.json
+          PROPHET_WEIGHTED_FIXED_STOP_NORMAL_REPORT_FILE: paper_reports/prophet_weighted_fixed_stop_normal_report.json
+          PROPHET_WEIGHTED_FIXED_STOP_INVERSE_HISTORY_FILE: paper_reports/prophet_weighted_fixed_stop_inverse_ledger.json
+          PROPHET_WEIGHTED_FIXED_STOP_INVERSE_REPORT_FILE: paper_reports/prophet_weighted_fixed_stop_inverse_report.json
+          PROPHET_WEIGHTED_FIXED_STOP_PER_CONTRACT: "0.05"
           PROPHET_SELECTOR_ENABLED: "false"
         run: |
           set -euo pipefail
@@ -225,7 +236,11 @@ jobs:
                         paper_reports/prophet_weighted_trailing_normal_ledger.json \
                         paper_reports/prophet_weighted_trailing_normal_report.json \
                         paper_reports/prophet_weighted_trailing_inverse_ledger.json \
-                        paper_reports/prophet_weighted_trailing_inverse_report.json; do
+                        paper_reports/prophet_weighted_trailing_inverse_report.json \
+                        paper_reports/prophet_weighted_fixed_stop_normal_ledger.json \
+                        paper_reports/prophet_weighted_fixed_stop_normal_report.json \
+                        paper_reports/prophet_weighted_fixed_stop_inverse_ledger.json \
+                        paper_reports/prophet_weighted_fixed_stop_inverse_report.json; do
               test ! -f "$file" || git add "$file"
             done
             if ! git diff --cached --quiet; then

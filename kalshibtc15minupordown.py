@@ -149,6 +149,13 @@ PROPHET_WEIGHTED_TRAILING_SHADOW_ENABLED = (
     DRY_RUN and os.getenv("PROPHET_WEIGHTED_TRAILING_SHADOW_ENABLED", "true").lower()
     in ("1", "true", "yes")
 )
+# Parallel to the trailing study, this is a regular 5c fixed-loss paper exit.
+# It observes the same frozen normal/inverse Prophet sides and can never send,
+# cancel, or close an exchange order.
+PROPHET_WEIGHTED_FIXED_STOP_SHADOW_ENABLED = (
+    DRY_RUN and os.getenv("PROPHET_WEIGHTED_FIXED_STOP_SHADOW_ENABLED", "true").lower()
+    in ("1", "true", "yes")
+)
 # Dedicated report Actions use the same causal pre-open Prophet signal and
 # WebSocket quote simulator but never create even a primary paper ladder.  The
 # primary record exists solely as a settlement/source envelope for the normal
@@ -229,6 +236,16 @@ PROPHET_WEIGHTED_TRAILING_SHADOW_INVERSE_REPORT_FILE = os.getenv(
     "PROPHET_WEIGHTED_TRAILING_SHADOW_INVERSE_REPORT_FILE", "prophet_btc_weighted_trailing_inverse_report.json")
 PROPHET_WEIGHTED_TRAILING_STOP_PER_CONTRACT = max(
     0.001, float(os.getenv("PROPHET_WEIGHTED_TRAILING_STOP_PER_CONTRACT", "0.10")))
+PROPHET_WEIGHTED_FIXED_STOP_NORMAL_HISTORY_FILE = os.getenv(
+    "PROPHET_WEIGHTED_FIXED_STOP_NORMAL_HISTORY_FILE", "prophet_btc_weighted_fixed_stop_normal_history.json")
+PROPHET_WEIGHTED_FIXED_STOP_NORMAL_REPORT_FILE = os.getenv(
+    "PROPHET_WEIGHTED_FIXED_STOP_NORMAL_REPORT_FILE", "prophet_btc_weighted_fixed_stop_normal_report.json")
+PROPHET_WEIGHTED_FIXED_STOP_INVERSE_HISTORY_FILE = os.getenv(
+    "PROPHET_WEIGHTED_FIXED_STOP_INVERSE_HISTORY_FILE", "prophet_btc_weighted_fixed_stop_inverse_history.json")
+PROPHET_WEIGHTED_FIXED_STOP_INVERSE_REPORT_FILE = os.getenv(
+    "PROPHET_WEIGHTED_FIXED_STOP_INVERSE_REPORT_FILE", "prophet_btc_weighted_fixed_stop_inverse_report.json")
+PROPHET_WEIGHTED_FIXED_STOP_PER_CONTRACT = max(
+    0.001, float(os.getenv("PROPHET_WEIGHTED_FIXED_STOP_PER_CONTRACT", "0.05")))
 WEIGHTED_SCALP_RUNG_QUANTITIES = {0.40: 1.0, 0.30: 2.0, 0.20: 3.0, 0.10: 4.0}
 
 ORDER_TIF      = "good_till_canceled"    # resting limit through market close
@@ -1451,6 +1468,21 @@ def prophet_weighted_trailing_shadow_performance(records: list[dict], *, inverse
     return report
 
 
+def prophet_weighted_fixed_stop_shadow_performance(records: list[dict], *, inverse: bool) -> dict:
+    """Report one frozen Prophet-side 1/2/3/4 regular fixed-stop study."""
+    report = scalp_performance(records)
+    report.update({
+        "generated_at": datetime.now(tz=timezone.utc).isoformat(),
+        "strategy": "inverse_prophet_weighted_1234_fixed_stop_loss_shadow_v1" if inverse
+        else "normal_prophet_weighted_1234_fixed_stop_loss_shadow_v1",
+        "source": "opposite_frozen_prophet_side" if inverse else "same_frozen_prophet_side_as_primary_ladder",
+        "locked_side_policy": "side is fixed before open and never changes on later quotes",
+        "weighted_rungs": {"0.40": 1.0, "0.30": 2.0, "0.20": 3.0, "0.10": 4.0},
+        "quote_max_age_seconds": DRY_QUOTE_MAX_AGE_S,
+    })
+    return report
+
+
 def write_json_atomically(path: str, payload: object) -> None:
     """Replace a ledger/report in one operation for concurrent Action publishing."""
     temporary_path = f"{path}.tmp"
@@ -1589,6 +1621,16 @@ prophet_weighted_trailing_inverse_tracker = ProphetLadderScalpShadowTracker(
     PROPHET_WEIGHTED_TRAILING_SHADOW_INVERSE_HISTORY_FILE,
     PROPHET_WEIGHTED_TRAILING_SHADOW_INVERSE_REPORT_FILE,
     lambda records: prophet_weighted_trailing_shadow_performance(records, inverse=True),
+)
+prophet_weighted_fixed_stop_normal_tracker = ProphetLadderScalpShadowTracker(
+    PROPHET_WEIGHTED_FIXED_STOP_NORMAL_HISTORY_FILE,
+    PROPHET_WEIGHTED_FIXED_STOP_NORMAL_REPORT_FILE,
+    lambda records: prophet_weighted_fixed_stop_shadow_performance(records, inverse=False),
+)
+prophet_weighted_fixed_stop_inverse_tracker = ProphetLadderScalpShadowTracker(
+    PROPHET_WEIGHTED_FIXED_STOP_INVERSE_HISTORY_FILE,
+    PROPHET_WEIGHTED_FIXED_STOP_INVERSE_REPORT_FILE,
+    lambda records: prophet_weighted_fixed_stop_shadow_performance(records, inverse=True),
 )
 
 
@@ -1931,6 +1973,52 @@ def print_active_prophet_weighted_trailing_shadow_status(
         )
 
 
+def print_prophet_weighted_fixed_stop_shadow_performance(
+    tracker_: ProphetLadderScalpShadowTracker, *, inverse: bool, label: str,
+) -> None:
+    """Print the parallel fixed 5c-loss study without blending it with trailing."""
+    report = prophet_weighted_fixed_stop_shadow_performance(tracker_.trades, inverse=inverse)
+    roi = "n/a" if report["return_on_simulated_capital"] is None else f"{100 * report['return_on_simulated_capital']:.1f}%"
+    current_streak = "none" if report["current_streak"] <= 0 else f"{report['current_streak']} {report['current_streak_kind']}"
+    configured = report["fixed_stop_loss"]["configured_gaps_per_contract"]
+    stop_gap = configured[0] if configured else PROPHET_WEIGHTED_FIXED_STOP_PER_CONTRACT
+    log.info(
+        "\n"
+        f"╔═══ {label} WEIGHTED FIXED STOP — PAPER ONLY ═════════════\n"
+        f"║  Locked side      : {'inverse of Prophet' if inverse else 'Prophet prediction'}\n"
+        "║  Ladder           : 1×40¢, 2×30¢, 3×20¢, 4×10¢ (10 max)\n"
+        f"║  Started / Active : {report['paper_markets_started']} / {report['active_paper_markets']}\n"
+        f"║  Filled / Stops   : {report['filled_market_trades']} / {report['fixed_stop_loss_exits']} fixed exits\n"
+        f"║  W / L            : {report['winning_trades']} / {report['losing_trades']}\n"
+        f"║  Current streak   : {current_streak}\n"
+        f"║  Longest W / L    : {report['longest_winning_streak']} / {report['longest_losing_streak']}\n"
+        f"║  Cash flow        : spent ${report['total_entry_cost']:.4f} → proceeds ${report['total_exit_proceeds']:.4f}\n"
+        f"║  Simulated P&L    : ${report['net_profit']:+,.4f}  (fees excluded)\n"
+        f"║  Simulated ROI    : {roi}\n"
+        f"║  Max drawdown     : ${-report['maximum_drawdown']:.4f}\n"
+        f"║  Fixed-stop rule  : fresh full-depth bid ≤ VWAP − ${stop_gap:.2f}; closes at observed bid\n"
+        "╚════════════════════════════════════════════════════════════"
+    )
+
+
+def print_active_prophet_weighted_fixed_stop_shadow_status(
+    tracker_: ProphetLadderScalpShadowTracker, label: str,
+) -> None:
+    for shadow in tracker_.find_active():
+        position = scalp_entry_summary(shadow)
+        epochs = shadow.get("position_epochs") if isinstance(shadow.get("position_epochs"), list) else []
+        epoch = epochs[-1] if epochs and isinstance(epochs[-1], dict) else {}
+        stop_bid = epoch.get("fixed_stop_loss_bid")
+        log.info(
+            "%s WEIGHTED FIXED STOP STATUS | ticker=%s locked_side=%s filled=%.2f avg_cost=%s fixed_stop_bid=%s "
+            "entry_quote_state=%s exit_quote_state=%s; no exchange order or close.",
+            label, shadow.get("ticker", "?"), str(shadow.get("side") or "?").upper(), _f(position.get("filled_contracts")),
+            "none" if position.get("average_entry_price") is None else f"${_f(position['average_entry_price']):.4f}",
+            "none" if stop_bid is None else f"${_f(stop_bid):.4f}",
+            shadow.get("last_entry_quote_state", "awaiting_quote"), shadow.get("last_exit_quote_state", "awaiting_quote"),
+        )
+
+
 _selector_pnl_series_logged_count = -1
 
 
@@ -2096,6 +2184,15 @@ async def report_portfolio(rest: KalshiREST) -> None:
             prophet_weighted_trailing_inverse_tracker, inverse=True, label="PROPHET INVERSE")
         print_active_prophet_weighted_trailing_shadow_status(
             prophet_weighted_trailing_inverse_tracker, "PROPHET INVERSE")
+    if PROPHET_WEIGHTED_FIXED_STOP_SHADOW_ENABLED:
+        print_prophet_weighted_fixed_stop_shadow_performance(
+            prophet_weighted_fixed_stop_normal_tracker, inverse=False, label="PROPHET NORMAL")
+        print_active_prophet_weighted_fixed_stop_shadow_status(
+            prophet_weighted_fixed_stop_normal_tracker, "PROPHET NORMAL")
+        print_prophet_weighted_fixed_stop_shadow_performance(
+            prophet_weighted_fixed_stop_inverse_tracker, inverse=True, label="PROPHET INVERSE")
+        print_active_prophet_weighted_fixed_stop_shadow_status(
+            prophet_weighted_fixed_stop_inverse_tracker, "PROPHET INVERSE")
     if PROPHET_SELECTOR_ENABLED:
         print_prophet_selector_performance()
         print_active_prophet_selector_status()
@@ -2188,6 +2285,50 @@ def create_prophet_weighted_trailing_shadows(primary: dict) -> None:
             )
 
 
+def create_prophet_weighted_fixed_stop_shadows(primary: dict) -> None:
+    """Create normal/inverse 5c fixed-stop shadows from the frozen Prophet side."""
+    if not PROPHET_WEIGHTED_FIXED_STOP_SHADOW_ENABLED:
+        return
+    ticker = str(primary.get("ticker") or "")
+    source_side = str(primary.get("source_prophet_side") or primary.get("side") or "").lower()
+    inverse_side = opposite_position_side(source_side)
+    if not ticker or source_side not in ("yes", "no") or inverse_side is None:
+        return
+    for tracker_, side, label, inverse in (
+        (prophet_weighted_fixed_stop_normal_tracker, source_side, "PROPHET NORMAL", False),
+        (prophet_weighted_fixed_stop_inverse_tracker, inverse_side, "PROPHET INVERSE", True),
+    ):
+        if tracker_.already_shadowed(ticker):
+            continue
+        shadow = new_ladder_average_entry_scalp_shadow(
+            strategy="inverse_prophet_weighted_1234_fixed_stop_loss_shadow_v1" if inverse
+            else "normal_prophet_weighted_1234_fixed_stop_loss_shadow_v1",
+            ticker=ticker,
+            side=side,
+            quantity_per_rung=1.0,
+            profit_target_per_contract=PROPHET_LADDER_SCALP_SHADOW_PROFIT_TARGET,
+            quote_max_age_seconds=DRY_QUOTE_MAX_AGE_S,
+            market_close_time=primary.get("settle_et"),
+            profit_targets_per_contract=EXTENDED_PROFIT_TARGETS,
+            rung_quantities=WEIGHTED_SCALP_RUNG_QUANTITIES,
+            fixed_stop_loss_per_contract=PROPHET_WEIGHTED_FIXED_STOP_PER_CONTRACT,
+            extra={
+                "source_prophet_side": source_side,
+                "locked_study_side": side,
+                "study_variant": label,
+                "source_decision_basis": primary.get("source_decision_basis"),
+                "p50_prediction": primary.get("p50_prediction"),
+                "strike": primary.get("strike"),
+            },
+        )
+        if tracker_.record_open(shadow):
+            log.info(
+                "%s WEIGHTED FIXED STOP STUDY STARTED | %s locked_side=%s rungs=1x$0.40/2x$0.30/3x$0.20/4x$0.10 "
+                "fixed_stop=$%.2f below VWAP; fresh full-depth executable bid only; paper only, no exchange order.",
+                label, ticker, side.upper(), PROPHET_WEIGHTED_FIXED_STOP_PER_CONTRACT,
+            )
+
+
 def simulate_prophet_ladder_scalp_shadow(shadow: dict) -> bool:
     """Advance one Prophet scalp alternative from fresh, executable book data."""
     if shadow.get("status") != "active":
@@ -2234,7 +2375,7 @@ def simulate_prophet_ladder_scalp_shadow(shadow: dict) -> bool:
 
 
 def simulate_prophet_weighted_trailing_shadow(shadow: dict, tracker_: ProphetLadderScalpShadowTracker, label: str) -> bool:
-    """Advance one locked Prophet-side weighted trailing paper position."""
+    """Advance one locked Prophet weighted trailing or fixed-stop paper position."""
     if shadow.get("status") != "active":
         return False
     ticker = str(shadow.get("ticker") or "")
@@ -2274,6 +2415,13 @@ def simulate_prophet_weighted_trailing_shadow(shadow: dict, tracker_: ProphetLad
                 "net=$%+.4f; paper only, no exchange close.",
                 label, ticker, side.upper(), _f(event.get("filled_contracts")), _f(event.get("highest_executable_bid")),
                 _f(event.get("trailing_stop_bid")), _f(event.get("exit_price")), _f(event.get("gross_profit_loss")),
+            )
+        elif event.get("kind") == "paper_scalp_fixed_stop_loss_exit":
+            log.info(
+                "%s WEIGHTED FIXED STOP | %s %s contracts=%.2f avg=$%.4f stop_bid=$%.4f observed_bid=$%.4f "
+                "net=$%+.4f; paper only, no exchange close.",
+                label, ticker, side.upper(), _f(event.get("filled_contracts")), _f(event.get("average_entry_price")),
+                _f(event.get("fixed_stop_loss_bid")), _f(event.get("exit_price")), _f(event.get("gross_profit_loss")),
             )
     if events:
         tracker_.save()
@@ -2350,6 +2498,12 @@ async def _settle_record_if_ready(rest: KalshiREST, rec: dict) -> bool:
             ticker, result, prophet_weighted_trailing_normal_tracker, "PROPHET NORMAL")
         finalize_prophet_weighted_trailing_shadow(
             ticker, result, prophet_weighted_trailing_inverse_tracker, "PROPHET INVERSE")
+    if DRY_RUN and PROPHET_WEIGHTED_FIXED_STOP_SHADOW_ENABLED:
+        ticker = str(rec.get("ticker") or "")
+        finalize_prophet_weighted_trailing_shadow(
+            ticker, result, prophet_weighted_fixed_stop_normal_tracker, "PROPHET NORMAL FIXED STOP")
+        finalize_prophet_weighted_trailing_shadow(
+            ticker, result, prophet_weighted_fixed_stop_inverse_tracker, "PROPHET INVERSE FIXED STOP")
 
     # Another task can settle while this coroutine awaits get_market.
     if rec.get("result") != "pending":
@@ -2425,6 +2579,16 @@ async def settlement_checker(rest: KalshiREST) -> None:
                         simulate_prophet_weighted_trailing_shadow(shadow, tracker_, label)
                     except Exception as exc:  # noqa: BLE001
                         log.warning("%s weighted trailing update failed for %s: %s", label, shadow.get("ticker"), exc)
+        if PROPHET_WEIGHTED_FIXED_STOP_SHADOW_ENABLED:
+            for tracker_, label in (
+                (prophet_weighted_fixed_stop_normal_tracker, "PROPHET NORMAL FIXED STOP"),
+                (prophet_weighted_fixed_stop_inverse_tracker, "PROPHET INVERSE FIXED STOP"),
+            ):
+                for shadow in tracker_.find_active():
+                    try:
+                        simulate_prophet_weighted_trailing_shadow(shadow, tracker_, label)
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning("%s weighted fixed-stop update failed for %s: %s", label, shadow.get("ticker"), exc)
         pending = tracker.find_pending()
         if DRY_RUN:
             pending += inverse_shadow_tracker.find_pending()
@@ -2931,9 +3095,10 @@ async def execute_locked_ladder(rest: KalshiREST, ct: str) -> None:
     create_inverse_prophet_shadow(rec)
     create_prophet_ladder_scalp_shadow(rec)
     create_prophet_weighted_trailing_shadows(rec)
+    create_prophet_weighted_fixed_stop_shadows(rec)
     create_prophet_selector_shadow(rec, selection)
     if WEIGHTED_TRAILING_MONITOR_ONLY:
-        log.info("WEIGHTED TRAILING PROPHET MONITOR STARTED | %s frozen_side=%s; normal and inverse quote monitors only.",
+        log.info("WEIGHTED PROPHET MONITOR STARTED | %s frozen_side=%s; normal/inverse trailing and 5c fixed-stop quote monitors only.",
                  ct, source_side.upper())
     else:
         log.info("%s | %s %s accepted=%d/%d. The side remains locked through settlement.",

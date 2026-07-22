@@ -142,6 +142,11 @@ DEFAULT_CONFIG = {
     # retracement. It can never create or alter a real order.
     "weighted_scalp_shadow_enabled": True,
     "weighted_scalp_trailing_stop_per_contract": 0.10,
+    # A parallel paper-only comparison: exit a completed weighted position
+    # when a fresh full-depth bid is at least 5c below its VWAP.  This is not
+    # a live stop order and never changes the existing trailing study.
+    "weighted_scalp_fixed_stop_loss_enabled": True,
+    "weighted_scalp_fixed_stop_loss_per_contract": 0.05,
     # When a retrain publishes a new artifact, paper-test both the retained
     # predecessor and the new model at the same readable size. Neither side
     # can create or alter an exchange order.
@@ -158,6 +163,10 @@ DEFAULT_WEIGHTED_TRAILING_NORMAL_LEDGER = Path("kalshi_btc15m_weighted_trailing_
 DEFAULT_WEIGHTED_TRAILING_NORMAL_REPORT = Path("kalshi_btc15m_weighted_trailing_normal_report.json")
 DEFAULT_WEIGHTED_TRAILING_INVERSE_LEDGER = Path("kalshi_btc15m_weighted_trailing_inverse_ledger.json")
 DEFAULT_WEIGHTED_TRAILING_INVERSE_REPORT = Path("kalshi_btc15m_weighted_trailing_inverse_report.json")
+DEFAULT_WEIGHTED_FIXED_STOP_NORMAL_LEDGER = Path("kalshi_btc15m_weighted_fixed_stop_normal_ledger.json")
+DEFAULT_WEIGHTED_FIXED_STOP_NORMAL_REPORT = Path("kalshi_btc15m_weighted_fixed_stop_normal_report.json")
+DEFAULT_WEIGHTED_FIXED_STOP_INVERSE_LEDGER = Path("kalshi_btc15m_weighted_fixed_stop_inverse_ledger.json")
+DEFAULT_WEIGHTED_FIXED_STOP_INVERSE_REPORT = Path("kalshi_btc15m_weighted_fixed_stop_inverse_report.json")
 
 
 def configure_logging() -> None:
@@ -418,6 +427,10 @@ class StateCheckpointPublisher:
     weighted_normal_report_path: Path
     weighted_inverse_ledger_path: Path
     weighted_inverse_report_path: Path
+    weighted_fixed_normal_ledger_path: Path
+    weighted_fixed_normal_report_path: Path
+    weighted_fixed_inverse_ledger_path: Path
+    weighted_fixed_inverse_report_path: Path
     config: dict[str, Any]
     last_fingerprint: str
     enabled: bool
@@ -428,6 +441,8 @@ class StateCheckpointPublisher:
         cls, config_path: Path, state_path: Path, report_path: Path,
         weighted_normal_ledger_path: Path, weighted_normal_report_path: Path,
         weighted_inverse_ledger_path: Path, weighted_inverse_report_path: Path,
+        weighted_fixed_normal_ledger_path: Path, weighted_fixed_normal_report_path: Path,
+        weighted_fixed_inverse_ledger_path: Path, weighted_fixed_inverse_report_path: Path,
         config: dict[str, Any], state: dict[str, Any],
     ) -> "StateCheckpointPublisher":
         enabled = (
@@ -442,6 +457,10 @@ class StateCheckpointPublisher:
             weighted_normal_report_path=weighted_normal_report_path,
             weighted_inverse_ledger_path=weighted_inverse_ledger_path,
             weighted_inverse_report_path=weighted_inverse_report_path,
+            weighted_fixed_normal_ledger_path=weighted_fixed_normal_ledger_path,
+            weighted_fixed_normal_report_path=weighted_fixed_normal_report_path,
+            weighted_fixed_inverse_ledger_path=weighted_fixed_inverse_ledger_path,
+            weighted_fixed_inverse_report_path=weighted_fixed_inverse_report_path,
             config=config,
             last_fingerprint=checkpoint_fingerprint(state, config),
             enabled=enabled,
@@ -468,6 +487,13 @@ class StateCheckpointPublisher:
                 inverse_ledger_path=self.weighted_inverse_ledger_path,
                 inverse_report_path=self.weighted_inverse_report_path,
             )
+            save_ml_weighted_fixed_stop_outputs(
+                state, self.config,
+                normal_ledger_path=self.weighted_fixed_normal_ledger_path,
+                normal_report_path=self.weighted_fixed_normal_report_path,
+                inverse_ledger_path=self.weighted_fixed_inverse_ledger_path,
+                inverse_report_path=self.weighted_fixed_inverse_report_path,
+            )
             repository = subprocess.run(
                 ["git", "rev-parse", "--show-toplevel"], check=True, capture_output=True, text=True,
             ).stdout.strip()
@@ -476,6 +502,8 @@ class StateCheckpointPublisher:
                 self.config_path, self.state_path, self.report_path,
                 self.weighted_normal_ledger_path, self.weighted_normal_report_path,
                 self.weighted_inverse_ledger_path, self.weighted_inverse_report_path,
+                self.weighted_fixed_normal_ledger_path, self.weighted_fixed_normal_report_path,
+                self.weighted_fixed_inverse_ledger_path, self.weighted_fixed_inverse_report_path,
             )]
             subprocess.run(["git", "add", *paths], check=True, capture_output=True, text=True)
             diff = subprocess.run(
@@ -515,7 +543,7 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         "watch_start_grace_seconds", "ml_preopen_lead_seconds", "ml_min_confidence",
         "inverse_shadow_position_size", "inverse_shadow_quote_max_age_seconds",
         "scalp_shadow_position_size", "scalp_shadow_profit_target", "scalp_shadow_quote_max_age_seconds",
-        "weighted_scalp_trailing_stop_per_contract",
+        "weighted_scalp_trailing_stop_per_contract", "weighted_scalp_fixed_stop_loss_per_contract",
         "model_transition_shadow_position_size", "status_log_seconds",
     ):
         value = as_float(merged.get(name))
@@ -536,6 +564,10 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
     if isinstance(weighted_scalp_enabled, str):
         weighted_scalp_enabled = weighted_scalp_enabled.strip().lower() in {"1", "true", "yes", "on"}
     merged["weighted_scalp_shadow_enabled"] = bool(weighted_scalp_enabled)
+    fixed_stop_enabled = merged.get("weighted_scalp_fixed_stop_loss_enabled", True)
+    if isinstance(fixed_stop_enabled, str):
+        fixed_stop_enabled = fixed_stop_enabled.strip().lower() in {"1", "true", "yes", "on"}
+    merged["weighted_scalp_fixed_stop_loss_enabled"] = bool(fixed_stop_enabled)
     transition_shadow_enabled = merged.get("model_transition_shadow_enabled", True)
     if isinstance(transition_shadow_enabled, str):
         transition_shadow_enabled = transition_shadow_enabled.strip().lower() in {"1", "true", "yes", "on"}
@@ -1921,10 +1953,64 @@ def ensure_ml_weighted_trailing_scalp_shadows(
         )
 
 
+def ensure_ml_weighted_fixed_stop_loss_shadow(
+    record: dict[str, Any], market: Any, config: dict[str, Any], *, side: str, record_key: str, label: str,
+) -> dict[str, Any] | None:
+    """Create a frozen-side 1/2/3/4 paper ladder with a regular 5c stop."""
+    if (not config.get("weighted_scalp_shadow_enabled", True)
+            or not config.get("weighted_scalp_fixed_stop_loss_enabled", True)
+            or side not in {"yes", "no"}):
+        return None
+    existing = record.get(record_key)
+    if isinstance(existing, dict):
+        return existing
+    shadow = new_ladder_average_entry_scalp_shadow(
+        strategy=f"{label.lower().replace(' ', '_')}_weighted_fixed_stop_loss_shadow_v1",
+        ticker=str(record.get("ticker") or ""),
+        side=side,
+        quantity_per_rung=1.0,
+        profit_target_per_contract=float(config["scalp_shadow_profit_target"]),
+        quote_max_age_seconds=float(config["scalp_shadow_quote_max_age_seconds"]),
+        market_close_time=field(market, "close_time", "expected_expiration_time"),
+        profit_targets_per_contract=EXTENDED_PROFIT_TARGETS,
+        rung_quantities=WEIGHTED_SCALP_RUNG_QUANTITIES,
+        fixed_stop_loss_per_contract=float(config["weighted_scalp_fixed_stop_loss_per_contract"]),
+        extra={
+            "source_ml_side": str(record.get("ml_inference", {}).get("side") or "").lower(),
+            "source_model_run_id": record.get("ml_inference", {}).get("model_run_id"),
+            "locked_study_side": side,
+            "study_variant": label,
+        },
+    )
+    record[record_key] = shadow
+    LOG.info(
+        "%s WEIGHTED FIXED STOP STUDY STARTED | %s locked_side=%s rungs=1x$0.40/2x$0.30/3x$0.20/4x$0.10 "
+        "fixed_stop=$%.2f below VWAP; fresh full-depth executable bid only; paper only, no exchange order.",
+        label, record.get("ticker", "?"), side.upper(), float(config["weighted_scalp_fixed_stop_loss_per_contract"]),
+    )
+    return shadow
+
+
+def ensure_ml_weighted_fixed_stop_loss_shadows(
+    record: dict[str, Any], market: Any, config: dict[str, Any], ml_side: str,
+) -> None:
+    """Start normal and inverse fixed-stop comparisons from one frozen signal."""
+    ensure_ml_weighted_fixed_stop_loss_shadow(
+        record, market, config, side=ml_side,
+        record_key="ml_weighted_fixed_stop_loss_shadow", label="ML NORMAL",
+    )
+    inverse_side = opposite_side(ml_side)
+    if inverse_side:
+        ensure_ml_weighted_fixed_stop_loss_shadow(
+            record, market, config, side=inverse_side,
+            record_key="inverse_ml_weighted_fixed_stop_loss_shadow", label="ML INVERSE",
+        )
+
+
 def simulate_ml_weighted_trailing_scalp_shadow(
     record: dict[str, Any], feed: KalshiLiveFeed | None, *, record_key: str, label: str,
 ) -> bool:
-    """Advance one locked-side weighted trailing paper position from fresh quotes."""
+    """Advance one locked-side weighted trailing or fixed-stop paper position."""
     shadow = record.get(record_key)
     if not isinstance(shadow, dict) or shadow.get("status") != "active":
         return False
@@ -1973,6 +2059,13 @@ def simulate_ml_weighted_trailing_scalp_shadow(
                 "observed_bid=$%.4f net=$%+.4f; paper only, no exchange close.",
                 label, ticker, side.upper(), float(event["filled_contracts"]), float(event["highest_executable_bid"]),
                 float(event["trailing_stop_bid"]), float(event["exit_price"]), float(event["gross_profit_loss"]),
+            )
+        elif event.get("kind") == "paper_scalp_fixed_stop_loss_exit":
+            LOG.info(
+                "%s WEIGHTED FIXED STOP | %s %s contracts=%.2f avg=$%.4f stop_bid=$%.4f "
+                "observed_bid=$%.4f net=$%+.4f; paper only, no exchange close.",
+                label, ticker, side.upper(), float(event["filled_contracts"]), float(event["average_entry_price"]),
+                float(event["fixed_stop_loss_bid"]), float(event["exit_price"]), float(event["gross_profit_loss"]),
             )
     return bool(events)
 
@@ -2391,6 +2484,10 @@ async def settle_or_cancel(rest: KalshiREST, record: dict[str, Any], market: Any
             record, result, record_key="ml_weighted_trailing_scalp_shadow", label="ML NORMAL")
         finalize_ml_weighted_trailing_scalp_shadow(
             record, result, record_key="inverse_ml_weighted_trailing_scalp_shadow", label="ML INVERSE")
+        finalize_ml_weighted_trailing_scalp_shadow(
+            record, result, record_key="ml_weighted_fixed_stop_loss_shadow", label="ML NORMAL FIXED STOP")
+        finalize_ml_weighted_trailing_scalp_shadow(
+            record, result, record_key="inverse_ml_weighted_fixed_stop_loss_shadow", label="ML INVERSE FIXED STOP")
         finalize_model_transition_shadow(record, result)
     if not record.get("candidate_side") and not orders_for_market(record):
         if result is None or market_status != "finalized":
@@ -2496,6 +2593,7 @@ async def consider_initial_entry(
     # fresh-market policy even if the live ladder is later blocked by balance,
     # capacity, or exchange recovery. It remains paper-only in all modes.
     ensure_ml_weighted_trailing_scalp_shadows(record, market, config, ml_side)
+    ensure_ml_weighted_fixed_stop_loss_shadows(record, market, config, ml_side)
     if paper_monitor_only:
         # The isolated report Action keeps the exact frozen ML side and uses
         # the authenticated quote stream only for its normal/inverse weighted
@@ -2508,13 +2606,13 @@ async def consider_initial_entry(
             "quantity": 0.0,
             "status": "paper_monitor_active",
             "paper_monitor_only": True,
-            "ladder_mode": "weighted_trailing_quote_monitor_only",
+            "ladder_mode": "weighted_exit_protection_quote_monitor_only",
             "reserved_principal": 0.0,
             "market_close_time": field(market, "close_time", "expected_expiration_time"),
         })
         LOG.info(
-            "WEIGHTED TRAILING ML MONITOR STARTED | %s frozen_side=%s; subscribing only for normal/inverse "
-            "1x$0.40/2x$0.30/3x$0.20/4x$0.10 paper fills and full-depth trailing exits. No order exists.",
+            "WEIGHTED ML MONITOR STARTED | %s frozen_side=%s; subscribing only for normal/inverse "
+            "1x$0.40/2x$0.30/3x$0.20/4x$0.10 paper fills, 10c trailing exits, and 5c fixed stops. No order exists.",
             ticker, ml_side.upper(),
         )
         return True
@@ -3050,6 +3148,74 @@ def save_ml_weighted_trailing_outputs(
     save_json(inverse_report_path, inverse_ledger["summary"])
 
 
+def ml_weighted_fixed_stop_loss_performance(state: dict[str, Any], *, inverse: bool) -> dict[str, Any]:
+    """Summarize the parallel normal or inverse ML 5c fixed-stop study."""
+    record_key = "inverse_ml_weighted_fixed_stop_loss_shadow" if inverse else "ml_weighted_fixed_stop_loss_shadow"
+    shadows = [
+        record[record_key]
+        for record in state.get("markets", {}).values()
+        if isinstance(record, dict) and isinstance(record.get(record_key), dict)
+    ]
+    report = scalp_performance(shadows)
+    report.update({
+        "strategy": "inverse_ml_weighted_1234_fixed_stop_loss_shadow_v1" if inverse
+        else "normal_ml_weighted_1234_fixed_stop_loss_shadow_v1",
+        "source": "opposite_frozen_ml_side" if inverse else "same_frozen_ml_side_as_primary_ladder",
+        "locked_side_policy": "side is fixed before open and never changes on later quotes",
+        "weighted_rungs": {"0.40": 1.0, "0.30": 2.0, "0.20": 3.0, "0.10": 4.0},
+    })
+    return report
+
+
+def ml_weighted_fixed_stop_loss_shadows(state: dict[str, Any], *, inverse: bool) -> list[dict[str, Any]]:
+    """Return the durable detailed ledger for one ML fixed-stop variant."""
+    record_key = "inverse_ml_weighted_fixed_stop_loss_shadow" if inverse else "ml_weighted_fixed_stop_loss_shadow"
+    return sorted([
+        record[record_key]
+        for record in state.get("markets", {}).values()
+        if isinstance(record, dict) and isinstance(record.get(record_key), dict)
+    ], key=lambda shadow: (
+        str(shadow.get("settled_at") or shadow.get("created_at") or ""),
+        str(shadow.get("ticker") or ""),
+    ))
+
+
+def ml_weighted_fixed_stop_loss_ledger(state: dict[str, Any], config: dict[str, Any], *, inverse: bool) -> dict[str, Any]:
+    """Emit a complete 5c-stop ledger with every quote/depth exit record."""
+    report = ml_weighted_fixed_stop_loss_performance(state, inverse=inverse)
+    return {
+        "schema": "ml_weighted_1234_fixed_stop_loss_paper_ledger_v1",
+        "generated_at": now_iso(),
+        "paper_only": True,
+        "model_variant": "inverse_ml" if inverse else "normal_ml",
+        "strategy": report["strategy"],
+        "locked_side_policy": report["locked_side_policy"],
+        "strategy_definition": {
+            "rung_quantities": {f"{level:.2f}": quantity for level, quantity in WEIGHTED_SCALP_RUNG_QUANTITIES.items()},
+            "fixed_stop_loss_per_contract": float(config["weighted_scalp_fixed_stop_loss_per_contract"]),
+            "entry_rule": "fresh executable side ask at or below each rung with displayed ask depth; shared quote depth is consumed across the 1/2/3/4 fills",
+            "exit_rule": "after a weighted position forms, a fresh full-depth executable bid at or below VWAP minus the fixed-stop gap closes all paper contracts at that observed bid",
+            "fee_treatment": "excluded_no_exchange_fill",
+        },
+        "summary": report,
+        "records": ml_weighted_fixed_stop_loss_shadows(state, inverse=inverse),
+    }
+
+
+def save_ml_weighted_fixed_stop_outputs(
+    state: dict[str, Any], config: dict[str, Any], *,
+    normal_ledger_path: Path, normal_report_path: Path,
+    inverse_ledger_path: Path, inverse_report_path: Path,
+) -> None:
+    """Persist viewable normal/inverse 5c fixed-stop comparison ledgers."""
+    normal_ledger = ml_weighted_fixed_stop_loss_ledger(state, config, inverse=False)
+    inverse_ledger = ml_weighted_fixed_stop_loss_ledger(state, config, inverse=True)
+    save_json(normal_ledger_path, normal_ledger)
+    save_json(normal_report_path, normal_ledger["summary"])
+    save_json(inverse_ledger_path, inverse_ledger)
+    save_json(inverse_report_path, inverse_ledger["summary"])
+
+
 def paper_shadow_summary(shadows: list[dict[str, Any]]) -> dict[str, Any]:
     """Return comparable settled paper metrics for any one-model shadow set."""
     settled_signals = sorted(
@@ -3211,6 +3377,8 @@ def performance_report(state: dict[str, Any], config: dict[str, Any]) -> dict[st
         "ml_ladder_scalp_shadow_performance": ml_scalp_shadow_performance(state),
         "ml_weighted_trailing_scalp_performance": ml_weighted_trailing_scalp_performance(state, inverse=False),
         "inverse_ml_weighted_trailing_scalp_performance": ml_weighted_trailing_scalp_performance(state, inverse=True),
+        "ml_weighted_fixed_stop_loss_performance": ml_weighted_fixed_stop_loss_performance(state, inverse=False),
+        "inverse_ml_weighted_fixed_stop_loss_performance": ml_weighted_fixed_stop_loss_performance(state, inverse=True),
         "note": "Only finalized records with filled contracts count as trades. The pre-open ML side is an execution filter; this report is realized live-ledger data, not a profitability proof.",
     }
     if settled:
@@ -3415,6 +3583,27 @@ def log_performance_summary(report: dict[str, Any], context: str) -> None:
                 "n/a" if profile["p75_maximum_gross_per_contract"] is None else f"${profile['p75_maximum_gross_per_contract']:+.4f}",
                 "n/a" if profile["p90_maximum_gross_per_contract"] is None else f"${profile['p90_maximum_gross_per_contract']:+.4f}",
             )
+    for label, fixed in (
+        ("ML NORMAL WEIGHTED FIXED STOP", report["ml_weighted_fixed_stop_loss_performance"]),
+        ("ML INVERSE WEIGHTED FIXED STOP", report["inverse_ml_weighted_fixed_stop_loss_performance"]),
+    ):
+        current_streak = (
+            "none" if fixed["current_streak"] <= 0
+            else f"{fixed['current_streak']} {fixed['current_streak_kind']}"
+        )
+        stop = fixed["fixed_stop_loss"]
+        LOG.info(
+            "%s PERFORMANCE | %s started=%d active=%d filled=%d fixed_stop_exits=%d settlement_exits=%d "
+            "W/L=%d/%d streak=%s longest_W/L=%d/%d net=$%+.4f roi=%s max_dd=$%.4f stop_gap=$%.2f "
+            "| locked side; 1x40c/2x30c/3x20c/4x10c; fresh full-depth bid <= VWAP-gap; paper only.",
+            label, context, fixed["paper_markets_started"], fixed["active_paper_markets"],
+            fixed["filled_market_trades"], stop["fixed_stop_loss_exits"],
+            fixed["settlement_exits_without_take_profit"], fixed["winning_trades"], fixed["losing_trades"],
+            current_streak, fixed["longest_winning_streak"], fixed["longest_losing_streak"], fixed["net_profit"],
+            "n/a" if fixed["return_on_simulated_capital"] is None
+            else f"{100 * fixed['return_on_simulated_capital']:.2f}%", fixed["maximum_drawdown"],
+            stop["configured_gaps_per_contract"][0] if stop["configured_gaps_per_contract"] else 0.0,
+        )
 
 
 def log_ml_deployment(
@@ -3582,6 +3771,27 @@ async def log_heartbeat(
                 weighted.get("last_entry_quote_state", "awaiting_quote"),
                 weighted.get("last_exit_quote_state", "awaiting_quote"),
             )
+        for fixed_key, fixed_label in (
+            ("ml_weighted_fixed_stop_loss_shadow", "ML NORMAL WEIGHTED FIXED STOP"),
+            ("inverse_ml_weighted_fixed_stop_loss_shadow", "ML INVERSE WEIGHTED FIXED STOP"),
+        ):
+            fixed = record.get(fixed_key)
+            if not isinstance(fixed, dict):
+                continue
+            position = scalp_entry_summary(fixed)
+            epochs = fixed.get("position_epochs") if isinstance(fixed.get("position_epochs"), list) else []
+            epoch = epochs[-1] if epochs and isinstance(epochs[-1], dict) else {}
+            stop_bid = epoch.get("fixed_stop_loss_bid")
+            LOG.info(
+                "%s STATUS | %s locked_side=%s status=%s filled=%.2f avg_cost=%s fixed_stop_bid=%s "
+                "entry_quote_state=%s exit_quote_state=%s; no exchange order or close.",
+                fixed_label, record.get("ticker", "?"), str(fixed.get("side") or "?").upper(),
+                fixed.get("status", "?"), float(position["filled_contracts"] or 0.0),
+                "none" if position["average_entry_price"] is None else f"${float(position['average_entry_price']):.4f}",
+                "none" if stop_bid is None else f"${float(stop_bid):.4f}",
+                fixed.get("last_entry_quote_state", "awaiting_quote"),
+                fixed.get("last_exit_quote_state", "awaiting_quote"),
+            )
         if record.get("status") == "watching":
             ml_signal = record.get("ml_inference") if isinstance(record.get("ml_inference"), dict) else {}
             ml_side = str(ml_signal.get("side") or "").upper()
@@ -3650,6 +3860,10 @@ async def run(args: argparse.Namespace) -> int:
     weighted_normal_report_path = args.weighted_trailing_normal_report.expanduser()
     weighted_inverse_ledger_path = args.weighted_trailing_inverse_ledger.expanduser()
     weighted_inverse_report_path = args.weighted_trailing_inverse_report.expanduser()
+    weighted_fixed_normal_ledger_path = args.weighted_fixed_stop_normal_ledger.expanduser()
+    weighted_fixed_normal_report_path = args.weighted_fixed_stop_normal_report.expanduser()
+    weighted_fixed_inverse_ledger_path = args.weighted_fixed_stop_inverse_ledger.expanduser()
+    weighted_fixed_inverse_report_path = args.weighted_fixed_stop_inverse_report.expanduser()
     state = load_json(state_path, default_state())
     state["format_version"] = STATE_VERSION
     state.setdefault("markets", {})
@@ -3657,6 +3871,8 @@ async def run(args: argparse.Namespace) -> int:
         config_path, state_path, args.report.expanduser(),
         weighted_normal_ledger_path, weighted_normal_report_path,
         weighted_inverse_ledger_path, weighted_inverse_report_path,
+        weighted_fixed_normal_ledger_path, weighted_fixed_normal_report_path,
+        weighted_fixed_inverse_ledger_path, weighted_fixed_inverse_report_path,
         config, state,
     )
     api_key = os.getenv("KALSHI_API_KEY_ID", "")
@@ -3679,6 +3895,13 @@ async def run(args: argparse.Namespace) -> int:
                 normal_report_path=weighted_normal_report_path,
                 inverse_ledger_path=weighted_inverse_ledger_path,
                 inverse_report_path=weighted_inverse_report_path,
+            )
+            save_ml_weighted_fixed_stop_outputs(
+                state, config,
+                normal_ledger_path=weighted_fixed_normal_ledger_path,
+                normal_report_path=weighted_fixed_normal_report_path,
+                inverse_ledger_path=weighted_fixed_inverse_ledger_path,
+                inverse_report_path=weighted_fixed_inverse_report_path,
             )
             LOG.warning("CANCEL-ONLY COMPLETE | canceled_open_mechanical_orders=%d", canceled)
             return 0
@@ -3801,6 +4024,10 @@ async def run(args: argparse.Namespace) -> int:
                         record, feed, record_key="ml_weighted_trailing_scalp_shadow", label="ML NORMAL")
                     simulate_ml_weighted_trailing_scalp_shadow(
                         record, feed, record_key="inverse_ml_weighted_trailing_scalp_shadow", label="ML INVERSE")
+                    simulate_ml_weighted_trailing_scalp_shadow(
+                        record, feed, record_key="ml_weighted_fixed_stop_loss_shadow", label="ML NORMAL FIXED STOP")
+                    simulate_ml_weighted_trailing_scalp_shadow(
+                        record, feed, record_key="inverse_ml_weighted_fixed_stop_loss_shadow", label="ML INVERSE FIXED STOP")
                     simulate_model_transition_shadow(record, feed, config)
             monotonic_now = asyncio.get_running_loop().time()
             if monotonic_now - last_heartbeat_at >= config["status_log_seconds"]:
@@ -3814,6 +4041,13 @@ async def run(args: argparse.Namespace) -> int:
                 normal_report_path=weighted_normal_report_path,
                 inverse_ledger_path=weighted_inverse_ledger_path,
                 inverse_report_path=weighted_inverse_report_path,
+            )
+            save_ml_weighted_fixed_stop_outputs(
+                state, config,
+                normal_ledger_path=weighted_fixed_normal_ledger_path,
+                normal_report_path=weighted_fixed_normal_report_path,
+                inverse_ledger_path=weighted_fixed_inverse_ledger_path,
+                inverse_report_path=weighted_fixed_inverse_report_path,
             )
             checkpoint.publish_if_changed(state, "material_strategy_event")
             if monotonic_now >= deadline:
@@ -3840,6 +4074,13 @@ async def run(args: argparse.Namespace) -> int:
             normal_report_path=weighted_normal_report_path,
             inverse_ledger_path=weighted_inverse_ledger_path,
             inverse_report_path=weighted_inverse_report_path,
+        )
+        save_ml_weighted_fixed_stop_outputs(
+            state, config,
+            normal_ledger_path=weighted_fixed_normal_ledger_path,
+            normal_report_path=weighted_fixed_normal_report_path,
+            inverse_ledger_path=weighted_fixed_inverse_ledger_path,
+            inverse_report_path=weighted_fixed_inverse_report_path,
         )
         log_performance_summary(final_report, "run_complete")
         await rest.close()
@@ -3871,6 +4112,26 @@ def build_parser() -> argparse.ArgumentParser:
         "--weighted-trailing-inverse-report", type=Path,
         default=DEFAULT_WEIGHTED_TRAILING_INVERSE_REPORT,
         help="Compact inverse-ML weighted trailing paper report JSON.",
+    )
+    parser.add_argument(
+        "--weighted-fixed-stop-normal-ledger", type=Path,
+        default=DEFAULT_WEIGHTED_FIXED_STOP_NORMAL_LEDGER,
+        help="Detailed normal-ML weighted fixed-stop paper ledger JSON.",
+    )
+    parser.add_argument(
+        "--weighted-fixed-stop-normal-report", type=Path,
+        default=DEFAULT_WEIGHTED_FIXED_STOP_NORMAL_REPORT,
+        help="Compact normal-ML weighted fixed-stop paper report JSON.",
+    )
+    parser.add_argument(
+        "--weighted-fixed-stop-inverse-ledger", type=Path,
+        default=DEFAULT_WEIGHTED_FIXED_STOP_INVERSE_LEDGER,
+        help="Detailed inverse-ML weighted fixed-stop paper ledger JSON.",
+    )
+    parser.add_argument(
+        "--weighted-fixed-stop-inverse-report", type=Path,
+        default=DEFAULT_WEIGHTED_FIXED_STOP_INVERSE_REPORT,
+        help="Compact inverse-ML weighted fixed-stop paper report JSON.",
     )
     parser.add_argument("--run-seconds", type=float, default=840.0)
     parser.add_argument(

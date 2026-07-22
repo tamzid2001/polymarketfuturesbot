@@ -86,6 +86,15 @@ class ProphetLockedLadderStaticTests(unittest.TestCase):
         self.assertNotIn("_submit(", selector)
         self.assertNotIn("_ladder_order_terms(", selector)
 
+    def test_prophet_fixed_stop_study_is_paper_only(self) -> None:
+        fixed = ast.get_source_segment(
+            self.source, self.functions["create_prophet_weighted_fixed_stop_shadows"])
+        self.assertIn("PROPHET_WEIGHTED_FIXED_STOP_SHADOW_ENABLED", self.source)
+        self.assertIn("DRY_RUN and", self.source)
+        self.assertIn("fixed_stop_loss_per_contract", fixed)
+        self.assertNotIn("_submit(", fixed)
+        self.assertNotIn("_ladder_order_terms(", fixed)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

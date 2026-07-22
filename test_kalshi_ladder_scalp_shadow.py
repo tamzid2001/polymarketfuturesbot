@@ -165,6 +165,45 @@ class LadderScalpShadowTests(unittest.TestCase):
             point["trailing_stop"]["observed_exit_bid"],
         ))
 
+    def test_weighted_ladder_fixed_five_cent_stop_requires_full_depth(self) -> None:
+        shadow = new_ladder_average_entry_scalp_shadow(
+            strategy="weighted-fixed-stop", ticker="KXBTC15M-TEST", side="yes", quantity_per_rung=1.0,
+            profit_target_per_contract=0.01, quote_max_age_seconds=3.0, market_close_time="later",
+            profit_targets_per_contract=EXTENDED_PROFIT_TARGETS,
+            rung_quantities={0.40: 1.0, 0.30: 2.0, 0.20: 3.0, 0.10: 4.0},
+            fixed_stop_loss_per_contract=0.05,
+        )
+        # Three weighted rungs fill for a 26.6667c VWAP.  The fixed stop is
+        # therefore 21.6667c and must use a fresh bid with all six contracts
+        # of displayed depth; it never assumes a fill at the stop price.
+        simulate_ladder_average_entry_scalp(
+            shadow, entry_quote=quote(0.20, 6.0, "weighted-entry"), entry_quote_state="fresh",
+            exit_quote=quote(0.21, 5.99, "thin-stop"), exit_quote_state="insufficient_depth",
+        )
+        self.assertEqual("active", shadow["status"])
+        events = simulate_ladder_average_entry_scalp(
+            shadow, entry_quote=None, entry_quote_state="fresh",
+            exit_quote=quote(0.21, 6.0, "full-stop"), exit_quote_state="fresh",
+        )
+        self.assertEqual("scalp_exited", shadow["status"])
+        self.assertEqual("paper_scalp_fixed_stop_loss_exit", events[-1]["kind"])
+        self.assertEqual(0.216667, shadow["position_epochs"][0]["fixed_stop_loss_bid"])
+        self.assertEqual((0.216667, 0.21, -0.34), (
+            events[-1]["fixed_stop_loss_bid"], events[-1]["exit_price"], events[-1]["gross_profit_loss"],
+        ))
+        report = scalp_performance([shadow])
+        self.assertEqual((1, 0, -0.34), (
+            report["fixed_stop_loss_exits"], report["trailing_stop_exits"], report["net_profit"],
+        ))
+        self.assertEqual((1, -0.34), (
+            report["average_entry_profiles"]["0.2667"]["fixed_stop_loss_exits"],
+            report["average_entry_profiles"]["0.2667"]["net_profit"],
+        ))
+        point = report["pnl_time_series"][0]
+        self.assertEqual((0.216667, 0.21), (
+            point["fixed_stop_loss"]["fixed_stop_loss_bid"], point["fixed_stop_loss"]["observed_exit_bid"],
+        ))
+
 
 if __name__ == "__main__":
     unittest.main()
