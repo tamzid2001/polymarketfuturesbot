@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-07-21T23:16:45.799405+00:00",
+  "generated_at": "2026-07-22T05:00:12.715573+00:00",
   "strategy": "prophet_trailing_win_rate_side_selector_v1",
   "mode": "paper_only_no_exchange_orders",
   "fill_rule": "YES buy: yes_ask <= rung; NO buy: 1 - yes_bid <= rung; fresh complete top-of-book and displayed depth >= rung quantity",
@@ -10,110 +10,1170 @@
     "Queue position, quote cancellation, hidden liquidity, and fees are not modeled.",
     "P&L uses the pre-posted rung limit rather than favorable price improvement."
   ],
-  "shadow_signals_started": 3,
+  "shadow_signals_started": 26,
   "active_shadow_markets": 1,
-  "settled_signal_markets": 2,
-  "unfilled_shadow_markets": 1,
-  "filled_market_trades": 1,
-  "directional_wins": 1,
-  "directional_losses": 1,
-  "directional_win_rate": 0.5,
-  "winning_trades": 0,
-  "losing_trades": 1,
-  "win_rate": 0.0,
-  "total_simulated_cost": 1.0,
-  "net_profit": -1.0,
-  "return_on_simulated_capital": -1.0,
-  "average_profit_per_filled_market": -1.0,
-  "largest_winning_trade": -1.0,
+  "settled_signal_markets": 25,
+  "unfilled_shadow_markets": 5,
+  "filled_market_trades": 20,
+  "directional_wins": 10,
+  "directional_losses": 15,
+  "directional_win_rate": 0.4,
+  "winning_trades": 5,
+  "losing_trades": 15,
+  "win_rate": 0.25,
+  "total_simulated_cost": 18.2,
+  "gross_settlement_payout": 10.0,
+  "net_profit": -8.2,
+  "return_on_simulated_capital": -0.450549,
+  "average_profit_per_filled_market": -0.41,
+  "largest_winning_trade": 3.0,
   "largest_losing_trade": -1.0,
-  "profit_factor": 0.0,
-  "maximum_drawdown": 1.0,
-  "longest_winning_streak": 0,
-  "longest_losing_streak": 1,
+  "profit_factor": 0.453333,
+  "maximum_drawdown": 8.2,
+  "current_streak": 4,
+  "current_kind": "LOSS",
+  "longest_winning_streak": 1,
+  "longest_losing_streak": 4,
   "rung_performance": {
     "0.40": {
       "rung_price": 0.4,
-      "paper_orders": 3,
-      "quote_hits": 2,
-      "paper_contracts": 3.0,
-      "filled_contracts": 2.0,
-      "winning_hits": 0,
-      "losing_hits": 2,
-      "net_profit": -0.8
+      "paper_orders": 26,
+      "quote_hits": 20,
+      "paper_contracts": 26.0,
+      "filled_contracts": 20.0,
+      "winning_hits": 5,
+      "losing_hits": 15,
+      "net_profit": -3.0
     },
     "0.30": {
       "rung_price": 0.3,
-      "paper_orders": 3,
-      "quote_hits": 2,
-      "paper_contracts": 3.0,
-      "filled_contracts": 2.0,
-      "winning_hits": 0,
-      "losing_hits": 2,
-      "net_profit": -0.6
+      "paper_orders": 26,
+      "quote_hits": 18,
+      "paper_contracts": 26.0,
+      "filled_contracts": 18.0,
+      "winning_hits": 3,
+      "losing_hits": 15,
+      "net_profit": -2.4
     },
     "0.20": {
       "rung_price": 0.2,
-      "paper_orders": 3,
-      "quote_hits": 2,
-      "paper_contracts": 3.0,
-      "filled_contracts": 2.0,
-      "winning_hits": 0,
-      "losing_hits": 2,
-      "net_profit": -0.4
+      "paper_orders": 26,
+      "quote_hits": 16,
+      "paper_contracts": 26.0,
+      "filled_contracts": 16.0,
+      "winning_hits": 1,
+      "losing_hits": 15,
+      "net_profit": -2.2
     },
     "0.10": {
       "rung_price": 0.1,
-      "paper_orders": 3,
-      "quote_hits": 1,
-      "paper_contracts": 3.0,
-      "filled_contracts": 1.0,
-      "winning_hits": 0,
-      "losing_hits": 1,
-      "net_profit": -0.1
+      "paper_orders": 26,
+      "quote_hits": 16,
+      "paper_contracts": 26.0,
+      "filled_contracts": 16.0,
+      "winning_hits": 1,
+      "losing_hits": 15,
+      "net_profit": -0.6
     }
   },
+  "pnl_time_series": [
+    {
+      "settled_at": "2026-07-21T19:00:00-04:00",
+      "ticker": "KXBTC15M-26JUL211900-00",
+      "source_prophet_side": "NO",
+      "selected_side": "YES",
+      "selector_mode": "inverse",
+      "market_result": "no",
+      "result": "LOSS",
+      "filled_contracts": 4.0,
+      "entry_cost": 1.0,
+      "settlement_payout": 0.0,
+      "net_profit": -1.0,
+      "rungs": [
+        {
+          "rung_price": 0.4,
+          "contracts": 1.0,
+          "entry_cost": 0.4,
+          "settlement_payout": 0.0,
+          "net_profit": -0.4,
+          "status": "simulated_executable_quote_hit"
+        },
+        {
+          "rung_price": 0.3,
+          "contracts": 1.0,
+          "entry_cost": 0.3,
+          "settlement_payout": 0.0,
+          "net_profit": -0.3,
+          "status": "simulated_executable_quote_hit"
+        },
+        {
+          "rung_price": 0.2,
+          "contracts": 1.0,
+          "entry_cost": 0.2,
+          "settlement_payout": 0.0,
+          "net_profit": -0.2,
+          "status": "simulated_executable_quote_hit"
+        },
+        {
+          "rung_price": 0.1,
+          "contracts": 1.0,
+          "entry_cost": 0.1,
+          "settlement_payout": 0.0,
+          "net_profit": -0.1,
+          "status": "simulated_executable_quote_hit"
+        }
+      ],
+      "cumulative_entry_cost": 1.0,
+      "cumulative_settlement_payout": 0.0,
+      "cumulative_net_profit": -1.0,
+      "cumulative_roi": -1.0,
+      "drawdown": 1.0
+    },
+    {
+      "settled_at": "2026-07-21T19:15:00-04:00",
+      "ticker": "KXBTC15M-26JUL211915-15",
+      "source_prophet_side": "NO",
+      "selected_side": "NO",
+      "selector_mode": "normal",
+      "market_result": "no",
+      "result": "UNFILLED",
+      "filled_contracts": 0.0,
+      "entry_cost": 0.0,
+      "settlement_payout": 0.0,
+      "net_profit": 0.0,
+      "rungs": [],
+      "cumulative_entry_cost": 1.0,
+      "cumulative_settlement_payout": 0.0,
+      "cumulative_net_profit": -1.0,
+      "cumulative_roi": -1.0,
+      "drawdown": 1.0
+    },
+    {
+      "settled_at": "2026-07-21T23:30:08.850143+00:00",
+      "ticker": "KXBTC15M-26JUL211930-30",
+      "source_prophet_side": "NO",
+      "selected_side": "NO",
+      "selector_mode": "normal",
+      "market_result": "yes",
+      "result": "LOSS",
+      "filled_contracts": 4.0,
+      "entry_cost": 1.0,
+      "settlement_payout": 0.0,
+      "net_profit": -1.0,
+      "rungs": [
+        {
+          "rung_price": 0.4,
+          "contracts": 1.0,
+          "entry_cost": 0.4,
+          "settlement_payout": 0.0,
+          "net_profit": -0.4,
+          "status": "simulated_executable_quote_hit"
+        },
+        {
+          "rung_price": 0.3,
+          "contracts": 1.0,
+          "entry_cost": 0.3,
+          "settlement_payout": 0.0,
+          "net_profit": -0.3,
+          "status": "simulated_executable_quote_hit"
+        },
+        {
+          "rung_price": 0.2,
+          "contracts": 1.0,
+          "entry_cost": 0.2,
+          "settlement_payout": 0.0,
+          "net_profit": -0.2,
+          "status": "simulated_executable_quote_hit"
+        },
+        {
+          "rung_price": 0.1,
+          "contracts": 1.0,
+          "entry_cost": 0.1,
+          "settlement_payout": 0.0,
+          "net_profit": -0.1,
+          "status": "simulated_executable_quote_hit"
+        }
+      ],
+      "cumulative_entry_cost": 2.0,
+      "cumulative_settlement_payout": 0.0,
+      "cumulative_net_profit": -2.0,
+      "cumulative_roi": -1.0,
+      "drawdown": 2.0
+    },
+    {
+      "settled_at": "2026-07-21T23:45:12.564864+00:00",
+      "ticker": "KXBTC15M-26JUL211945-45",
+      "source_prophet_side": "NO",
+      "selected_side": "NO",
+      "selector_mode": "normal",
+      "market_result": "yes",
+      "result": "LOSS",
+      "filled_contracts": 4.0,
+      "entry_cost": 1.0,
+      "settlement_payout": 0.0,
+      "net_profit": -1.0,
+      "rungs": [
+        {
+          "rung_price": 0.4,
+          "contracts": 1.0,
+          "entry_cost": 0.4,
+          "settlement_payout": 0.0,
+          "net_profit": -0.4,
+          "status": "simulated_executable_quote_hit"
+        },
+        {
+          "rung_price": 0.3,
+          "contracts": 1.0,
+          "entry_cost": 0.3,
+          "settlement_payout": 0.0,
+          "net_profit": -0.3,
+          "status": "simulated_executable_quote_hit"
+        },
+        {
+          "rung_price": 0.2,
+          "contracts": 1.0,
+          "entry_cost": 0.2,
+          "settlement_payout": 0.0,
+          "net_profit": -0.2,
+          "status": "simulated_executable_quote_hit"
+        },
+        {
+          "rung_price": 0.1,
+          "contracts": 1.0,
+          "entry_cost": 0.1,
+          "settlement_payout": 0.0,
+          "net_profit": -0.1,
+          "status": "simulated_executable_quote_hit"
+        }
+      ],
+      "cumulative_entry_cost": 3.0,
+      "cumulative_settlement_payout": 0.0,
+      "cumulative_net_profit": -3.0,
+      "cumulative_roi": -1.0,
+      "drawdown": 3.0
+    },
+    {
+      "settled_at": "2026-07-22T00:00:14.769658+00:00",
+      "ticker": "KXBTC15M-26JUL212000-00",
+      "source_prophet_side": "NO",
+      "selected_side": "NO",
+      "selector_mode": "normal",
+      "market_result": "yes",
+      "result": "LOSS",
+      "filled_contracts": 4.0,
+      "entry_cost": 1.0,
+      "settlement_payout": 0.0,
+      "net_profit": -1.0,
+      "rungs": [
+        {
+          "rung_price": 0.4,
+          "contracts": 1.0,
+          "entry_cost": 0.4,
+          "settlement_payout": 0.0,
+          "net_profit": -0.4,
+          "status": "simulated_executable_quote_hit"
+        },
+        {
+          "rung_price": 0.3,
+          "contracts": 1.0,
+          "entry_cost": 0.3,
+          "settlement_payout": 0.0,
+          "net_profit": -0.3,
+          "status": "simulated_executable_quote_hit"
+        },
+        {
+          "rung_price": 0.2,
+          "contracts": 1.0,
+          "entry_cost": 0.2,
+          "settlement_payout": 0.0,
+          "net_profit": -0.2,
+          "status": "simulated_executable_quote_hit"
+        },
+        {
+          "rung_price": 0.1,
+          "contracts": 1.0,
+          "entry_cost": 0.1,
+          "settlement_payout": 0.0,
+          "net_profit": -0.1,
+          "status": "simulated_executable_quote_hit"
+        }
+      ],
+      "cumulative_entry_cost": 4.0,
+      "cumulative_settlement_payout": 0.0,
+      "cumulative_net_profit": -4.0,
+      "cumulative_roi": -1.0,
+      "drawdown": 4.0
+    },
+    {
+      "settled_at": "2026-07-22T00:15:21.575850+00:00",
+      "ticker": "KXBTC15M-26JUL212015-15",
+      "source_prophet_side": "NO",
+      "selected_side": "YES",
+      "selector_mode": "inverse",
+      "market_result": "yes",
+      "result": "WIN",
+      "filled_contracts": 1.0,
+      "entry_cost": 0.4,
+      "settlement_payout": 1.0,
+      "net_profit": 0.6,
+      "rungs": [
+        {
+          "rung_price": 0.4,
+          "contracts": 1.0,
+          "entry_cost": 0.4,
+          "settlement_payout": 1.0,
+          "net_profit": 0.6,
+          "status": "simulated_executable_quote_hit"
+        }
+      ],
+      "cumulative_entry_cost": 4.4,
+      "cumulative_settlement_payout": 1.0,
+      "cumulative_net_profit": -3.4,
+      "cumulative_roi": -0.772727,
+      "drawdown": 4.0
+    },
+    {
+      "settled_at": "2026-07-22T00:30:13.576049+00:00",
+      "ticker": "KXBTC15M-26JUL212030-30",
+      "source_prophet_side": "NO",
+      "selected_side": "YES",
+      "selector_mode": "inverse",
+      "market_result": "no",
+      "result": "LOSS",
+      "filled_contracts": 4.0,
+      "entry_cost": 1.0,
+      "settlement_payout": 0.0,
+      "net_profit": -1.0,
+      "rungs": [
+        {
+          "rung_price": 0.4,
+          "contracts": 1.0,
+          "entry_cost": 0.4,
+          "settlement_payout": 0.0,
+          "net_profit": -0.4,
+          "status": "simulated_executable_quote_hit"
+        },
+        {
+          "rung_price": 0.3,
+          "contracts": 1.0,
+          "entry_cost": 0.3,
+          "settlement_payout": 0.0,
+          "net_profit": -0.3,
+          "status": "simulated_executable_quote_hit"
+        },
+        {
+          "rung_price": 0.2,
+          "contracts": 1.0,
+          "entry_cost": 0.2,
+          "settlement_payout": 0.0,
+          "net_profit": -0.2,
+          "status": "simulated_executable_quote_hit"
+        },
+        {
+          "rung_price": 0.1,
+          "contracts": 1.0,
+          "entry_cost": 0.1,
+          "settlement_payout": 0.0,
+          "net_profit": -0.1,
+          "status": "simulated_executable_quote_hit"
+        }
+      ],
+      "cumulative_entry_cost": 5.4,
+      "cumulative_settlement_payout": 1.0,
+      "cumulative_net_profit": -4.4,
+      "cumulative_roi": -0.814815,
+      "drawdown": 4.4
+    },
+    {
+      "settled_at": "2026-07-22T00:45:09.304812+00:00",
+      "ticker": "KXBTC15M-26JUL212045-45",
+      "source_prophet_side": "YES",
+      "selected_side": "NO",
+      "selector_mode": "inverse",
+      "market_result": "yes",
+      "result": "LOSS",
+      "filled_contracts": 4.0,
+      "entry_cost": 1.0,
+      "settlement_payout": 0.0,
+      "net_profit": -1.0,
+      "rungs": [
+        {
+          "rung_price": 0.4,
+          "contracts": 1.0,
+          "entry_cost": 0.4,
+          "settlement_payout": 0.0,
+          "net_profit": -0.4,
+          "status": "simulated_executable_quote_hit"
+        },
+        {
+          "rung_price": 0.3,
+          "contracts": 1.0,
+          "entry_cost": 0.3,
+          "settlement_payout": 0.0,
+          "net_profit": -0.3,
+          "status": "simulated_executable_quote_hit"
+        },
+        {
+          "rung_price": 0.2,
+          "contracts": 1.0,
+          "entry_cost": 0.2,
+          "settlement_payout": 0.0,
+          "net_profit": -0.2,
+          "status": "simulated_executable_quote_hit"
+        },
+        {
+          "rung_price": 0.1,
+          "contracts": 1.0,
+          "entry_cost": 0.1,
+          "settlement_payout": 0.0,
+          "net_profit": -0.1,
+          "status": "simulated_executable_quote_hit"
+        }
+      ],
+      "cumulative_entry_cost": 6.4,
+      "cumulative_settlement_payout": 1.0,
+      "cumulative_net_profit": -5.4,
+      "cumulative_roi": -0.84375,
+      "drawdown": 5.4
+    },
+    {
+      "settled_at": "2026-07-22T01:00:06.543271+00:00",
+      "ticker": "KXBTC15M-26JUL212100-00",
+      "source_prophet_side": "YES",
+      "selected_side": "NO",
+      "selector_mode": "inverse",
+      "market_result": "no",
+      "result": "UNFILLED",
+      "filled_contracts": 0.0,
+      "entry_cost": 0.0,
+      "settlement_payout": 0.0,
+      "net_profit": 0.0,
+      "rungs": [],
+      "cumulative_entry_cost": 6.4,
+      "cumulative_settlement_payout": 1.0,
+      "cumulative_net_profit": -5.4,
+      "cumulative_roi": -0.84375,
+      "drawdown": 5.4
+    },
+    {
+      "settled_at": "2026-07-22T01:15:08.091366+00:00",
+      "ticker": "KXBTC15M-26JUL212115-15",
+      "source_prophet_side": "YES",
+      "selected_side": "NO",
+      "selector_mode": "inverse",
+      "market_result": "no",
+      "result": "UNFILLED",
+      "filled_contracts": 0.0,
+      "entry_cost": 0.0,
+      "settlement_payout": 0.0,
+      "net_profit": 0.0,
+      "rungs": [],
+      "cumulative_entry_cost": 6.4,
+      "cumulative_settlement_payout": 1.0,
+      "cumulative_net_profit": -5.4,
+      "cumulative_roi": -0.84375,
+      "drawdown": 5.4
+    },
+    {
+      "settled_at": "2026-07-22T01:30:09.718431+00:00",
+      "ticker": "KXBTC15M-26JUL212130-30",
+      "source_prophet_side": "YES",
+      "selected_side": "NO",
+      "selector_mode": "inverse",
+      "market_result": "no",
+      "result": "UNFILLED",
+      "filled_contracts": 0.0,
+      "entry_cost": 0.0,
+      "settlement_payout": 0.0,
+      "net_profit": 0.0,
+      "rungs": [],
+      "cumulative_entry_cost": 6.4,
+      "cumulative_settlement_payout": 1.0,
+      "cumulative_net_profit": -5.4,
+      "cumulative_roi": -0.84375,
+      "drawdown": 5.4
+    },
+    {
+      "settled_at": "2026-07-22T01:45:07.117358+00:00",
+      "ticker": "KXBTC15M-26JUL212145-45",
+      "source_prophet_side": "YES",
+      "selected_side": "NO",
+      "selector_mode": "inverse",
+      "market_result": "no",
+      "result": "WIN",
+      "filled_contracts": 1.0,
+      "entry_cost": 0.4,
+      "settlement_payout": 1.0,
+      "net_profit": 0.6,
+      "rungs": [
+        {
+          "rung_price": 0.4,
+          "contracts": 1.0,
+          "entry_cost": 0.4,
+          "settlement_payout": 1.0,
+          "net_profit": 0.6,
+          "status": "simulated_executable_quote_hit"
+        }
+      ],
+      "cumulative_entry_cost": 6.8,
+      "cumulative_settlement_payout": 2.0,
+      "cumulative_net_profit": -4.8,
+      "cumulative_roi": -0.705882,
+      "drawdown": 5.4
+    },
+    {
+      "settled_at": "2026-07-22T02:00:06.252127+00:00",
+      "ticker": "KXBTC15M-26JUL212200-00",
+      "source_prophet_side": "YES",
+      "selected_side": "NO",
+      "selector_mode": "inverse",
+      "market_result": "yes",
+      "result": "LOSS",
+      "filled_contracts": 4.0,
+      "entry_cost": 1.0,
+      "settlement_payout": 0.0,
+      "net_profit": -1.0,
+      "rungs": [
+        {
+          "rung_price": 0.4,
+          "contracts": 1.0,
+          "entry_cost": 0.4,
+          "settlement_payout": 0.0,
+          "net_profit": -0.4,
+          "status": "simulated_executable_quote_hit"
+        },
+        {
+          "rung_price": 0.3,
+          "contracts": 1.0,
+          "entry_cost": 0.3,
+          "settlement_payout": 0.0,
+          "net_profit": -0.3,
+          "status": "simulated_executable_quote_hit"
+        },
+        {
+          "rung_price": 0.2,
+          "contracts": 1.0,
+          "entry_cost": 0.2,
+          "settlement_payout": 0.0,
+          "net_profit": -0.2,
+          "status": "simulated_executable_quote_hit"
+        },
+        {
+          "rung_price": 0.1,
+          "contracts": 1.0,
+          "entry_cost": 0.1,
+          "settlement_payout": 0.0,
+          "net_profit": -0.1,
+          "status": "simulated_executable_quote_hit"
+        }
+      ],
+      "cumulative_entry_cost": 7.8,
+      "cumulative_settlement_payout": 2.0,
+      "cumulative_net_profit": -5.8,
+      "cumulative_roi": -0.74359,
+      "drawdown": 5.8
+    },
+    {
+      "settled_at": "2026-07-22T02:15:03.223578+00:00",
+      "ticker": "KXBTC15M-26JUL212215-15",
+      "source_prophet_side": "NO",
+      "selected_side": "YES",
+      "selector_mode": "inverse",
+      "market_result": "yes",
+      "result": "WIN",
+      "filled_contracts": 2.0,
+      "entry_cost": 0.7,
+      "settlement_payout": 2.0,
+      "net_profit": 1.3,
+      "rungs": [
+        {
+          "rung_price": 0.4,
+          "contracts": 1.0,
+          "entry_cost": 0.4,
+          "settlement_payout": 1.0,
+          "net_profit": 0.6,
+          "status": "simulated_executable_quote_hit"
+        },
+        {
+          "rung_price": 0.3,
+          "contracts": 1.0,
+          "entry_cost": 0.3,
+          "settlement_payout": 1.0,
+          "net_profit": 0.7,
+          "status": "simulated_executable_quote_hit"
+        }
+      ],
+      "cumulative_entry_cost": 8.5,
+      "cumulative_settlement_payout": 4.0,
+      "cumulative_net_profit": -4.5,
+      "cumulative_roi": -0.529412,
+      "drawdown": 5.8
+    },
+    {
+      "settled_at": "2026-07-22T02:30:13.205671+00:00",
+      "ticker": "KXBTC15M-26JUL212230-30",
+      "source_prophet_side": "NO",
+      "selected_side": "YES",
+      "selector_mode": "inverse",
+      "market_result": "no",
+      "result": "LOSS",
+      "filled_contracts": 4.0,
+      "entry_cost": 1.0,
+      "settlement_payout": 0.0,
+      "net_profit": -1.0,
+      "rungs": [
+        {
+          "rung_price": 0.4,
+          "contracts": 1.0,
+          "entry_cost": 0.4,
+          "settlement_payout": 0.0,
+          "net_profit": -0.4,
+          "status": "simulated_executable_quote_hit"
+        },
+        {
+          "rung_price": 0.3,
+          "contracts": 1.0,
+          "entry_cost": 0.3,
+          "settlement_payout": 0.0,
+          "net_profit": -0.3,
+          "status": "simulated_executable_quote_hit"
+        },
+        {
+          "rung_price": 0.2,
+          "contracts": 1.0,
+          "entry_cost": 0.2,
+          "settlement_payout": 0.0,
+          "net_profit": -0.2,
+          "status": "simulated_executable_quote_hit"
+        },
+        {
+          "rung_price": 0.1,
+          "contracts": 1.0,
+          "entry_cost": 0.1,
+          "settlement_payout": 0.0,
+          "net_profit": -0.1,
+          "status": "simulated_executable_quote_hit"
+        }
+      ],
+      "cumulative_entry_cost": 9.5,
+      "cumulative_settlement_payout": 4.0,
+      "cumulative_net_profit": -5.5,
+      "cumulative_roi": -0.578947,
+      "drawdown": 5.8
+    },
+    {
+      "settled_at": "2026-07-22T02:45:06.359671+00:00",
+      "ticker": "KXBTC15M-26JUL212245-45",
+      "source_prophet_side": "NO",
+      "selected_side": "YES",
+      "selector_mode": "inverse",
+      "market_result": "no",
+      "result": "LOSS",
+      "filled_contracts": 4.0,
+      "entry_cost": 1.0,
+      "settlement_payout": 0.0,
+      "net_profit": -1.0,
+      "rungs": [
+        {
+          "rung_price": 0.4,
+          "contracts": 1.0,
+          "entry_cost": 0.4,
+          "settlement_payout": 0.0,
+          "net_profit": -0.4,
+          "status": "simulated_executable_quote_hit"
+        },
+        {
+          "rung_price": 0.3,
+          "contracts": 1.0,
+          "entry_cost": 0.3,
+          "settlement_payout": 0.0,
+          "net_profit": -0.3,
+          "status": "simulated_executable_quote_hit"
+        },
+        {
+          "rung_price": 0.2,
+          "contracts": 1.0,
+          "entry_cost": 0.2,
+          "settlement_payout": 0.0,
+          "net_profit": -0.2,
+          "status": "simulated_executable_quote_hit"
+        },
+        {
+          "rung_price": 0.1,
+          "contracts": 1.0,
+          "entry_cost": 0.1,
+          "settlement_payout": 0.0,
+          "net_profit": -0.1,
+          "status": "simulated_executable_quote_hit"
+        }
+      ],
+      "cumulative_entry_cost": 10.5,
+      "cumulative_settlement_payout": 4.0,
+      "cumulative_net_profit": -6.5,
+      "cumulative_roi": -0.619048,
+      "drawdown": 6.5
+    },
+    {
+      "settled_at": "2026-07-22T03:00:03.638939+00:00",
+      "ticker": "KXBTC15M-26JUL212300-00",
+      "source_prophet_side": "NO",
+      "selected_side": "YES",
+      "selector_mode": "inverse",
+      "market_result": "no",
+      "result": "LOSS",
+      "filled_contracts": 4.0,
+      "entry_cost": 1.0,
+      "settlement_payout": 0.0,
+      "net_profit": -1.0,
+      "rungs": [
+        {
+          "rung_price": 0.4,
+          "contracts": 1.0,
+          "entry_cost": 0.4,
+          "settlement_payout": 0.0,
+          "net_profit": -0.4,
+          "status": "simulated_executable_quote_hit"
+        },
+        {
+          "rung_price": 0.3,
+          "contracts": 1.0,
+          "entry_cost": 0.3,
+          "settlement_payout": 0.0,
+          "net_profit": -0.3,
+          "status": "simulated_executable_quote_hit"
+        },
+        {
+          "rung_price": 0.2,
+          "contracts": 1.0,
+          "entry_cost": 0.2,
+          "settlement_payout": 0.0,
+          "net_profit": -0.2,
+          "status": "simulated_executable_quote_hit"
+        },
+        {
+          "rung_price": 0.1,
+          "contracts": 1.0,
+          "entry_cost": 0.1,
+          "settlement_payout": 0.0,
+          "net_profit": -0.1,
+          "status": "simulated_executable_quote_hit"
+        }
+      ],
+      "cumulative_entry_cost": 11.5,
+      "cumulative_settlement_payout": 4.0,
+      "cumulative_net_profit": -7.5,
+      "cumulative_roi": -0.652174,
+      "drawdown": 7.5
+    },
+    {
+      "settled_at": "2026-07-22T03:15:11.387670+00:00",
+      "ticker": "KXBTC15M-26JUL212315-15",
+      "source_prophet_side": "YES",
+      "selected_side": "NO",
+      "selector_mode": "inverse",
+      "market_result": "no",
+      "result": "WIN",
+      "filled_contracts": 2.0,
+      "entry_cost": 0.7,
+      "settlement_payout": 2.0,
+      "net_profit": 1.3,
+      "rungs": [
+        {
+          "rung_price": 0.4,
+          "contracts": 1.0,
+          "entry_cost": 0.4,
+          "settlement_payout": 1.0,
+          "net_profit": 0.6,
+          "status": "simulated_executable_quote_hit"
+        },
+        {
+          "rung_price": 0.3,
+          "contracts": 1.0,
+          "entry_cost": 0.3,
+          "settlement_payout": 1.0,
+          "net_profit": 0.7,
+          "status": "simulated_executable_quote_hit"
+        }
+      ],
+      "cumulative_entry_cost": 12.2,
+      "cumulative_settlement_payout": 6.0,
+      "cumulative_net_profit": -6.2,
+      "cumulative_roi": -0.508197,
+      "drawdown": 7.5
+    },
+    {
+      "settled_at": "2026-07-22T03:30:10.948879+00:00",
+      "ticker": "KXBTC15M-26JUL212330-30",
+      "source_prophet_side": "YES",
+      "selected_side": "NO",
+      "selector_mode": "inverse",
+      "market_result": "yes",
+      "result": "LOSS",
+      "filled_contracts": 4.0,
+      "entry_cost": 1.0,
+      "settlement_payout": 0.0,
+      "net_profit": -1.0,
+      "rungs": [
+        {
+          "rung_price": 0.4,
+          "contracts": 1.0,
+          "entry_cost": 0.4,
+          "settlement_payout": 0.0,
+          "net_profit": -0.4,
+          "status": "simulated_executable_quote_hit"
+        },
+        {
+          "rung_price": 0.3,
+          "contracts": 1.0,
+          "entry_cost": 0.3,
+          "settlement_payout": 0.0,
+          "net_profit": -0.3,
+          "status": "simulated_executable_quote_hit"
+        },
+        {
+          "rung_price": 0.2,
+          "contracts": 1.0,
+          "entry_cost": 0.2,
+          "settlement_payout": 0.0,
+          "net_profit": -0.2,
+          "status": "simulated_executable_quote_hit"
+        },
+        {
+          "rung_price": 0.1,
+          "contracts": 1.0,
+          "entry_cost": 0.1,
+          "settlement_payout": 0.0,
+          "net_profit": -0.1,
+          "status": "simulated_executable_quote_hit"
+        }
+      ],
+      "cumulative_entry_cost": 13.2,
+      "cumulative_settlement_payout": 6.0,
+      "cumulative_net_profit": -7.2,
+      "cumulative_roi": -0.545455,
+      "drawdown": 7.5
+    },
+    {
+      "settled_at": "2026-07-22T03:45:10.529767+00:00",
+      "ticker": "KXBTC15M-26JUL212345-45",
+      "source_prophet_side": "NO",
+      "selected_side": "NO",
+      "selector_mode": "normal",
+      "market_result": "no",
+      "result": "UNFILLED",
+      "filled_contracts": 0.0,
+      "entry_cost": 0.0,
+      "settlement_payout": 0.0,
+      "net_profit": 0.0,
+      "rungs": [],
+      "cumulative_entry_cost": 13.2,
+      "cumulative_settlement_payout": 6.0,
+      "cumulative_net_profit": -7.2,
+      "cumulative_roi": -0.545455,
+      "drawdown": 7.5
+    },
+    {
+      "settled_at": "2026-07-22T04:00:05.833321+00:00",
+      "ticker": "KXBTC15M-26JUL220000-00",
+      "source_prophet_side": "NO",
+      "selected_side": "NO",
+      "selector_mode": "normal",
+      "market_result": "no",
+      "result": "WIN",
+      "filled_contracts": 4.0,
+      "entry_cost": 1.0,
+      "settlement_payout": 4.0,
+      "net_profit": 3.0,
+      "rungs": [
+        {
+          "rung_price": 0.4,
+          "contracts": 1.0,
+          "entry_cost": 0.4,
+          "settlement_payout": 1.0,
+          "net_profit": 0.6,
+          "status": "simulated_executable_quote_hit"
+        },
+        {
+          "rung_price": 0.3,
+          "contracts": 1.0,
+          "entry_cost": 0.3,
+          "settlement_payout": 1.0,
+          "net_profit": 0.7,
+          "status": "simulated_executable_quote_hit"
+        },
+        {
+          "rung_price": 0.2,
+          "contracts": 1.0,
+          "entry_cost": 0.2,
+          "settlement_payout": 1.0,
+          "net_profit": 0.8,
+          "status": "simulated_executable_quote_hit"
+        },
+        {
+          "rung_price": 0.1,
+          "contracts": 1.0,
+          "entry_cost": 0.1,
+          "settlement_payout": 1.0,
+          "net_profit": 0.9,
+          "status": "simulated_executable_quote_hit"
+        }
+      ],
+      "cumulative_entry_cost": 14.2,
+      "cumulative_settlement_payout": 10.0,
+      "cumulative_net_profit": -4.2,
+      "cumulative_roi": -0.295775,
+      "drawdown": 7.5
+    },
+    {
+      "settled_at": "2026-07-22T04:15:07.237112+00:00",
+      "ticker": "KXBTC15M-26JUL220015-15",
+      "source_prophet_side": "NO",
+      "selected_side": "NO",
+      "selector_mode": "normal",
+      "market_result": "yes",
+      "result": "LOSS",
+      "filled_contracts": 4.0,
+      "entry_cost": 1.0,
+      "settlement_payout": 0.0,
+      "net_profit": -1.0,
+      "rungs": [
+        {
+          "rung_price": 0.4,
+          "contracts": 1.0,
+          "entry_cost": 0.4,
+          "settlement_payout": 0.0,
+          "net_profit": -0.4,
+          "status": "simulated_executable_quote_hit"
+        },
+        {
+          "rung_price": 0.3,
+          "contracts": 1.0,
+          "entry_cost": 0.3,
+          "settlement_payout": 0.0,
+          "net_profit": -0.3,
+          "status": "simulated_executable_quote_hit"
+        },
+        {
+          "rung_price": 0.2,
+          "contracts": 1.0,
+          "entry_cost": 0.2,
+          "settlement_payout": 0.0,
+          "net_profit": -0.2,
+          "status": "simulated_executable_quote_hit"
+        },
+        {
+          "rung_price": 0.1,
+          "contracts": 1.0,
+          "entry_cost": 0.1,
+          "settlement_payout": 0.0,
+          "net_profit": -0.1,
+          "status": "simulated_executable_quote_hit"
+        }
+      ],
+      "cumulative_entry_cost": 15.2,
+      "cumulative_settlement_payout": 10.0,
+      "cumulative_net_profit": -5.2,
+      "cumulative_roi": -0.342105,
+      "drawdown": 7.5
+    },
+    {
+      "settled_at": "2026-07-22T04:30:10.860562+00:00",
+      "ticker": "KXBTC15M-26JUL220030-30",
+      "source_prophet_side": "NO",
+      "selected_side": "NO",
+      "selector_mode": "normal",
+      "market_result": "yes",
+      "result": "LOSS",
+      "filled_contracts": 4.0,
+      "entry_cost": 1.0,
+      "settlement_payout": 0.0,
+      "net_profit": -1.0,
+      "rungs": [
+        {
+          "rung_price": 0.4,
+          "contracts": 1.0,
+          "entry_cost": 0.4,
+          "settlement_payout": 0.0,
+          "net_profit": -0.4,
+          "status": "simulated_executable_quote_hit"
+        },
+        {
+          "rung_price": 0.3,
+          "contracts": 1.0,
+          "entry_cost": 0.3,
+          "settlement_payout": 0.0,
+          "net_profit": -0.3,
+          "status": "simulated_executable_quote_hit"
+        },
+        {
+          "rung_price": 0.2,
+          "contracts": 1.0,
+          "entry_cost": 0.2,
+          "settlement_payout": 0.0,
+          "net_profit": -0.2,
+          "status": "simulated_executable_quote_hit"
+        },
+        {
+          "rung_price": 0.1,
+          "contracts": 1.0,
+          "entry_cost": 0.1,
+          "settlement_payout": 0.0,
+          "net_profit": -0.1,
+          "status": "simulated_executable_quote_hit"
+        }
+      ],
+      "cumulative_entry_cost": 16.2,
+      "cumulative_settlement_payout": 10.0,
+      "cumulative_net_profit": -6.2,
+      "cumulative_roi": -0.382716,
+      "drawdown": 7.5
+    },
+    {
+      "settled_at": "2026-07-22T04:45:14.895225+00:00",
+      "ticker": "KXBTC15M-26JUL220045-45",
+      "source_prophet_side": "NO",
+      "selected_side": "NO",
+      "selector_mode": "normal",
+      "market_result": "yes",
+      "result": "LOSS",
+      "filled_contracts": 4.0,
+      "entry_cost": 1.0,
+      "settlement_payout": 0.0,
+      "net_profit": -1.0,
+      "rungs": [
+        {
+          "rung_price": 0.4,
+          "contracts": 1.0,
+          "entry_cost": 0.4,
+          "settlement_payout": 0.0,
+          "net_profit": -0.4,
+          "status": "simulated_executable_quote_hit"
+        },
+        {
+          "rung_price": 0.3,
+          "contracts": 1.0,
+          "entry_cost": 0.3,
+          "settlement_payout": 0.0,
+          "net_profit": -0.3,
+          "status": "simulated_executable_quote_hit"
+        },
+        {
+          "rung_price": 0.2,
+          "contracts": 1.0,
+          "entry_cost": 0.2,
+          "settlement_payout": 0.0,
+          "net_profit": -0.2,
+          "status": "simulated_executable_quote_hit"
+        },
+        {
+          "rung_price": 0.1,
+          "contracts": 1.0,
+          "entry_cost": 0.1,
+          "settlement_payout": 0.0,
+          "net_profit": -0.1,
+          "status": "simulated_executable_quote_hit"
+        }
+      ],
+      "cumulative_entry_cost": 17.2,
+      "cumulative_settlement_payout": 10.0,
+      "cumulative_net_profit": -7.2,
+      "cumulative_roi": -0.418605,
+      "drawdown": 7.5
+    },
+    {
+      "settled_at": "2026-07-22T05:00:12.708624+00:00",
+      "ticker": "KXBTC15M-26JUL220100-00",
+      "source_prophet_side": "NO",
+      "selected_side": "YES",
+      "selector_mode": "inverse",
+      "market_result": "no",
+      "result": "LOSS",
+      "filled_contracts": 4.0,
+      "entry_cost": 1.0,
+      "settlement_payout": 0.0,
+      "net_profit": -1.0,
+      "rungs": [
+        {
+          "rung_price": 0.4,
+          "contracts": 1.0,
+          "entry_cost": 0.4,
+          "settlement_payout": 0.0,
+          "net_profit": -0.4,
+          "status": "simulated_executable_quote_hit"
+        },
+        {
+          "rung_price": 0.3,
+          "contracts": 1.0,
+          "entry_cost": 0.3,
+          "settlement_payout": 0.0,
+          "net_profit": -0.3,
+          "status": "simulated_executable_quote_hit"
+        },
+        {
+          "rung_price": 0.2,
+          "contracts": 1.0,
+          "entry_cost": 0.2,
+          "settlement_payout": 0.0,
+          "net_profit": -0.2,
+          "status": "simulated_executable_quote_hit"
+        },
+        {
+          "rung_price": 0.1,
+          "contracts": 1.0,
+          "entry_cost": 0.1,
+          "settlement_payout": 0.0,
+          "net_profit": -0.1,
+          "status": "simulated_executable_quote_hit"
+        }
+      ],
+      "cumulative_entry_cost": 18.2,
+      "cumulative_settlement_payout": 10.0,
+      "cumulative_net_profit": -8.2,
+      "cumulative_roi": -0.450549,
+      "drawdown": 8.2
+    }
+  ],
   "selection_rule": "Before each market, each trailing window (3,5,7,10,25,50) votes for the higher directional win-rate side on prior paired settled signals; the majority wins and ties/no history select inverse.",
   "selection_starts_with": "inverse",
   "selection_counts": {
-    "normal": 2,
-    "inverse": 1
+    "normal": 9,
+    "inverse": 17
   },
-  "paired_signals_available": 20,
+  "paired_signals_available": 43,
   "window_monitor": {
     "3": {
       "window": 3,
       "sample_size": 3,
-      "normal_wins": 2,
-      "normal_losses": 1,
-      "normal_win_rate": 0.666667,
-      "inverse_wins": 1,
-      "inverse_losses": 2,
-      "inverse_win_rate": 0.333333,
-      "leader": "normal",
+      "normal_wins": 1,
+      "normal_losses": 2,
+      "normal_win_rate": 0.333333,
+      "inverse_wins": 2,
+      "inverse_losses": 1,
+      "inverse_win_rate": 0.666667,
+      "leader": "inverse",
       "tied": false
     },
     "5": {
       "window": 5,
       "sample_size": 5,
-      "normal_wins": 4,
-      "normal_losses": 1,
-      "normal_win_rate": 0.8,
-      "inverse_wins": 1,
-      "inverse_losses": 4,
-      "inverse_win_rate": 0.2,
-      "leader": "normal",
+      "normal_wins": 2,
+      "normal_losses": 3,
+      "normal_win_rate": 0.4,
+      "inverse_wins": 3,
+      "inverse_losses": 2,
+      "inverse_win_rate": 0.6,
+      "leader": "inverse",
       "tied": false
     },
     "7": {
       "window": 7,
       "sample_size": 7,
-      "normal_wins": 5,
-      "normal_losses": 2,
-      "normal_win_rate": 0.714286,
-      "inverse_wins": 2,
-      "inverse_losses": 5,
-      "inverse_win_rate": 0.285714,
+      "normal_wins": 4,
+      "normal_losses": 3,
+      "normal_win_rate": 0.571429,
+      "inverse_wins": 3,
+      "inverse_losses": 4,
+      "inverse_win_rate": 0.428571,
       "leader": "normal",
       "tied": false
     },
@@ -131,25 +1191,25 @@
     },
     "25": {
       "window": 25,
-      "sample_size": 20,
-      "normal_wins": 9,
-      "normal_losses": 11,
-      "normal_win_rate": 0.45,
-      "inverse_wins": 11,
-      "inverse_losses": 9,
-      "inverse_win_rate": 0.55,
+      "sample_size": 25,
+      "normal_wins": 12,
+      "normal_losses": 13,
+      "normal_win_rate": 0.48,
+      "inverse_wins": 13,
+      "inverse_losses": 12,
+      "inverse_win_rate": 0.52,
       "leader": "inverse",
       "tied": false
     },
     "50": {
       "window": 50,
-      "sample_size": 20,
-      "normal_wins": 9,
-      "normal_losses": 11,
-      "normal_win_rate": 0.45,
-      "inverse_wins": 11,
-      "inverse_losses": 9,
-      "inverse_win_rate": 0.55,
+      "sample_size": 43,
+      "normal_wins": 19,
+      "normal_losses": 24,
+      "normal_win_rate": 0.44186,
+      "inverse_wins": 24,
+      "inverse_losses": 19,
+      "inverse_win_rate": 0.55814,
       "leader": "inverse",
       "tied": false
     }
