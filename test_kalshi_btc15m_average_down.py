@@ -461,6 +461,59 @@ class MechanicalAverageDownTests(unittest.TestCase):
         self.assertEqual(record["status"], "ladder_active")
         self.assertEqual(record["orders"]["0.3000"]["order_id"], "recovered-order")
 
+    def test_exchange_recovery_preserves_weighted_live_inverse_ladder(self):
+        class FakeRest:
+            async def resting_mechanical_orders(self):
+                ticker = "KXBTC15M-TEST-WEIGHTED-RECOVERY"
+                return [
+                    ({
+                        "ticker": ticker,
+                        "order_id": f"weighted-{role}",
+                        "client_order_id": client_order_id(ticker, "no", role),
+                        "status": "resting",
+                        "count": str(quantity),
+                        "fill_count": "0",
+                        "remaining_count": str(quantity),
+                    }, ("no", role))
+                    for role, quantity in (("initial", 1.0), ("0.3000", 2.0), ("0.2000", 3.0), ("0.1000", 4.0))
+                ]
+
+            async def get_market(self, _ticker):
+                return SimpleNamespace(
+                    open_time="2026-07-20T00:00:00Z", close_time="2099-07-20T00:15:00Z",
+                )
+
+            async def position_for_ticker(self, _ticker):
+                return 0.0
+
+        async def scenario():
+            config, _ = apply_config_overrides(
+                validate_config(DEFAULT_CONFIG), SimpleNamespace(live_execution_strategy="inverse_ml_weighted_hold_gate"),
+            )
+            state = default_state()
+            record = market_record(state, "KXBTC15M-TEST-WEIGHTED-RECOVERY")
+            record.update({
+                "strategy": "inverse_ml_weighted_hold_gate_live_v1",
+                "source_ml_side": "yes",
+                "candidate_side": "no",
+                "locked_side": "no",
+                "status": "ladder_active",
+            })
+            ok = await recover_exchange_state(FakeRest(), state, config, dry_run=False)
+            return ok, state["markets"]["KXBTC15M-TEST-WEIGHTED-RECOVERY"]
+
+        ok, record = asyncio.run(scenario())
+        self.assertTrue(ok)
+        self.assertEqual(record["strategy"], "inverse_ml_weighted_hold_gate_live_v1")
+        self.assertEqual(record["source_ml_side"], "yes")
+        self.assertEqual(record["locked_side"], "no")
+        self.assertEqual(record["reserved_principal"], 2.0)
+        self.assertEqual(record["quantity"], 4.0)
+        self.assertEqual(
+            {key: order["quantity"] for key, order in record["orders"].items()},
+            {"0.4000": 1.0, "0.3000": 2.0, "0.2000": 3.0, "0.1000": 4.0},
+        )
+
     def test_recovery_marks_mixed_side_orders_ambiguous(self):
         class FakeRest:
             async def resting_mechanical_orders(self):

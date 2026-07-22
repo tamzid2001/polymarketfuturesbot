@@ -2697,10 +2697,21 @@ async def recover_exchange_state(rest: KalshiREST, state: dict[str, Any], config
 
         side = next(iter(sides))
         typed_orders = [item for item in records if item is not None]
-        quantities = {float(item["quantity"]) for item in typed_orders}
         record = market_record(state, ticker)
         existing_side = record.get("locked_side") or record.get("candidate_side")
-        if len(quantities) != 1 or existing_side not in {None, side}:
+        quantity_by_level = {float(item["ladder_level"]): float(item["quantity"]) for item in typed_orders}
+        quantities = set(quantity_by_level.values())
+        expected_weighted = live_rung_quantities(config)
+        weighted_ladder = (
+            live_weighted_inverse_enabled(config)
+            and all(
+                level in expected_weighted
+                and abs(quantity - expected_weighted[level]) <= 0.004
+                for level, quantity in quantity_by_level.items()
+            )
+        )
+        uniform_ladder = len(quantities) == 1
+        if (not (uniform_ladder or weighted_ladder)) or existing_side not in {None, side}:
             record.update({
                 "status": "recovery_blocked_ambiguous",
                 "exchange_recovery_blocked": "quantity or side conflicts with persisted ledger",
@@ -2711,18 +2722,29 @@ async def recover_exchange_state(rest: KalshiREST, state: dict[str, Any], config
             continue
 
         market = await rest.get_market(ticker)
+        recovered_quantity = max(expected_weighted.values()) if weighted_ladder else next(iter(quantities))
+        recovered_reserve = (
+            ladder_principal_for_rungs(expected_weighted)
+            if weighted_ladder else ladder_principal(float(typed_orders[0]["quantity"]))
+        )
         record.update({
             "candidate_side": side,
             "locked_side": side,
-            "quantity": quantities.pop(),
+            "quantity": recovered_quantity,
             "status": "ladder_active",
             "ladder_mode": "preposted_gtc_v2",
-            "reserved_principal": ladder_principal(float(typed_orders[0]["quantity"])),
+            "reserved_principal": recovered_reserve,
             "market_open_time": field(market, "open_time") if market is not None else record.get("market_open_time"),
             "market_close_time": field(market, "close_time", "expected_expiration_time") if market is not None else record.get("market_close_time"),
             "recovered_at": now_iso(),
             "recovery_source": "Kalshi resting deterministic client-order IDs",
         })
+        if weighted_ladder:
+            record.update({
+                "strategy": "inverse_ml_weighted_hold_gate_live_v1",
+                "source_ml_side": record.get("source_ml_side") or opposite_side(side),
+                "rung_quantities": {f"{level:.2f}": quantity for level, quantity in expected_weighted.items()},
+            })
         for item in typed_orders:
             record.setdefault("orders", {})[f"{float(item['ladder_level']):.4f}"] = item
         if not await exchange_position_guard(rest, record, config):
