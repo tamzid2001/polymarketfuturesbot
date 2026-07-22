@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-07-22T04:45:24.081699+00:00",
+  "generated_at": "2026-07-22T04:45:42.398925+00:00",
   "locked_side_policy": "side is fixed before open and never changes on later quotes",
   "model_variant": "normal_ml",
   "paper_only": true,
@@ -272,6 +272,86 @@
       "total_cost": 0.4,
       "trailing_activation_gain_per_contract": 0.1,
       "trailing_stop_per_contract": 0.1
+    },
+    {
+      "created_at": "2026-07-22T04:45:42.390328+00:00",
+      "entry_quote_depth_consumed": {},
+      "entry_summary": {
+        "average_entry_price": null,
+        "entry_cost": 0.0,
+        "filled_contracts": 0.0,
+        "take_profit_bid": null
+      },
+      "events": [],
+      "fixed_stop_loss_per_contract": 0.05,
+      "last_entry_quote_state": "missing_complete_top_of_book",
+      "last_exit_quote_state": "missing_complete_top_of_book",
+      "limitation": "Paper-only. Entry and exit require a fresh complete top-of-book and displayed depth, but queue priority, latency, cancellations, hidden liquidity, partial fills, and fees are excluded.",
+      "locked_study_side": "no",
+      "market_close_time": "2026-07-22 05:00:00+00:00",
+      "mode": "paper_only_no_exchange_orders",
+      "observation_only": false,
+      "position_epochs": [],
+      "profit_target_per_contract": 0.01,
+      "profit_targets_per_contract": [
+        0.01,
+        0.02,
+        0.03,
+        0.05,
+        0.1,
+        0.2,
+        0.3,
+        0.4,
+        0.5,
+        0.6
+      ],
+      "quantity_per_rung": 1.0,
+      "quote_max_age_seconds": 3.0,
+      "rung_quantities": {
+        "0.1000": 4.0,
+        "0.2000": 3.0,
+        "0.3000": 2.0,
+        "0.4000": 1.0
+      },
+      "rungs": {
+        "0.1000": {
+          "average_fill_price": null,
+          "fill_count": 0.0,
+          "quantity": 4.0,
+          "rung_price": 0.1,
+          "status": "simulated_resting"
+        },
+        "0.2000": {
+          "average_fill_price": null,
+          "fill_count": 0.0,
+          "quantity": 3.0,
+          "rung_price": 0.2,
+          "status": "simulated_resting"
+        },
+        "0.3000": {
+          "average_fill_price": null,
+          "fill_count": 0.0,
+          "quantity": 2.0,
+          "rung_price": 0.3,
+          "status": "simulated_resting"
+        },
+        "0.4000": {
+          "average_fill_price": null,
+          "fill_count": 0.0,
+          "quantity": 1.0,
+          "rung_price": 0.4,
+          "status": "simulated_resting"
+        }
+      },
+      "side": "no",
+      "source_ml_side": "no",
+      "source_model_run_id": "29889729268",
+      "status": "active",
+      "strategy": "ml_normal_weighted_fixed_stop_and_trailing_shadow_v2",
+      "study_variant": "ML NORMAL",
+      "ticker": "KXBTC15M-26JUL220100-00",
+      "trailing_activation_gain_per_contract": 0.1,
+      "trailing_stop_per_contract": 0.1
     }
   ],
   "schema": "ml_weighted_1234_fixed_stop_and_trailing_paper_ledger_v2",
@@ -291,7 +371,7 @@
     "trailing_stop_per_contract": 0.1
   },
   "summary": {
-    "active_paper_markets": 0,
+    "active_paper_markets": 1,
     "average_entry_profiles": {
       "0.4": {
         "active_positions": 0,
@@ -426,7 +506,7 @@
     "maximum_drawdown": 0.08,
     "mode": "paper_only_no_exchange_orders",
     "net_profit": -0.08,
-    "paper_markets_started": 1,
+    "paper_markets_started": 2,
     "pnl_time_series": [
       {
         "average_entry_price": 0.4,
