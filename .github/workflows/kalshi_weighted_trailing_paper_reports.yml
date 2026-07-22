@@ -8,10 +8,15 @@ on:
   workflow_dispatch:
     inputs:
       run_minutes:
-        description: "Paper-monitor duration in minutes (15-60; default 30)."
+        description: "Paper-monitor duration in minutes (15-345; default 345)."
         required: true
-        default: "30"
+        default: "345"
         type: string
+      continuous:
+        description: "Queue the next paper-only 5h45m handoff when this run completes."
+        required: true
+        default: true
+        type: boolean
 
 concurrency:
   group: kalshi-weighted-trailing-paper-reports
@@ -19,14 +24,14 @@ concurrency:
 
 permissions:
   contents: write
-  actions: read
+  actions: write
 
 jobs:
   ml-weighted-paper:
     name: ML normal + inverse weighted paper study
     runs-on: ubuntu-latest
     environment: "Kalshi"
-    timeout-minutes: 75
+    timeout-minutes: 370
     steps:
       - uses: actions/checkout@v7
 
@@ -47,8 +52,8 @@ jobs:
           case "$RUN_MINUTES" in
             ''|*[!0-9]*) echo "run_minutes must be a whole number"; exit 2 ;;
           esac
-          if [ "$RUN_MINUTES" -lt 15 ] || [ "$RUN_MINUTES" -gt 60 ]; then
-            echo "run_minutes must be between 15 and 60"
+          if [ "$RUN_MINUTES" -lt 15 ] || [ "$RUN_MINUTES" -gt 345 ]; then
+            echo "run_minutes must be between 15 and 345"
             exit 2
           fi
 
@@ -147,7 +152,7 @@ jobs:
     name: Prophet normal + inverse weighted paper study
     runs-on: ubuntu-latest
     environment: "Kalshi"
-    timeout-minutes: 75
+    timeout-minutes: 370
     steps:
       - uses: actions/checkout@v7
 
@@ -168,8 +173,8 @@ jobs:
           case "$RUN_MINUTES" in
             ''|*[!0-9]*) echo "run_minutes must be a whole number"; exit 2 ;;
           esac
-          if [ "$RUN_MINUTES" -lt 15 ] || [ "$RUN_MINUTES" -gt 60 ]; then
-            echo "run_minutes must be between 15 and 60"
+          if [ "$RUN_MINUTES" -lt 15 ] || [ "$RUN_MINUTES" -gt 345 ]; then
+            echo "run_minutes must be between 15 and 345"
             exit 2
           fi
 
@@ -251,3 +256,23 @@ jobs:
           path: paper_reports/
           if-no-files-found: warn
           retention-days: 90
+
+  queue-next-paper-handoff:
+    name: Queue next 24/7 paper handoff
+    needs: [ml-weighted-paper, prophet-weighted-paper]
+    if: ${{ success() && inputs.continuous == true }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Queue the next 5h45m paper monitor
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh workflow run kalshi_weighted_trailing_paper_reports.yml \
+            --repo "$GITHUB_REPOSITORY" \
+            --ref main \
+            -f run_minutes=345 \
+            -f continuous=true
+          echo "PAPER HANDOFF QUEUED | normal/inverse ML and Prophet quote monitors continue on main."
