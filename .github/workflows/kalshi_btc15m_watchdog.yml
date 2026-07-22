@@ -29,16 +29,16 @@ jobs:
           set -euo pipefail
           runs="$(gh run list --repo "$REPOSITORY" \
             --workflow kalshi_btc15m_average_down.yml --limit 20 \
-            --json databaseId,status,conclusion,completedAt)"
+            --json databaseId,status,conclusion,updatedAt)"
           active="$(jq '[.[] | select(.status == "in_progress" or .status == "queued" or .status == "waiting")] | length' <<<"$runs")"
           if [ "$active" -gt 0 ]; then
             echo "WATCHDOG OK | active_or_queued_live_runs=$active"
             exit 0
           fi
 
-          latest="$(jq -c 'sort_by(.completedAt // "") | last // {}' <<<"$runs")"
+          latest="$(jq -c 'sort_by(.updatedAt // "") | last // {}' <<<"$runs")"
           conclusion="$(jq -r '.conclusion // "none"' <<<"$latest")"
-          completed="$(jq -r '.completedAt // ""' <<<"$latest")"
+          completed="$(jq -r '.updatedAt // ""' <<<"$latest")"
           if [ "$conclusion" = "success" ] && [ -n "$completed" ]; then
             completed_epoch="$(date -u -d "$completed" +%s)"
             now_epoch="$(date -u +%s)"

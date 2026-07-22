@@ -19,7 +19,17 @@ on:
         description: "Contracts per 40c/30c/20c/10c rung. If changed alone, the four-rung contract and capital caps auto-scale; blank keeps persisted values."
         required: false
         type: string
-        default: "0.01"
+        default: ""
+      live_execution_strategy:
+        description: "Blank keeps persisted mode. Use inverse_ml_weighted_hold_gate only for the explicitly authorized inverse-ML live 1/2/3/4 ladder with a 5c stop and 60c-gate/10c-trail exit."
+        required: false
+        type: string
+        default: ""
+      live_inverse_ml_hold_gate:
+        description: "Blank keeps persisted gate. For inverse_ml_weighted_hold_gate, 0.60 means arm the 10c trail only after bid reaches current average entry + 60c."
+        required: false
+        type: string
+        default: ""
       max_active_markets:
         description: "Blank keeps persisted value."
         required: false
@@ -169,6 +179,8 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           LIVE_TRADING: ${{ github.event_name == 'schedule' || inputs.live_trading == true }}
           INITIAL_POSITION_SIZE: ${{ inputs.initial_position_size }}
+          LIVE_EXECUTION_STRATEGY: ${{ inputs.live_execution_strategy }}
+          LIVE_INVERSE_ML_HOLD_GATE: ${{ inputs.live_inverse_ml_hold_gate }}
           MAX_ACTIVE_MARKETS: ${{ inputs.max_active_markets }}
           MAX_CONTRACTS_PER_MARKET: ${{ inputs.max_contracts_per_market }}
           MAX_TOTAL_CAPITAL: ${{ inputs.max_total_capital }}
@@ -185,6 +197,8 @@ jobs:
                 --ml-training-csv "training_data/$LEDGER_PATH"
                 --persist-config --run-seconds 20700)
           [ -z "$INITIAL_POSITION_SIZE" ] || args+=(--initial-position-size "$INITIAL_POSITION_SIZE")
+          [ -z "$LIVE_EXECUTION_STRATEGY" ] || args+=(--live-execution-strategy "$LIVE_EXECUTION_STRATEGY")
+          [ -z "$LIVE_INVERSE_ML_HOLD_GATE" ] || args+=(--live-inverse-ml-hold-gate "$LIVE_INVERSE_ML_HOLD_GATE")
           [ -z "$MAX_ACTIVE_MARKETS" ] || args+=(--max-active-markets "$MAX_ACTIVE_MARKETS")
           [ -z "$MAX_CONTRACTS_PER_MARKET" ] || args+=(--max-contracts-per-market "$MAX_CONTRACTS_PER_MARKET")
           [ -z "$MAX_TOTAL_CAPITAL" ] || args+=(--max-total-capital "$MAX_TOTAL_CAPITAL")

@@ -163,6 +163,17 @@ DEFAULT_CONFIG = {
     # can create or alter an exchange order.
     "model_transition_shadow_enabled": True,
     "model_transition_shadow_position_size": 1.0,
+    # Live execution is deliberately explicit and persisted separately from
+    # the paper-only weighted studies above.  The special mode uses the
+    # inverse frozen ML side, a 1/2/3/4-contract ladder, an absolute 5c bid
+    # stop, then a 10c trailing exit only after a 60c gain over the *current*
+    # average filled entry.  It is selected only by an authenticated manual
+    # workflow input; normal_ml_ladder remains the repository default.
+    "live_execution_strategy": "normal_ml_ladder",
+    "live_inverse_ml_hold_gate": 0.60,
+    "live_inverse_ml_absolute_stop_price": 0.05,
+    "live_inverse_ml_trailing_stop": 0.10,
+    "live_inverse_ml_quote_max_age_seconds": 3.0,
     "status_log_seconds": 30.0,
 }
 
@@ -170,6 +181,7 @@ DEFAULT_CONFIG = {
 # study.  It deliberately has no relationship to the 0.01-contract live GTC
 # ladder or its capital limits.
 WEIGHTED_SCALP_RUNG_QUANTITIES = {0.40: 1.0, 0.30: 2.0, 0.20: 3.0, 0.10: 4.0}
+LIVE_EXECUTION_STRATEGIES = {"normal_ml_ladder", "inverse_ml_weighted_hold_gate"}
 DEFAULT_WEIGHTED_TRAILING_NORMAL_LEDGER = Path("kalshi_btc15m_weighted_trailing_normal_ledger.json")
 DEFAULT_WEIGHTED_TRAILING_NORMAL_REPORT = Path("kalshi_btc15m_weighted_trailing_normal_report.json")
 DEFAULT_WEIGHTED_TRAILING_INVERSE_LEDGER = Path("kalshi_btc15m_weighted_trailing_inverse_ledger.json")
@@ -377,6 +389,23 @@ def choose_entry_side(asks: dict[str, float | None]) -> tuple[str, float] | None
 
 def ladder_principal(quantity: float) -> float:
     return round(sum(LADDER_LEVELS) * quantity, 6)
+
+
+def ladder_principal_for_rungs(rung_quantities: dict[float, float]) -> float:
+    """Return the maximum principal of a fixed, one-side ladder."""
+    return round(sum(level * float(rung_quantities.get(level) or 0.0) for level in LADDER_LEVELS), 6)
+
+
+def live_weighted_inverse_enabled(config: dict[str, Any]) -> bool:
+    return str(config.get("live_execution_strategy") or "").strip() == "inverse_ml_weighted_hold_gate"
+
+
+def live_rung_quantities(config: dict[str, Any]) -> dict[float, float]:
+    """Use the authorized weighted schedule only for the explicit live mode."""
+    if live_weighted_inverse_enabled(config):
+        return dict(WEIGHTED_SCALP_RUNG_QUANTITIES)
+    quantity = float(config["initial_position_size"])
+    return {level: quantity for level in LADDER_LEVELS}
 
 
 def load_json(path: Path, default: dict[str, Any]) -> dict[str, Any]:
@@ -618,6 +647,8 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         "weighted_scalp_trailing_stop_per_contract", "weighted_scalp_trailing_activation_gain_per_contract",
         "weighted_scalp_fixed_stop_loss_per_contract", "weighted_scalp_absolute_stop_price",
         "model_transition_shadow_position_size", "status_log_seconds",
+        "live_inverse_ml_hold_gate", "live_inverse_ml_absolute_stop_price",
+        "live_inverse_ml_trailing_stop", "live_inverse_ml_quote_max_age_seconds",
     ):
         value = as_float(merged.get(name))
         if value is None or value <= 0:
@@ -625,6 +656,10 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         merged[name] = value
     if merged["ml_min_confidence"] < 0.5 or merged["ml_min_confidence"] > 1.0:
         raise ValueError("ml_min_confidence must be between 0.5 and 1.0")
+    execution_strategy = str(merged.get("live_execution_strategy") or "").strip()
+    if execution_strategy not in LIVE_EXECUTION_STRATEGIES:
+        raise ValueError(f"live_execution_strategy must be one of {sorted(LIVE_EXECUTION_STRATEGIES)}")
+    merged["live_execution_strategy"] = execution_strategy
     shadow_enabled = merged.get("inverse_shadow_enabled", True)
     if isinstance(shadow_enabled, str):
         shadow_enabled = shadow_enabled.strip().lower() in {"1", "true", "yes", "on"}
@@ -682,7 +717,7 @@ def apply_config_overrides(config: dict[str, Any], args: argparse.Namespace) -> 
         "initial_position_size", "max_active_markets", "max_contracts_per_market",
         "max_total_capital", "fee_reserve", "poll_seconds", "market_refresh_seconds",
         "order_reconcile_seconds", "watch_start_grace_seconds", "ml_preopen_lead_seconds",
-        "ml_min_confidence", "status_log_seconds",
+        "ml_min_confidence", "status_log_seconds", "live_inverse_ml_hold_gate",
     )
     changed = False
     updated = dict(config)
@@ -701,6 +736,17 @@ def apply_config_overrides(config: dict[str, Any], args: argparse.Namespace) -> 
             updated["max_contracts_per_market"] = round(rung_override * len(LADDER_LEVELS), 2)
         if getattr(args, "max_total_capital", None) is None:
             updated["max_total_capital"] = ladder_principal(rung_override)
+    strategy_override = getattr(args, "live_execution_strategy", None)
+    if strategy_override is not None:
+        updated["live_execution_strategy"] = strategy_override
+        changed = True
+        if strategy_override == "inverse_ml_weighted_hold_gate":
+            # This mode has no fractional 0.01 ladder: it reserves the full
+            # 1/2/3/4 schedule, i.e. 10 contracts and $2.00 maximum principal.
+            if getattr(args, "max_contracts_per_market", None) is None:
+                updated["max_contracts_per_market"] = round(sum(WEIGHTED_SCALP_RUNG_QUANTITIES.values()), 2)
+            if getattr(args, "max_total_capital", None) is None:
+                updated["max_total_capital"] = ladder_principal_for_rungs(WEIGHTED_SCALP_RUNG_QUANTITIES)
     return validate_config(updated), changed
 
 
@@ -1593,9 +1639,87 @@ class KalshiREST:
                  record["fill_count"], record["remaining_count"], record["order_id"] or "?")
         return record
 
+    async def create_reduce_only_exit(
+        self, *, ticker: str, held_side: str, economic_exit_price: float, quantity: float,
+        dry_run: bool, order_key: str,
+    ) -> dict[str, Any]:
+        """Close an existing YES/NO position with a marketable, reduce-only IOC.
+
+        V2 is a YES-side book: selling a held YES is an ASK at the YES bid,
+        while selling a held NO is a BID at ``1 - no_bid``.  ``reduce_only``
+        is the second guard: even if the ledger is stale, Kalshi caps the
+        submitted count to the actual held position instead of reversing it.
+        """
+        if held_side not in {"yes", "no"}:
+            raise ValueError(f"Unsupported held side for exit: {held_side}")
+        if not 0.0 < economic_exit_price < 1.0 or quantity <= 0.0:
+            raise ValueError("A live exit requires positive quantity and a valid executable bid")
+        api_price = economic_exit_price if held_side == "yes" else 1.0 - economic_exit_price
+        book_side = BookSide.ASK if held_side == "yes" else BookSide.BID
+        record = {
+            "client_order_id": client_order_id(ticker, f"reduce-{held_side}", order_key),
+            "ticker": ticker,
+            "side": held_side,
+            "held_side": held_side,
+            "order_type": "reduce_only_exit_ioc",
+            "position_price": round(economic_exit_price, 4),
+            "api_price": f"{api_price:.4f}",
+            "book_side": "ask" if held_side == "yes" else "bid",
+            "quantity": round(quantity, 2),
+            "time_in_force": "immediate_or_cancel",
+            "reduce_only": True,
+            "submitted_at": now_iso(),
+            "status": "dry_run" if dry_run else "submitting",
+            "fill_count": 0.0,
+            "remaining_count": round(quantity, 2),
+            "fees_paid": 0.0,
+        }
+        if dry_run:
+            LOG.info("DRY RUN REDUCE-ONLY EXIT | %s %s bid=$%.4f x %.2f", ticker, held_side.upper(), economic_exit_price, quantity)
+            return record
+        if self.trading_pause_active():
+            record["status"] = "paused"
+            record["error"] = self.pause_reason or "scheduled Kalshi trading pause"
+            LOG.warning("EXIT DEFERRED FOR PAUSE | %s %s bid=$%.4f", ticker, held_side.upper(), economic_exit_price)
+            return record
+        try:
+            response = await self.orders.create_order_v2(
+                ticker=ticker,
+                side=book_side,
+                count=f"{quantity:.2f}",
+                price=record["api_price"],
+                time_in_force="immediate_or_cancel",
+                client_order_id=record["client_order_id"],
+                self_trade_prevention_type=SelfTradePreventionType.TAKER_AT_CROSS,
+                reduce_only=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            if pause_error(exc):
+                self.note_trading_pause(str(exc))
+                record["status"] = "paused"
+            else:
+                record["status"] = "submit_failed"
+            record["error"] = str(exc)
+            LOG.error("EXIT REJECTED | %s %s bid=$%.4f: %s", ticker, held_side.upper(), economic_exit_price, exc)
+            return record
+        record["order_id"] = str(field(response, "order_id") or "") or None
+        record["fill_count"] = round(order_fill_count(response), 2)
+        record["remaining_count"] = round(
+            order_remaining_count(response) if order_remaining_count(response) is not None else quantity - record["fill_count"], 2,
+        )
+        record["average_fill_price"] = order_average_position_price(response, held_side, economic_exit_price)
+        record["fees_paid"] = order_fee_total(response)
+        record["status"] = classify_submission(record["fill_count"], record["remaining_count"], quantity, "immediate_or_cancel")
+        LOG.warning(
+            "REDUCE-ONLY EXIT %s | %s %s bid=$%.4f x %.2f fill=%.2f remaining=%.2f id=%s",
+            record["status"].upper(), ticker, held_side.upper(), economic_exit_price, quantity,
+            record["fill_count"], record["remaining_count"], record["order_id"] or "?",
+        )
+        return record
+
     async def refresh_order(self, record: dict[str, Any]) -> None:
         order_id = record.get("order_id")
-        if not order_id or record.get("status") in {"dry_run", "submit_failed", "canceled"}:
+        if not order_id or record.get("status") in {"dry_run", "submit_failed"}:
             return
         try:
             response = await self.orders.get_order(order_id)
@@ -1639,17 +1763,49 @@ class KalshiREST:
                 return
             LOG.warning("Order lookup failed for %s: %s", order_id, exc)
 
+    async def refresh_exit_order(self, record: dict[str, Any]) -> None:
+        """Refresh a reduce-only exit without treating its book side as a new long side."""
+        order_id = record.get("order_id")
+        if not order_id or record.get("status") in {"dry_run", "submit_failed", "canceled", "canceled_unfilled"}:
+            return
+        try:
+            response = await self.orders.get_order(order_id)
+            order = field(response, "order")
+            if order is None:
+                return
+            held_side = str(record.get("held_side") or record.get("side") or "")
+            record["fill_count"] = round(order_fill_count(order), 2)
+            remaining = order_remaining_count(order)
+            if remaining is not None:
+                record["remaining_count"] = round(remaining, 2)
+            record["average_fill_price"] = order_average_position_price(
+                order, held_side, float(record.get("position_price") or 0.0),
+            )
+            record["fees_paid"] = max(float(record.get("fees_paid") or 0.0), order_fee_total(order))
+            status = normalized_order_status(field(order, "status"))
+            if status:
+                record["status"] = status
+            record["last_checked_at"] = now_iso()
+        except Exception as exc:  # noqa: BLE001
+            if (getattr(exc, "status", None) == 404
+                    and float(record.get("fill_count") or 0.0) > 0.004
+                    and float(record.get("remaining_count") or 0.0) <= 0.004):
+                return
+            LOG.warning("Exit order lookup failed for %s: %s", order_id, exc)
+
     async def cancel_order(self, record: dict[str, Any], dry_run: bool) -> None:
         order_id = record.get("order_id")
         if not order_id or float(record.get("remaining_count") or 0.0) <= 0.004:
             return
         if dry_run:
             record["status"] = "dry_run_canceled"
+            record["remaining_count"] = 0.0
             return
         try:
             await self.orders.cancel_order_v2(order_id)
             record["status"] = "canceled"
             record["canceled_at"] = now_iso()
+            record["remaining_count"] = 0.0
             LOG.info("CANCELED | %s", order_id)
         except Exception as exc:  # noqa: BLE001
             # Closed markets reject cancellation after the exchange has already
@@ -1676,7 +1832,7 @@ def market_record(state: dict[str, Any], ticker: str) -> dict[str, Any]:
     return markets[ticker]
 
 
-FINAL_RECORD_STATUSES = {"finalized", "finalized_unfilled", "finalized_no_signal"}
+FINAL_RECORD_STATUSES = {"finalized", "finalized_unfilled", "finalized_no_signal", "exited_early"}
 
 
 def start_market_watcher(state: dict[str, Any], market: Any, config: dict[str, Any]) -> dict[str, Any] | None:
@@ -2576,7 +2732,9 @@ async def recover_exchange_state(rest: KalshiREST, state: dict[str, Any], config
 def active_strategy_records(state: dict[str, Any]) -> list[dict[str, Any]]:
     active: list[dict[str, Any]] = []
     for record in state.get("markets", {}).values():
-        if not isinstance(record, dict) or record.get("status") not in {"watching", "initial_submitted", "ladder_active"}:
+        if not isinstance(record, dict) or record.get("status") not in {
+            "watching", "initial_submitted", "ladder_active", "live_exit_pending",
+        }:
             continue
         close_time = timestamp_epoch(record.get("market_close_time"))
         if close_time is None or time.time() < close_time:
@@ -2587,8 +2745,11 @@ def active_strategy_records(state: dict[str, Any]) -> list[dict[str, Any]]:
 def reserved_principal(state: dict[str, Any]) -> float:
     total = 0.0
     for record in active_strategy_records(state):
+        reserve = as_float(record.get("reserved_principal"))
         quantity = as_float(record.get("quantity"))
-        if quantity is not None and record.get("candidate_side"):
+        if reserve is not None and record.get("candidate_side"):
+            total += reserve
+        elif quantity is not None and record.get("candidate_side"):
             total += ladder_principal(quantity)
     return round(total, 6)
 
@@ -2609,6 +2770,22 @@ async def reconcile_orders(rest: KalshiREST, record: dict[str, Any], dry_run: bo
                 order.get("order_id") or order.get("client_order_id") or "?",
             )
             changed = True
+    live_exit = record.get("live_exit_orders")
+    if isinstance(live_exit, list):
+        for exit_order in live_exit:
+            if not isinstance(exit_order, dict):
+                continue
+            before = (exit_order.get("fill_count"), exit_order.get("status"), exit_order.get("fees_paid"))
+            await rest.refresh_exit_order(exit_order)
+            if before != (exit_order.get("fill_count"), exit_order.get("status"), exit_order.get("fees_paid")):
+                LOG.info(
+                    "EXIT UPDATE | %s side=%s status=%s->%s fill=%.2f->%.2f remaining=%.2f id=%s",
+                    record.get("ticker", "?"), str(exit_order.get("held_side") or exit_order.get("side") or "?").upper(),
+                    before[1], exit_order.get("status"), float(before[0] or 0.0),
+                    float(exit_order.get("fill_count") or 0.0), float(exit_order.get("remaining_count") or 0.0),
+                    exit_order.get("order_id") or exit_order.get("client_order_id") or "?",
+                )
+                changed = True
     initial = (record.get("orders") or {}).get("0.4000")
     if isinstance(initial, dict) and initial.get("direction_verified") is False:
         record["status"] = "direction_mismatch"
@@ -2676,6 +2853,220 @@ async def submit_ladder(
         )
 
 
+def live_exit_filled_contracts(record: dict[str, Any]) -> float:
+    return round(sum(
+        float(order.get("fill_count") or 0.0)
+        for order in (record.get("live_exit_orders") or []) if isinstance(order, dict)
+    ), 2)
+
+
+def live_entry_cost(record: dict[str, Any]) -> float:
+    return round(sum(
+        float(order.get("fill_count") or 0.0)
+        * float(order.get("average_fill_price") or order.get("position_price") or 0.0)
+        for order in orders_for_market(record)
+    ), 6)
+
+
+def live_entry_fees(record: dict[str, Any]) -> float:
+    return round(sum(float(order.get("fees_paid") or 0.0) for order in orders_for_market(record)), 6)
+
+
+def live_exit_proceeds(record: dict[str, Any]) -> float:
+    return round(sum(
+        float(order.get("fill_count") or 0.0)
+        * float(order.get("average_fill_price") or order.get("position_price") or 0.0)
+        for order in (record.get("live_exit_orders") or []) if isinstance(order, dict)
+    ), 6)
+
+
+def live_exit_fees(record: dict[str, Any]) -> float:
+    return round(sum(
+        float(order.get("fees_paid") or 0.0)
+        for order in (record.get("live_exit_orders") or []) if isinstance(order, dict)
+    ), 6)
+
+
+def mark_live_exit_if_flat(record: dict[str, Any]) -> bool:
+    """Finalize an early live close only after all entry contracts were sold."""
+    entries = filled_contracts(record)
+    exits = live_exit_filled_contracts(record)
+    if entries <= 0.004 or exits + 0.004 < entries:
+        return False
+    cost = live_entry_cost(record)
+    entry_fees = live_entry_fees(record)
+    proceeds = live_exit_proceeds(record)
+    exit_fees = live_exit_fees(record)
+    gross = proceeds - cost
+    net = gross - entry_fees - exit_fees
+    record.update({
+        "status": "exited_early",
+        "exited_at": now_iso(),
+        "contracts": round(entries, 2),
+        "total_cost": cost,
+        "average_entry": round(cost / entries, 6),
+        "gross_payout": proceeds,
+        "gross_profit_loss": round(gross, 6),
+        "kalshi_fees": round(entry_fees + exit_fees, 6),
+        "net_profit_loss": round(net, 6),
+        "return_percentage": round(100.0 * net / cost, 4) if cost else None,
+        "exit_method": "live_reduce_only_" + str(
+            (record.get("live_exit_protection") or {}).get("trigger") or "unknown"
+        ),
+    })
+    LOG.warning(
+        "LIVE EXIT COMPLETE | %s contracts=%.2f cost=$%.4f proceeds=$%.4f net=$%+.4f",
+        record.get("ticker", "?"), entries, cost, proceeds, net,
+    )
+    return True
+
+
+async def monitor_live_inverse_ml_weighted_hold_gate(
+    rest: KalshiREST, record: dict[str, Any], feed: KalshiLiveFeed | None,
+    config: dict[str, Any], dry_run: bool,
+) -> bool:
+    """Manage the explicit live inverse-ML 1/2/3/4 entry after fills.
+
+    All trigger decisions are made from a current complete WebSocket top of
+    book with enough displayed depth to close the *whole remaining position*.
+    The hard stop is an absolute selected-side 5c bid.  The trailing exit
+    starts only after bid >= current average entry + 60c; it remains armed
+    after later lower-rung fills, but its high is rebased to a quote that has
+    depth for the enlarged position.
+    """
+    if not live_weighted_inverse_enabled(config):
+        return False
+    if record.get("strategy") != "inverse_ml_weighted_hold_gate_live_v1":
+        return False
+    if record.get("status") not in {"ladder_active", "live_exit_pending"}:
+        return False
+    side = str(record.get("locked_side") or record.get("candidate_side") or "").lower()
+    ticker = str(record.get("ticker") or "")
+    if feed is None or side not in {"yes", "no"} or not ticker:
+        return False
+    entries = filled_contracts(record)
+    exits = live_exit_filled_contracts(record)
+    remaining = round(max(0.0, entries - exits), 2)
+    protection = record.setdefault("live_exit_protection", {})
+    if remaining <= 0.004:
+        return mark_live_exit_if_flat(record)
+    quote, quote_state = feed.executable_shadow_exit_quote(
+        ticker, side, remaining, float(config["live_inverse_ml_quote_max_age_seconds"]),
+    )
+    protection["last_quote_state"] = quote_state
+    protection["last_checked_at"] = now_iso()
+    protection["remaining_contracts"] = remaining
+    if quote is None:
+        return False
+    bid = float(quote["economic_price"])
+    protection["last_executable_bid"] = bid
+    protection["last_quote"] = quote
+    average_entry = live_entry_cost(record) / entries if entries > 0.004 else None
+    if average_entry is None:
+        return False
+    protection["average_filled_entry"] = round(average_entry, 6)
+    prior_quantity = float(protection.get("high_depth_contracts") or 0.0)
+    # A high that was only executable for a smaller position must not be used
+    # as the trailing reference after a new rung increases exposure.
+    if remaining > prior_quantity + 0.004:
+        protection["trailing_high_bid"] = None
+        protection["high_depth_contracts"] = remaining
+        protection["rebaselined_at"] = now_iso()
+    gate = float(config["live_inverse_ml_hold_gate"])
+    trail = float(config["live_inverse_ml_trailing_stop"])
+    hard_stop = float(config["live_inverse_ml_absolute_stop_price"])
+    armed = bool(protection.get("armed"))
+    if not armed and bid + 1e-9 >= average_entry + gate:
+        protection.update({
+            "armed": True, "armed_at": now_iso(), "armed_average_entry": round(average_entry, 6),
+            "trailing_high_bid": bid, "high_depth_contracts": remaining,
+        })
+        armed = True
+        LOG.warning(
+            "LIVE INVERSE ML TRAIL ARMED | %s %s avg=$%.4f gate=+$%.2f bid=$%.4f stop=$%.4f qty=%.2f",
+            ticker, side.upper(), average_entry, gate, bid, bid - trail, remaining,
+        )
+    high = as_float(protection.get("trailing_high_bid"))
+    if armed and (high is None or bid > high + 1e-9):
+        protection["trailing_high_bid"] = bid
+        protection["high_depth_contracts"] = remaining
+        high = bid
+    trigger: str | None = None
+    if bid <= hard_stop + 1e-9:
+        trigger = "absolute_5c_stop"
+    elif armed and high is not None and bid <= high - trail + 1e-9:
+        trigger = "60c_gate_10c_trail"
+    if trigger is None:
+        return False
+    protection.update({"trigger": trigger, "triggered_at": now_iso(), "trigger_bid": bid})
+    LOG.critical(
+        "LIVE INVERSE ML EXIT TRIGGER | %s %s reason=%s bid=$%.4f avg=$%.4f high=%s remaining=%.2f; canceling entries before reduce-only IOC.",
+        ticker, side.upper(), trigger, bid, average_entry,
+        "none" if high is None else f"${high:.4f}", remaining,
+    )
+    # Kalshi does not permit a reduce-only close while this runner's entry
+    # limits could still add exposure. Cancel every remaining entry first.
+    for entry in orders_for_market(record):
+        if float(entry.get("remaining_count") or 0.0) > 0.004:
+            await rest.cancel_order(entry, dry_run)
+    # Cancellation can race a last fill.  Refresh each known order before
+    # relying on the ledger quantity for a reduce-only close.
+    for entry in orders_for_market(record):
+        await rest.refresh_order(entry)
+    entries = filled_contracts(record)
+    exits = live_exit_filled_contracts(record)
+    remaining = round(max(0.0, entries - exits), 2)
+    if remaining <= 0.004:
+        return mark_live_exit_if_flat(record)
+    confirm_quote, confirm_state = feed.executable_shadow_exit_quote(
+        ticker, side, remaining, float(config["live_inverse_ml_quote_max_age_seconds"]),
+    )
+    protection["last_quote_state"] = confirm_state
+    if confirm_quote is None:
+        return False
+    bid = float(confirm_quote["economic_price"])
+    protection["last_executable_bid"] = bid
+    high = as_float(protection.get("trailing_high_bid"))
+    if high is None or bid > high + 1e-9:
+        protection["trailing_high_bid"] = bid
+        protection["high_depth_contracts"] = remaining
+        high = bid
+    still_triggered = bid <= hard_stop + 1e-9 or (armed and high is not None and bid <= high - trail + 1e-9)
+    if not still_triggered:
+        protection.pop("trigger", None)
+        protection.pop("triggered_at", None)
+        return False
+    position = await rest.position_for_ticker(ticker)
+    if position is None:
+        protection["exit_blocked"] = "exchange position unavailable after entry cancels"
+        LOG.critical("LIVE EXIT BLOCKED | %s cannot verify exchange position; no close submitted.", ticker)
+        return False
+    actual_side = "yes" if position > 0.004 else ("no" if position < -0.004 else None)
+    if actual_side is not None and actual_side != side:
+        protection["exit_blocked"] = f"exchange side {actual_side} conflicts with expected {side}"
+        LOG.critical("LIVE EXIT BLOCKED | %s %s", ticker, protection["exit_blocked"])
+        return False
+    exchange_remaining = round(abs(position), 2)
+    if exchange_remaining <= 0.004:
+        return mark_live_exit_if_flat(record)
+    if exchange_remaining > remaining + 0.004:
+        protection["exit_blocked"] = f"exchange quantity {exchange_remaining:.2f} exceeds ledger remaining {remaining:.2f}"
+        LOG.critical("LIVE EXIT BLOCKED | %s %s", ticker, protection["exit_blocked"])
+        return False
+    # The bid quote was already depth-checked for `remaining`; it therefore
+    # also covers this verified (possibly smaller) exchange position.
+    exits = record.setdefault("live_exit_orders", [])
+    sequence = len(exits) + 1
+    exit_order = await rest.create_reduce_only_exit(
+        ticker=ticker, held_side=side, economic_exit_price=bid, quantity=exchange_remaining,
+        dry_run=dry_run, order_key=f"exit-{sequence}",
+    )
+    exit_order.update({"trigger": trigger, "quote_evidence": confirm_quote, "requested_at": now_iso()})
+    exits.append(exit_order)
+    record["status"] = "live_exit_pending"
+    return mark_live_exit_if_flat(record) or True
+
+
 async def settle_or_cancel(rest: KalshiREST, record: dict[str, Any], market: Any, dry_run: bool) -> None:
     if market_is_tradeable(market):
         return
@@ -2714,6 +3105,8 @@ async def settle_or_cancel(rest: KalshiREST, record: dict[str, Any], market: Any
         return
     for order in orders_for_market(record):
         await rest.cancel_order(order, dry_run)
+    for order in orders_for_market(record):
+        await rest.refresh_order(order)
     if result is None or market_status != "finalized":
         return
     side = record.get("locked_side") or record.get("candidate_side")
@@ -2731,19 +3124,25 @@ async def settle_or_cancel(rest: KalshiREST, record: dict[str, Any], market: Any
         LOG.info("FINALIZED UNFILLED | %s %s: zero contracts held; excluded from performance.",
                  record["ticker"], result.upper())
         return
-    cost = sum(float(order.get("fill_count") or 0.0) * float(order.get("average_fill_price") or order.get("position_price") or 0.0)
-               for order in orders_for_market(record))
-    fees = sum(float(order.get("fees_paid") or 0.0) for order in orders_for_market(record))
-    payout = quantity if side == result else 0.0
-    gross = payout - cost
+    cost = live_entry_cost(record)
+    entry_fees = live_entry_fees(record)
+    exit_count = min(quantity, live_exit_filled_contracts(record))
+    proceeds = live_exit_proceeds(record)
+    exit_fees = live_exit_fees(record)
+    remaining_contracts = max(0.0, quantity - exit_count)
+    payout = remaining_contracts if side == result else 0.0
+    gross = proceeds + payout - cost
+    fees = entry_fees + exit_fees
     net = gross - fees
     record.update({
         "status": "finalized", "settled_at": now_iso(), "settlement_outcome": result,
         "contracts": round(quantity, 2), "total_cost": round(cost, 6),
         "average_entry": round(cost / quantity, 6) if quantity else None,
-        "gross_payout": round(payout, 6), "gross_profit_loss": round(gross, 6),
+        "gross_payout": round(proceeds + payout, 6), "gross_profit_loss": round(gross, 6),
         "kalshi_fees": round(fees, 6), "net_profit_loss": round(net, 6),
         "return_percentage": round(100.0 * net / cost, 4) if cost else None,
+        "early_exit_contracts": round(exit_count, 2),
+        "settlement_contracts": round(remaining_contracts, 2),
     })
     LOG.info("SETTLED | %s %s contracts=%.2f net=$%.4f", record["ticker"], result.upper(), quantity, net)
 
@@ -2836,13 +3235,19 @@ async def consider_initial_entry(
     # this mode.  Once the frozen ML side is available, every fixed rung is a
     # market-close-expiring GTC limit on that side.
     _ = live_asks
-    side = ml_side
-    quantity = config["initial_position_size"]
-    reserve = ladder_principal(quantity)
+    inverse_weighted_live = live_weighted_inverse_enabled(config)
+    side = opposite_side(ml_side) if inverse_weighted_live else ml_side
+    if side not in {"yes", "no"}:
+        return False
+    rung_quantities = live_rung_quantities(config)
+    quantity = max(rung_quantities.values())
+    reserve = ladder_principal_for_rungs(rung_quantities)
     # A retried, partially submitted ladder is already included in the active
     # reserve. Replace that record's reserve rather than adding it twice.
-    existing_quantity = as_float(record.get("quantity")) if record.get("candidate_side") else None
-    existing_reserve = ladder_principal(existing_quantity) if existing_quantity is not None else 0.0
+    existing_reserve = as_float(record.get("reserved_principal")) if record.get("candidate_side") else None
+    if existing_reserve is None:
+        existing_quantity = as_float(record.get("quantity")) if record.get("candidate_side") else None
+        existing_reserve = ladder_principal(existing_quantity) if existing_quantity is not None else 0.0
     total_after_reserve = reserved_principal(state) - existing_reserve + reserve
     if total_after_reserve > config["max_total_capital"] + 1e-9:
         LOG.warning(
@@ -2862,6 +3267,12 @@ async def consider_initial_entry(
         "status": "ladder_active",
         "ladder_mode": "preposted_gtc_v2",
         "reserved_principal": reserve,
+        "rung_quantities": {f"{level:.4f}": rung_quantities[level] for level in LADDER_LEVELS},
+        "strategy": (
+            "inverse_ml_weighted_hold_gate_live_v1" if inverse_weighted_live
+            else "ml_side_preposted_gtc_ladder_v2"
+        ),
+        "source_ml_side": ml_side,
         "market_close_time": field(market, "close_time", "expected_expiration_time"),
     })
     if not await exchange_position_guard(rest, record, config):
@@ -2873,10 +3284,17 @@ async def consider_initial_entry(
         record["status"] = "initial_blocked_no_expiry"
         LOG.critical("GTC LADDER BLOCKED | %s has no market-close expiry; no GTC orders submitted.", ticker)
         return False
-    LOG.info(
-        "SIDE LOCKED | %s %s from frozen ML decision; immediately posting GTC ladder $0.40/$0.30/$0.20/$0.10 through close_epoch=%d.",
-        ticker, side.upper(), expiry,
-    )
+    if inverse_weighted_live:
+        LOG.warning(
+            "LIVE INVERSE ML SIDE LOCKED | %s source_ml=%s selected=%s; posting 1x$0.40/2x$0.30/3x$0.20/4x$0.10 "
+            "GTC ladder through close_epoch=%d; absolute bid stop=$0.05, trail arms at current average+$0.60 then retraces $0.10.",
+            ticker, ml_side.upper(), side.upper(), expiry,
+        )
+    else:
+        LOG.info(
+            "SIDE LOCKED | %s %s from frozen ML decision; immediately posting GTC ladder $0.40/$0.30/$0.20/$0.10 through close_epoch=%d.",
+            ticker, side.upper(), expiry,
+        )
     for level in LADDER_LEVELS:
         key = f"{level:.4f}"
         prior_order = record["orders"].get(key)
@@ -2888,17 +3306,18 @@ async def consider_initial_entry(
                 record["orders"].pop(key, None)
             else:
                 continue
+        rung_quantity = float(rung_quantities[level])
         submitted_contracts = sum(float(order.get("quantity") or 0.0) for order in orders_for_market(record))
-        if submitted_contracts + quantity > config["max_contracts_per_market"] + 1e-9:
+        if submitted_contracts + rung_quantity > config["max_contracts_per_market"] + 1e-9:
             record["ladder_prepost_error"] = "contract cap"
             LOG.critical(
                 "GTC LADDER BLOCKED | %s cannot post $%.2f: requested=%.2f cap=%.2f.",
-                ticker, level, submitted_contracts + quantity, config["max_contracts_per_market"],
+                ticker, level, submitted_contracts + rung_quantity, config["max_contracts_per_market"],
             )
             break
-        LOG.info("GTC LADDER LIMIT | %s %s @ $%.2f x %.2f expires_at=%d", ticker, side.upper(), level, quantity, expiry)
+        LOG.info("GTC LADDER LIMIT | %s %s @ $%.2f x %.2f expires_at=%d", ticker, side.upper(), level, rung_quantity, expiry)
         order = await rest.create_order(
-            ticker=ticker, side=side, position_price=level, quantity=quantity,
+            ticker=ticker, side=side, position_price=level, quantity=rung_quantity,
             tif="good_till_canceled", expiration_time=expiry, dry_run=dry_run,
             order_key="initial" if level == LADDER_LEVELS[0] else key,
         )
@@ -3604,11 +4023,58 @@ def model_transition_shadow_performance(state: dict[str, Any]) -> dict[str, Any]
     }
 
 
+def live_inverse_ml_hold_gate_performance(state: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
+    """Report the real inverse-ML live mode separately from every paper path."""
+    records = [
+        record for record in state.get("markets", {}).values()
+        if isinstance(record, dict) and record.get("strategy") == "inverse_ml_weighted_hold_gate_live_v1"
+    ]
+    closed = [record for record in records if record.get("status") in {"finalized", "exited_early"}]
+    active = [record for record in records if record.get("status") in {"ladder_active", "live_exit_pending"}]
+    pnls = [float(record.get("net_profit_loss") or 0.0) for record in closed]
+    costs = [float(record.get("total_cost") or 0.0) for record in closed]
+    wins = sum(value > 0.0 for value in pnls)
+    losses = sum(value < 0.0 for value in pnls)
+    equity = peak = 0.0
+    drawdowns: list[float] = []
+    for value in pnls:
+        equity += value
+        peak = max(peak, equity)
+        drawdowns.append(peak - equity)
+    current_streak = 0
+    current_is_win: bool | None = None
+    if pnls:
+        current_is_win = pnls[-1] > 0.0
+        for value in reversed(pnls):
+            if (value > 0.0) != current_is_win:
+                break
+            current_streak += 1
+    exits = [order for record in records for order in (record.get("live_exit_orders") or []) if isinstance(order, dict)]
+    return {
+        "strategy": "inverse_ml_weighted_hold_gate_live_v1",
+        "mode": "live_exchange_orders",
+        "started_markets": len(records), "active_markets": len(active), "closed_markets": len(closed),
+        "winning_trades": wins, "losing_trades": losses,
+        "win_rate": round(wins / len(closed), 6) if closed else None,
+        "net_profit": round(sum(pnls), 6),
+        "return_on_capital": round(sum(pnls) / sum(costs), 6) if sum(costs) else None,
+        "maximum_drawdown": round(max(drawdowns, default=0.0), 6),
+        "current_streak": current_streak,
+        "current_streak_kind": "win" if current_is_win else ("loss" if pnls else "none"),
+        "longest_winning_streak": streak(pnls, True), "longest_losing_streak": streak(pnls, False),
+        "exit_orders_submitted": len(exits),
+        "absolute_stop_price": float(config["live_inverse_ml_absolute_stop_price"]),
+        "hold_gate": float(config["live_inverse_ml_hold_gate"]),
+        "trailing_retracement": float(config["live_inverse_ml_trailing_stop"]),
+        "ladder": "1x40c/2x30c/3x20c/4x10c",
+    }
+
+
 def performance_report(state: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
     settled = sorted((record for record in state.get("markets", {}).values()
-                      if isinstance(record, dict) and record.get("status") == "finalized"
+                      if isinstance(record, dict) and record.get("status") in {"finalized", "exited_early"}
                       and float(record.get("contracts") or 0.0) > 0.004),
-                     key=lambda record: str(record.get("settled_at") or ""))
+                     key=lambda record: str(record.get("settled_at") or record.get("exited_at") or ""))
     unfilled = sum(1 for record in state.get("markets", {}).values()
                    if isinstance(record, dict) and (
                        record.get("status") == "finalized_unfilled"
@@ -3650,9 +4116,12 @@ def performance_report(state: dict[str, Any], config: dict[str, Any]) -> dict[st
         "longest_winning_streak": streak(pnls, True), "longest_losing_streak": streak(pnls, False),
         "largest_losing_trade": round(min(pnls, default=0.0), 6), "largest_winning_trade": round(max(pnls, default=0.0), 6),
         "worst_historical_drawdown": round(max(drawdowns, default=0.0), 6),
-        "rung_performance": rung_performance(settled),
+        "rung_performance": rung_performance([record for record in settled if record.get("status") == "finalized"]),
         "rung_order_activity": rung_order_activity(state),
-        "ml_live_directional_performance": ml_live_directional_performance(settled),
+        "ml_live_directional_performance": ml_live_directional_performance(
+            [record for record in settled if record.get("status") == "finalized"]
+        ),
+        "live_inverse_ml_hold_gate_performance": live_inverse_ml_hold_gate_performance(state, config),
         "ml_model_transition_side_comparison": model_transition_side_comparison(state),
         "ml_model_transition_shadow_performance": model_transition_shadow_performance(state),
         "inverse_ml_shadow_performance": inverse_shadow_performance(state),
@@ -3663,7 +4132,7 @@ def performance_report(state: dict[str, Any], config: dict[str, Any]) -> dict[st
         "inverse_ml_weighted_fixed_stop_loss_performance": ml_weighted_fixed_stop_loss_performance(state, inverse=True),
         "ml_weighted_activation_comparison_performance": ml_weighted_activation_comparison_performance(state, config, inverse=False),
         "inverse_ml_weighted_activation_comparison_performance": ml_weighted_activation_comparison_performance(state, config, inverse=True),
-        "note": "Only finalized records with filled contracts count as trades. The pre-open ML side is an execution filter; this report is realized live-ledger data, not a profitability proof.",
+        "note": "Finalized settlement records and fully completed reduce-only exits with filled contracts count as trades. The pre-open ML side is an execution filter; this report is realized live-ledger data, not a profitability proof.",
     }
     if settled:
         levels = {level: 0 for level in LADDER_LEVELS}
@@ -3746,6 +4215,22 @@ def log_performance_summary(report: dict[str, Any], context: str) -> None:
         "n/a" if model["average_model_confidence"] is None else f"{model['average_model_confidence']:.4f}",
         "n/a" if model["average_probability_yes"] is None else f"{model['average_probability_yes']:.4f}",
     )
+    live_inverse = report["live_inverse_ml_hold_gate_performance"]
+    if live_inverse["started_markets"] or live_weighted_inverse_enabled(report["configuration"]):
+        streak_text = "none" if not live_inverse["current_streak"] else (
+            f"{live_inverse['current_streak']} {live_inverse['current_streak_kind']}"
+        )
+        LOG.warning(
+            "LIVE INVERSE ML HOLD-GATE | %s started=%d active=%d closed=%d W/L=%d/%d streak=%s longest_W/L=%d/%d "
+            "net=$%+.4f roi=%s exits=%d | 1x40c/2x30c/3x20c/4x10c; selected-side absolute stop=$%.2f; "
+            "gate=+$%.2f then trailing retracement=$%.2f.",
+            context, live_inverse["started_markets"], live_inverse["active_markets"], live_inverse["closed_markets"],
+            live_inverse["winning_trades"], live_inverse["losing_trades"], streak_text,
+            live_inverse["longest_winning_streak"], live_inverse["longest_losing_streak"], live_inverse["net_profit"],
+            "n/a" if live_inverse["return_on_capital"] is None else f"{100 * live_inverse['return_on_capital']:.2f}%",
+            live_inverse["exit_orders_submitted"], live_inverse["absolute_stop_price"], live_inverse["hold_gate"],
+            live_inverse["trailing_retracement"],
+        )
     transition_summary = report["ml_model_transition_side_comparison"]
     for transition in transition_summary["comparisons"]:
         LOG.info(
@@ -4022,6 +4507,23 @@ async def log_heartbeat(
     for record in state.get("markets", {}).values():
         if not isinstance(record, dict) or record.get("status") in FINAL_RECORD_STATUSES:
             continue
+        if record.get("strategy") == "inverse_ml_weighted_hold_gate_live_v1":
+            protection = record.get("live_exit_protection") if isinstance(record.get("live_exit_protection"), dict) else {}
+            entry_count = filled_contracts(record)
+            exit_count = live_exit_filled_contracts(record)
+            LOG.warning(
+                "LIVE INVERSE ML STATUS | %s source_ml=%s side=%s status=%s filled=%.2f exited=%.2f avg=%s "
+                "bid=%s quote_state=%s armed=%s high=%s stop=$%.2f gate=+$%.2f trail=$%.2f; real exchange orders enabled.",
+                record.get("ticker", "?"), str(record.get("source_ml_side") or "?").upper(),
+                str(record.get("locked_side") or record.get("candidate_side") or "?").upper(), record.get("status", "?"),
+                entry_count, exit_count,
+                "none" if protection.get("average_filled_entry") is None else f"${float(protection['average_filled_entry']):.4f}",
+                "none" if protection.get("last_executable_bid") is None else f"${float(protection['last_executable_bid']):.4f}",
+                protection.get("last_quote_state", "awaiting_quote"), "yes" if protection.get("armed") else "no",
+                "none" if protection.get("trailing_high_bid") is None else f"${float(protection['trailing_high_bid']):.4f}",
+                float(config["live_inverse_ml_absolute_stop_price"]), float(config["live_inverse_ml_hold_gate"]),
+                float(config["live_inverse_ml_trailing_stop"]),
+            )
         shadow = record.get("inverse_ml_shadow")
         if isinstance(shadow, dict):
             rungs = shadow.get("rungs") if isinstance(shadow.get("rungs"), dict) else {}
@@ -4283,11 +4785,20 @@ async def run(args: argparse.Namespace) -> int:
     last_private_update_count = 0
     active_markets: list[Any] = []
     LOG.info(
-        "STARTUP | mode=%s run_seconds=%.0f quantity_per_rung=%.2f market_contract_cap=%.2f ladder=%s capital_cap=$%.4f",
-        "DRY_RUN" if dry_run else "LIVE", args.run_seconds, config["initial_position_size"],
-        config["max_contracts_per_market"], "/".join(f"${level:.2f}" for level in LADDER_LEVELS),
+        "STARTUP | mode=%s run_seconds=%.0f execution_strategy=%s quantity_per_rung=%.2f market_contract_cap=%.2f ladder=%s capital_cap=$%.4f",
+        "DRY_RUN" if dry_run else "LIVE", args.run_seconds, config["live_execution_strategy"],
+        config["initial_position_size"], config["max_contracts_per_market"], "/".join(f"${level:.2f}" for level in LADDER_LEVELS),
         config["max_total_capital"],
     )
+    if live_weighted_inverse_enabled(config):
+        LOG.warning(
+            "LIVE INVERSE ML POLICY | enabled=%s ladder=1x$0.40/2x$0.30/3x$0.20/4x$0.10 total_contracts=10 "
+            "max_principal=$%.2f absolute_bid_stop=$%.2f hold_gate=+$%.2f trailing_retracement=$%.2f "
+            "quote_max_age=%.1fs. This submits real exchange orders when LIVE mode is enabled.",
+            not dry_run, ladder_principal_for_rungs(WEIGHTED_SCALP_RUNG_QUANTITIES),
+            config["live_inverse_ml_absolute_stop_price"], config["live_inverse_ml_hold_gate"],
+            config["live_inverse_ml_trailing_stop"], config["live_inverse_ml_quote_max_age_seconds"],
+        )
     LOG.info(
         "INVERSE ML SHADOW POLICY | paper_only=%s quantity_per_rung=%.2f; primary live quantity remains %.2f.",
         bool(config["inverse_shadow_enabled"]), config["inverse_shadow_position_size"], config["initial_position_size"],
@@ -4361,6 +4872,7 @@ async def run(args: argparse.Namespace) -> int:
             # live order reconciliation and cannot call any order endpoint.
             for record in state["markets"].values():
                 if isinstance(record, dict):
+                    await monitor_live_inverse_ml_weighted_hold_gate(rest, record, feed, config, dry_run)
                     simulate_inverse_shadow(record, feed, config)
                     simulate_ml_scalp_shadow(record, feed, config)
                     simulate_ml_weighted_trailing_scalp_shadow(
@@ -4491,6 +5003,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--persist-config", action="store_true")
     parser.add_argument("--submit", action="store_true")
     parser.add_argument("--allow-live", action="store_true")
+    parser.add_argument(
+        "--live-execution-strategy", choices=sorted(LIVE_EXECUTION_STRATEGIES),
+        help="Persisted real-order mode. inverse_ml_weighted_hold_gate is the explicit inverse-ML 1/2/3/4 exit-protected strategy.",
+    )
+    parser.add_argument(
+        "--live-inverse-ml-hold-gate", type=float,
+        help="Profit gain over the current average entry needed to arm the live inverse-ML 10c trailing exit.",
+    )
     parser.add_argument("--initial-position-size", type=float)
     parser.add_argument("--max-active-markets", type=int)
     parser.add_argument("--max-contracts-per-market", type=float)

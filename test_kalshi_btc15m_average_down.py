@@ -31,6 +31,9 @@ from kalshi_btc15m_average_down import (
     exchange_position_guard,
     exchange_outcome_side,
     ladder_principal,
+    ladder_principal_for_rungs,
+    live_rung_quantities,
+    mark_live_exit_if_flat,
     performance_report,
     pause_error,
     reconcile_orders,
@@ -509,6 +512,15 @@ class MechanicalAverageDownTests(unittest.TestCase):
         self.assertEqual(config["max_contracts_per_market"], 40.0)
         self.assertEqual(config["max_total_capital"], 10.0)
 
+    def test_inverse_ml_live_mode_uses_the_authorized_weighted_ladder_and_caps(self):
+        args = SimpleNamespace(live_execution_strategy="inverse_ml_weighted_hold_gate")
+        config, changed = apply_config_overrides(validate_config(DEFAULT_CONFIG), args)
+        self.assertTrue(changed)
+        self.assertEqual(config["live_execution_strategy"], "inverse_ml_weighted_hold_gate")
+        self.assertEqual(live_rung_quantities(config), {0.40: 1.0, 0.30: 2.0, 0.20: 3.0, 0.10: 4.0})
+        self.assertEqual(ladder_principal_for_rungs(live_rung_quantities(config)), 2.0)
+        self.assertEqual((config["max_contracts_per_market"], config["max_total_capital"]), (10.0, 2.0))
+
     def test_exchange_position_over_cap_blocks_all_further_orders(self):
         class FakeRest:
             async def position_for_ticker(self, _ticker):
@@ -694,6 +706,65 @@ class MechanicalAverageDownTests(unittest.TestCase):
         self.assertTrue(all(request["expiration_time"] is not None for request in requests))
         self.assertEqual(len({request["expiration_time"] for request in requests}), 1)
         self.assertTrue(all(request["side"] == "yes" for request in requests))
+
+    def test_live_inverse_mode_posts_opposite_ml_side_with_1234_sizes(self):
+        class FakeRest:
+            def __init__(self):
+                self.requests = []
+
+            async def balance_dollars(self):
+                return 10.0
+
+            async def position_for_ticker(self, _ticker):
+                return 0.0
+
+            async def create_order(self, **kwargs):
+                self.requests.append(kwargs)
+                return {
+                    "order_id": f"order-{len(self.requests)}", "side": kwargs["side"],
+                    "position_price": kwargs["position_price"], "quantity": kwargs["quantity"],
+                    "fill_count": 0.0, "remaining_count": kwargs["quantity"],
+                    "fees_paid": 0.0, "status": "resting",
+                }
+
+        async def scenario():
+            config, _ = apply_config_overrides(
+                validate_config(DEFAULT_CONFIG), SimpleNamespace(live_execution_strategy="inverse_ml_weighted_hold_gate"),
+            )
+            state = default_state()
+            market = SimpleNamespace(
+                ticker="KXBTC15M-TEST-INVERSE-LIVE", status="active", open_time=time.time() - 5,
+                close_time=time.time() + 895,
+            )
+            rest = FakeRest()
+            entered = await consider_initial_entry(rest, state, market, config, dry_run=False, ml_side="yes")
+            return entered, state["markets"][market.ticker], rest.requests
+
+        entered, record, requests = asyncio.run(scenario())
+        self.assertTrue(entered)
+        self.assertEqual((record["strategy"], record["source_ml_side"], record["locked_side"]), (
+            "inverse_ml_weighted_hold_gate_live_v1", "yes", "no",
+        ))
+        self.assertEqual([request["side"] for request in requests], ["no"] * 4)
+        self.assertEqual([request["quantity"] for request in requests], [1.0, 2.0, 3.0, 4.0])
+        self.assertEqual(record["reserved_principal"], 2.0)
+
+    def test_completed_reduce_only_exit_uses_actual_proceeds_and_all_fees(self):
+        record = {
+            "ticker": "KXBTC15M-TEST-EARLY-EXIT", "status": "live_exit_pending",
+            "live_exit_protection": {"trigger": "60c_gate_10c_trail"},
+            "orders": {
+                "0.4000": {"fill_count": 1.0, "average_fill_price": 0.40, "fees_paid": 0.01},
+                "0.3000": {"fill_count": 2.0, "average_fill_price": 0.30, "fees_paid": 0.02},
+            },
+            "live_exit_orders": [
+                {"fill_count": 3.0, "average_fill_price": 0.70, "fees_paid": 0.03},
+            ],
+        }
+        self.assertTrue(mark_live_exit_if_flat(record))
+        self.assertEqual(record["status"], "exited_early")
+        self.assertEqual((record["total_cost"], record["gross_payout"], record["kalshi_fees"]), (1.0, 2.1, 0.06))
+        self.assertEqual(record["net_profit_loss"], 1.04)
 
     def test_weighted_paper_monitor_locks_ml_side_without_primary_order_or_balance_call(self):
         class NoOrderRest:
