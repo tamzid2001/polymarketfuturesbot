@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-07-22T15:33:02.720288+00:00",
+  "generated_at": "2026-07-22T15:33:12.987746+00:00",
   "locked_side_policy": "side is fixed before open and never changes on later quotes",
   "model_variant": "inverse_ml",
   "paper_only": true,
@@ -1084,16 +1084,20 @@
       },
       {
         "absolute_stop_price": 0.05,
+        "average_entry": 0.333333,
+        "contracts": 3.0,
         "created_at": "2026-07-22T15:30:19.293964+00:00",
         "entry_quote_depth_consumed": {
-          "KXBTC15M-26JUL221145-45:154:2026-07-22T15:32:54.792107+00:00": 1.0
+          "KXBTC15M-26JUL221145-45:154:2026-07-22T15:32:54.792107+00:00": 1.0,
+          "KXBTC15M-26JUL221145-45:171:2026-07-22T15:33:11.792075+00:00": 2.0
         },
         "entry_summary": {
-          "average_entry_price": 0.4,
-          "entry_cost": 0.4,
-          "filled_contracts": 1.0,
-          "take_profit_bid": 0.41
+          "average_entry_price": 0.333333,
+          "entry_cost": 1.0,
+          "filled_contracts": 3.0,
+          "take_profit_bid": 0.343333
         },
+        "estimated_fees": 0.0,
         "events": [
           {
             "at": "2026-07-22T15:32:54.793459+00:00",
@@ -1238,22 +1242,104 @@
             "observed_bid": 0.41,
             "trailing_activation_bid": 0.41,
             "trailing_activation_gain_per_contract": 0.01
+          },
+          {
+            "at": "2026-07-22T15:33:11.793444+00:00",
+            "entry_quote": {
+              "displayed_depth": 635.0,
+              "economic_price": 0.3,
+              "quote_age_seconds": 0.001317,
+              "quote_id": "KXBTC15M-26JUL221145-45:171:2026-07-22T15:33:11.792075+00:00",
+              "received_at": "2026-07-22T15:33:11.792075+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:11.728807Z",
+              "source_timestamp_ms": 1784734391728,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.3,
+              "yes_ask_size": 635.0,
+              "yes_bid": 0.29,
+              "yes_bid_size": 5008.78
+            },
+            "kind": "paper_scalp_entry_rung_hit",
+            "quantity": 2.0,
+            "rung_price": 0.3
+          },
+          {
+            "at": "2026-07-22T15:33:11.793485+00:00",
+            "average_entry_price": 0.333333,
+            "exit_price": 0.29,
+            "exit_quote": {
+              "displayed_depth": 5008.78,
+              "economic_price": 0.29,
+              "quote_age_seconds": 0.001323,
+              "quote_id": "KXBTC15M-26JUL221145-45:171:2026-07-22T15:33:11.792075+00:00",
+              "received_at": "2026-07-22T15:33:11.792075+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:11.728807Z",
+              "source_timestamp_ms": 1784734391728,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.3,
+              "yes_ask_size": 635.0,
+              "yes_bid": 0.29,
+              "yes_bid_size": 5008.78
+            },
+            "filled_contracts": 3.0,
+            "gross_per_contract": -0.043333,
+            "gross_total": -0.129999,
+            "kind": "paper_scalp_maximum_update"
+          },
+          {
+            "at": "2026-07-22T15:33:11.793515+00:00",
+            "average_entry_price": 0.333333,
+            "entry_cost": 1.0,
+            "exit_price": 0.29,
+            "exit_proceeds": 0.87,
+            "exit_quote": {
+              "displayed_depth": 5008.78,
+              "economic_price": 0.29,
+              "quote_age_seconds": 0.001323,
+              "quote_id": "KXBTC15M-26JUL221145-45:171:2026-07-22T15:33:11.792075+00:00",
+              "received_at": "2026-07-22T15:33:11.792075+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:11.728807Z",
+              "source_timestamp_ms": 1784734391728,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.3,
+              "yes_ask_size": 635.0,
+              "yes_bid": 0.29,
+              "yes_bid_size": 5008.78
+            },
+            "fees_model": "excluded_no_exchange_fill",
+            "filled_contracts": 3.0,
+            "gross_profit_loss": -0.13,
+            "highest_executable_bid": 0.41,
+            "kind": "paper_scalp_trailing_stop_exit",
+            "market_wide_trailing": true,
+            "trailing_activation_bid": 0.343333,
+            "trailing_activation_gain_per_contract": 0.01,
+            "trailing_armed_at": "2026-07-22T15:32:58.793156+00:00",
+            "trailing_stop_bid": 0.31,
+            "trailing_stop_per_contract": 0.1
           }
         ],
+        "exit_method": "fresh_executable_bid_trailing_stop",
+        "fees_model": "excluded_no_exchange_fill",
         "fixed_stop_loss_per_contract": null,
+        "gross_payout": 0.87,
+        "gross_profit_loss": -0.13,
         "hold_gain_gate_per_contract": 0.01,
         "last_actual_top_of_book": {
-          "no_ask": 0.6,
-          "no_bid": 0.59,
-          "observed_at": "2026-07-22T15:33:01.792079+00:00",
-          "quote_age_seconds": 0.761929,
-          "quote_id": "KXBTC15M-26JUL221145-45:161:2026-07-22T15:33:01.792079+00:00",
-          "selected_side_executable_ask": 0.41,
-          "selected_side_executable_bid": 0.4,
-          "yes_ask": 0.41,
-          "yes_ask_size": 10913.53,
-          "yes_bid": 0.4,
-          "yes_bid_size": 823.07
+          "no_ask": 0.71,
+          "no_bid": 0.7,
+          "observed_at": "2026-07-22T15:33:11.792075+00:00",
+          "quote_age_seconds": 0.001323,
+          "quote_id": "KXBTC15M-26JUL221145-45:171:2026-07-22T15:33:11.792075+00:00",
+          "selected_side_executable_ask": 0.3,
+          "selected_side_executable_bid": 0.29,
+          "yes_ask": 0.3,
+          "yes_ask_size": 635.0,
+          "yes_bid": 0.29,
+          "yes_bid_size": 5008.78
         },
         "last_entry_quote_state": "executable_top_of_book",
         "last_exit_quote_state": "executable_top_of_book",
@@ -1266,10 +1352,12 @@
         "market_trailing_high_at": "2026-07-22T15:32:58.793156+00:00",
         "market_trailing_high_bid": 0.41,
         "mode": "paper_only_no_exchange_orders",
+        "net_profit_loss": -0.13,
         "observation_only": false,
         "position_epochs": [
           {
             "average_entry_price": 0.4,
+            "ended_at": "2026-07-22T15:33:11.793457+00:00",
             "entry_cost": 0.4,
             "filled_contracts": 1.0,
             "fixed_stop_loss_bid": 0.05,
@@ -1346,6 +1434,60 @@
             "trailing_armed_at": "2026-07-22T15:32:58.793156+00:00",
             "trailing_armed_high_bid": 0.41,
             "trailing_stop_bid": 0.31
+          },
+          {
+            "average_entry_price": 0.333333,
+            "ended_at": "2026-07-22T15:33:11.793515+00:00",
+            "ended_by": "trailing_stop",
+            "entry_cost": 1.0,
+            "filled_contracts": 3.0,
+            "fixed_stop_loss_bid": 0.05,
+            "market_trailing_activation_bid": 0.41,
+            "market_trailing_high_bid": 0.41,
+            "max_executable_exit_bid": 0.29,
+            "max_executable_gross_per_contract": -0.043333,
+            "max_executable_gross_total": -0.129999,
+            "max_exit_quote": {
+              "displayed_depth": 5008.78,
+              "economic_price": 0.29,
+              "quote_age_seconds": 0.001323,
+              "quote_id": "KXBTC15M-26JUL221145-45:171:2026-07-22T15:33:11.792075+00:00",
+              "received_at": "2026-07-22T15:33:11.792075+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:11.728807Z",
+              "source_timestamp_ms": 1784734391728,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.3,
+              "yes_ask_size": 635.0,
+              "yes_bid": 0.29,
+              "yes_bid_size": 5008.78
+            },
+            "max_recorded_at": "2026-07-22T15:33:11.793485+00:00",
+            "started_at": "2026-07-22T15:33:11.793460+00:00",
+            "target_bids": {
+              "0.01": 0.343333,
+              "0.02": 0.353333,
+              "0.03": 0.363333,
+              "0.04": 0.373333,
+              "0.05": 0.383333,
+              "0.06": 0.393333,
+              "0.07": 0.403333,
+              "0.08": 0.413333,
+              "0.09": 0.423333,
+              "0.10": 0.433333,
+              "0.20": 0.533333,
+              "0.30": 0.633333,
+              "0.40": 0.733333,
+              "0.50": 0.833333,
+              "0.60": 0.933333,
+              "0.70": 1.033333,
+              "0.80": 1.133333
+            },
+            "target_hits": {},
+            "trailing_activation_bid": 0.343333,
+            "trailing_armed_at": "2026-07-22T15:32:58.793156+00:00",
+            "trailing_armed_high_bid": 0.41,
+            "trailing_stop_bid": 0.31
           }
         ],
         "profit_target_per_contract": 0.01,
@@ -1370,6 +1512,7 @@
         ],
         "quantity_per_rung": 1.0,
         "quote_max_age_seconds": 3.0,
+        "return_percentage": -13.0,
         "rung_quantities": {
           "0.1000": 4.0,
           "0.2000": 3.0,
@@ -1380,23 +1523,41 @@
           "0.1000": {
             "average_fill_price": null,
             "fill_count": 0.0,
+            "paper_canceled_at": "2026-07-22T15:33:11.793511+00:00",
             "quantity": 4.0,
             "rung_price": 0.1,
-            "status": "simulated_resting"
+            "status": "paper_canceled_after_scalp_exit"
           },
           "0.2000": {
             "average_fill_price": null,
             "fill_count": 0.0,
+            "paper_canceled_at": "2026-07-22T15:33:11.793508+00:00",
             "quantity": 3.0,
             "rung_price": 0.2,
-            "status": "simulated_resting"
+            "status": "paper_canceled_after_scalp_exit"
           },
           "0.3000": {
-            "average_fill_price": null,
-            "fill_count": 0.0,
+            "average_fill_price": 0.3,
+            "fill_count": 2.0,
+            "filled_at": "2026-07-22T15:33:11.793426+00:00",
             "quantity": 2.0,
             "rung_price": 0.3,
-            "status": "simulated_resting"
+            "simulation_entry_quote": {
+              "displayed_depth": 635.0,
+              "economic_price": 0.3,
+              "quote_age_seconds": 0.001317,
+              "quote_id": "KXBTC15M-26JUL221145-45:171:2026-07-22T15:33:11.792075+00:00",
+              "received_at": "2026-07-22T15:33:11.792075+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:11.728807Z",
+              "source_timestamp_ms": 1784734391728,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.3,
+              "yes_ask_size": 635.0,
+              "yes_bid": 0.29,
+              "yes_bid_size": 5008.78
+            },
+            "status": "simulated_executable_quote_hit"
           },
           "0.4000": {
             "average_fill_price": 0.4,
@@ -1422,13 +1583,48 @@
             "status": "simulated_executable_quote_hit"
           }
         },
+        "scalp_exit": {
+          "at": "2026-07-22T15:33:11.793515+00:00",
+          "average_entry_price": 0.333333,
+          "entry_cost": 1.0,
+          "exit_price": 0.29,
+          "exit_proceeds": 0.87,
+          "exit_quote": {
+            "displayed_depth": 5008.78,
+            "economic_price": 0.29,
+            "quote_age_seconds": 0.001323,
+            "quote_id": "KXBTC15M-26JUL221145-45:171:2026-07-22T15:33:11.792075+00:00",
+            "received_at": "2026-07-22T15:33:11.792075+00:00",
+            "side": "yes",
+            "source_server_timestamp": "2026-07-22T15:33:11.728807Z",
+            "source_timestamp_ms": 1784734391728,
+            "ticker": "KXBTC15M-26JUL221145-45",
+            "yes_ask": 0.3,
+            "yes_ask_size": 635.0,
+            "yes_bid": 0.29,
+            "yes_bid_size": 5008.78
+          },
+          "fees_model": "excluded_no_exchange_fill",
+          "filled_contracts": 3.0,
+          "gross_profit_loss": -0.13,
+          "highest_executable_bid": 0.41,
+          "kind": "paper_scalp_trailing_stop_exit",
+          "market_wide_trailing": true,
+          "trailing_activation_bid": 0.343333,
+          "trailing_activation_gain_per_contract": 0.01,
+          "trailing_armed_at": "2026-07-22T15:32:58.793156+00:00",
+          "trailing_stop_bid": 0.31,
+          "trailing_stop_per_contract": 0.1
+        },
+        "settled_at": "2026-07-22T15:33:11.793515+00:00",
         "side": "yes",
         "source_ml_side": "no",
         "source_model_run_id": "29889729268",
-        "status": "active",
+        "status": "scalp_exited",
         "strategy": "inverse_ml_weighted_1234_hold_gate_trailing_v3",
         "study_variant": "ML INVERSE",
         "ticker": "KXBTC15M-26JUL221145-45",
+        "total_cost": 1.0,
         "trailing_activation_gain_per_contract": 0.01,
         "trailing_stop_per_contract": 0.1
       }
@@ -2515,13 +2711,14 @@
         "absolute_stop_price": 0.05,
         "created_at": "2026-07-22T15:30:19.294046+00:00",
         "entry_quote_depth_consumed": {
-          "KXBTC15M-26JUL221145-45:154:2026-07-22T15:32:54.792107+00:00": 1.0
+          "KXBTC15M-26JUL221145-45:154:2026-07-22T15:32:54.792107+00:00": 1.0,
+          "KXBTC15M-26JUL221145-45:171:2026-07-22T15:33:11.792075+00:00": 2.0
         },
         "entry_summary": {
-          "average_entry_price": 0.4,
-          "entry_cost": 0.4,
-          "filled_contracts": 1.0,
-          "take_profit_bid": 0.41
+          "average_entry_price": 0.333333,
+          "entry_cost": 1.0,
+          "filled_contracts": 3.0,
+          "take_profit_bid": 0.343333
         },
         "events": [
           {
@@ -2642,22 +2839,91 @@
             "observed_gross_total": 0.01,
             "target_bid": 0.41,
             "target_per_contract": 0.01
+          },
+          {
+            "at": "2026-07-22T15:33:11.793670+00:00",
+            "entry_quote": {
+              "displayed_depth": 635.0,
+              "economic_price": 0.3,
+              "quote_age_seconds": 0.001551,
+              "quote_id": "KXBTC15M-26JUL221145-45:171:2026-07-22T15:33:11.792075+00:00",
+              "received_at": "2026-07-22T15:33:11.792075+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:11.728807Z",
+              "source_timestamp_ms": 1784734391728,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.3,
+              "yes_ask_size": 635.0,
+              "yes_bid": 0.29,
+              "yes_bid_size": 5008.78
+            },
+            "kind": "paper_scalp_entry_rung_hit",
+            "quantity": 2.0,
+            "rung_price": 0.3
+          },
+          {
+            "at": "2026-07-22T15:33:11.793711+00:00",
+            "average_entry_price": 0.333333,
+            "exit_price": 0.29,
+            "exit_quote": {
+              "displayed_depth": 5008.78,
+              "economic_price": 0.29,
+              "quote_age_seconds": 0.001559,
+              "quote_id": "KXBTC15M-26JUL221145-45:171:2026-07-22T15:33:11.792075+00:00",
+              "received_at": "2026-07-22T15:33:11.792075+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:11.728807Z",
+              "source_timestamp_ms": 1784734391728,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.3,
+              "yes_ask_size": 635.0,
+              "yes_bid": 0.29,
+              "yes_bid_size": 5008.78
+            },
+            "filled_contracts": 3.0,
+            "gross_per_contract": -0.043333,
+            "gross_total": -0.129999,
+            "kind": "paper_scalp_maximum_update"
+          },
+          {
+            "at": "2026-07-22T15:33:12.810287+00:00",
+            "average_entry_price": 0.333333,
+            "exit_price": 0.32,
+            "exit_quote": {
+              "displayed_depth": 3842.7,
+              "economic_price": 0.32,
+              "quote_age_seconds": 0.01842,
+              "quote_id": "KXBTC15M-26JUL221145-45:172:2026-07-22T15:33:12.791828+00:00",
+              "received_at": "2026-07-22T15:33:12.791828+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:12.729919Z",
+              "source_timestamp_ms": 1784734392729,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.33,
+              "yes_ask_size": 513.48,
+              "yes_bid": 0.32,
+              "yes_bid_size": 3842.7
+            },
+            "filled_contracts": 3.0,
+            "gross_per_contract": -0.013333,
+            "gross_total": -0.039999,
+            "kind": "paper_scalp_maximum_update"
           }
         ],
         "fixed_stop_loss_per_contract": null,
         "hold_gain_gate_per_contract": 0.02,
         "last_actual_top_of_book": {
-          "no_ask": 0.6,
-          "no_bid": 0.59,
-          "observed_at": "2026-07-22T15:33:01.792079+00:00",
-          "quote_age_seconds": 0.761965,
-          "quote_id": "KXBTC15M-26JUL221145-45:161:2026-07-22T15:33:01.792079+00:00",
-          "selected_side_executable_ask": 0.41,
-          "selected_side_executable_bid": 0.4,
-          "yes_ask": 0.41,
-          "yes_ask_size": 10913.53,
-          "yes_bid": 0.4,
-          "yes_bid_size": 823.07
+          "no_ask": 0.68,
+          "no_bid": 0.67,
+          "observed_at": "2026-07-22T15:33:12.791828+00:00",
+          "quote_age_seconds": 0.01842,
+          "quote_id": "KXBTC15M-26JUL221145-45:172:2026-07-22T15:33:12.791828+00:00",
+          "selected_side_executable_ask": 0.33,
+          "selected_side_executable_bid": 0.32,
+          "yes_ask": 0.33,
+          "yes_ask_size": 513.48,
+          "yes_bid": 0.32,
+          "yes_bid_size": 3842.7
         },
         "last_entry_quote_state": "executable_top_of_book",
         "last_exit_quote_state": "executable_top_of_book",
@@ -2669,6 +2935,7 @@
         "position_epochs": [
           {
             "average_entry_price": 0.4,
+            "ended_at": "2026-07-22T15:33:11.793683+00:00",
             "entry_cost": 0.4,
             "filled_contracts": 1.0,
             "fixed_stop_loss_bid": 0.05,
@@ -2737,6 +3004,53 @@
               }
             },
             "trailing_activation_bid": 0.42
+          },
+          {
+            "average_entry_price": 0.333333,
+            "entry_cost": 1.0,
+            "filled_contracts": 3.0,
+            "fixed_stop_loss_bid": 0.05,
+            "max_executable_exit_bid": 0.32,
+            "max_executable_gross_per_contract": -0.013333,
+            "max_executable_gross_total": -0.039999,
+            "max_exit_quote": {
+              "displayed_depth": 3842.7,
+              "economic_price": 0.32,
+              "quote_age_seconds": 0.01842,
+              "quote_id": "KXBTC15M-26JUL221145-45:172:2026-07-22T15:33:12.791828+00:00",
+              "received_at": "2026-07-22T15:33:12.791828+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:12.729919Z",
+              "source_timestamp_ms": 1784734392729,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.33,
+              "yes_ask_size": 513.48,
+              "yes_bid": 0.32,
+              "yes_bid_size": 3842.7
+            },
+            "max_recorded_at": "2026-07-22T15:33:12.810287+00:00",
+            "started_at": "2026-07-22T15:33:11.793686+00:00",
+            "target_bids": {
+              "0.01": 0.343333,
+              "0.02": 0.353333,
+              "0.03": 0.363333,
+              "0.04": 0.373333,
+              "0.05": 0.383333,
+              "0.06": 0.393333,
+              "0.07": 0.403333,
+              "0.08": 0.413333,
+              "0.09": 0.423333,
+              "0.10": 0.433333,
+              "0.20": 0.533333,
+              "0.30": 0.633333,
+              "0.40": 0.733333,
+              "0.50": 0.833333,
+              "0.60": 0.933333,
+              "0.70": 1.033333,
+              "0.80": 1.133333
+            },
+            "target_hits": {},
+            "trailing_activation_bid": 0.353333
           }
         ],
         "profit_target_per_contract": 0.01,
@@ -2783,11 +3097,27 @@
             "status": "simulated_resting"
           },
           "0.3000": {
-            "average_fill_price": null,
-            "fill_count": 0.0,
+            "average_fill_price": 0.3,
+            "fill_count": 2.0,
+            "filled_at": "2026-07-22T15:33:11.793664+00:00",
             "quantity": 2.0,
             "rung_price": 0.3,
-            "status": "simulated_resting"
+            "simulation_entry_quote": {
+              "displayed_depth": 635.0,
+              "economic_price": 0.3,
+              "quote_age_seconds": 0.001551,
+              "quote_id": "KXBTC15M-26JUL221145-45:171:2026-07-22T15:33:11.792075+00:00",
+              "received_at": "2026-07-22T15:33:11.792075+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:11.728807Z",
+              "source_timestamp_ms": 1784734391728,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.3,
+              "yes_ask_size": 635.0,
+              "yes_bid": 0.29,
+              "yes_bid_size": 5008.78
+            },
+            "status": "simulated_executable_quote_hit"
           },
           "0.4000": {
             "average_fill_price": 0.4,
@@ -3906,13 +4236,14 @@
         "absolute_stop_price": 0.05,
         "created_at": "2026-07-22T15:30:19.294132+00:00",
         "entry_quote_depth_consumed": {
-          "KXBTC15M-26JUL221145-45:154:2026-07-22T15:32:54.792107+00:00": 1.0
+          "KXBTC15M-26JUL221145-45:154:2026-07-22T15:32:54.792107+00:00": 1.0,
+          "KXBTC15M-26JUL221145-45:171:2026-07-22T15:33:11.792075+00:00": 2.0
         },
         "entry_summary": {
-          "average_entry_price": 0.4,
-          "entry_cost": 0.4,
-          "filled_contracts": 1.0,
-          "take_profit_bid": 0.41
+          "average_entry_price": 0.333333,
+          "entry_cost": 1.0,
+          "filled_contracts": 3.0,
+          "take_profit_bid": 0.343333
         },
         "events": [
           {
@@ -4033,22 +4364,91 @@
             "observed_gross_total": 0.01,
             "target_bid": 0.41,
             "target_per_contract": 0.01
+          },
+          {
+            "at": "2026-07-22T15:33:11.793759+00:00",
+            "entry_quote": {
+              "displayed_depth": 635.0,
+              "economic_price": 0.3,
+              "quote_age_seconds": 0.001638,
+              "quote_id": "KXBTC15M-26JUL221145-45:171:2026-07-22T15:33:11.792075+00:00",
+              "received_at": "2026-07-22T15:33:11.792075+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:11.728807Z",
+              "source_timestamp_ms": 1784734391728,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.3,
+              "yes_ask_size": 635.0,
+              "yes_bid": 0.29,
+              "yes_bid_size": 5008.78
+            },
+            "kind": "paper_scalp_entry_rung_hit",
+            "quantity": 2.0,
+            "rung_price": 0.3
+          },
+          {
+            "at": "2026-07-22T15:33:11.793816+00:00",
+            "average_entry_price": 0.333333,
+            "exit_price": 0.29,
+            "exit_quote": {
+              "displayed_depth": 5008.78,
+              "economic_price": 0.29,
+              "quote_age_seconds": 0.001644,
+              "quote_id": "KXBTC15M-26JUL221145-45:171:2026-07-22T15:33:11.792075+00:00",
+              "received_at": "2026-07-22T15:33:11.792075+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:11.728807Z",
+              "source_timestamp_ms": 1784734391728,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.3,
+              "yes_ask_size": 635.0,
+              "yes_bid": 0.29,
+              "yes_bid_size": 5008.78
+            },
+            "filled_contracts": 3.0,
+            "gross_per_contract": -0.043333,
+            "gross_total": -0.129999,
+            "kind": "paper_scalp_maximum_update"
+          },
+          {
+            "at": "2026-07-22T15:33:12.810342+00:00",
+            "average_entry_price": 0.333333,
+            "exit_price": 0.32,
+            "exit_quote": {
+              "displayed_depth": 3842.7,
+              "economic_price": 0.32,
+              "quote_age_seconds": 0.018478,
+              "quote_id": "KXBTC15M-26JUL221145-45:172:2026-07-22T15:33:12.791828+00:00",
+              "received_at": "2026-07-22T15:33:12.791828+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:12.729919Z",
+              "source_timestamp_ms": 1784734392729,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.33,
+              "yes_ask_size": 513.48,
+              "yes_bid": 0.32,
+              "yes_bid_size": 3842.7
+            },
+            "filled_contracts": 3.0,
+            "gross_per_contract": -0.013333,
+            "gross_total": -0.039999,
+            "kind": "paper_scalp_maximum_update"
           }
         ],
         "fixed_stop_loss_per_contract": null,
         "hold_gain_gate_per_contract": 0.03,
         "last_actual_top_of_book": {
-          "no_ask": 0.6,
-          "no_bid": 0.59,
-          "observed_at": "2026-07-22T15:33:01.792079+00:00",
-          "quote_age_seconds": 0.761999,
-          "quote_id": "KXBTC15M-26JUL221145-45:161:2026-07-22T15:33:01.792079+00:00",
-          "selected_side_executable_ask": 0.41,
-          "selected_side_executable_bid": 0.4,
-          "yes_ask": 0.41,
-          "yes_ask_size": 10913.53,
-          "yes_bid": 0.4,
-          "yes_bid_size": 823.07
+          "no_ask": 0.68,
+          "no_bid": 0.67,
+          "observed_at": "2026-07-22T15:33:12.791828+00:00",
+          "quote_age_seconds": 0.018478,
+          "quote_id": "KXBTC15M-26JUL221145-45:172:2026-07-22T15:33:12.791828+00:00",
+          "selected_side_executable_ask": 0.33,
+          "selected_side_executable_bid": 0.32,
+          "yes_ask": 0.33,
+          "yes_ask_size": 513.48,
+          "yes_bid": 0.32,
+          "yes_bid_size": 3842.7
         },
         "last_entry_quote_state": "executable_top_of_book",
         "last_exit_quote_state": "executable_top_of_book",
@@ -4060,6 +4460,7 @@
         "position_epochs": [
           {
             "average_entry_price": 0.4,
+            "ended_at": "2026-07-22T15:33:11.793777+00:00",
             "entry_cost": 0.4,
             "filled_contracts": 1.0,
             "fixed_stop_loss_bid": 0.05,
@@ -4128,6 +4529,53 @@
               }
             },
             "trailing_activation_bid": 0.43
+          },
+          {
+            "average_entry_price": 0.333333,
+            "entry_cost": 1.0,
+            "filled_contracts": 3.0,
+            "fixed_stop_loss_bid": 0.05,
+            "max_executable_exit_bid": 0.32,
+            "max_executable_gross_per_contract": -0.013333,
+            "max_executable_gross_total": -0.039999,
+            "max_exit_quote": {
+              "displayed_depth": 3842.7,
+              "economic_price": 0.32,
+              "quote_age_seconds": 0.018478,
+              "quote_id": "KXBTC15M-26JUL221145-45:172:2026-07-22T15:33:12.791828+00:00",
+              "received_at": "2026-07-22T15:33:12.791828+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:12.729919Z",
+              "source_timestamp_ms": 1784734392729,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.33,
+              "yes_ask_size": 513.48,
+              "yes_bid": 0.32,
+              "yes_bid_size": 3842.7
+            },
+            "max_recorded_at": "2026-07-22T15:33:12.810342+00:00",
+            "started_at": "2026-07-22T15:33:11.793781+00:00",
+            "target_bids": {
+              "0.01": 0.343333,
+              "0.02": 0.353333,
+              "0.03": 0.363333,
+              "0.04": 0.373333,
+              "0.05": 0.383333,
+              "0.06": 0.393333,
+              "0.07": 0.403333,
+              "0.08": 0.413333,
+              "0.09": 0.423333,
+              "0.10": 0.433333,
+              "0.20": 0.533333,
+              "0.30": 0.633333,
+              "0.40": 0.733333,
+              "0.50": 0.833333,
+              "0.60": 0.933333,
+              "0.70": 1.033333,
+              "0.80": 1.133333
+            },
+            "target_hits": {},
+            "trailing_activation_bid": 0.363333
           }
         ],
         "profit_target_per_contract": 0.01,
@@ -4174,11 +4622,27 @@
             "status": "simulated_resting"
           },
           "0.3000": {
-            "average_fill_price": null,
-            "fill_count": 0.0,
+            "average_fill_price": 0.3,
+            "fill_count": 2.0,
+            "filled_at": "2026-07-22T15:33:11.793750+00:00",
             "quantity": 2.0,
             "rung_price": 0.3,
-            "status": "simulated_resting"
+            "simulation_entry_quote": {
+              "displayed_depth": 635.0,
+              "economic_price": 0.3,
+              "quote_age_seconds": 0.001638,
+              "quote_id": "KXBTC15M-26JUL221145-45:171:2026-07-22T15:33:11.792075+00:00",
+              "received_at": "2026-07-22T15:33:11.792075+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:11.728807Z",
+              "source_timestamp_ms": 1784734391728,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.3,
+              "yes_ask_size": 635.0,
+              "yes_bid": 0.29,
+              "yes_bid_size": 5008.78
+            },
+            "status": "simulated_executable_quote_hit"
           },
           "0.4000": {
             "average_fill_price": 0.4,
@@ -5297,13 +5761,14 @@
         "absolute_stop_price": 0.05,
         "created_at": "2026-07-22T15:30:19.294215+00:00",
         "entry_quote_depth_consumed": {
-          "KXBTC15M-26JUL221145-45:154:2026-07-22T15:32:54.792107+00:00": 1.0
+          "KXBTC15M-26JUL221145-45:154:2026-07-22T15:32:54.792107+00:00": 1.0,
+          "KXBTC15M-26JUL221145-45:171:2026-07-22T15:33:11.792075+00:00": 2.0
         },
         "entry_summary": {
-          "average_entry_price": 0.4,
-          "entry_cost": 0.4,
-          "filled_contracts": 1.0,
-          "take_profit_bid": 0.41
+          "average_entry_price": 0.333333,
+          "entry_cost": 1.0,
+          "filled_contracts": 3.0,
+          "take_profit_bid": 0.343333
         },
         "events": [
           {
@@ -5424,22 +5889,91 @@
             "observed_gross_total": 0.01,
             "target_bid": 0.41,
             "target_per_contract": 0.01
+          },
+          {
+            "at": "2026-07-22T15:33:11.793873+00:00",
+            "entry_quote": {
+              "displayed_depth": 635.0,
+              "economic_price": 0.3,
+              "quote_age_seconds": 0.00175,
+              "quote_id": "KXBTC15M-26JUL221145-45:171:2026-07-22T15:33:11.792075+00:00",
+              "received_at": "2026-07-22T15:33:11.792075+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:11.728807Z",
+              "source_timestamp_ms": 1784734391728,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.3,
+              "yes_ask_size": 635.0,
+              "yes_bid": 0.29,
+              "yes_bid_size": 5008.78
+            },
+            "kind": "paper_scalp_entry_rung_hit",
+            "quantity": 2.0,
+            "rung_price": 0.3
+          },
+          {
+            "at": "2026-07-22T15:33:11.793923+00:00",
+            "average_entry_price": 0.333333,
+            "exit_price": 0.29,
+            "exit_quote": {
+              "displayed_depth": 5008.78,
+              "economic_price": 0.29,
+              "quote_age_seconds": 0.001759,
+              "quote_id": "KXBTC15M-26JUL221145-45:171:2026-07-22T15:33:11.792075+00:00",
+              "received_at": "2026-07-22T15:33:11.792075+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:11.728807Z",
+              "source_timestamp_ms": 1784734391728,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.3,
+              "yes_ask_size": 635.0,
+              "yes_bid": 0.29,
+              "yes_bid_size": 5008.78
+            },
+            "filled_contracts": 3.0,
+            "gross_per_contract": -0.043333,
+            "gross_total": -0.129999,
+            "kind": "paper_scalp_maximum_update"
+          },
+          {
+            "at": "2026-07-22T15:33:12.810389+00:00",
+            "average_entry_price": 0.333333,
+            "exit_price": 0.32,
+            "exit_quote": {
+              "displayed_depth": 3842.7,
+              "economic_price": 0.32,
+              "quote_age_seconds": 0.018526,
+              "quote_id": "KXBTC15M-26JUL221145-45:172:2026-07-22T15:33:12.791828+00:00",
+              "received_at": "2026-07-22T15:33:12.791828+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:12.729919Z",
+              "source_timestamp_ms": 1784734392729,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.33,
+              "yes_ask_size": 513.48,
+              "yes_bid": 0.32,
+              "yes_bid_size": 3842.7
+            },
+            "filled_contracts": 3.0,
+            "gross_per_contract": -0.013333,
+            "gross_total": -0.039999,
+            "kind": "paper_scalp_maximum_update"
           }
         ],
         "fixed_stop_loss_per_contract": null,
         "hold_gain_gate_per_contract": 0.04,
         "last_actual_top_of_book": {
-          "no_ask": 0.6,
-          "no_bid": 0.59,
-          "observed_at": "2026-07-22T15:33:01.792079+00:00",
-          "quote_age_seconds": 0.762032,
-          "quote_id": "KXBTC15M-26JUL221145-45:161:2026-07-22T15:33:01.792079+00:00",
-          "selected_side_executable_ask": 0.41,
-          "selected_side_executable_bid": 0.4,
-          "yes_ask": 0.41,
-          "yes_ask_size": 10913.53,
-          "yes_bid": 0.4,
-          "yes_bid_size": 823.07
+          "no_ask": 0.68,
+          "no_bid": 0.67,
+          "observed_at": "2026-07-22T15:33:12.791828+00:00",
+          "quote_age_seconds": 0.018526,
+          "quote_id": "KXBTC15M-26JUL221145-45:172:2026-07-22T15:33:12.791828+00:00",
+          "selected_side_executable_ask": 0.33,
+          "selected_side_executable_bid": 0.32,
+          "yes_ask": 0.33,
+          "yes_ask_size": 513.48,
+          "yes_bid": 0.32,
+          "yes_bid_size": 3842.7
         },
         "last_entry_quote_state": "executable_top_of_book",
         "last_exit_quote_state": "executable_top_of_book",
@@ -5451,6 +5985,7 @@
         "position_epochs": [
           {
             "average_entry_price": 0.4,
+            "ended_at": "2026-07-22T15:33:11.793889+00:00",
             "entry_cost": 0.4,
             "filled_contracts": 1.0,
             "fixed_stop_loss_bid": 0.05,
@@ -5519,6 +6054,53 @@
               }
             },
             "trailing_activation_bid": 0.44
+          },
+          {
+            "average_entry_price": 0.333333,
+            "entry_cost": 1.0,
+            "filled_contracts": 3.0,
+            "fixed_stop_loss_bid": 0.05,
+            "max_executable_exit_bid": 0.32,
+            "max_executable_gross_per_contract": -0.013333,
+            "max_executable_gross_total": -0.039999,
+            "max_exit_quote": {
+              "displayed_depth": 3842.7,
+              "economic_price": 0.32,
+              "quote_age_seconds": 0.018526,
+              "quote_id": "KXBTC15M-26JUL221145-45:172:2026-07-22T15:33:12.791828+00:00",
+              "received_at": "2026-07-22T15:33:12.791828+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:12.729919Z",
+              "source_timestamp_ms": 1784734392729,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.33,
+              "yes_ask_size": 513.48,
+              "yes_bid": 0.32,
+              "yes_bid_size": 3842.7
+            },
+            "max_recorded_at": "2026-07-22T15:33:12.810389+00:00",
+            "started_at": "2026-07-22T15:33:11.793892+00:00",
+            "target_bids": {
+              "0.01": 0.343333,
+              "0.02": 0.353333,
+              "0.03": 0.363333,
+              "0.04": 0.373333,
+              "0.05": 0.383333,
+              "0.06": 0.393333,
+              "0.07": 0.403333,
+              "0.08": 0.413333,
+              "0.09": 0.423333,
+              "0.10": 0.433333,
+              "0.20": 0.533333,
+              "0.30": 0.633333,
+              "0.40": 0.733333,
+              "0.50": 0.833333,
+              "0.60": 0.933333,
+              "0.70": 1.033333,
+              "0.80": 1.133333
+            },
+            "target_hits": {},
+            "trailing_activation_bid": 0.373333
           }
         ],
         "profit_target_per_contract": 0.01,
@@ -5565,11 +6147,27 @@
             "status": "simulated_resting"
           },
           "0.3000": {
-            "average_fill_price": null,
-            "fill_count": 0.0,
+            "average_fill_price": 0.3,
+            "fill_count": 2.0,
+            "filled_at": "2026-07-22T15:33:11.793867+00:00",
             "quantity": 2.0,
             "rung_price": 0.3,
-            "status": "simulated_resting"
+            "simulation_entry_quote": {
+              "displayed_depth": 635.0,
+              "economic_price": 0.3,
+              "quote_age_seconds": 0.00175,
+              "quote_id": "KXBTC15M-26JUL221145-45:171:2026-07-22T15:33:11.792075+00:00",
+              "received_at": "2026-07-22T15:33:11.792075+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:11.728807Z",
+              "source_timestamp_ms": 1784734391728,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.3,
+              "yes_ask_size": 635.0,
+              "yes_bid": 0.29,
+              "yes_bid_size": 5008.78
+            },
+            "status": "simulated_executable_quote_hit"
           },
           "0.4000": {
             "average_fill_price": 0.4,
@@ -6688,13 +7286,14 @@
         "absolute_stop_price": 0.05,
         "created_at": "2026-07-22T15:30:19.294308+00:00",
         "entry_quote_depth_consumed": {
-          "KXBTC15M-26JUL221145-45:154:2026-07-22T15:32:54.792107+00:00": 1.0
+          "KXBTC15M-26JUL221145-45:154:2026-07-22T15:32:54.792107+00:00": 1.0,
+          "KXBTC15M-26JUL221145-45:171:2026-07-22T15:33:11.792075+00:00": 2.0
         },
         "entry_summary": {
-          "average_entry_price": 0.4,
-          "entry_cost": 0.4,
-          "filled_contracts": 1.0,
-          "take_profit_bid": 0.41
+          "average_entry_price": 0.333333,
+          "entry_cost": 1.0,
+          "filled_contracts": 3.0,
+          "take_profit_bid": 0.343333
         },
         "events": [
           {
@@ -6815,22 +7414,91 @@
             "observed_gross_total": 0.01,
             "target_bid": 0.41,
             "target_per_contract": 0.01
+          },
+          {
+            "at": "2026-07-22T15:33:11.793960+00:00",
+            "entry_quote": {
+              "displayed_depth": 635.0,
+              "economic_price": 0.3,
+              "quote_age_seconds": 0.001847,
+              "quote_id": "KXBTC15M-26JUL221145-45:171:2026-07-22T15:33:11.792075+00:00",
+              "received_at": "2026-07-22T15:33:11.792075+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:11.728807Z",
+              "source_timestamp_ms": 1784734391728,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.3,
+              "yes_ask_size": 635.0,
+              "yes_bid": 0.29,
+              "yes_bid_size": 5008.78
+            },
+            "kind": "paper_scalp_entry_rung_hit",
+            "quantity": 2.0,
+            "rung_price": 0.3
+          },
+          {
+            "at": "2026-07-22T15:33:11.793993+00:00",
+            "average_entry_price": 0.333333,
+            "exit_price": 0.29,
+            "exit_quote": {
+              "displayed_depth": 5008.78,
+              "economic_price": 0.29,
+              "quote_age_seconds": 0.001853,
+              "quote_id": "KXBTC15M-26JUL221145-45:171:2026-07-22T15:33:11.792075+00:00",
+              "received_at": "2026-07-22T15:33:11.792075+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:11.728807Z",
+              "source_timestamp_ms": 1784734391728,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.3,
+              "yes_ask_size": 635.0,
+              "yes_bid": 0.29,
+              "yes_bid_size": 5008.78
+            },
+            "filled_contracts": 3.0,
+            "gross_per_contract": -0.043333,
+            "gross_total": -0.129999,
+            "kind": "paper_scalp_maximum_update"
+          },
+          {
+            "at": "2026-07-22T15:33:12.810447+00:00",
+            "average_entry_price": 0.333333,
+            "exit_price": 0.32,
+            "exit_quote": {
+              "displayed_depth": 3842.7,
+              "economic_price": 0.32,
+              "quote_age_seconds": 0.018571,
+              "quote_id": "KXBTC15M-26JUL221145-45:172:2026-07-22T15:33:12.791828+00:00",
+              "received_at": "2026-07-22T15:33:12.791828+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:12.729919Z",
+              "source_timestamp_ms": 1784734392729,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.33,
+              "yes_ask_size": 513.48,
+              "yes_bid": 0.32,
+              "yes_bid_size": 3842.7
+            },
+            "filled_contracts": 3.0,
+            "gross_per_contract": -0.013333,
+            "gross_total": -0.039999,
+            "kind": "paper_scalp_maximum_update"
           }
         ],
         "fixed_stop_loss_per_contract": null,
         "hold_gain_gate_per_contract": 0.05,
         "last_actual_top_of_book": {
-          "no_ask": 0.6,
-          "no_bid": 0.59,
-          "observed_at": "2026-07-22T15:33:01.792079+00:00",
-          "quote_age_seconds": 0.762066,
-          "quote_id": "KXBTC15M-26JUL221145-45:161:2026-07-22T15:33:01.792079+00:00",
-          "selected_side_executable_ask": 0.41,
-          "selected_side_executable_bid": 0.4,
-          "yes_ask": 0.41,
-          "yes_ask_size": 10913.53,
-          "yes_bid": 0.4,
-          "yes_bid_size": 823.07
+          "no_ask": 0.68,
+          "no_bid": 0.67,
+          "observed_at": "2026-07-22T15:33:12.791828+00:00",
+          "quote_age_seconds": 0.018571,
+          "quote_id": "KXBTC15M-26JUL221145-45:172:2026-07-22T15:33:12.791828+00:00",
+          "selected_side_executable_ask": 0.33,
+          "selected_side_executable_bid": 0.32,
+          "yes_ask": 0.33,
+          "yes_ask_size": 513.48,
+          "yes_bid": 0.32,
+          "yes_bid_size": 3842.7
         },
         "last_entry_quote_state": "executable_top_of_book",
         "last_exit_quote_state": "executable_top_of_book",
@@ -6842,6 +7510,7 @@
         "position_epochs": [
           {
             "average_entry_price": 0.4,
+            "ended_at": "2026-07-22T15:33:11.793971+00:00",
             "entry_cost": 0.4,
             "filled_contracts": 1.0,
             "fixed_stop_loss_bid": 0.05,
@@ -6910,6 +7579,53 @@
               }
             },
             "trailing_activation_bid": 0.45
+          },
+          {
+            "average_entry_price": 0.333333,
+            "entry_cost": 1.0,
+            "filled_contracts": 3.0,
+            "fixed_stop_loss_bid": 0.05,
+            "max_executable_exit_bid": 0.32,
+            "max_executable_gross_per_contract": -0.013333,
+            "max_executable_gross_total": -0.039999,
+            "max_exit_quote": {
+              "displayed_depth": 3842.7,
+              "economic_price": 0.32,
+              "quote_age_seconds": 0.018571,
+              "quote_id": "KXBTC15M-26JUL221145-45:172:2026-07-22T15:33:12.791828+00:00",
+              "received_at": "2026-07-22T15:33:12.791828+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:12.729919Z",
+              "source_timestamp_ms": 1784734392729,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.33,
+              "yes_ask_size": 513.48,
+              "yes_bid": 0.32,
+              "yes_bid_size": 3842.7
+            },
+            "max_recorded_at": "2026-07-22T15:33:12.810447+00:00",
+            "started_at": "2026-07-22T15:33:11.793973+00:00",
+            "target_bids": {
+              "0.01": 0.343333,
+              "0.02": 0.353333,
+              "0.03": 0.363333,
+              "0.04": 0.373333,
+              "0.05": 0.383333,
+              "0.06": 0.393333,
+              "0.07": 0.403333,
+              "0.08": 0.413333,
+              "0.09": 0.423333,
+              "0.10": 0.433333,
+              "0.20": 0.533333,
+              "0.30": 0.633333,
+              "0.40": 0.733333,
+              "0.50": 0.833333,
+              "0.60": 0.933333,
+              "0.70": 1.033333,
+              "0.80": 1.133333
+            },
+            "target_hits": {},
+            "trailing_activation_bid": 0.383333
           }
         ],
         "profit_target_per_contract": 0.01,
@@ -6956,11 +7672,27 @@
             "status": "simulated_resting"
           },
           "0.3000": {
-            "average_fill_price": null,
-            "fill_count": 0.0,
+            "average_fill_price": 0.3,
+            "fill_count": 2.0,
+            "filled_at": "2026-07-22T15:33:11.793956+00:00",
             "quantity": 2.0,
             "rung_price": 0.3,
-            "status": "simulated_resting"
+            "simulation_entry_quote": {
+              "displayed_depth": 635.0,
+              "economic_price": 0.3,
+              "quote_age_seconds": 0.001847,
+              "quote_id": "KXBTC15M-26JUL221145-45:171:2026-07-22T15:33:11.792075+00:00",
+              "received_at": "2026-07-22T15:33:11.792075+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:11.728807Z",
+              "source_timestamp_ms": 1784734391728,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.3,
+              "yes_ask_size": 635.0,
+              "yes_bid": 0.29,
+              "yes_bid_size": 5008.78
+            },
+            "status": "simulated_executable_quote_hit"
           },
           "0.4000": {
             "average_fill_price": 0.4,
@@ -8079,13 +8811,14 @@
         "absolute_stop_price": 0.05,
         "created_at": "2026-07-22T15:30:19.294389+00:00",
         "entry_quote_depth_consumed": {
-          "KXBTC15M-26JUL221145-45:154:2026-07-22T15:32:54.792107+00:00": 1.0
+          "KXBTC15M-26JUL221145-45:154:2026-07-22T15:32:54.792107+00:00": 1.0,
+          "KXBTC15M-26JUL221145-45:171:2026-07-22T15:33:11.792075+00:00": 2.0
         },
         "entry_summary": {
-          "average_entry_price": 0.4,
-          "entry_cost": 0.4,
-          "filled_contracts": 1.0,
-          "take_profit_bid": 0.41
+          "average_entry_price": 0.333333,
+          "entry_cost": 1.0,
+          "filled_contracts": 3.0,
+          "take_profit_bid": 0.343333
         },
         "events": [
           {
@@ -8206,22 +8939,91 @@
             "observed_gross_total": 0.01,
             "target_bid": 0.41,
             "target_per_contract": 0.01
+          },
+          {
+            "at": "2026-07-22T15:33:11.794028+00:00",
+            "entry_quote": {
+              "displayed_depth": 635.0,
+              "economic_price": 0.3,
+              "quote_age_seconds": 0.001918,
+              "quote_id": "KXBTC15M-26JUL221145-45:171:2026-07-22T15:33:11.792075+00:00",
+              "received_at": "2026-07-22T15:33:11.792075+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:11.728807Z",
+              "source_timestamp_ms": 1784734391728,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.3,
+              "yes_ask_size": 635.0,
+              "yes_bid": 0.29,
+              "yes_bid_size": 5008.78
+            },
+            "kind": "paper_scalp_entry_rung_hit",
+            "quantity": 2.0,
+            "rung_price": 0.3
+          },
+          {
+            "at": "2026-07-22T15:33:11.794062+00:00",
+            "average_entry_price": 0.333333,
+            "exit_price": 0.29,
+            "exit_quote": {
+              "displayed_depth": 5008.78,
+              "economic_price": 0.29,
+              "quote_age_seconds": 0.001923,
+              "quote_id": "KXBTC15M-26JUL221145-45:171:2026-07-22T15:33:11.792075+00:00",
+              "received_at": "2026-07-22T15:33:11.792075+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:11.728807Z",
+              "source_timestamp_ms": 1784734391728,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.3,
+              "yes_ask_size": 635.0,
+              "yes_bid": 0.29,
+              "yes_bid_size": 5008.78
+            },
+            "filled_contracts": 3.0,
+            "gross_per_contract": -0.043333,
+            "gross_total": -0.129999,
+            "kind": "paper_scalp_maximum_update"
+          },
+          {
+            "at": "2026-07-22T15:33:12.810492+00:00",
+            "average_entry_price": 0.333333,
+            "exit_price": 0.32,
+            "exit_quote": {
+              "displayed_depth": 3842.7,
+              "economic_price": 0.32,
+              "quote_age_seconds": 0.01863,
+              "quote_id": "KXBTC15M-26JUL221145-45:172:2026-07-22T15:33:12.791828+00:00",
+              "received_at": "2026-07-22T15:33:12.791828+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:12.729919Z",
+              "source_timestamp_ms": 1784734392729,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.33,
+              "yes_ask_size": 513.48,
+              "yes_bid": 0.32,
+              "yes_bid_size": 3842.7
+            },
+            "filled_contracts": 3.0,
+            "gross_per_contract": -0.013333,
+            "gross_total": -0.039999,
+            "kind": "paper_scalp_maximum_update"
           }
         ],
         "fixed_stop_loss_per_contract": null,
         "hold_gain_gate_per_contract": 0.06,
         "last_actual_top_of_book": {
-          "no_ask": 0.6,
-          "no_bid": 0.59,
-          "observed_at": "2026-07-22T15:33:01.792079+00:00",
-          "quote_age_seconds": 0.762099,
-          "quote_id": "KXBTC15M-26JUL221145-45:161:2026-07-22T15:33:01.792079+00:00",
-          "selected_side_executable_ask": 0.41,
-          "selected_side_executable_bid": 0.4,
-          "yes_ask": 0.41,
-          "yes_ask_size": 10913.53,
-          "yes_bid": 0.4,
-          "yes_bid_size": 823.07
+          "no_ask": 0.68,
+          "no_bid": 0.67,
+          "observed_at": "2026-07-22T15:33:12.791828+00:00",
+          "quote_age_seconds": 0.01863,
+          "quote_id": "KXBTC15M-26JUL221145-45:172:2026-07-22T15:33:12.791828+00:00",
+          "selected_side_executable_ask": 0.33,
+          "selected_side_executable_bid": 0.32,
+          "yes_ask": 0.33,
+          "yes_ask_size": 513.48,
+          "yes_bid": 0.32,
+          "yes_bid_size": 3842.7
         },
         "last_entry_quote_state": "executable_top_of_book",
         "last_exit_quote_state": "executable_top_of_book",
@@ -8233,6 +9035,7 @@
         "position_epochs": [
           {
             "average_entry_price": 0.4,
+            "ended_at": "2026-07-22T15:33:11.794039+00:00",
             "entry_cost": 0.4,
             "filled_contracts": 1.0,
             "fixed_stop_loss_bid": 0.05,
@@ -8301,6 +9104,53 @@
               }
             },
             "trailing_activation_bid": 0.46
+          },
+          {
+            "average_entry_price": 0.333333,
+            "entry_cost": 1.0,
+            "filled_contracts": 3.0,
+            "fixed_stop_loss_bid": 0.05,
+            "max_executable_exit_bid": 0.32,
+            "max_executable_gross_per_contract": -0.013333,
+            "max_executable_gross_total": -0.039999,
+            "max_exit_quote": {
+              "displayed_depth": 3842.7,
+              "economic_price": 0.32,
+              "quote_age_seconds": 0.01863,
+              "quote_id": "KXBTC15M-26JUL221145-45:172:2026-07-22T15:33:12.791828+00:00",
+              "received_at": "2026-07-22T15:33:12.791828+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:12.729919Z",
+              "source_timestamp_ms": 1784734392729,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.33,
+              "yes_ask_size": 513.48,
+              "yes_bid": 0.32,
+              "yes_bid_size": 3842.7
+            },
+            "max_recorded_at": "2026-07-22T15:33:12.810492+00:00",
+            "started_at": "2026-07-22T15:33:11.794042+00:00",
+            "target_bids": {
+              "0.01": 0.343333,
+              "0.02": 0.353333,
+              "0.03": 0.363333,
+              "0.04": 0.373333,
+              "0.05": 0.383333,
+              "0.06": 0.393333,
+              "0.07": 0.403333,
+              "0.08": 0.413333,
+              "0.09": 0.423333,
+              "0.10": 0.433333,
+              "0.20": 0.533333,
+              "0.30": 0.633333,
+              "0.40": 0.733333,
+              "0.50": 0.833333,
+              "0.60": 0.933333,
+              "0.70": 1.033333,
+              "0.80": 1.133333
+            },
+            "target_hits": {},
+            "trailing_activation_bid": 0.393333
           }
         ],
         "profit_target_per_contract": 0.01,
@@ -8347,11 +9197,27 @@
             "status": "simulated_resting"
           },
           "0.3000": {
-            "average_fill_price": null,
-            "fill_count": 0.0,
+            "average_fill_price": 0.3,
+            "fill_count": 2.0,
+            "filled_at": "2026-07-22T15:33:11.794025+00:00",
             "quantity": 2.0,
             "rung_price": 0.3,
-            "status": "simulated_resting"
+            "simulation_entry_quote": {
+              "displayed_depth": 635.0,
+              "economic_price": 0.3,
+              "quote_age_seconds": 0.001918,
+              "quote_id": "KXBTC15M-26JUL221145-45:171:2026-07-22T15:33:11.792075+00:00",
+              "received_at": "2026-07-22T15:33:11.792075+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:11.728807Z",
+              "source_timestamp_ms": 1784734391728,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.3,
+              "yes_ask_size": 635.0,
+              "yes_bid": 0.29,
+              "yes_bid_size": 5008.78
+            },
+            "status": "simulated_executable_quote_hit"
           },
           "0.4000": {
             "average_fill_price": 0.4,
@@ -9470,13 +10336,14 @@
         "absolute_stop_price": 0.05,
         "created_at": "2026-07-22T15:30:19.294490+00:00",
         "entry_quote_depth_consumed": {
-          "KXBTC15M-26JUL221145-45:154:2026-07-22T15:32:54.792107+00:00": 1.0
+          "KXBTC15M-26JUL221145-45:154:2026-07-22T15:32:54.792107+00:00": 1.0,
+          "KXBTC15M-26JUL221145-45:171:2026-07-22T15:33:11.792075+00:00": 2.0
         },
         "entry_summary": {
-          "average_entry_price": 0.4,
-          "entry_cost": 0.4,
-          "filled_contracts": 1.0,
-          "take_profit_bid": 0.41
+          "average_entry_price": 0.333333,
+          "entry_cost": 1.0,
+          "filled_contracts": 3.0,
+          "take_profit_bid": 0.343333
         },
         "events": [
           {
@@ -9597,22 +10464,91 @@
             "observed_gross_total": 0.01,
             "target_bid": 0.41,
             "target_per_contract": 0.01
+          },
+          {
+            "at": "2026-07-22T15:33:11.794098+00:00",
+            "entry_quote": {
+              "displayed_depth": 635.0,
+              "economic_price": 0.3,
+              "quote_age_seconds": 0.001986,
+              "quote_id": "KXBTC15M-26JUL221145-45:171:2026-07-22T15:33:11.792075+00:00",
+              "received_at": "2026-07-22T15:33:11.792075+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:11.728807Z",
+              "source_timestamp_ms": 1784734391728,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.3,
+              "yes_ask_size": 635.0,
+              "yes_bid": 0.29,
+              "yes_bid_size": 5008.78
+            },
+            "kind": "paper_scalp_entry_rung_hit",
+            "quantity": 2.0,
+            "rung_price": 0.3
+          },
+          {
+            "at": "2026-07-22T15:33:11.794136+00:00",
+            "average_entry_price": 0.333333,
+            "exit_price": 0.29,
+            "exit_quote": {
+              "displayed_depth": 5008.78,
+              "economic_price": 0.29,
+              "quote_age_seconds": 0.001991,
+              "quote_id": "KXBTC15M-26JUL221145-45:171:2026-07-22T15:33:11.792075+00:00",
+              "received_at": "2026-07-22T15:33:11.792075+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:11.728807Z",
+              "source_timestamp_ms": 1784734391728,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.3,
+              "yes_ask_size": 635.0,
+              "yes_bid": 0.29,
+              "yes_bid_size": 5008.78
+            },
+            "filled_contracts": 3.0,
+            "gross_per_contract": -0.043333,
+            "gross_total": -0.129999,
+            "kind": "paper_scalp_maximum_update"
+          },
+          {
+            "at": "2026-07-22T15:33:12.810535+00:00",
+            "average_entry_price": 0.333333,
+            "exit_price": 0.32,
+            "exit_quote": {
+              "displayed_depth": 3842.7,
+              "economic_price": 0.32,
+              "quote_age_seconds": 0.018674,
+              "quote_id": "KXBTC15M-26JUL221145-45:172:2026-07-22T15:33:12.791828+00:00",
+              "received_at": "2026-07-22T15:33:12.791828+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:12.729919Z",
+              "source_timestamp_ms": 1784734392729,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.33,
+              "yes_ask_size": 513.48,
+              "yes_bid": 0.32,
+              "yes_bid_size": 3842.7
+            },
+            "filled_contracts": 3.0,
+            "gross_per_contract": -0.013333,
+            "gross_total": -0.039999,
+            "kind": "paper_scalp_maximum_update"
           }
         ],
         "fixed_stop_loss_per_contract": null,
         "hold_gain_gate_per_contract": 0.07,
         "last_actual_top_of_book": {
-          "no_ask": 0.6,
-          "no_bid": 0.59,
-          "observed_at": "2026-07-22T15:33:01.792079+00:00",
-          "quote_age_seconds": 0.762134,
-          "quote_id": "KXBTC15M-26JUL221145-45:161:2026-07-22T15:33:01.792079+00:00",
-          "selected_side_executable_ask": 0.41,
-          "selected_side_executable_bid": 0.4,
-          "yes_ask": 0.41,
-          "yes_ask_size": 10913.53,
-          "yes_bid": 0.4,
-          "yes_bid_size": 823.07
+          "no_ask": 0.68,
+          "no_bid": 0.67,
+          "observed_at": "2026-07-22T15:33:12.791828+00:00",
+          "quote_age_seconds": 0.018674,
+          "quote_id": "KXBTC15M-26JUL221145-45:172:2026-07-22T15:33:12.791828+00:00",
+          "selected_side_executable_ask": 0.33,
+          "selected_side_executable_bid": 0.32,
+          "yes_ask": 0.33,
+          "yes_ask_size": 513.48,
+          "yes_bid": 0.32,
+          "yes_bid_size": 3842.7
         },
         "last_entry_quote_state": "executable_top_of_book",
         "last_exit_quote_state": "executable_top_of_book",
@@ -9624,6 +10560,7 @@
         "position_epochs": [
           {
             "average_entry_price": 0.4,
+            "ended_at": "2026-07-22T15:33:11.794113+00:00",
             "entry_cost": 0.4,
             "filled_contracts": 1.0,
             "fixed_stop_loss_bid": 0.05,
@@ -9692,6 +10629,53 @@
               }
             },
             "trailing_activation_bid": 0.47
+          },
+          {
+            "average_entry_price": 0.333333,
+            "entry_cost": 1.0,
+            "filled_contracts": 3.0,
+            "fixed_stop_loss_bid": 0.05,
+            "max_executable_exit_bid": 0.32,
+            "max_executable_gross_per_contract": -0.013333,
+            "max_executable_gross_total": -0.039999,
+            "max_exit_quote": {
+              "displayed_depth": 3842.7,
+              "economic_price": 0.32,
+              "quote_age_seconds": 0.018674,
+              "quote_id": "KXBTC15M-26JUL221145-45:172:2026-07-22T15:33:12.791828+00:00",
+              "received_at": "2026-07-22T15:33:12.791828+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:12.729919Z",
+              "source_timestamp_ms": 1784734392729,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.33,
+              "yes_ask_size": 513.48,
+              "yes_bid": 0.32,
+              "yes_bid_size": 3842.7
+            },
+            "max_recorded_at": "2026-07-22T15:33:12.810535+00:00",
+            "started_at": "2026-07-22T15:33:11.794115+00:00",
+            "target_bids": {
+              "0.01": 0.343333,
+              "0.02": 0.353333,
+              "0.03": 0.363333,
+              "0.04": 0.373333,
+              "0.05": 0.383333,
+              "0.06": 0.393333,
+              "0.07": 0.403333,
+              "0.08": 0.413333,
+              "0.09": 0.423333,
+              "0.10": 0.433333,
+              "0.20": 0.533333,
+              "0.30": 0.633333,
+              "0.40": 0.733333,
+              "0.50": 0.833333,
+              "0.60": 0.933333,
+              "0.70": 1.033333,
+              "0.80": 1.133333
+            },
+            "target_hits": {},
+            "trailing_activation_bid": 0.403333
           }
         ],
         "profit_target_per_contract": 0.01,
@@ -9738,11 +10722,27 @@
             "status": "simulated_resting"
           },
           "0.3000": {
-            "average_fill_price": null,
-            "fill_count": 0.0,
+            "average_fill_price": 0.3,
+            "fill_count": 2.0,
+            "filled_at": "2026-07-22T15:33:11.794094+00:00",
             "quantity": 2.0,
             "rung_price": 0.3,
-            "status": "simulated_resting"
+            "simulation_entry_quote": {
+              "displayed_depth": 635.0,
+              "economic_price": 0.3,
+              "quote_age_seconds": 0.001986,
+              "quote_id": "KXBTC15M-26JUL221145-45:171:2026-07-22T15:33:11.792075+00:00",
+              "received_at": "2026-07-22T15:33:11.792075+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:11.728807Z",
+              "source_timestamp_ms": 1784734391728,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.3,
+              "yes_ask_size": 635.0,
+              "yes_bid": 0.29,
+              "yes_bid_size": 5008.78
+            },
+            "status": "simulated_executable_quote_hit"
           },
           "0.4000": {
             "average_fill_price": 0.4,
@@ -10861,13 +11861,14 @@
         "absolute_stop_price": 0.05,
         "created_at": "2026-07-22T15:30:19.294590+00:00",
         "entry_quote_depth_consumed": {
-          "KXBTC15M-26JUL221145-45:154:2026-07-22T15:32:54.792107+00:00": 1.0
+          "KXBTC15M-26JUL221145-45:154:2026-07-22T15:32:54.792107+00:00": 1.0,
+          "KXBTC15M-26JUL221145-45:171:2026-07-22T15:33:11.792075+00:00": 2.0
         },
         "entry_summary": {
-          "average_entry_price": 0.4,
-          "entry_cost": 0.4,
-          "filled_contracts": 1.0,
-          "take_profit_bid": 0.41
+          "average_entry_price": 0.333333,
+          "entry_cost": 1.0,
+          "filled_contracts": 3.0,
+          "take_profit_bid": 0.343333
         },
         "events": [
           {
@@ -10988,22 +11989,91 @@
             "observed_gross_total": 0.01,
             "target_bid": 0.41,
             "target_per_contract": 0.01
+          },
+          {
+            "at": "2026-07-22T15:33:11.794170+00:00",
+            "entry_quote": {
+              "displayed_depth": 635.0,
+              "economic_price": 0.3,
+              "quote_age_seconds": 0.002061,
+              "quote_id": "KXBTC15M-26JUL221145-45:171:2026-07-22T15:33:11.792075+00:00",
+              "received_at": "2026-07-22T15:33:11.792075+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:11.728807Z",
+              "source_timestamp_ms": 1784734391728,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.3,
+              "yes_ask_size": 635.0,
+              "yes_bid": 0.29,
+              "yes_bid_size": 5008.78
+            },
+            "kind": "paper_scalp_entry_rung_hit",
+            "quantity": 2.0,
+            "rung_price": 0.3
+          },
+          {
+            "at": "2026-07-22T15:33:11.794205+00:00",
+            "average_entry_price": 0.333333,
+            "exit_price": 0.29,
+            "exit_quote": {
+              "displayed_depth": 5008.78,
+              "economic_price": 0.29,
+              "quote_age_seconds": 0.002066,
+              "quote_id": "KXBTC15M-26JUL221145-45:171:2026-07-22T15:33:11.792075+00:00",
+              "received_at": "2026-07-22T15:33:11.792075+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:11.728807Z",
+              "source_timestamp_ms": 1784734391728,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.3,
+              "yes_ask_size": 635.0,
+              "yes_bid": 0.29,
+              "yes_bid_size": 5008.78
+            },
+            "filled_contracts": 3.0,
+            "gross_per_contract": -0.043333,
+            "gross_total": -0.129999,
+            "kind": "paper_scalp_maximum_update"
+          },
+          {
+            "at": "2026-07-22T15:33:12.810578+00:00",
+            "average_entry_price": 0.333333,
+            "exit_price": 0.32,
+            "exit_quote": {
+              "displayed_depth": 3842.7,
+              "economic_price": 0.32,
+              "quote_age_seconds": 0.018716,
+              "quote_id": "KXBTC15M-26JUL221145-45:172:2026-07-22T15:33:12.791828+00:00",
+              "received_at": "2026-07-22T15:33:12.791828+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:12.729919Z",
+              "source_timestamp_ms": 1784734392729,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.33,
+              "yes_ask_size": 513.48,
+              "yes_bid": 0.32,
+              "yes_bid_size": 3842.7
+            },
+            "filled_contracts": 3.0,
+            "gross_per_contract": -0.013333,
+            "gross_total": -0.039999,
+            "kind": "paper_scalp_maximum_update"
           }
         ],
         "fixed_stop_loss_per_contract": null,
         "hold_gain_gate_per_contract": 0.08,
         "last_actual_top_of_book": {
-          "no_ask": 0.6,
-          "no_bid": 0.59,
-          "observed_at": "2026-07-22T15:33:01.792079+00:00",
-          "quote_age_seconds": 0.762168,
-          "quote_id": "KXBTC15M-26JUL221145-45:161:2026-07-22T15:33:01.792079+00:00",
-          "selected_side_executable_ask": 0.41,
-          "selected_side_executable_bid": 0.4,
-          "yes_ask": 0.41,
-          "yes_ask_size": 10913.53,
-          "yes_bid": 0.4,
-          "yes_bid_size": 823.07
+          "no_ask": 0.68,
+          "no_bid": 0.67,
+          "observed_at": "2026-07-22T15:33:12.791828+00:00",
+          "quote_age_seconds": 0.018716,
+          "quote_id": "KXBTC15M-26JUL221145-45:172:2026-07-22T15:33:12.791828+00:00",
+          "selected_side_executable_ask": 0.33,
+          "selected_side_executable_bid": 0.32,
+          "yes_ask": 0.33,
+          "yes_ask_size": 513.48,
+          "yes_bid": 0.32,
+          "yes_bid_size": 3842.7
         },
         "last_entry_quote_state": "executable_top_of_book",
         "last_exit_quote_state": "executable_top_of_book",
@@ -11015,6 +12085,7 @@
         "position_epochs": [
           {
             "average_entry_price": 0.4,
+            "ended_at": "2026-07-22T15:33:11.794181+00:00",
             "entry_cost": 0.4,
             "filled_contracts": 1.0,
             "fixed_stop_loss_bid": 0.05,
@@ -11083,6 +12154,53 @@
               }
             },
             "trailing_activation_bid": 0.48
+          },
+          {
+            "average_entry_price": 0.333333,
+            "entry_cost": 1.0,
+            "filled_contracts": 3.0,
+            "fixed_stop_loss_bid": 0.05,
+            "max_executable_exit_bid": 0.32,
+            "max_executable_gross_per_contract": -0.013333,
+            "max_executable_gross_total": -0.039999,
+            "max_exit_quote": {
+              "displayed_depth": 3842.7,
+              "economic_price": 0.32,
+              "quote_age_seconds": 0.018716,
+              "quote_id": "KXBTC15M-26JUL221145-45:172:2026-07-22T15:33:12.791828+00:00",
+              "received_at": "2026-07-22T15:33:12.791828+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:12.729919Z",
+              "source_timestamp_ms": 1784734392729,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.33,
+              "yes_ask_size": 513.48,
+              "yes_bid": 0.32,
+              "yes_bid_size": 3842.7
+            },
+            "max_recorded_at": "2026-07-22T15:33:12.810578+00:00",
+            "started_at": "2026-07-22T15:33:11.794183+00:00",
+            "target_bids": {
+              "0.01": 0.343333,
+              "0.02": 0.353333,
+              "0.03": 0.363333,
+              "0.04": 0.373333,
+              "0.05": 0.383333,
+              "0.06": 0.393333,
+              "0.07": 0.403333,
+              "0.08": 0.413333,
+              "0.09": 0.423333,
+              "0.10": 0.433333,
+              "0.20": 0.533333,
+              "0.30": 0.633333,
+              "0.40": 0.733333,
+              "0.50": 0.833333,
+              "0.60": 0.933333,
+              "0.70": 1.033333,
+              "0.80": 1.133333
+            },
+            "target_hits": {},
+            "trailing_activation_bid": 0.413333
           }
         ],
         "profit_target_per_contract": 0.01,
@@ -11129,11 +12247,27 @@
             "status": "simulated_resting"
           },
           "0.3000": {
-            "average_fill_price": null,
-            "fill_count": 0.0,
+            "average_fill_price": 0.3,
+            "fill_count": 2.0,
+            "filled_at": "2026-07-22T15:33:11.794167+00:00",
             "quantity": 2.0,
             "rung_price": 0.3,
-            "status": "simulated_resting"
+            "simulation_entry_quote": {
+              "displayed_depth": 635.0,
+              "economic_price": 0.3,
+              "quote_age_seconds": 0.002061,
+              "quote_id": "KXBTC15M-26JUL221145-45:171:2026-07-22T15:33:11.792075+00:00",
+              "received_at": "2026-07-22T15:33:11.792075+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:11.728807Z",
+              "source_timestamp_ms": 1784734391728,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.3,
+              "yes_ask_size": 635.0,
+              "yes_bid": 0.29,
+              "yes_bid_size": 5008.78
+            },
+            "status": "simulated_executable_quote_hit"
           },
           "0.4000": {
             "average_fill_price": 0.4,
@@ -12252,13 +13386,14 @@
         "absolute_stop_price": 0.05,
         "created_at": "2026-07-22T15:30:19.294680+00:00",
         "entry_quote_depth_consumed": {
-          "KXBTC15M-26JUL221145-45:154:2026-07-22T15:32:54.792107+00:00": 1.0
+          "KXBTC15M-26JUL221145-45:154:2026-07-22T15:32:54.792107+00:00": 1.0,
+          "KXBTC15M-26JUL221145-45:171:2026-07-22T15:33:11.792075+00:00": 2.0
         },
         "entry_summary": {
-          "average_entry_price": 0.4,
-          "entry_cost": 0.4,
-          "filled_contracts": 1.0,
-          "take_profit_bid": 0.41
+          "average_entry_price": 0.333333,
+          "entry_cost": 1.0,
+          "filled_contracts": 3.0,
+          "take_profit_bid": 0.343333
         },
         "events": [
           {
@@ -12379,22 +13514,91 @@
             "observed_gross_total": 0.01,
             "target_bid": 0.41,
             "target_per_contract": 0.01
+          },
+          {
+            "at": "2026-07-22T15:33:11.794241+00:00",
+            "entry_quote": {
+              "displayed_depth": 635.0,
+              "economic_price": 0.3,
+              "quote_age_seconds": 0.00213,
+              "quote_id": "KXBTC15M-26JUL221145-45:171:2026-07-22T15:33:11.792075+00:00",
+              "received_at": "2026-07-22T15:33:11.792075+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:11.728807Z",
+              "source_timestamp_ms": 1784734391728,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.3,
+              "yes_ask_size": 635.0,
+              "yes_bid": 0.29,
+              "yes_bid_size": 5008.78
+            },
+            "kind": "paper_scalp_entry_rung_hit",
+            "quantity": 2.0,
+            "rung_price": 0.3
+          },
+          {
+            "at": "2026-07-22T15:33:11.794277+00:00",
+            "average_entry_price": 0.333333,
+            "exit_price": 0.29,
+            "exit_quote": {
+              "displayed_depth": 5008.78,
+              "economic_price": 0.29,
+              "quote_age_seconds": 0.002135,
+              "quote_id": "KXBTC15M-26JUL221145-45:171:2026-07-22T15:33:11.792075+00:00",
+              "received_at": "2026-07-22T15:33:11.792075+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:11.728807Z",
+              "source_timestamp_ms": 1784734391728,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.3,
+              "yes_ask_size": 635.0,
+              "yes_bid": 0.29,
+              "yes_bid_size": 5008.78
+            },
+            "filled_contracts": 3.0,
+            "gross_per_contract": -0.043333,
+            "gross_total": -0.129999,
+            "kind": "paper_scalp_maximum_update"
+          },
+          {
+            "at": "2026-07-22T15:33:12.810620+00:00",
+            "average_entry_price": 0.333333,
+            "exit_price": 0.32,
+            "exit_quote": {
+              "displayed_depth": 3842.7,
+              "economic_price": 0.32,
+              "quote_age_seconds": 0.018759,
+              "quote_id": "KXBTC15M-26JUL221145-45:172:2026-07-22T15:33:12.791828+00:00",
+              "received_at": "2026-07-22T15:33:12.791828+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:12.729919Z",
+              "source_timestamp_ms": 1784734392729,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.33,
+              "yes_ask_size": 513.48,
+              "yes_bid": 0.32,
+              "yes_bid_size": 3842.7
+            },
+            "filled_contracts": 3.0,
+            "gross_per_contract": -0.013333,
+            "gross_total": -0.039999,
+            "kind": "paper_scalp_maximum_update"
           }
         ],
         "fixed_stop_loss_per_contract": null,
         "hold_gain_gate_per_contract": 0.09,
         "last_actual_top_of_book": {
-          "no_ask": 0.6,
-          "no_bid": 0.59,
-          "observed_at": "2026-07-22T15:33:01.792079+00:00",
-          "quote_age_seconds": 0.762202,
-          "quote_id": "KXBTC15M-26JUL221145-45:161:2026-07-22T15:33:01.792079+00:00",
-          "selected_side_executable_ask": 0.41,
-          "selected_side_executable_bid": 0.4,
-          "yes_ask": 0.41,
-          "yes_ask_size": 10913.53,
-          "yes_bid": 0.4,
-          "yes_bid_size": 823.07
+          "no_ask": 0.68,
+          "no_bid": 0.67,
+          "observed_at": "2026-07-22T15:33:12.791828+00:00",
+          "quote_age_seconds": 0.018759,
+          "quote_id": "KXBTC15M-26JUL221145-45:172:2026-07-22T15:33:12.791828+00:00",
+          "selected_side_executable_ask": 0.33,
+          "selected_side_executable_bid": 0.32,
+          "yes_ask": 0.33,
+          "yes_ask_size": 513.48,
+          "yes_bid": 0.32,
+          "yes_bid_size": 3842.7
         },
         "last_entry_quote_state": "executable_top_of_book",
         "last_exit_quote_state": "executable_top_of_book",
@@ -12406,6 +13610,7 @@
         "position_epochs": [
           {
             "average_entry_price": 0.4,
+            "ended_at": "2026-07-22T15:33:11.794252+00:00",
             "entry_cost": 0.4,
             "filled_contracts": 1.0,
             "fixed_stop_loss_bid": 0.05,
@@ -12474,6 +13679,53 @@
               }
             },
             "trailing_activation_bid": 0.49
+          },
+          {
+            "average_entry_price": 0.333333,
+            "entry_cost": 1.0,
+            "filled_contracts": 3.0,
+            "fixed_stop_loss_bid": 0.05,
+            "max_executable_exit_bid": 0.32,
+            "max_executable_gross_per_contract": -0.013333,
+            "max_executable_gross_total": -0.039999,
+            "max_exit_quote": {
+              "displayed_depth": 3842.7,
+              "economic_price": 0.32,
+              "quote_age_seconds": 0.018759,
+              "quote_id": "KXBTC15M-26JUL221145-45:172:2026-07-22T15:33:12.791828+00:00",
+              "received_at": "2026-07-22T15:33:12.791828+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:12.729919Z",
+              "source_timestamp_ms": 1784734392729,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.33,
+              "yes_ask_size": 513.48,
+              "yes_bid": 0.32,
+              "yes_bid_size": 3842.7
+            },
+            "max_recorded_at": "2026-07-22T15:33:12.810620+00:00",
+            "started_at": "2026-07-22T15:33:11.794254+00:00",
+            "target_bids": {
+              "0.01": 0.343333,
+              "0.02": 0.353333,
+              "0.03": 0.363333,
+              "0.04": 0.373333,
+              "0.05": 0.383333,
+              "0.06": 0.393333,
+              "0.07": 0.403333,
+              "0.08": 0.413333,
+              "0.09": 0.423333,
+              "0.10": 0.433333,
+              "0.20": 0.533333,
+              "0.30": 0.633333,
+              "0.40": 0.733333,
+              "0.50": 0.833333,
+              "0.60": 0.933333,
+              "0.70": 1.033333,
+              "0.80": 1.133333
+            },
+            "target_hits": {},
+            "trailing_activation_bid": 0.423333
           }
         ],
         "profit_target_per_contract": 0.01,
@@ -12520,11 +13772,27 @@
             "status": "simulated_resting"
           },
           "0.3000": {
-            "average_fill_price": null,
-            "fill_count": 0.0,
+            "average_fill_price": 0.3,
+            "fill_count": 2.0,
+            "filled_at": "2026-07-22T15:33:11.794238+00:00",
             "quantity": 2.0,
             "rung_price": 0.3,
-            "status": "simulated_resting"
+            "simulation_entry_quote": {
+              "displayed_depth": 635.0,
+              "economic_price": 0.3,
+              "quote_age_seconds": 0.00213,
+              "quote_id": "KXBTC15M-26JUL221145-45:171:2026-07-22T15:33:11.792075+00:00",
+              "received_at": "2026-07-22T15:33:11.792075+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:11.728807Z",
+              "source_timestamp_ms": 1784734391728,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.3,
+              "yes_ask_size": 635.0,
+              "yes_bid": 0.29,
+              "yes_bid_size": 5008.78
+            },
+            "status": "simulated_executable_quote_hit"
           },
           "0.4000": {
             "average_fill_price": 0.4,
@@ -13643,13 +14911,14 @@
         "absolute_stop_price": 0.05,
         "created_at": "2026-07-22T15:30:19.294760+00:00",
         "entry_quote_depth_consumed": {
-          "KXBTC15M-26JUL221145-45:154:2026-07-22T15:32:54.792107+00:00": 1.0
+          "KXBTC15M-26JUL221145-45:154:2026-07-22T15:32:54.792107+00:00": 1.0,
+          "KXBTC15M-26JUL221145-45:171:2026-07-22T15:33:11.792075+00:00": 2.0
         },
         "entry_summary": {
-          "average_entry_price": 0.4,
-          "entry_cost": 0.4,
-          "filled_contracts": 1.0,
-          "take_profit_bid": 0.41
+          "average_entry_price": 0.333333,
+          "entry_cost": 1.0,
+          "filled_contracts": 3.0,
+          "take_profit_bid": 0.343333
         },
         "events": [
           {
@@ -13770,22 +15039,91 @@
             "observed_gross_total": 0.01,
             "target_bid": 0.41,
             "target_per_contract": 0.01
+          },
+          {
+            "at": "2026-07-22T15:33:11.794313+00:00",
+            "entry_quote": {
+              "displayed_depth": 635.0,
+              "economic_price": 0.3,
+              "quote_age_seconds": 0.002201,
+              "quote_id": "KXBTC15M-26JUL221145-45:171:2026-07-22T15:33:11.792075+00:00",
+              "received_at": "2026-07-22T15:33:11.792075+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:11.728807Z",
+              "source_timestamp_ms": 1784734391728,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.3,
+              "yes_ask_size": 635.0,
+              "yes_bid": 0.29,
+              "yes_bid_size": 5008.78
+            },
+            "kind": "paper_scalp_entry_rung_hit",
+            "quantity": 2.0,
+            "rung_price": 0.3
+          },
+          {
+            "at": "2026-07-22T15:33:11.794349+00:00",
+            "average_entry_price": 0.333333,
+            "exit_price": 0.29,
+            "exit_quote": {
+              "displayed_depth": 5008.78,
+              "economic_price": 0.29,
+              "quote_age_seconds": 0.002207,
+              "quote_id": "KXBTC15M-26JUL221145-45:171:2026-07-22T15:33:11.792075+00:00",
+              "received_at": "2026-07-22T15:33:11.792075+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:11.728807Z",
+              "source_timestamp_ms": 1784734391728,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.3,
+              "yes_ask_size": 635.0,
+              "yes_bid": 0.29,
+              "yes_bid_size": 5008.78
+            },
+            "filled_contracts": 3.0,
+            "gross_per_contract": -0.043333,
+            "gross_total": -0.129999,
+            "kind": "paper_scalp_maximum_update"
+          },
+          {
+            "at": "2026-07-22T15:33:12.810662+00:00",
+            "average_entry_price": 0.333333,
+            "exit_price": 0.32,
+            "exit_quote": {
+              "displayed_depth": 3842.7,
+              "economic_price": 0.32,
+              "quote_age_seconds": 0.0188,
+              "quote_id": "KXBTC15M-26JUL221145-45:172:2026-07-22T15:33:12.791828+00:00",
+              "received_at": "2026-07-22T15:33:12.791828+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:12.729919Z",
+              "source_timestamp_ms": 1784734392729,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.33,
+              "yes_ask_size": 513.48,
+              "yes_bid": 0.32,
+              "yes_bid_size": 3842.7
+            },
+            "filled_contracts": 3.0,
+            "gross_per_contract": -0.013333,
+            "gross_total": -0.039999,
+            "kind": "paper_scalp_maximum_update"
           }
         ],
         "fixed_stop_loss_per_contract": null,
         "hold_gain_gate_per_contract": 0.1,
         "last_actual_top_of_book": {
-          "no_ask": 0.6,
-          "no_bid": 0.59,
-          "observed_at": "2026-07-22T15:33:01.792079+00:00",
-          "quote_age_seconds": 0.762234,
-          "quote_id": "KXBTC15M-26JUL221145-45:161:2026-07-22T15:33:01.792079+00:00",
-          "selected_side_executable_ask": 0.41,
-          "selected_side_executable_bid": 0.4,
-          "yes_ask": 0.41,
-          "yes_ask_size": 10913.53,
-          "yes_bid": 0.4,
-          "yes_bid_size": 823.07
+          "no_ask": 0.68,
+          "no_bid": 0.67,
+          "observed_at": "2026-07-22T15:33:12.791828+00:00",
+          "quote_age_seconds": 0.0188,
+          "quote_id": "KXBTC15M-26JUL221145-45:172:2026-07-22T15:33:12.791828+00:00",
+          "selected_side_executable_ask": 0.33,
+          "selected_side_executable_bid": 0.32,
+          "yes_ask": 0.33,
+          "yes_ask_size": 513.48,
+          "yes_bid": 0.32,
+          "yes_bid_size": 3842.7
         },
         "last_entry_quote_state": "executable_top_of_book",
         "last_exit_quote_state": "executable_top_of_book",
@@ -13797,6 +15135,7 @@
         "position_epochs": [
           {
             "average_entry_price": 0.4,
+            "ended_at": "2026-07-22T15:33:11.794325+00:00",
             "entry_cost": 0.4,
             "filled_contracts": 1.0,
             "fixed_stop_loss_bid": 0.05,
@@ -13865,6 +15204,53 @@
               }
             },
             "trailing_activation_bid": 0.5
+          },
+          {
+            "average_entry_price": 0.333333,
+            "entry_cost": 1.0,
+            "filled_contracts": 3.0,
+            "fixed_stop_loss_bid": 0.05,
+            "max_executable_exit_bid": 0.32,
+            "max_executable_gross_per_contract": -0.013333,
+            "max_executable_gross_total": -0.039999,
+            "max_exit_quote": {
+              "displayed_depth": 3842.7,
+              "economic_price": 0.32,
+              "quote_age_seconds": 0.0188,
+              "quote_id": "KXBTC15M-26JUL221145-45:172:2026-07-22T15:33:12.791828+00:00",
+              "received_at": "2026-07-22T15:33:12.791828+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:12.729919Z",
+              "source_timestamp_ms": 1784734392729,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.33,
+              "yes_ask_size": 513.48,
+              "yes_bid": 0.32,
+              "yes_bid_size": 3842.7
+            },
+            "max_recorded_at": "2026-07-22T15:33:12.810662+00:00",
+            "started_at": "2026-07-22T15:33:11.794327+00:00",
+            "target_bids": {
+              "0.01": 0.343333,
+              "0.02": 0.353333,
+              "0.03": 0.363333,
+              "0.04": 0.373333,
+              "0.05": 0.383333,
+              "0.06": 0.393333,
+              "0.07": 0.403333,
+              "0.08": 0.413333,
+              "0.09": 0.423333,
+              "0.10": 0.433333,
+              "0.20": 0.533333,
+              "0.30": 0.633333,
+              "0.40": 0.733333,
+              "0.50": 0.833333,
+              "0.60": 0.933333,
+              "0.70": 1.033333,
+              "0.80": 1.133333
+            },
+            "target_hits": {},
+            "trailing_activation_bid": 0.433333
           }
         ],
         "profit_target_per_contract": 0.01,
@@ -13911,11 +15297,27 @@
             "status": "simulated_resting"
           },
           "0.3000": {
-            "average_fill_price": null,
-            "fill_count": 0.0,
+            "average_fill_price": 0.3,
+            "fill_count": 2.0,
+            "filled_at": "2026-07-22T15:33:11.794310+00:00",
             "quantity": 2.0,
             "rung_price": 0.3,
-            "status": "simulated_resting"
+            "simulation_entry_quote": {
+              "displayed_depth": 635.0,
+              "economic_price": 0.3,
+              "quote_age_seconds": 0.002201,
+              "quote_id": "KXBTC15M-26JUL221145-45:171:2026-07-22T15:33:11.792075+00:00",
+              "received_at": "2026-07-22T15:33:11.792075+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:11.728807Z",
+              "source_timestamp_ms": 1784734391728,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.3,
+              "yes_ask_size": 635.0,
+              "yes_bid": 0.29,
+              "yes_bid_size": 5008.78
+            },
+            "status": "simulated_executable_quote_hit"
           },
           "0.4000": {
             "average_fill_price": 0.4,
@@ -15227,13 +16629,14 @@
         "absolute_stop_price": 0.05,
         "created_at": "2026-07-22T15:30:19.294837+00:00",
         "entry_quote_depth_consumed": {
-          "KXBTC15M-26JUL221145-45:154:2026-07-22T15:32:54.792107+00:00": 1.0
+          "KXBTC15M-26JUL221145-45:154:2026-07-22T15:32:54.792107+00:00": 1.0,
+          "KXBTC15M-26JUL221145-45:171:2026-07-22T15:33:11.792075+00:00": 2.0
         },
         "entry_summary": {
-          "average_entry_price": 0.4,
-          "entry_cost": 0.4,
-          "filled_contracts": 1.0,
-          "take_profit_bid": 0.41
+          "average_entry_price": 0.333333,
+          "entry_cost": 1.0,
+          "filled_contracts": 3.0,
+          "take_profit_bid": 0.343333
         },
         "events": [
           {
@@ -15354,22 +16757,91 @@
             "observed_gross_total": 0.01,
             "target_bid": 0.41,
             "target_per_contract": 0.01
+          },
+          {
+            "at": "2026-07-22T15:33:11.794384+00:00",
+            "entry_quote": {
+              "displayed_depth": 635.0,
+              "economic_price": 0.3,
+              "quote_age_seconds": 0.002273,
+              "quote_id": "KXBTC15M-26JUL221145-45:171:2026-07-22T15:33:11.792075+00:00",
+              "received_at": "2026-07-22T15:33:11.792075+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:11.728807Z",
+              "source_timestamp_ms": 1784734391728,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.3,
+              "yes_ask_size": 635.0,
+              "yes_bid": 0.29,
+              "yes_bid_size": 5008.78
+            },
+            "kind": "paper_scalp_entry_rung_hit",
+            "quantity": 2.0,
+            "rung_price": 0.3
+          },
+          {
+            "at": "2026-07-22T15:33:11.794420+00:00",
+            "average_entry_price": 0.333333,
+            "exit_price": 0.29,
+            "exit_quote": {
+              "displayed_depth": 5008.78,
+              "economic_price": 0.29,
+              "quote_age_seconds": 0.002278,
+              "quote_id": "KXBTC15M-26JUL221145-45:171:2026-07-22T15:33:11.792075+00:00",
+              "received_at": "2026-07-22T15:33:11.792075+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:11.728807Z",
+              "source_timestamp_ms": 1784734391728,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.3,
+              "yes_ask_size": 635.0,
+              "yes_bid": 0.29,
+              "yes_bid_size": 5008.78
+            },
+            "filled_contracts": 3.0,
+            "gross_per_contract": -0.043333,
+            "gross_total": -0.129999,
+            "kind": "paper_scalp_maximum_update"
+          },
+          {
+            "at": "2026-07-22T15:33:12.810704+00:00",
+            "average_entry_price": 0.333333,
+            "exit_price": 0.32,
+            "exit_quote": {
+              "displayed_depth": 3842.7,
+              "economic_price": 0.32,
+              "quote_age_seconds": 0.018842,
+              "quote_id": "KXBTC15M-26JUL221145-45:172:2026-07-22T15:33:12.791828+00:00",
+              "received_at": "2026-07-22T15:33:12.791828+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:12.729919Z",
+              "source_timestamp_ms": 1784734392729,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.33,
+              "yes_ask_size": 513.48,
+              "yes_bid": 0.32,
+              "yes_bid_size": 3842.7
+            },
+            "filled_contracts": 3.0,
+            "gross_per_contract": -0.013333,
+            "gross_total": -0.039999,
+            "kind": "paper_scalp_maximum_update"
           }
         ],
         "fixed_stop_loss_per_contract": null,
         "hold_gain_gate_per_contract": 0.2,
         "last_actual_top_of_book": {
-          "no_ask": 0.6,
-          "no_bid": 0.59,
-          "observed_at": "2026-07-22T15:33:01.792079+00:00",
-          "quote_age_seconds": 0.762268,
-          "quote_id": "KXBTC15M-26JUL221145-45:161:2026-07-22T15:33:01.792079+00:00",
-          "selected_side_executable_ask": 0.41,
-          "selected_side_executable_bid": 0.4,
-          "yes_ask": 0.41,
-          "yes_ask_size": 10913.53,
-          "yes_bid": 0.4,
-          "yes_bid_size": 823.07
+          "no_ask": 0.68,
+          "no_bid": 0.67,
+          "observed_at": "2026-07-22T15:33:12.791828+00:00",
+          "quote_age_seconds": 0.018842,
+          "quote_id": "KXBTC15M-26JUL221145-45:172:2026-07-22T15:33:12.791828+00:00",
+          "selected_side_executable_ask": 0.33,
+          "selected_side_executable_bid": 0.32,
+          "yes_ask": 0.33,
+          "yes_ask_size": 513.48,
+          "yes_bid": 0.32,
+          "yes_bid_size": 3842.7
         },
         "last_entry_quote_state": "executable_top_of_book",
         "last_exit_quote_state": "executable_top_of_book",
@@ -15381,6 +16853,7 @@
         "position_epochs": [
           {
             "average_entry_price": 0.4,
+            "ended_at": "2026-07-22T15:33:11.794396+00:00",
             "entry_cost": 0.4,
             "filled_contracts": 1.0,
             "fixed_stop_loss_bid": 0.05,
@@ -15449,6 +16922,53 @@
               }
             },
             "trailing_activation_bid": 0.6
+          },
+          {
+            "average_entry_price": 0.333333,
+            "entry_cost": 1.0,
+            "filled_contracts": 3.0,
+            "fixed_stop_loss_bid": 0.05,
+            "max_executable_exit_bid": 0.32,
+            "max_executable_gross_per_contract": -0.013333,
+            "max_executable_gross_total": -0.039999,
+            "max_exit_quote": {
+              "displayed_depth": 3842.7,
+              "economic_price": 0.32,
+              "quote_age_seconds": 0.018842,
+              "quote_id": "KXBTC15M-26JUL221145-45:172:2026-07-22T15:33:12.791828+00:00",
+              "received_at": "2026-07-22T15:33:12.791828+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:12.729919Z",
+              "source_timestamp_ms": 1784734392729,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.33,
+              "yes_ask_size": 513.48,
+              "yes_bid": 0.32,
+              "yes_bid_size": 3842.7
+            },
+            "max_recorded_at": "2026-07-22T15:33:12.810704+00:00",
+            "started_at": "2026-07-22T15:33:11.794398+00:00",
+            "target_bids": {
+              "0.01": 0.343333,
+              "0.02": 0.353333,
+              "0.03": 0.363333,
+              "0.04": 0.373333,
+              "0.05": 0.383333,
+              "0.06": 0.393333,
+              "0.07": 0.403333,
+              "0.08": 0.413333,
+              "0.09": 0.423333,
+              "0.10": 0.433333,
+              "0.20": 0.533333,
+              "0.30": 0.633333,
+              "0.40": 0.733333,
+              "0.50": 0.833333,
+              "0.60": 0.933333,
+              "0.70": 1.033333,
+              "0.80": 1.133333
+            },
+            "target_hits": {},
+            "trailing_activation_bid": 0.533333
           }
         ],
         "profit_target_per_contract": 0.01,
@@ -15495,11 +17015,27 @@
             "status": "simulated_resting"
           },
           "0.3000": {
-            "average_fill_price": null,
-            "fill_count": 0.0,
+            "average_fill_price": 0.3,
+            "fill_count": 2.0,
+            "filled_at": "2026-07-22T15:33:11.794381+00:00",
             "quantity": 2.0,
             "rung_price": 0.3,
-            "status": "simulated_resting"
+            "simulation_entry_quote": {
+              "displayed_depth": 635.0,
+              "economic_price": 0.3,
+              "quote_age_seconds": 0.002273,
+              "quote_id": "KXBTC15M-26JUL221145-45:171:2026-07-22T15:33:11.792075+00:00",
+              "received_at": "2026-07-22T15:33:11.792075+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:11.728807Z",
+              "source_timestamp_ms": 1784734391728,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.3,
+              "yes_ask_size": 635.0,
+              "yes_bid": 0.29,
+              "yes_bid_size": 5008.78
+            },
+            "status": "simulated_executable_quote_hit"
           },
           "0.4000": {
             "average_fill_price": 0.4,
@@ -17245,13 +18781,14 @@
         "absolute_stop_price": 0.05,
         "created_at": "2026-07-22T15:30:19.294915+00:00",
         "entry_quote_depth_consumed": {
-          "KXBTC15M-26JUL221145-45:154:2026-07-22T15:32:54.792107+00:00": 1.0
+          "KXBTC15M-26JUL221145-45:154:2026-07-22T15:32:54.792107+00:00": 1.0,
+          "KXBTC15M-26JUL221145-45:171:2026-07-22T15:33:11.792075+00:00": 2.0
         },
         "entry_summary": {
-          "average_entry_price": 0.4,
-          "entry_cost": 0.4,
-          "filled_contracts": 1.0,
-          "take_profit_bid": 0.41
+          "average_entry_price": 0.333333,
+          "entry_cost": 1.0,
+          "filled_contracts": 3.0,
+          "take_profit_bid": 0.343333
         },
         "events": [
           {
@@ -17372,22 +18909,91 @@
             "observed_gross_total": 0.01,
             "target_bid": 0.41,
             "target_per_contract": 0.01
+          },
+          {
+            "at": "2026-07-22T15:33:11.794469+00:00",
+            "entry_quote": {
+              "displayed_depth": 635.0,
+              "economic_price": 0.3,
+              "quote_age_seconds": 0.002357,
+              "quote_id": "KXBTC15M-26JUL221145-45:171:2026-07-22T15:33:11.792075+00:00",
+              "received_at": "2026-07-22T15:33:11.792075+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:11.728807Z",
+              "source_timestamp_ms": 1784734391728,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.3,
+              "yes_ask_size": 635.0,
+              "yes_bid": 0.29,
+              "yes_bid_size": 5008.78
+            },
+            "kind": "paper_scalp_entry_rung_hit",
+            "quantity": 2.0,
+            "rung_price": 0.3
+          },
+          {
+            "at": "2026-07-22T15:33:11.794505+00:00",
+            "average_entry_price": 0.333333,
+            "exit_price": 0.29,
+            "exit_quote": {
+              "displayed_depth": 5008.78,
+              "economic_price": 0.29,
+              "quote_age_seconds": 0.002363,
+              "quote_id": "KXBTC15M-26JUL221145-45:171:2026-07-22T15:33:11.792075+00:00",
+              "received_at": "2026-07-22T15:33:11.792075+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:11.728807Z",
+              "source_timestamp_ms": 1784734391728,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.3,
+              "yes_ask_size": 635.0,
+              "yes_bid": 0.29,
+              "yes_bid_size": 5008.78
+            },
+            "filled_contracts": 3.0,
+            "gross_per_contract": -0.043333,
+            "gross_total": -0.129999,
+            "kind": "paper_scalp_maximum_update"
+          },
+          {
+            "at": "2026-07-22T15:33:12.810744+00:00",
+            "average_entry_price": 0.333333,
+            "exit_price": 0.32,
+            "exit_quote": {
+              "displayed_depth": 3842.7,
+              "economic_price": 0.32,
+              "quote_age_seconds": 0.018883,
+              "quote_id": "KXBTC15M-26JUL221145-45:172:2026-07-22T15:33:12.791828+00:00",
+              "received_at": "2026-07-22T15:33:12.791828+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:12.729919Z",
+              "source_timestamp_ms": 1784734392729,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.33,
+              "yes_ask_size": 513.48,
+              "yes_bid": 0.32,
+              "yes_bid_size": 3842.7
+            },
+            "filled_contracts": 3.0,
+            "gross_per_contract": -0.013333,
+            "gross_total": -0.039999,
+            "kind": "paper_scalp_maximum_update"
           }
         ],
         "fixed_stop_loss_per_contract": null,
         "hold_gain_gate_per_contract": 0.3,
         "last_actual_top_of_book": {
-          "no_ask": 0.6,
-          "no_bid": 0.59,
-          "observed_at": "2026-07-22T15:33:01.792079+00:00",
-          "quote_age_seconds": 0.762302,
-          "quote_id": "KXBTC15M-26JUL221145-45:161:2026-07-22T15:33:01.792079+00:00",
-          "selected_side_executable_ask": 0.41,
-          "selected_side_executable_bid": 0.4,
-          "yes_ask": 0.41,
-          "yes_ask_size": 10913.53,
-          "yes_bid": 0.4,
-          "yes_bid_size": 823.07
+          "no_ask": 0.68,
+          "no_bid": 0.67,
+          "observed_at": "2026-07-22T15:33:12.791828+00:00",
+          "quote_age_seconds": 0.018883,
+          "quote_id": "KXBTC15M-26JUL221145-45:172:2026-07-22T15:33:12.791828+00:00",
+          "selected_side_executable_ask": 0.33,
+          "selected_side_executable_bid": 0.32,
+          "yes_ask": 0.33,
+          "yes_ask_size": 513.48,
+          "yes_bid": 0.32,
+          "yes_bid_size": 3842.7
         },
         "last_entry_quote_state": "executable_top_of_book",
         "last_exit_quote_state": "executable_top_of_book",
@@ -17399,6 +19005,7 @@
         "position_epochs": [
           {
             "average_entry_price": 0.4,
+            "ended_at": "2026-07-22T15:33:11.794480+00:00",
             "entry_cost": 0.4,
             "filled_contracts": 1.0,
             "fixed_stop_loss_bid": 0.05,
@@ -17467,6 +19074,53 @@
               }
             },
             "trailing_activation_bid": 0.7
+          },
+          {
+            "average_entry_price": 0.333333,
+            "entry_cost": 1.0,
+            "filled_contracts": 3.0,
+            "fixed_stop_loss_bid": 0.05,
+            "max_executable_exit_bid": 0.32,
+            "max_executable_gross_per_contract": -0.013333,
+            "max_executable_gross_total": -0.039999,
+            "max_exit_quote": {
+              "displayed_depth": 3842.7,
+              "economic_price": 0.32,
+              "quote_age_seconds": 0.018883,
+              "quote_id": "KXBTC15M-26JUL221145-45:172:2026-07-22T15:33:12.791828+00:00",
+              "received_at": "2026-07-22T15:33:12.791828+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:12.729919Z",
+              "source_timestamp_ms": 1784734392729,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.33,
+              "yes_ask_size": 513.48,
+              "yes_bid": 0.32,
+              "yes_bid_size": 3842.7
+            },
+            "max_recorded_at": "2026-07-22T15:33:12.810744+00:00",
+            "started_at": "2026-07-22T15:33:11.794483+00:00",
+            "target_bids": {
+              "0.01": 0.343333,
+              "0.02": 0.353333,
+              "0.03": 0.363333,
+              "0.04": 0.373333,
+              "0.05": 0.383333,
+              "0.06": 0.393333,
+              "0.07": 0.403333,
+              "0.08": 0.413333,
+              "0.09": 0.423333,
+              "0.10": 0.433333,
+              "0.20": 0.533333,
+              "0.30": 0.633333,
+              "0.40": 0.733333,
+              "0.50": 0.833333,
+              "0.60": 0.933333,
+              "0.70": 1.033333,
+              "0.80": 1.133333
+            },
+            "target_hits": {},
+            "trailing_activation_bid": 0.633333
           }
         ],
         "profit_target_per_contract": 0.01,
@@ -17513,11 +19167,27 @@
             "status": "simulated_resting"
           },
           "0.3000": {
-            "average_fill_price": null,
-            "fill_count": 0.0,
+            "average_fill_price": 0.3,
+            "fill_count": 2.0,
+            "filled_at": "2026-07-22T15:33:11.794466+00:00",
             "quantity": 2.0,
             "rung_price": 0.3,
-            "status": "simulated_resting"
+            "simulation_entry_quote": {
+              "displayed_depth": 635.0,
+              "economic_price": 0.3,
+              "quote_age_seconds": 0.002357,
+              "quote_id": "KXBTC15M-26JUL221145-45:171:2026-07-22T15:33:11.792075+00:00",
+              "received_at": "2026-07-22T15:33:11.792075+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:11.728807Z",
+              "source_timestamp_ms": 1784734391728,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.3,
+              "yes_ask_size": 635.0,
+              "yes_bid": 0.29,
+              "yes_bid_size": 5008.78
+            },
+            "status": "simulated_executable_quote_hit"
           },
           "0.4000": {
             "average_fill_price": 0.4,
@@ -19263,13 +20933,14 @@
         "absolute_stop_price": 0.05,
         "created_at": "2026-07-22T15:30:19.294992+00:00",
         "entry_quote_depth_consumed": {
-          "KXBTC15M-26JUL221145-45:154:2026-07-22T15:32:54.792107+00:00": 1.0
+          "KXBTC15M-26JUL221145-45:154:2026-07-22T15:32:54.792107+00:00": 1.0,
+          "KXBTC15M-26JUL221145-45:171:2026-07-22T15:33:11.792075+00:00": 2.0
         },
         "entry_summary": {
-          "average_entry_price": 0.4,
-          "entry_cost": 0.4,
-          "filled_contracts": 1.0,
-          "take_profit_bid": 0.41
+          "average_entry_price": 0.333333,
+          "entry_cost": 1.0,
+          "filled_contracts": 3.0,
+          "take_profit_bid": 0.343333
         },
         "events": [
           {
@@ -19390,22 +21061,91 @@
             "observed_gross_total": 0.01,
             "target_bid": 0.41,
             "target_per_contract": 0.01
+          },
+          {
+            "at": "2026-07-22T15:33:11.794542+00:00",
+            "entry_quote": {
+              "displayed_depth": 635.0,
+              "economic_price": 0.3,
+              "quote_age_seconds": 0.00243,
+              "quote_id": "KXBTC15M-26JUL221145-45:171:2026-07-22T15:33:11.792075+00:00",
+              "received_at": "2026-07-22T15:33:11.792075+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:11.728807Z",
+              "source_timestamp_ms": 1784734391728,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.3,
+              "yes_ask_size": 635.0,
+              "yes_bid": 0.29,
+              "yes_bid_size": 5008.78
+            },
+            "kind": "paper_scalp_entry_rung_hit",
+            "quantity": 2.0,
+            "rung_price": 0.3
+          },
+          {
+            "at": "2026-07-22T15:33:11.794579+00:00",
+            "average_entry_price": 0.333333,
+            "exit_price": 0.29,
+            "exit_quote": {
+              "displayed_depth": 5008.78,
+              "economic_price": 0.29,
+              "quote_age_seconds": 0.002435,
+              "quote_id": "KXBTC15M-26JUL221145-45:171:2026-07-22T15:33:11.792075+00:00",
+              "received_at": "2026-07-22T15:33:11.792075+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:11.728807Z",
+              "source_timestamp_ms": 1784734391728,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.3,
+              "yes_ask_size": 635.0,
+              "yes_bid": 0.29,
+              "yes_bid_size": 5008.78
+            },
+            "filled_contracts": 3.0,
+            "gross_per_contract": -0.043333,
+            "gross_total": -0.129999,
+            "kind": "paper_scalp_maximum_update"
+          },
+          {
+            "at": "2026-07-22T15:33:12.810786+00:00",
+            "average_entry_price": 0.333333,
+            "exit_price": 0.32,
+            "exit_quote": {
+              "displayed_depth": 3842.7,
+              "economic_price": 0.32,
+              "quote_age_seconds": 0.018923,
+              "quote_id": "KXBTC15M-26JUL221145-45:172:2026-07-22T15:33:12.791828+00:00",
+              "received_at": "2026-07-22T15:33:12.791828+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:12.729919Z",
+              "source_timestamp_ms": 1784734392729,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.33,
+              "yes_ask_size": 513.48,
+              "yes_bid": 0.32,
+              "yes_bid_size": 3842.7
+            },
+            "filled_contracts": 3.0,
+            "gross_per_contract": -0.013333,
+            "gross_total": -0.039999,
+            "kind": "paper_scalp_maximum_update"
           }
         ],
         "fixed_stop_loss_per_contract": null,
         "hold_gain_gate_per_contract": 0.4,
         "last_actual_top_of_book": {
-          "no_ask": 0.6,
-          "no_bid": 0.59,
-          "observed_at": "2026-07-22T15:33:01.792079+00:00",
-          "quote_age_seconds": 0.762346,
-          "quote_id": "KXBTC15M-26JUL221145-45:161:2026-07-22T15:33:01.792079+00:00",
-          "selected_side_executable_ask": 0.41,
-          "selected_side_executable_bid": 0.4,
-          "yes_ask": 0.41,
-          "yes_ask_size": 10913.53,
-          "yes_bid": 0.4,
-          "yes_bid_size": 823.07
+          "no_ask": 0.68,
+          "no_bid": 0.67,
+          "observed_at": "2026-07-22T15:33:12.791828+00:00",
+          "quote_age_seconds": 0.018923,
+          "quote_id": "KXBTC15M-26JUL221145-45:172:2026-07-22T15:33:12.791828+00:00",
+          "selected_side_executable_ask": 0.33,
+          "selected_side_executable_bid": 0.32,
+          "yes_ask": 0.33,
+          "yes_ask_size": 513.48,
+          "yes_bid": 0.32,
+          "yes_bid_size": 3842.7
         },
         "last_entry_quote_state": "executable_top_of_book",
         "last_exit_quote_state": "executable_top_of_book",
@@ -19417,6 +21157,7 @@
         "position_epochs": [
           {
             "average_entry_price": 0.4,
+            "ended_at": "2026-07-22T15:33:11.794553+00:00",
             "entry_cost": 0.4,
             "filled_contracts": 1.0,
             "fixed_stop_loss_bid": 0.05,
@@ -19485,6 +21226,53 @@
               }
             },
             "trailing_activation_bid": 0.8
+          },
+          {
+            "average_entry_price": 0.333333,
+            "entry_cost": 1.0,
+            "filled_contracts": 3.0,
+            "fixed_stop_loss_bid": 0.05,
+            "max_executable_exit_bid": 0.32,
+            "max_executable_gross_per_contract": -0.013333,
+            "max_executable_gross_total": -0.039999,
+            "max_exit_quote": {
+              "displayed_depth": 3842.7,
+              "economic_price": 0.32,
+              "quote_age_seconds": 0.018923,
+              "quote_id": "KXBTC15M-26JUL221145-45:172:2026-07-22T15:33:12.791828+00:00",
+              "received_at": "2026-07-22T15:33:12.791828+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:12.729919Z",
+              "source_timestamp_ms": 1784734392729,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.33,
+              "yes_ask_size": 513.48,
+              "yes_bid": 0.32,
+              "yes_bid_size": 3842.7
+            },
+            "max_recorded_at": "2026-07-22T15:33:12.810786+00:00",
+            "started_at": "2026-07-22T15:33:11.794556+00:00",
+            "target_bids": {
+              "0.01": 0.343333,
+              "0.02": 0.353333,
+              "0.03": 0.363333,
+              "0.04": 0.373333,
+              "0.05": 0.383333,
+              "0.06": 0.393333,
+              "0.07": 0.403333,
+              "0.08": 0.413333,
+              "0.09": 0.423333,
+              "0.10": 0.433333,
+              "0.20": 0.533333,
+              "0.30": 0.633333,
+              "0.40": 0.733333,
+              "0.50": 0.833333,
+              "0.60": 0.933333,
+              "0.70": 1.033333,
+              "0.80": 1.133333
+            },
+            "target_hits": {},
+            "trailing_activation_bid": 0.733333
           }
         ],
         "profit_target_per_contract": 0.01,
@@ -19531,11 +21319,27 @@
             "status": "simulated_resting"
           },
           "0.3000": {
-            "average_fill_price": null,
-            "fill_count": 0.0,
+            "average_fill_price": 0.3,
+            "fill_count": 2.0,
+            "filled_at": "2026-07-22T15:33:11.794539+00:00",
             "quantity": 2.0,
             "rung_price": 0.3,
-            "status": "simulated_resting"
+            "simulation_entry_quote": {
+              "displayed_depth": 635.0,
+              "economic_price": 0.3,
+              "quote_age_seconds": 0.00243,
+              "quote_id": "KXBTC15M-26JUL221145-45:171:2026-07-22T15:33:11.792075+00:00",
+              "received_at": "2026-07-22T15:33:11.792075+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:11.728807Z",
+              "source_timestamp_ms": 1784734391728,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.3,
+              "yes_ask_size": 635.0,
+              "yes_bid": 0.29,
+              "yes_bid_size": 5008.78
+            },
+            "status": "simulated_executable_quote_hit"
           },
           "0.4000": {
             "average_fill_price": 0.4,
@@ -21775,13 +23579,14 @@
         "absolute_stop_price": 0.05,
         "created_at": "2026-07-22T15:30:19.295069+00:00",
         "entry_quote_depth_consumed": {
-          "KXBTC15M-26JUL221145-45:154:2026-07-22T15:32:54.792107+00:00": 1.0
+          "KXBTC15M-26JUL221145-45:154:2026-07-22T15:32:54.792107+00:00": 1.0,
+          "KXBTC15M-26JUL221145-45:171:2026-07-22T15:33:11.792075+00:00": 2.0
         },
         "entry_summary": {
-          "average_entry_price": 0.4,
-          "entry_cost": 0.4,
-          "filled_contracts": 1.0,
-          "take_profit_bid": 0.41
+          "average_entry_price": 0.333333,
+          "entry_cost": 1.0,
+          "filled_contracts": 3.0,
+          "take_profit_bid": 0.343333
         },
         "events": [
           {
@@ -21902,22 +23707,91 @@
             "observed_gross_total": 0.01,
             "target_bid": 0.41,
             "target_per_contract": 0.01
+          },
+          {
+            "at": "2026-07-22T15:33:11.794616+00:00",
+            "entry_quote": {
+              "displayed_depth": 635.0,
+              "economic_price": 0.3,
+              "quote_age_seconds": 0.002504,
+              "quote_id": "KXBTC15M-26JUL221145-45:171:2026-07-22T15:33:11.792075+00:00",
+              "received_at": "2026-07-22T15:33:11.792075+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:11.728807Z",
+              "source_timestamp_ms": 1784734391728,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.3,
+              "yes_ask_size": 635.0,
+              "yes_bid": 0.29,
+              "yes_bid_size": 5008.78
+            },
+            "kind": "paper_scalp_entry_rung_hit",
+            "quantity": 2.0,
+            "rung_price": 0.3
+          },
+          {
+            "at": "2026-07-22T15:33:11.794652+00:00",
+            "average_entry_price": 0.333333,
+            "exit_price": 0.29,
+            "exit_quote": {
+              "displayed_depth": 5008.78,
+              "economic_price": 0.29,
+              "quote_age_seconds": 0.00251,
+              "quote_id": "KXBTC15M-26JUL221145-45:171:2026-07-22T15:33:11.792075+00:00",
+              "received_at": "2026-07-22T15:33:11.792075+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:11.728807Z",
+              "source_timestamp_ms": 1784734391728,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.3,
+              "yes_ask_size": 635.0,
+              "yes_bid": 0.29,
+              "yes_bid_size": 5008.78
+            },
+            "filled_contracts": 3.0,
+            "gross_per_contract": -0.043333,
+            "gross_total": -0.129999,
+            "kind": "paper_scalp_maximum_update"
+          },
+          {
+            "at": "2026-07-22T15:33:12.810826+00:00",
+            "average_entry_price": 0.333333,
+            "exit_price": 0.32,
+            "exit_quote": {
+              "displayed_depth": 3842.7,
+              "economic_price": 0.32,
+              "quote_age_seconds": 0.018965,
+              "quote_id": "KXBTC15M-26JUL221145-45:172:2026-07-22T15:33:12.791828+00:00",
+              "received_at": "2026-07-22T15:33:12.791828+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:12.729919Z",
+              "source_timestamp_ms": 1784734392729,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.33,
+              "yes_ask_size": 513.48,
+              "yes_bid": 0.32,
+              "yes_bid_size": 3842.7
+            },
+            "filled_contracts": 3.0,
+            "gross_per_contract": -0.013333,
+            "gross_total": -0.039999,
+            "kind": "paper_scalp_maximum_update"
           }
         ],
         "fixed_stop_loss_per_contract": null,
         "hold_gain_gate_per_contract": 0.5,
         "last_actual_top_of_book": {
-          "no_ask": 0.6,
-          "no_bid": 0.59,
-          "observed_at": "2026-07-22T15:33:01.792079+00:00",
-          "quote_age_seconds": 0.762381,
-          "quote_id": "KXBTC15M-26JUL221145-45:161:2026-07-22T15:33:01.792079+00:00",
-          "selected_side_executable_ask": 0.41,
-          "selected_side_executable_bid": 0.4,
-          "yes_ask": 0.41,
-          "yes_ask_size": 10913.53,
-          "yes_bid": 0.4,
-          "yes_bid_size": 823.07
+          "no_ask": 0.68,
+          "no_bid": 0.67,
+          "observed_at": "2026-07-22T15:33:12.791828+00:00",
+          "quote_age_seconds": 0.018965,
+          "quote_id": "KXBTC15M-26JUL221145-45:172:2026-07-22T15:33:12.791828+00:00",
+          "selected_side_executable_ask": 0.33,
+          "selected_side_executable_bid": 0.32,
+          "yes_ask": 0.33,
+          "yes_ask_size": 513.48,
+          "yes_bid": 0.32,
+          "yes_bid_size": 3842.7
         },
         "last_entry_quote_state": "executable_top_of_book",
         "last_exit_quote_state": "executable_top_of_book",
@@ -21929,6 +23803,7 @@
         "position_epochs": [
           {
             "average_entry_price": 0.4,
+            "ended_at": "2026-07-22T15:33:11.794627+00:00",
             "entry_cost": 0.4,
             "filled_contracts": 1.0,
             "fixed_stop_loss_bid": 0.05,
@@ -21997,6 +23872,53 @@
               }
             },
             "trailing_activation_bid": 0.9
+          },
+          {
+            "average_entry_price": 0.333333,
+            "entry_cost": 1.0,
+            "filled_contracts": 3.0,
+            "fixed_stop_loss_bid": 0.05,
+            "max_executable_exit_bid": 0.32,
+            "max_executable_gross_per_contract": -0.013333,
+            "max_executable_gross_total": -0.039999,
+            "max_exit_quote": {
+              "displayed_depth": 3842.7,
+              "economic_price": 0.32,
+              "quote_age_seconds": 0.018965,
+              "quote_id": "KXBTC15M-26JUL221145-45:172:2026-07-22T15:33:12.791828+00:00",
+              "received_at": "2026-07-22T15:33:12.791828+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:12.729919Z",
+              "source_timestamp_ms": 1784734392729,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.33,
+              "yes_ask_size": 513.48,
+              "yes_bid": 0.32,
+              "yes_bid_size": 3842.7
+            },
+            "max_recorded_at": "2026-07-22T15:33:12.810826+00:00",
+            "started_at": "2026-07-22T15:33:11.794630+00:00",
+            "target_bids": {
+              "0.01": 0.343333,
+              "0.02": 0.353333,
+              "0.03": 0.363333,
+              "0.04": 0.373333,
+              "0.05": 0.383333,
+              "0.06": 0.393333,
+              "0.07": 0.403333,
+              "0.08": 0.413333,
+              "0.09": 0.423333,
+              "0.10": 0.433333,
+              "0.20": 0.533333,
+              "0.30": 0.633333,
+              "0.40": 0.733333,
+              "0.50": 0.833333,
+              "0.60": 0.933333,
+              "0.70": 1.033333,
+              "0.80": 1.133333
+            },
+            "target_hits": {},
+            "trailing_activation_bid": 0.833333
           }
         ],
         "profit_target_per_contract": 0.01,
@@ -22043,11 +23965,27 @@
             "status": "simulated_resting"
           },
           "0.3000": {
-            "average_fill_price": null,
-            "fill_count": 0.0,
+            "average_fill_price": 0.3,
+            "fill_count": 2.0,
+            "filled_at": "2026-07-22T15:33:11.794613+00:00",
             "quantity": 2.0,
             "rung_price": 0.3,
-            "status": "simulated_resting"
+            "simulation_entry_quote": {
+              "displayed_depth": 635.0,
+              "economic_price": 0.3,
+              "quote_age_seconds": 0.002504,
+              "quote_id": "KXBTC15M-26JUL221145-45:171:2026-07-22T15:33:11.792075+00:00",
+              "received_at": "2026-07-22T15:33:11.792075+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:11.728807Z",
+              "source_timestamp_ms": 1784734391728,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.3,
+              "yes_ask_size": 635.0,
+              "yes_bid": 0.29,
+              "yes_bid_size": 5008.78
+            },
+            "status": "simulated_executable_quote_hit"
           },
           "0.4000": {
             "average_fill_price": 0.4,
@@ -24249,13 +26187,14 @@
         "absolute_stop_price": 0.05,
         "created_at": "2026-07-22T15:30:19.295149+00:00",
         "entry_quote_depth_consumed": {
-          "KXBTC15M-26JUL221145-45:154:2026-07-22T15:32:54.792107+00:00": 1.0
+          "KXBTC15M-26JUL221145-45:154:2026-07-22T15:32:54.792107+00:00": 1.0,
+          "KXBTC15M-26JUL221145-45:171:2026-07-22T15:33:11.792075+00:00": 2.0
         },
         "entry_summary": {
-          "average_entry_price": 0.4,
-          "entry_cost": 0.4,
-          "filled_contracts": 1.0,
-          "take_profit_bid": 0.41
+          "average_entry_price": 0.333333,
+          "entry_cost": 1.0,
+          "filled_contracts": 3.0,
+          "take_profit_bid": 0.343333
         },
         "events": [
           {
@@ -24376,22 +26315,91 @@
             "observed_gross_total": 0.01,
             "target_bid": 0.41,
             "target_per_contract": 0.01
+          },
+          {
+            "at": "2026-07-22T15:33:11.794687+00:00",
+            "entry_quote": {
+              "displayed_depth": 635.0,
+              "economic_price": 0.3,
+              "quote_age_seconds": 0.002577,
+              "quote_id": "KXBTC15M-26JUL221145-45:171:2026-07-22T15:33:11.792075+00:00",
+              "received_at": "2026-07-22T15:33:11.792075+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:11.728807Z",
+              "source_timestamp_ms": 1784734391728,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.3,
+              "yes_ask_size": 635.0,
+              "yes_bid": 0.29,
+              "yes_bid_size": 5008.78
+            },
+            "kind": "paper_scalp_entry_rung_hit",
+            "quantity": 2.0,
+            "rung_price": 0.3
+          },
+          {
+            "at": "2026-07-22T15:33:11.794722+00:00",
+            "average_entry_price": 0.333333,
+            "exit_price": 0.29,
+            "exit_quote": {
+              "displayed_depth": 5008.78,
+              "economic_price": 0.29,
+              "quote_age_seconds": 0.002582,
+              "quote_id": "KXBTC15M-26JUL221145-45:171:2026-07-22T15:33:11.792075+00:00",
+              "received_at": "2026-07-22T15:33:11.792075+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:11.728807Z",
+              "source_timestamp_ms": 1784734391728,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.3,
+              "yes_ask_size": 635.0,
+              "yes_bid": 0.29,
+              "yes_bid_size": 5008.78
+            },
+            "filled_contracts": 3.0,
+            "gross_per_contract": -0.043333,
+            "gross_total": -0.129999,
+            "kind": "paper_scalp_maximum_update"
+          },
+          {
+            "at": "2026-07-22T15:33:12.810867+00:00",
+            "average_entry_price": 0.333333,
+            "exit_price": 0.32,
+            "exit_quote": {
+              "displayed_depth": 3842.7,
+              "economic_price": 0.32,
+              "quote_age_seconds": 0.019007,
+              "quote_id": "KXBTC15M-26JUL221145-45:172:2026-07-22T15:33:12.791828+00:00",
+              "received_at": "2026-07-22T15:33:12.791828+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:12.729919Z",
+              "source_timestamp_ms": 1784734392729,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.33,
+              "yes_ask_size": 513.48,
+              "yes_bid": 0.32,
+              "yes_bid_size": 3842.7
+            },
+            "filled_contracts": 3.0,
+            "gross_per_contract": -0.013333,
+            "gross_total": -0.039999,
+            "kind": "paper_scalp_maximum_update"
           }
         ],
         "fixed_stop_loss_per_contract": null,
         "hold_gain_gate_per_contract": 0.6,
         "last_actual_top_of_book": {
-          "no_ask": 0.6,
-          "no_bid": 0.59,
-          "observed_at": "2026-07-22T15:33:01.792079+00:00",
-          "quote_age_seconds": 0.762414,
-          "quote_id": "KXBTC15M-26JUL221145-45:161:2026-07-22T15:33:01.792079+00:00",
-          "selected_side_executable_ask": 0.41,
-          "selected_side_executable_bid": 0.4,
-          "yes_ask": 0.41,
-          "yes_ask_size": 10913.53,
-          "yes_bid": 0.4,
-          "yes_bid_size": 823.07
+          "no_ask": 0.68,
+          "no_bid": 0.67,
+          "observed_at": "2026-07-22T15:33:12.791828+00:00",
+          "quote_age_seconds": 0.019007,
+          "quote_id": "KXBTC15M-26JUL221145-45:172:2026-07-22T15:33:12.791828+00:00",
+          "selected_side_executable_ask": 0.33,
+          "selected_side_executable_bid": 0.32,
+          "yes_ask": 0.33,
+          "yes_ask_size": 513.48,
+          "yes_bid": 0.32,
+          "yes_bid_size": 3842.7
         },
         "last_entry_quote_state": "executable_top_of_book",
         "last_exit_quote_state": "executable_top_of_book",
@@ -24403,6 +26411,7 @@
         "position_epochs": [
           {
             "average_entry_price": 0.4,
+            "ended_at": "2026-07-22T15:33:11.794699+00:00",
             "entry_cost": 0.4,
             "filled_contracts": 1.0,
             "fixed_stop_loss_bid": 0.05,
@@ -24471,6 +26480,53 @@
               }
             },
             "trailing_activation_bid": 1.0
+          },
+          {
+            "average_entry_price": 0.333333,
+            "entry_cost": 1.0,
+            "filled_contracts": 3.0,
+            "fixed_stop_loss_bid": 0.05,
+            "max_executable_exit_bid": 0.32,
+            "max_executable_gross_per_contract": -0.013333,
+            "max_executable_gross_total": -0.039999,
+            "max_exit_quote": {
+              "displayed_depth": 3842.7,
+              "economic_price": 0.32,
+              "quote_age_seconds": 0.019007,
+              "quote_id": "KXBTC15M-26JUL221145-45:172:2026-07-22T15:33:12.791828+00:00",
+              "received_at": "2026-07-22T15:33:12.791828+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:12.729919Z",
+              "source_timestamp_ms": 1784734392729,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.33,
+              "yes_ask_size": 513.48,
+              "yes_bid": 0.32,
+              "yes_bid_size": 3842.7
+            },
+            "max_recorded_at": "2026-07-22T15:33:12.810867+00:00",
+            "started_at": "2026-07-22T15:33:11.794701+00:00",
+            "target_bids": {
+              "0.01": 0.343333,
+              "0.02": 0.353333,
+              "0.03": 0.363333,
+              "0.04": 0.373333,
+              "0.05": 0.383333,
+              "0.06": 0.393333,
+              "0.07": 0.403333,
+              "0.08": 0.413333,
+              "0.09": 0.423333,
+              "0.10": 0.433333,
+              "0.20": 0.533333,
+              "0.30": 0.633333,
+              "0.40": 0.733333,
+              "0.50": 0.833333,
+              "0.60": 0.933333,
+              "0.70": 1.033333,
+              "0.80": 1.133333
+            },
+            "target_hits": {},
+            "trailing_activation_bid": 0.933333
           }
         ],
         "profit_target_per_contract": 0.01,
@@ -24517,11 +26573,27 @@
             "status": "simulated_resting"
           },
           "0.3000": {
-            "average_fill_price": null,
-            "fill_count": 0.0,
+            "average_fill_price": 0.3,
+            "fill_count": 2.0,
+            "filled_at": "2026-07-22T15:33:11.794684+00:00",
             "quantity": 2.0,
             "rung_price": 0.3,
-            "status": "simulated_resting"
+            "simulation_entry_quote": {
+              "displayed_depth": 635.0,
+              "economic_price": 0.3,
+              "quote_age_seconds": 0.002577,
+              "quote_id": "KXBTC15M-26JUL221145-45:171:2026-07-22T15:33:11.792075+00:00",
+              "received_at": "2026-07-22T15:33:11.792075+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:11.728807Z",
+              "source_timestamp_ms": 1784734391728,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.3,
+              "yes_ask_size": 635.0,
+              "yes_bid": 0.29,
+              "yes_bid_size": 5008.78
+            },
+            "status": "simulated_executable_quote_hit"
           },
           "0.4000": {
             "average_fill_price": 0.4,
@@ -26723,13 +28795,14 @@
         "absolute_stop_price": 0.05,
         "created_at": "2026-07-22T15:30:19.295227+00:00",
         "entry_quote_depth_consumed": {
-          "KXBTC15M-26JUL221145-45:154:2026-07-22T15:32:54.792107+00:00": 1.0
+          "KXBTC15M-26JUL221145-45:154:2026-07-22T15:32:54.792107+00:00": 1.0,
+          "KXBTC15M-26JUL221145-45:171:2026-07-22T15:33:11.792075+00:00": 2.0
         },
         "entry_summary": {
-          "average_entry_price": 0.4,
-          "entry_cost": 0.4,
-          "filled_contracts": 1.0,
-          "take_profit_bid": 0.41
+          "average_entry_price": 0.333333,
+          "entry_cost": 1.0,
+          "filled_contracts": 3.0,
+          "take_profit_bid": 0.343333
         },
         "events": [
           {
@@ -26850,22 +28923,91 @@
             "observed_gross_total": 0.01,
             "target_bid": 0.41,
             "target_per_contract": 0.01
+          },
+          {
+            "at": "2026-07-22T15:33:11.794757+00:00",
+            "entry_quote": {
+              "displayed_depth": 635.0,
+              "economic_price": 0.3,
+              "quote_age_seconds": 0.002645,
+              "quote_id": "KXBTC15M-26JUL221145-45:171:2026-07-22T15:33:11.792075+00:00",
+              "received_at": "2026-07-22T15:33:11.792075+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:11.728807Z",
+              "source_timestamp_ms": 1784734391728,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.3,
+              "yes_ask_size": 635.0,
+              "yes_bid": 0.29,
+              "yes_bid_size": 5008.78
+            },
+            "kind": "paper_scalp_entry_rung_hit",
+            "quantity": 2.0,
+            "rung_price": 0.3
+          },
+          {
+            "at": "2026-07-22T15:33:11.794789+00:00",
+            "average_entry_price": 0.333333,
+            "exit_price": 0.29,
+            "exit_quote": {
+              "displayed_depth": 5008.78,
+              "economic_price": 0.29,
+              "quote_age_seconds": 0.002651,
+              "quote_id": "KXBTC15M-26JUL221145-45:171:2026-07-22T15:33:11.792075+00:00",
+              "received_at": "2026-07-22T15:33:11.792075+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:11.728807Z",
+              "source_timestamp_ms": 1784734391728,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.3,
+              "yes_ask_size": 635.0,
+              "yes_bid": 0.29,
+              "yes_bid_size": 5008.78
+            },
+            "filled_contracts": 3.0,
+            "gross_per_contract": -0.043333,
+            "gross_total": -0.129999,
+            "kind": "paper_scalp_maximum_update"
+          },
+          {
+            "at": "2026-07-22T15:33:12.810908+00:00",
+            "average_entry_price": 0.333333,
+            "exit_price": 0.32,
+            "exit_quote": {
+              "displayed_depth": 3842.7,
+              "economic_price": 0.32,
+              "quote_age_seconds": 0.019047,
+              "quote_id": "KXBTC15M-26JUL221145-45:172:2026-07-22T15:33:12.791828+00:00",
+              "received_at": "2026-07-22T15:33:12.791828+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:12.729919Z",
+              "source_timestamp_ms": 1784734392729,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.33,
+              "yes_ask_size": 513.48,
+              "yes_bid": 0.32,
+              "yes_bid_size": 3842.7
+            },
+            "filled_contracts": 3.0,
+            "gross_per_contract": -0.013333,
+            "gross_total": -0.039999,
+            "kind": "paper_scalp_maximum_update"
           }
         ],
         "fixed_stop_loss_per_contract": null,
         "hold_gain_gate_per_contract": 0.7,
         "last_actual_top_of_book": {
-          "no_ask": 0.6,
-          "no_bid": 0.59,
-          "observed_at": "2026-07-22T15:33:01.792079+00:00",
-          "quote_age_seconds": 0.762446,
-          "quote_id": "KXBTC15M-26JUL221145-45:161:2026-07-22T15:33:01.792079+00:00",
-          "selected_side_executable_ask": 0.41,
-          "selected_side_executable_bid": 0.4,
-          "yes_ask": 0.41,
-          "yes_ask_size": 10913.53,
-          "yes_bid": 0.4,
-          "yes_bid_size": 823.07
+          "no_ask": 0.68,
+          "no_bid": 0.67,
+          "observed_at": "2026-07-22T15:33:12.791828+00:00",
+          "quote_age_seconds": 0.019047,
+          "quote_id": "KXBTC15M-26JUL221145-45:172:2026-07-22T15:33:12.791828+00:00",
+          "selected_side_executable_ask": 0.33,
+          "selected_side_executable_bid": 0.32,
+          "yes_ask": 0.33,
+          "yes_ask_size": 513.48,
+          "yes_bid": 0.32,
+          "yes_bid_size": 3842.7
         },
         "last_entry_quote_state": "executable_top_of_book",
         "last_exit_quote_state": "executable_top_of_book",
@@ -26877,6 +29019,7 @@
         "position_epochs": [
           {
             "average_entry_price": 0.4,
+            "ended_at": "2026-07-22T15:33:11.794768+00:00",
             "entry_cost": 0.4,
             "filled_contracts": 1.0,
             "fixed_stop_loss_bid": 0.05,
@@ -26945,6 +29088,53 @@
               }
             },
             "trailing_activation_bid": 1.1
+          },
+          {
+            "average_entry_price": 0.333333,
+            "entry_cost": 1.0,
+            "filled_contracts": 3.0,
+            "fixed_stop_loss_bid": 0.05,
+            "max_executable_exit_bid": 0.32,
+            "max_executable_gross_per_contract": -0.013333,
+            "max_executable_gross_total": -0.039999,
+            "max_exit_quote": {
+              "displayed_depth": 3842.7,
+              "economic_price": 0.32,
+              "quote_age_seconds": 0.019047,
+              "quote_id": "KXBTC15M-26JUL221145-45:172:2026-07-22T15:33:12.791828+00:00",
+              "received_at": "2026-07-22T15:33:12.791828+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:12.729919Z",
+              "source_timestamp_ms": 1784734392729,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.33,
+              "yes_ask_size": 513.48,
+              "yes_bid": 0.32,
+              "yes_bid_size": 3842.7
+            },
+            "max_recorded_at": "2026-07-22T15:33:12.810908+00:00",
+            "started_at": "2026-07-22T15:33:11.794770+00:00",
+            "target_bids": {
+              "0.01": 0.343333,
+              "0.02": 0.353333,
+              "0.03": 0.363333,
+              "0.04": 0.373333,
+              "0.05": 0.383333,
+              "0.06": 0.393333,
+              "0.07": 0.403333,
+              "0.08": 0.413333,
+              "0.09": 0.423333,
+              "0.10": 0.433333,
+              "0.20": 0.533333,
+              "0.30": 0.633333,
+              "0.40": 0.733333,
+              "0.50": 0.833333,
+              "0.60": 0.933333,
+              "0.70": 1.033333,
+              "0.80": 1.133333
+            },
+            "target_hits": {},
+            "trailing_activation_bid": 1.033333
           }
         ],
         "profit_target_per_contract": 0.01,
@@ -26991,11 +29181,27 @@
             "status": "simulated_resting"
           },
           "0.3000": {
-            "average_fill_price": null,
-            "fill_count": 0.0,
+            "average_fill_price": 0.3,
+            "fill_count": 2.0,
+            "filled_at": "2026-07-22T15:33:11.794754+00:00",
             "quantity": 2.0,
             "rung_price": 0.3,
-            "status": "simulated_resting"
+            "simulation_entry_quote": {
+              "displayed_depth": 635.0,
+              "economic_price": 0.3,
+              "quote_age_seconds": 0.002645,
+              "quote_id": "KXBTC15M-26JUL221145-45:171:2026-07-22T15:33:11.792075+00:00",
+              "received_at": "2026-07-22T15:33:11.792075+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:11.728807Z",
+              "source_timestamp_ms": 1784734391728,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.3,
+              "yes_ask_size": 635.0,
+              "yes_bid": 0.29,
+              "yes_bid_size": 5008.78
+            },
+            "status": "simulated_executable_quote_hit"
           },
           "0.4000": {
             "average_fill_price": 0.4,
@@ -29197,13 +31403,14 @@
         "absolute_stop_price": 0.05,
         "created_at": "2026-07-22T15:30:19.295306+00:00",
         "entry_quote_depth_consumed": {
-          "KXBTC15M-26JUL221145-45:154:2026-07-22T15:32:54.792107+00:00": 1.0
+          "KXBTC15M-26JUL221145-45:154:2026-07-22T15:32:54.792107+00:00": 1.0,
+          "KXBTC15M-26JUL221145-45:171:2026-07-22T15:33:11.792075+00:00": 2.0
         },
         "entry_summary": {
-          "average_entry_price": 0.4,
-          "entry_cost": 0.4,
-          "filled_contracts": 1.0,
-          "take_profit_bid": 0.41
+          "average_entry_price": 0.333333,
+          "entry_cost": 1.0,
+          "filled_contracts": 3.0,
+          "take_profit_bid": 0.343333
         },
         "events": [
           {
@@ -29324,22 +31531,91 @@
             "observed_gross_total": 0.01,
             "target_bid": 0.41,
             "target_per_contract": 0.01
+          },
+          {
+            "at": "2026-07-22T15:33:11.794823+00:00",
+            "entry_quote": {
+              "displayed_depth": 635.0,
+              "economic_price": 0.3,
+              "quote_age_seconds": 0.002712,
+              "quote_id": "KXBTC15M-26JUL221145-45:171:2026-07-22T15:33:11.792075+00:00",
+              "received_at": "2026-07-22T15:33:11.792075+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:11.728807Z",
+              "source_timestamp_ms": 1784734391728,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.3,
+              "yes_ask_size": 635.0,
+              "yes_bid": 0.29,
+              "yes_bid_size": 5008.78
+            },
+            "kind": "paper_scalp_entry_rung_hit",
+            "quantity": 2.0,
+            "rung_price": 0.3
+          },
+          {
+            "at": "2026-07-22T15:33:11.794856+00:00",
+            "average_entry_price": 0.333333,
+            "exit_price": 0.29,
+            "exit_quote": {
+              "displayed_depth": 5008.78,
+              "economic_price": 0.29,
+              "quote_age_seconds": 0.002717,
+              "quote_id": "KXBTC15M-26JUL221145-45:171:2026-07-22T15:33:11.792075+00:00",
+              "received_at": "2026-07-22T15:33:11.792075+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:11.728807Z",
+              "source_timestamp_ms": 1784734391728,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.3,
+              "yes_ask_size": 635.0,
+              "yes_bid": 0.29,
+              "yes_bid_size": 5008.78
+            },
+            "filled_contracts": 3.0,
+            "gross_per_contract": -0.043333,
+            "gross_total": -0.129999,
+            "kind": "paper_scalp_maximum_update"
+          },
+          {
+            "at": "2026-07-22T15:33:12.810952+00:00",
+            "average_entry_price": 0.333333,
+            "exit_price": 0.32,
+            "exit_quote": {
+              "displayed_depth": 3842.7,
+              "economic_price": 0.32,
+              "quote_age_seconds": 0.019092,
+              "quote_id": "KXBTC15M-26JUL221145-45:172:2026-07-22T15:33:12.791828+00:00",
+              "received_at": "2026-07-22T15:33:12.791828+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:12.729919Z",
+              "source_timestamp_ms": 1784734392729,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.33,
+              "yes_ask_size": 513.48,
+              "yes_bid": 0.32,
+              "yes_bid_size": 3842.7
+            },
+            "filled_contracts": 3.0,
+            "gross_per_contract": -0.013333,
+            "gross_total": -0.039999,
+            "kind": "paper_scalp_maximum_update"
           }
         ],
         "fixed_stop_loss_per_contract": null,
         "hold_gain_gate_per_contract": 0.8,
         "last_actual_top_of_book": {
-          "no_ask": 0.6,
-          "no_bid": 0.59,
-          "observed_at": "2026-07-22T15:33:01.792079+00:00",
-          "quote_age_seconds": 0.762477,
-          "quote_id": "KXBTC15M-26JUL221145-45:161:2026-07-22T15:33:01.792079+00:00",
-          "selected_side_executable_ask": 0.41,
-          "selected_side_executable_bid": 0.4,
-          "yes_ask": 0.41,
-          "yes_ask_size": 10913.53,
-          "yes_bid": 0.4,
-          "yes_bid_size": 823.07
+          "no_ask": 0.68,
+          "no_bid": 0.67,
+          "observed_at": "2026-07-22T15:33:12.791828+00:00",
+          "quote_age_seconds": 0.019092,
+          "quote_id": "KXBTC15M-26JUL221145-45:172:2026-07-22T15:33:12.791828+00:00",
+          "selected_side_executable_ask": 0.33,
+          "selected_side_executable_bid": 0.32,
+          "yes_ask": 0.33,
+          "yes_ask_size": 513.48,
+          "yes_bid": 0.32,
+          "yes_bid_size": 3842.7
         },
         "last_entry_quote_state": "executable_top_of_book",
         "last_exit_quote_state": "executable_top_of_book",
@@ -29351,6 +31627,7 @@
         "position_epochs": [
           {
             "average_entry_price": 0.4,
+            "ended_at": "2026-07-22T15:33:11.794834+00:00",
             "entry_cost": 0.4,
             "filled_contracts": 1.0,
             "fixed_stop_loss_bid": 0.05,
@@ -29419,6 +31696,53 @@
               }
             },
             "trailing_activation_bid": 1.2
+          },
+          {
+            "average_entry_price": 0.333333,
+            "entry_cost": 1.0,
+            "filled_contracts": 3.0,
+            "fixed_stop_loss_bid": 0.05,
+            "max_executable_exit_bid": 0.32,
+            "max_executable_gross_per_contract": -0.013333,
+            "max_executable_gross_total": -0.039999,
+            "max_exit_quote": {
+              "displayed_depth": 3842.7,
+              "economic_price": 0.32,
+              "quote_age_seconds": 0.019092,
+              "quote_id": "KXBTC15M-26JUL221145-45:172:2026-07-22T15:33:12.791828+00:00",
+              "received_at": "2026-07-22T15:33:12.791828+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:12.729919Z",
+              "source_timestamp_ms": 1784734392729,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.33,
+              "yes_ask_size": 513.48,
+              "yes_bid": 0.32,
+              "yes_bid_size": 3842.7
+            },
+            "max_recorded_at": "2026-07-22T15:33:12.810952+00:00",
+            "started_at": "2026-07-22T15:33:11.794836+00:00",
+            "target_bids": {
+              "0.01": 0.343333,
+              "0.02": 0.353333,
+              "0.03": 0.363333,
+              "0.04": 0.373333,
+              "0.05": 0.383333,
+              "0.06": 0.393333,
+              "0.07": 0.403333,
+              "0.08": 0.413333,
+              "0.09": 0.423333,
+              "0.10": 0.433333,
+              "0.20": 0.533333,
+              "0.30": 0.633333,
+              "0.40": 0.733333,
+              "0.50": 0.833333,
+              "0.60": 0.933333,
+              "0.70": 1.033333,
+              "0.80": 1.133333
+            },
+            "target_hits": {},
+            "trailing_activation_bid": 1.133333
           }
         ],
         "profit_target_per_contract": 0.01,
@@ -29465,11 +31789,27 @@
             "status": "simulated_resting"
           },
           "0.3000": {
-            "average_fill_price": null,
-            "fill_count": 0.0,
+            "average_fill_price": 0.3,
+            "fill_count": 2.0,
+            "filled_at": "2026-07-22T15:33:11.794820+00:00",
             "quantity": 2.0,
             "rung_price": 0.3,
-            "status": "simulated_resting"
+            "simulation_entry_quote": {
+              "displayed_depth": 635.0,
+              "economic_price": 0.3,
+              "quote_age_seconds": 0.002712,
+              "quote_id": "KXBTC15M-26JUL221145-45:171:2026-07-22T15:33:11.792075+00:00",
+              "received_at": "2026-07-22T15:33:11.792075+00:00",
+              "side": "yes",
+              "source_server_timestamp": "2026-07-22T15:33:11.728807Z",
+              "source_timestamp_ms": 1784734391728,
+              "ticker": "KXBTC15M-26JUL221145-45",
+              "yes_ask": 0.3,
+              "yes_ask_size": 635.0,
+              "yes_bid": 0.29,
+              "yes_bid_size": 5008.78
+            },
+            "status": "simulated_executable_quote_hit"
           },
           "0.4000": {
             "average_fill_price": 0.4,
@@ -29543,7 +31883,7 @@
   },
   "summary": {
     "absolute_stop_price": 0.05,
-    "generated_at": "2026-07-22T15:33:02.720283+00:00",
+    "generated_at": "2026-07-22T15:33:12.987741+00:00",
     "locked_side_policy": "side is fixed before open and never changes on later quotes",
     "market_wide_armed_trail": true,
     "source": "opposite_frozen_ml_side",
@@ -29552,14 +31892,32 @@
     "variants": {
       "0.01": {
         "activation_gain_per_contract": 0.01,
-        "active_paper_markets": 1,
+        "active_paper_markets": 0,
         "armed_markets": 2,
         "average_entry_profiles": {
+          "0.3333": {
+            "active_positions": 0,
+            "average_entry_price": 0.333333,
+            "average_maximum_gross_per_contract": -0.043333,
+            "completed_position_states": 1,
+            "depth_observed_positions": 1,
+            "fixed_stop_loss_exits": 0,
+            "maximum_gross_per_contract": -0.043333,
+            "median_filled_contracts": 3.0,
+            "median_maximum_gross_per_contract": -0.043333,
+            "net_profit": -0.13,
+            "observed_positions": 1,
+            "p75_maximum_gross_per_contract": -0.043333,
+            "p90_maximum_gross_per_contract": -0.043333,
+            "scalp_exits": 0,
+            "settlement_exits": 0,
+            "trailing_stop_exits": 1
+          },
           "0.4": {
-            "active_positions": 1,
+            "active_positions": 0,
             "average_entry_price": 0.4,
             "average_maximum_gross_per_contract": 0.065,
-            "completed_position_states": 1,
+            "completed_position_states": 2,
             "depth_observed_positions": 2,
             "fixed_stop_loss_exits": 0,
             "maximum_gross_per_contract": 0.12,
@@ -29575,137 +31933,137 @@
           }
         },
         "current_streak": 1,
-        "current_streak_kind": "win",
+        "current_streak_kind": "loss",
         "excursion_observer": {
-          "completed_position_states": 1,
-          "depth_observed_position_states": 1,
+          "completed_position_states": 3,
+          "depth_observed_position_states": 3,
           "enabled": true,
           "maximum_gross_per_contract": {
-            "average": 0.12,
+            "average": 0.028889,
             "maximum": 0.12,
-            "median": 0.12,
-            "minimum": 0.12,
-            "p25": 0.12,
-            "p75": 0.12,
-            "p90": 0.12
+            "median": 0.01,
+            "minimum": -0.043333,
+            "p25": -0.016667,
+            "p75": 0.065,
+            "p90": 0.098
           },
           "method": "records the maximum later fresh executable bid with displayed depth for each unchanged filled-average/size; range shadows do not select an exit, trailing shadows may close on their configured retracement, and fixed-stop shadows may close at their configured loss threshold",
           "target_opportunities": {
             "0.01": {
-              "completed_position_states": 1,
-              "depth_observed_position_states": 1,
-              "hit_position_states": 1,
-              "hit_rate_given_depth_observation": 1.0,
+              "completed_position_states": 3,
+              "depth_observed_position_states": 3,
+              "hit_position_states": 2,
+              "hit_rate_given_depth_observation": 0.666667,
               "target_per_contract": 0.01
             },
             "0.02": {
-              "completed_position_states": 1,
-              "depth_observed_position_states": 1,
+              "completed_position_states": 3,
+              "depth_observed_position_states": 3,
               "hit_position_states": 1,
-              "hit_rate_given_depth_observation": 1.0,
+              "hit_rate_given_depth_observation": 0.333333,
               "target_per_contract": 0.02
             },
             "0.03": {
-              "completed_position_states": 1,
-              "depth_observed_position_states": 1,
+              "completed_position_states": 3,
+              "depth_observed_position_states": 3,
               "hit_position_states": 1,
-              "hit_rate_given_depth_observation": 1.0,
+              "hit_rate_given_depth_observation": 0.333333,
               "target_per_contract": 0.03
             },
             "0.04": {
-              "completed_position_states": 1,
-              "depth_observed_position_states": 1,
+              "completed_position_states": 3,
+              "depth_observed_position_states": 3,
               "hit_position_states": 1,
-              "hit_rate_given_depth_observation": 1.0,
+              "hit_rate_given_depth_observation": 0.333333,
               "target_per_contract": 0.04
             },
             "0.05": {
-              "completed_position_states": 1,
-              "depth_observed_position_states": 1,
+              "completed_position_states": 3,
+              "depth_observed_position_states": 3,
               "hit_position_states": 1,
-              "hit_rate_given_depth_observation": 1.0,
+              "hit_rate_given_depth_observation": 0.333333,
               "target_per_contract": 0.05
             },
             "0.06": {
-              "completed_position_states": 1,
-              "depth_observed_position_states": 1,
+              "completed_position_states": 3,
+              "depth_observed_position_states": 3,
               "hit_position_states": 1,
-              "hit_rate_given_depth_observation": 1.0,
+              "hit_rate_given_depth_observation": 0.333333,
               "target_per_contract": 0.06
             },
             "0.07": {
-              "completed_position_states": 1,
-              "depth_observed_position_states": 1,
+              "completed_position_states": 3,
+              "depth_observed_position_states": 3,
               "hit_position_states": 1,
-              "hit_rate_given_depth_observation": 1.0,
+              "hit_rate_given_depth_observation": 0.333333,
               "target_per_contract": 0.07
             },
             "0.08": {
-              "completed_position_states": 1,
-              "depth_observed_position_states": 1,
+              "completed_position_states": 3,
+              "depth_observed_position_states": 3,
               "hit_position_states": 1,
-              "hit_rate_given_depth_observation": 1.0,
+              "hit_rate_given_depth_observation": 0.333333,
               "target_per_contract": 0.08
             },
             "0.09": {
-              "completed_position_states": 1,
-              "depth_observed_position_states": 1,
+              "completed_position_states": 3,
+              "depth_observed_position_states": 3,
               "hit_position_states": 1,
-              "hit_rate_given_depth_observation": 1.0,
+              "hit_rate_given_depth_observation": 0.333333,
               "target_per_contract": 0.09
             },
             "0.10": {
-              "completed_position_states": 1,
-              "depth_observed_position_states": 1,
+              "completed_position_states": 3,
+              "depth_observed_position_states": 3,
               "hit_position_states": 1,
-              "hit_rate_given_depth_observation": 1.0,
+              "hit_rate_given_depth_observation": 0.333333,
               "target_per_contract": 0.1
             },
             "0.20": {
-              "completed_position_states": 1,
-              "depth_observed_position_states": 1,
+              "completed_position_states": 3,
+              "depth_observed_position_states": 3,
               "hit_position_states": 0,
               "hit_rate_given_depth_observation": 0.0,
               "target_per_contract": 0.2
             },
             "0.30": {
-              "completed_position_states": 1,
-              "depth_observed_position_states": 1,
+              "completed_position_states": 3,
+              "depth_observed_position_states": 3,
               "hit_position_states": 0,
               "hit_rate_given_depth_observation": 0.0,
               "target_per_contract": 0.3
             },
             "0.40": {
-              "completed_position_states": 1,
-              "depth_observed_position_states": 1,
+              "completed_position_states": 3,
+              "depth_observed_position_states": 3,
               "hit_position_states": 0,
               "hit_rate_given_depth_observation": 0.0,
               "target_per_contract": 0.4
             },
             "0.50": {
-              "completed_position_states": 1,
-              "depth_observed_position_states": 1,
+              "completed_position_states": 3,
+              "depth_observed_position_states": 3,
               "hit_position_states": 0,
               "hit_rate_given_depth_observation": 0.0,
               "target_per_contract": 0.5
             },
             "0.60": {
-              "completed_position_states": 1,
-              "depth_observed_position_states": 1,
+              "completed_position_states": 3,
+              "depth_observed_position_states": 3,
               "hit_position_states": 0,
               "hit_rate_given_depth_observation": 0.0,
               "target_per_contract": 0.6
             },
             "0.70": {
-              "completed_position_states": 1,
-              "depth_observed_position_states": 1,
+              "completed_position_states": 3,
+              "depth_observed_position_states": 3,
               "hit_position_states": 0,
               "hit_rate_given_depth_observation": 0.0,
               "target_per_contract": 0.7
             },
             "0.80": {
-              "completed_position_states": 1,
-              "depth_observed_position_states": 1,
+              "completed_position_states": 3,
+              "depth_observed_position_states": 3,
               "hit_position_states": 0,
               "hit_rate_given_depth_observation": 0.0,
               "target_per_contract": 0.8
@@ -29715,7 +32073,7 @@
         },
         "fee_treatment": "excluded_no_exchange_fill",
         "fill_rule": "buy at a fresh actual executable ask <= rung with displayed ask depth; maintains the latest fresh YES and NO top-of-book snapshot, requires displayed bid depth for the whole filled position on every exit, closes an absolute stop only at its configured selected-side price, and closes a trailing stop only after its average-filled-entry gain activation and later configured retracement",
-        "filled_market_trades": 1,
+        "filled_market_trades": 2,
         "fixed_stop_loss": {
           "configured_absolute_prices": [
             0.05
@@ -29731,12 +32089,12 @@
           "Queue priority, quote cancellation, latency, hidden liquidity, partial fills, and fees are not modeled.",
           "The full simulated position is closed at the observed bid; no favorable price improvement is assumed."
         ],
-        "longest_losing_streak": 0,
+        "longest_losing_streak": 1,
         "longest_winning_streak": 1,
-        "losing_trades": 0,
-        "maximum_drawdown": 0.0,
+        "losing_trades": 1,
+        "maximum_drawdown": 0.13,
         "mode": "paper_only_no_exchange_orders",
-        "net_profit": 0.02,
+        "net_profit": -0.11,
         "paper_markets_started": 3,
         "pnl_time_series": [
           {
@@ -30049,15 +32407,95 @@
               "trailing_armed_at": "2026-07-22T15:16:22.392306+00:00",
               "trailing_stop_bid": 0.42
             }
+          },
+          {
+            "average_entry_price": 0.333333,
+            "cumulative_net_profit": -0.11,
+            "current_streak": 1,
+            "current_streak_kind": "loss",
+            "entry_cost": 1.0,
+            "exit_method": "fresh_executable_bid_trailing_stop",
+            "exit_proceeds": 0.87,
+            "filled_contracts": 3.0,
+            "fixed_stop_loss": {
+              "fixed_stop_loss_bid": 0.05,
+              "observed_exit_bid": 0.29
+            },
+            "last_actual_top_of_book": {
+              "no_ask": 0.71,
+              "no_bid": 0.7,
+              "observed_at": "2026-07-22T15:33:11.792075+00:00",
+              "quote_age_seconds": 0.001323,
+              "quote_id": "KXBTC15M-26JUL221145-45:171:2026-07-22T15:33:11.792075+00:00",
+              "selected_side_executable_ask": 0.3,
+              "selected_side_executable_bid": 0.29,
+              "yes_ask": 0.3,
+              "yes_ask_size": 635.0,
+              "yes_bid": 0.29,
+              "yes_bid_size": 5008.78
+            },
+            "locked_study_side": "yes",
+            "net_profit": -0.13,
+            "rungs": [
+              {
+                "average_fill_price": 0.4,
+                "filled_at": "2026-07-22T15:32:54.793455+00:00",
+                "filled_contracts": 1.0,
+                "quantity": 1.0,
+                "rung_price": 0.4,
+                "status": "simulated_executable_quote_hit"
+              },
+              {
+                "average_fill_price": 0.3,
+                "filled_at": "2026-07-22T15:33:11.793426+00:00",
+                "filled_contracts": 2.0,
+                "quantity": 2.0,
+                "rung_price": 0.3,
+                "status": "simulated_executable_quote_hit"
+              },
+              {
+                "average_fill_price": null,
+                "filled_at": null,
+                "filled_contracts": 0.0,
+                "quantity": 3.0,
+                "rung_price": 0.2,
+                "status": "paper_canceled_after_scalp_exit"
+              },
+              {
+                "average_fill_price": null,
+                "filled_at": null,
+                "filled_contracts": 0.0,
+                "quantity": 4.0,
+                "rung_price": 0.1,
+                "status": "paper_canceled_after_scalp_exit"
+              }
+            ],
+            "running_drawdown": 0.13,
+            "sequence": 2,
+            "settled_at": "2026-07-22T15:33:11.793515+00:00",
+            "settlement_outcome": null,
+            "side": "yes",
+            "source_signal_side": "no",
+            "status": "scalp_exited",
+            "target_hits": {},
+            "ticker": "KXBTC15M-26JUL221145-45",
+            "trade_outcome": "loss",
+            "trailing_stop": {
+              "highest_executable_bid": 0.41,
+              "observed_exit_bid": 0.29,
+              "trailing_activation_bid": 0.343333,
+              "trailing_armed_at": "2026-07-22T15:32:58.793156+00:00",
+              "trailing_stop_bid": 0.31
+            }
           }
         ],
-        "return_on_simulated_capital": 0.05,
+        "return_on_simulated_capital": -0.078571,
         "scalp_exits": 0,
         "settlement_exits_without_take_profit": 0,
         "strategy": "ladder_average_entry_scalp_executable_quote_shadow_v1",
-        "total_entry_cost": 0.4,
-        "total_exit_proceeds": 0.42,
-        "total_simulated_contracts": 1.0,
+        "total_entry_cost": 1.4,
+        "total_exit_proceeds": 1.29,
+        "total_simulated_contracts": 4.0,
         "trailing_stop": {
           "configured_activation_gains_per_contract": [
             0.01
@@ -30067,11 +32505,11 @@
           ],
           "enabled": true,
           "execution_rule": "after a fresh full-depth bid first reaches average filled entry plus the configured activation gain, a later fresh full-depth bid at or below the maximum minus the configured gap exits the whole paper position at that observed bid",
-          "trailing_stop_exits": 1
+          "trailing_stop_exits": 2
         },
-        "trailing_stop_exits": 1,
+        "trailing_stop_exits": 2,
         "unfilled_markets": 1,
-        "win_rate": 1.0,
+        "win_rate": 0.5,
         "winning_trades": 1
       },
       "0.02": {
@@ -30079,6 +32517,24 @@
         "active_paper_markets": 1,
         "armed_markets": 1,
         "average_entry_profiles": {
+          "0.3333": {
+            "active_positions": 1,
+            "average_entry_price": 0.333333,
+            "average_maximum_gross_per_contract": -0.013333,
+            "completed_position_states": 0,
+            "depth_observed_positions": 1,
+            "fixed_stop_loss_exits": 0,
+            "maximum_gross_per_contract": -0.013333,
+            "median_filled_contracts": 3.0,
+            "median_maximum_gross_per_contract": -0.013333,
+            "net_profit": 0.0,
+            "observed_positions": 1,
+            "p75_maximum_gross_per_contract": -0.013333,
+            "p90_maximum_gross_per_contract": -0.013333,
+            "scalp_exits": 0,
+            "settlement_exits": 0,
+            "trailing_stop_exits": 0
+          },
           "0.4": {
             "active_positions": 1,
             "average_entry_price": 0.4,
@@ -30603,6 +33059,24 @@
         "active_paper_markets": 1,
         "armed_markets": 1,
         "average_entry_profiles": {
+          "0.3333": {
+            "active_positions": 1,
+            "average_entry_price": 0.333333,
+            "average_maximum_gross_per_contract": -0.013333,
+            "completed_position_states": 0,
+            "depth_observed_positions": 1,
+            "fixed_stop_loss_exits": 0,
+            "maximum_gross_per_contract": -0.013333,
+            "median_filled_contracts": 3.0,
+            "median_maximum_gross_per_contract": -0.013333,
+            "net_profit": 0.0,
+            "observed_positions": 1,
+            "p75_maximum_gross_per_contract": -0.013333,
+            "p90_maximum_gross_per_contract": -0.013333,
+            "scalp_exits": 0,
+            "settlement_exits": 0,
+            "trailing_stop_exits": 0
+          },
           "0.4": {
             "active_positions": 1,
             "average_entry_price": 0.4,
@@ -31127,6 +33601,24 @@
         "active_paper_markets": 1,
         "armed_markets": 1,
         "average_entry_profiles": {
+          "0.3333": {
+            "active_positions": 1,
+            "average_entry_price": 0.333333,
+            "average_maximum_gross_per_contract": -0.013333,
+            "completed_position_states": 0,
+            "depth_observed_positions": 1,
+            "fixed_stop_loss_exits": 0,
+            "maximum_gross_per_contract": -0.013333,
+            "median_filled_contracts": 3.0,
+            "median_maximum_gross_per_contract": -0.013333,
+            "net_profit": 0.0,
+            "observed_positions": 1,
+            "p75_maximum_gross_per_contract": -0.013333,
+            "p90_maximum_gross_per_contract": -0.013333,
+            "scalp_exits": 0,
+            "settlement_exits": 0,
+            "trailing_stop_exits": 0
+          },
           "0.4": {
             "active_positions": 1,
             "average_entry_price": 0.4,
@@ -31651,6 +34143,24 @@
         "active_paper_markets": 1,
         "armed_markets": 1,
         "average_entry_profiles": {
+          "0.3333": {
+            "active_positions": 1,
+            "average_entry_price": 0.333333,
+            "average_maximum_gross_per_contract": -0.013333,
+            "completed_position_states": 0,
+            "depth_observed_positions": 1,
+            "fixed_stop_loss_exits": 0,
+            "maximum_gross_per_contract": -0.013333,
+            "median_filled_contracts": 3.0,
+            "median_maximum_gross_per_contract": -0.013333,
+            "net_profit": 0.0,
+            "observed_positions": 1,
+            "p75_maximum_gross_per_contract": -0.013333,
+            "p90_maximum_gross_per_contract": -0.013333,
+            "scalp_exits": 0,
+            "settlement_exits": 0,
+            "trailing_stop_exits": 0
+          },
           "0.4": {
             "active_positions": 1,
             "average_entry_price": 0.4,
@@ -32175,6 +34685,24 @@
         "active_paper_markets": 1,
         "armed_markets": 1,
         "average_entry_profiles": {
+          "0.3333": {
+            "active_positions": 1,
+            "average_entry_price": 0.333333,
+            "average_maximum_gross_per_contract": -0.013333,
+            "completed_position_states": 0,
+            "depth_observed_positions": 1,
+            "fixed_stop_loss_exits": 0,
+            "maximum_gross_per_contract": -0.013333,
+            "median_filled_contracts": 3.0,
+            "median_maximum_gross_per_contract": -0.013333,
+            "net_profit": 0.0,
+            "observed_positions": 1,
+            "p75_maximum_gross_per_contract": -0.013333,
+            "p90_maximum_gross_per_contract": -0.013333,
+            "scalp_exits": 0,
+            "settlement_exits": 0,
+            "trailing_stop_exits": 0
+          },
           "0.4": {
             "active_positions": 1,
             "average_entry_price": 0.4,
@@ -32699,6 +35227,24 @@
         "active_paper_markets": 1,
         "armed_markets": 1,
         "average_entry_profiles": {
+          "0.3333": {
+            "active_positions": 1,
+            "average_entry_price": 0.333333,
+            "average_maximum_gross_per_contract": -0.013333,
+            "completed_position_states": 0,
+            "depth_observed_positions": 1,
+            "fixed_stop_loss_exits": 0,
+            "maximum_gross_per_contract": -0.013333,
+            "median_filled_contracts": 3.0,
+            "median_maximum_gross_per_contract": -0.013333,
+            "net_profit": 0.0,
+            "observed_positions": 1,
+            "p75_maximum_gross_per_contract": -0.013333,
+            "p90_maximum_gross_per_contract": -0.013333,
+            "scalp_exits": 0,
+            "settlement_exits": 0,
+            "trailing_stop_exits": 0
+          },
           "0.4": {
             "active_positions": 1,
             "average_entry_price": 0.4,
@@ -33223,6 +35769,24 @@
         "active_paper_markets": 1,
         "armed_markets": 1,
         "average_entry_profiles": {
+          "0.3333": {
+            "active_positions": 1,
+            "average_entry_price": 0.333333,
+            "average_maximum_gross_per_contract": -0.013333,
+            "completed_position_states": 0,
+            "depth_observed_positions": 1,
+            "fixed_stop_loss_exits": 0,
+            "maximum_gross_per_contract": -0.013333,
+            "median_filled_contracts": 3.0,
+            "median_maximum_gross_per_contract": -0.013333,
+            "net_profit": 0.0,
+            "observed_positions": 1,
+            "p75_maximum_gross_per_contract": -0.013333,
+            "p90_maximum_gross_per_contract": -0.013333,
+            "scalp_exits": 0,
+            "settlement_exits": 0,
+            "trailing_stop_exits": 0
+          },
           "0.4": {
             "active_positions": 1,
             "average_entry_price": 0.4,
@@ -33747,6 +36311,24 @@
         "active_paper_markets": 1,
         "armed_markets": 1,
         "average_entry_profiles": {
+          "0.3333": {
+            "active_positions": 1,
+            "average_entry_price": 0.333333,
+            "average_maximum_gross_per_contract": -0.013333,
+            "completed_position_states": 0,
+            "depth_observed_positions": 1,
+            "fixed_stop_loss_exits": 0,
+            "maximum_gross_per_contract": -0.013333,
+            "median_filled_contracts": 3.0,
+            "median_maximum_gross_per_contract": -0.013333,
+            "net_profit": 0.0,
+            "observed_positions": 1,
+            "p75_maximum_gross_per_contract": -0.013333,
+            "p90_maximum_gross_per_contract": -0.013333,
+            "scalp_exits": 0,
+            "settlement_exits": 0,
+            "trailing_stop_exits": 0
+          },
           "0.4": {
             "active_positions": 1,
             "average_entry_price": 0.4,
@@ -34271,6 +36853,24 @@
         "active_paper_markets": 1,
         "armed_markets": 1,
         "average_entry_profiles": {
+          "0.3333": {
+            "active_positions": 1,
+            "average_entry_price": 0.333333,
+            "average_maximum_gross_per_contract": -0.013333,
+            "completed_position_states": 0,
+            "depth_observed_positions": 1,
+            "fixed_stop_loss_exits": 0,
+            "maximum_gross_per_contract": -0.013333,
+            "median_filled_contracts": 3.0,
+            "median_maximum_gross_per_contract": -0.013333,
+            "net_profit": 0.0,
+            "observed_positions": 1,
+            "p75_maximum_gross_per_contract": -0.013333,
+            "p90_maximum_gross_per_contract": -0.013333,
+            "scalp_exits": 0,
+            "settlement_exits": 0,
+            "trailing_stop_exits": 0
+          },
           "0.4": {
             "active_positions": 1,
             "average_entry_price": 0.4,
@@ -34795,6 +37395,24 @@
         "active_paper_markets": 1,
         "armed_markets": 1,
         "average_entry_profiles": {
+          "0.3333": {
+            "active_positions": 1,
+            "average_entry_price": 0.333333,
+            "average_maximum_gross_per_contract": -0.013333,
+            "completed_position_states": 0,
+            "depth_observed_positions": 1,
+            "fixed_stop_loss_exits": 0,
+            "maximum_gross_per_contract": -0.013333,
+            "median_filled_contracts": 3.0,
+            "median_maximum_gross_per_contract": -0.013333,
+            "net_profit": 0.0,
+            "observed_positions": 1,
+            "p75_maximum_gross_per_contract": -0.013333,
+            "p90_maximum_gross_per_contract": -0.013333,
+            "scalp_exits": 0,
+            "settlement_exits": 0,
+            "trailing_stop_exits": 0
+          },
           "0.4": {
             "active_positions": 1,
             "average_entry_price": 0.4,
@@ -35342,6 +37960,24 @@
         "active_paper_markets": 1,
         "armed_markets": 1,
         "average_entry_profiles": {
+          "0.3333": {
+            "active_positions": 1,
+            "average_entry_price": 0.333333,
+            "average_maximum_gross_per_contract": -0.013333,
+            "completed_position_states": 0,
+            "depth_observed_positions": 1,
+            "fixed_stop_loss_exits": 0,
+            "maximum_gross_per_contract": -0.013333,
+            "median_filled_contracts": 3.0,
+            "median_maximum_gross_per_contract": -0.013333,
+            "net_profit": 0.0,
+            "observed_positions": 1,
+            "p75_maximum_gross_per_contract": -0.013333,
+            "p90_maximum_gross_per_contract": -0.013333,
+            "scalp_exits": 0,
+            "settlement_exits": 0,
+            "trailing_stop_exits": 0
+          },
           "0.4": {
             "active_positions": 1,
             "average_entry_price": 0.4,
@@ -35935,6 +38571,24 @@
         "active_paper_markets": 1,
         "armed_markets": 1,
         "average_entry_profiles": {
+          "0.3333": {
+            "active_positions": 1,
+            "average_entry_price": 0.333333,
+            "average_maximum_gross_per_contract": -0.013333,
+            "completed_position_states": 0,
+            "depth_observed_positions": 1,
+            "fixed_stop_loss_exits": 0,
+            "maximum_gross_per_contract": -0.013333,
+            "median_filled_contracts": 3.0,
+            "median_maximum_gross_per_contract": -0.013333,
+            "net_profit": 0.0,
+            "observed_positions": 1,
+            "p75_maximum_gross_per_contract": -0.013333,
+            "p90_maximum_gross_per_contract": -0.013333,
+            "scalp_exits": 0,
+            "settlement_exits": 0,
+            "trailing_stop_exits": 0
+          },
           "0.4": {
             "active_positions": 1,
             "average_entry_price": 0.4,
@@ -36528,6 +39182,24 @@
         "active_paper_markets": 1,
         "armed_markets": 1,
         "average_entry_profiles": {
+          "0.3333": {
+            "active_positions": 1,
+            "average_entry_price": 0.333333,
+            "average_maximum_gross_per_contract": -0.013333,
+            "completed_position_states": 0,
+            "depth_observed_positions": 1,
+            "fixed_stop_loss_exits": 0,
+            "maximum_gross_per_contract": -0.013333,
+            "median_filled_contracts": 3.0,
+            "median_maximum_gross_per_contract": -0.013333,
+            "net_profit": 0.0,
+            "observed_positions": 1,
+            "p75_maximum_gross_per_contract": -0.013333,
+            "p90_maximum_gross_per_contract": -0.013333,
+            "scalp_exits": 0,
+            "settlement_exits": 0,
+            "trailing_stop_exits": 0
+          },
           "0.4": {
             "active_positions": 1,
             "average_entry_price": 0.4,
@@ -37144,6 +39816,24 @@
         "active_paper_markets": 1,
         "armed_markets": 0,
         "average_entry_profiles": {
+          "0.3333": {
+            "active_positions": 1,
+            "average_entry_price": 0.333333,
+            "average_maximum_gross_per_contract": -0.013333,
+            "completed_position_states": 0,
+            "depth_observed_positions": 1,
+            "fixed_stop_loss_exits": 0,
+            "maximum_gross_per_contract": -0.013333,
+            "median_filled_contracts": 3.0,
+            "median_maximum_gross_per_contract": -0.013333,
+            "net_profit": 0.0,
+            "observed_positions": 1,
+            "p75_maximum_gross_per_contract": -0.013333,
+            "p90_maximum_gross_per_contract": -0.013333,
+            "scalp_exits": 0,
+            "settlement_exits": 0,
+            "trailing_stop_exits": 0
+          },
           "0.4": {
             "active_positions": 1,
             "average_entry_price": 0.4,
@@ -37760,6 +40450,24 @@
         "active_paper_markets": 1,
         "armed_markets": 0,
         "average_entry_profiles": {
+          "0.3333": {
+            "active_positions": 1,
+            "average_entry_price": 0.333333,
+            "average_maximum_gross_per_contract": -0.013333,
+            "completed_position_states": 0,
+            "depth_observed_positions": 1,
+            "fixed_stop_loss_exits": 0,
+            "maximum_gross_per_contract": -0.013333,
+            "median_filled_contracts": 3.0,
+            "median_maximum_gross_per_contract": -0.013333,
+            "net_profit": 0.0,
+            "observed_positions": 1,
+            "p75_maximum_gross_per_contract": -0.013333,
+            "p90_maximum_gross_per_contract": -0.013333,
+            "scalp_exits": 0,
+            "settlement_exits": 0,
+            "trailing_stop_exits": 0
+          },
           "0.4": {
             "active_positions": 1,
             "average_entry_price": 0.4,
@@ -38376,6 +41084,24 @@
         "active_paper_markets": 1,
         "armed_markets": 0,
         "average_entry_profiles": {
+          "0.3333": {
+            "active_positions": 1,
+            "average_entry_price": 0.333333,
+            "average_maximum_gross_per_contract": -0.013333,
+            "completed_position_states": 0,
+            "depth_observed_positions": 1,
+            "fixed_stop_loss_exits": 0,
+            "maximum_gross_per_contract": -0.013333,
+            "median_filled_contracts": 3.0,
+            "median_maximum_gross_per_contract": -0.013333,
+            "net_profit": 0.0,
+            "observed_positions": 1,
+            "p75_maximum_gross_per_contract": -0.013333,
+            "p90_maximum_gross_per_contract": -0.013333,
+            "scalp_exits": 0,
+            "settlement_exits": 0,
+            "trailing_stop_exits": 0
+          },
           "0.4": {
             "active_positions": 1,
             "average_entry_price": 0.4,
