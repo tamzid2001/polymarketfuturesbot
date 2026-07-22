@@ -1,7 +1,7 @@
 {
   "strategy": "normal_prophet_weighted_1234_trailing_scalp_shadow_v1",
   "mode": "paper_only_no_exchange_orders",
-  "fill_rule": "buy at fresh executable ask <= rung with displayed ask depth; fixed-exit shadows close all filled rungs at their target, range shadows record later executable bids with displayed bid depth >= the full position, and trailing shadows close only after a full-depth bid retraces by the configured gap from the prior maximum",
+  "fill_rule": "buy at fresh executable ask <= rung with displayed ask depth; fixed-exit shadows close all filled rungs at their target, range shadows record later executable bids with displayed bid depth >= the full position, trailing shadows close only after a full-depth bid retraces by the configured gap from the prior maximum, and fixed-stop shadows close only when a fresh full-depth bid reaches the average entry less the configured gap",
   "fee_treatment": "excluded_no_exchange_fill",
   "limitations": [
     "A quote hit or exit is a paper event, not a Kalshi exchange fill.",
@@ -12,6 +12,7 @@
   "active_paper_markets": 1,
   "scalp_exits": 0,
   "trailing_stop_exits": 1,
+  "fixed_stop_loss_exits": 0,
   "settlement_exits_without_take_profit": 0,
   "unfilled_markets": 0,
   "filled_market_trades": 1,
@@ -88,6 +89,10 @@
         "trailing_stop_bid": 0.12,
         "observed_exit_bid": 0.12
       },
+      "fixed_stop_loss": {
+        "fixed_stop_loss_bid": null,
+        "observed_exit_bid": 0.12
+      },
       "target_hits": {}
     }
   ],
@@ -99,6 +104,7 @@
       "completed_position_states": 1,
       "scalp_exits": 0,
       "trailing_stop_exits": 0,
+      "fixed_stop_loss_exits": 0,
       "settlement_exits": 0,
       "net_profit": 0.0,
       "depth_observed_positions": 2,
@@ -116,6 +122,7 @@
       "completed_position_states": 1,
       "scalp_exits": 0,
       "trailing_stop_exits": 0,
+      "fixed_stop_loss_exits": 0,
       "settlement_exits": 0,
       "net_profit": 0.0,
       "depth_observed_positions": 2,
@@ -128,25 +135,26 @@
     },
     "0.2667": {
       "average_entry_price": 0.266667,
-      "observed_positions": 1,
-      "active_positions": 0,
+      "observed_positions": 2,
+      "active_positions": 1,
       "completed_position_states": 1,
       "scalp_exits": 0,
       "trailing_stop_exits": 1,
+      "fixed_stop_loss_exits": 0,
       "settlement_exits": 0,
       "net_profit": -0.88,
-      "depth_observed_positions": 1,
-      "median_maximum_gross_per_contract": -0.046667,
-      "p75_maximum_gross_per_contract": -0.046667,
-      "p90_maximum_gross_per_contract": -0.046667,
+      "depth_observed_positions": 2,
+      "median_maximum_gross_per_contract": -0.096667,
+      "p75_maximum_gross_per_contract": -0.071667,
+      "p90_maximum_gross_per_contract": -0.056667,
       "maximum_gross_per_contract": -0.046667,
-      "average_maximum_gross_per_contract": -0.046667,
+      "average_maximum_gross_per_contract": -0.096667,
       "median_filled_contracts": 6.0
     }
   },
   "excursion_observer": {
     "enabled": true,
-    "method": "records the maximum later fresh executable bid with displayed depth for each unchanged filled VWAP/size; range shadows do not select an exit while trailing shadows may later close on their configured retracement",
+    "method": "records the maximum later fresh executable bid with displayed depth for each unchanged filled VWAP/size; range shadows do not select an exit, trailing shadows may close on their configured retracement, and fixed-stop shadows may close at their configured loss threshold",
     "unit": "gross dollars per contract; fees, queue position, latency, and price impact excluded",
     "completed_position_states": 3,
     "depth_observed_position_states": 3,
@@ -240,7 +248,13 @@
     "trailing_stop_exits": 1,
     "execution_rule": "after a fresh full-depth bid establishes a maximum, a later fresh full-depth bid at or below maximum minus the configured gap exits the whole paper position at that observed bid"
   },
-  "generated_at": "2026-07-22T04:02:23.330860+00:00",
+  "fixed_stop_loss": {
+    "enabled": false,
+    "configured_gaps_per_contract": [],
+    "fixed_stop_loss_exits": 0,
+    "execution_rule": "after a weighted position forms, a fresh full-depth executable bid at or below average entry minus the configured gap exits the whole paper position at that observed bid"
+  },
+  "generated_at": "2026-07-22T04:03:42.653664+00:00",
   "source": "same_frozen_prophet_side_as_primary_ladder",
   "locked_side_policy": "side is fixed before open and never changes on later quotes",
   "weighted_rungs": {
