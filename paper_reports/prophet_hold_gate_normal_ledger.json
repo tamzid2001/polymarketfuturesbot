@@ -22821,7 +22821,7 @@
   {
     "strategy": "normal_prophet_weighted_1234_hold_gate_trailing_v3",
     "mode": "paper_only_no_exchange_orders",
-    "status": "active",
+    "status": "finalized_settlement",
     "ticker": "KXBTC15M-26JUL220145-45",
     "side": "yes",
     "created_at": "2026-07-22T05:30:04.856268+00:00",
@@ -23096,7 +23096,9 @@
         "target_hits": {},
         "max_recorded_at": "2026-07-22T05:37:06.271028+00:00",
         "fixed_stop_loss_bid": 0.05,
-        "trailing_activation_bid": 0.276667
+        "trailing_activation_bid": 0.276667,
+        "ended_at": "2026-07-22T15:02:36.253464+00:00",
+        "ended_by": "settlement"
       }
     ],
     "events": [
@@ -23428,6 +23430,15 @@
           "quote_source_ts_ms": 1784698625258,
           "quote_age_seconds": 0.944
         }
+      },
+      {
+        "kind": "paper_scalp_settlement",
+        "at": "2026-07-22T15:02:36.253464+00:00",
+        "settlement_outcome": "no",
+        "filled_contracts": 6.0,
+        "entry_cost": 1.6,
+        "settlement_payout": 0.0,
+        "gross_profit_loss": -1.6
       }
     ],
     "limitation": "Paper-only. Entry and exit require a fresh complete top-of-book and displayed depth, but queue priority, latency, cancellations, hidden liquidity, partial fills, and fees are excluded.",
@@ -23439,8 +23450,8 @@
     "strike": 66032.23,
     "hold_gain_gate_per_contract": 0.01,
     "activation_comparison_key": "0.01",
-    "last_entry_quote_state": "executable_top_of_book",
-    "last_exit_quote_state": "executable_top_of_book",
+    "last_entry_quote_state": "no_book_quote",
+    "last_exit_quote_state": "no_book_quote",
     "last_actual_top_of_book": {
       "observed_at": "2026-07-22T05:37:05.326836+00:00",
       "quote_id": "KXBTC15M-26JUL220145-45:421:2026-07-22T05:37:05.326836+00:00",
@@ -23459,7 +23470,19 @@
       "entry_cost": 1.6,
       "average_entry_price": 0.266667,
       "take_profit_bid": 0.276667
-    }
+    },
+    "settled_at": "2026-07-22T15:02:36.253464+00:00",
+    "settlement_outcome": "no",
+    "contracts": 6.0,
+    "total_cost": 1.6,
+    "average_entry": 0.266667,
+    "gross_payout": 0.0,
+    "gross_profit_loss": -1.6,
+    "net_profit_loss": -1.6,
+    "estimated_fees": 0.0,
+    "fees_model": "excluded_no_exchange_fill",
+    "return_percentage": -100.0,
+    "exit_method": "settlement_no_take_profit_exit"
   },
   {
     "strategy": "normal_prophet_weighted_1234_hold_gate_trailing_v3",
@@ -24082,8 +24105,8 @@
     "strike": 66032.23,
     "hold_gain_gate_per_contract": 0.02,
     "activation_comparison_key": "0.02",
-    "last_entry_quote_state": "executable_top_of_book",
-    "last_exit_quote_state": "executable_top_of_book",
+    "last_entry_quote_state": "no_book_quote",
+    "last_exit_quote_state": "no_book_quote",
     "last_actual_top_of_book": {
       "observed_at": "2026-07-22T05:37:05.326836+00:00",
       "quote_id": "KXBTC15M-26JUL220145-45:421:2026-07-22T05:37:05.326836+00:00",
@@ -24725,8 +24748,8 @@
     "strike": 66032.23,
     "hold_gain_gate_per_contract": 0.03,
     "activation_comparison_key": "0.03",
-    "last_entry_quote_state": "executable_top_of_book",
-    "last_exit_quote_state": "executable_top_of_book",
+    "last_entry_quote_state": "no_book_quote",
+    "last_exit_quote_state": "no_book_quote",
     "last_actual_top_of_book": {
       "observed_at": "2026-07-22T05:37:05.326836+00:00",
       "quote_id": "KXBTC15M-26JUL220145-45:421:2026-07-22T05:37:05.326836+00:00",
@@ -25368,8 +25391,8 @@
     "strike": 66032.23,
     "hold_gain_gate_per_contract": 0.04,
     "activation_comparison_key": "0.04",
-    "last_entry_quote_state": "executable_top_of_book",
-    "last_exit_quote_state": "executable_top_of_book",
+    "last_entry_quote_state": "no_book_quote",
+    "last_exit_quote_state": "no_book_quote",
     "last_actual_top_of_book": {
       "observed_at": "2026-07-22T05:37:05.326836+00:00",
       "quote_id": "KXBTC15M-26JUL220145-45:421:2026-07-22T05:37:05.326836+00:00",
@@ -26011,8 +26034,8 @@
     "strike": 66032.23,
     "hold_gain_gate_per_contract": 0.05,
     "activation_comparison_key": "0.05",
-    "last_entry_quote_state": "executable_top_of_book",
-    "last_exit_quote_state": "executable_top_of_book",
+    "last_entry_quote_state": "no_book_quote",
+    "last_exit_quote_state": "no_book_quote",
     "last_actual_top_of_book": {
       "observed_at": "2026-07-22T05:37:05.326836+00:00",
       "quote_id": "KXBTC15M-26JUL220145-45:421:2026-07-22T05:37:05.326836+00:00",
@@ -26654,8 +26677,8 @@
     "strike": 66032.23,
     "hold_gain_gate_per_contract": 0.06,
     "activation_comparison_key": "0.06",
-    "last_entry_quote_state": "executable_top_of_book",
-    "last_exit_quote_state": "executable_top_of_book",
+    "last_entry_quote_state": "no_book_quote",
+    "last_exit_quote_state": "no_book_quote",
     "last_actual_top_of_book": {
       "observed_at": "2026-07-22T05:37:05.326836+00:00",
       "quote_id": "KXBTC15M-26JUL220145-45:421:2026-07-22T05:37:05.326836+00:00",
@@ -27297,8 +27320,8 @@
     "strike": 66032.23,
     "hold_gain_gate_per_contract": 0.07,
     "activation_comparison_key": "0.07",
-    "last_entry_quote_state": "executable_top_of_book",
-    "last_exit_quote_state": "executable_top_of_book",
+    "last_entry_quote_state": "no_book_quote",
+    "last_exit_quote_state": "no_book_quote",
     "last_actual_top_of_book": {
       "observed_at": "2026-07-22T05:37:05.326836+00:00",
       "quote_id": "KXBTC15M-26JUL220145-45:421:2026-07-22T05:37:05.326836+00:00",
@@ -27940,8 +27963,8 @@
     "strike": 66032.23,
     "hold_gain_gate_per_contract": 0.08,
     "activation_comparison_key": "0.08",
-    "last_entry_quote_state": "executable_top_of_book",
-    "last_exit_quote_state": "executable_top_of_book",
+    "last_entry_quote_state": "no_book_quote",
+    "last_exit_quote_state": "no_book_quote",
     "last_actual_top_of_book": {
       "observed_at": "2026-07-22T05:37:05.326836+00:00",
       "quote_id": "KXBTC15M-26JUL220145-45:421:2026-07-22T05:37:05.326836+00:00",
@@ -28583,8 +28606,8 @@
     "strike": 66032.23,
     "hold_gain_gate_per_contract": 0.09,
     "activation_comparison_key": "0.09",
-    "last_entry_quote_state": "executable_top_of_book",
-    "last_exit_quote_state": "executable_top_of_book",
+    "last_entry_quote_state": "no_book_quote",
+    "last_exit_quote_state": "no_book_quote",
     "last_actual_top_of_book": {
       "observed_at": "2026-07-22T05:37:05.326836+00:00",
       "quote_id": "KXBTC15M-26JUL220145-45:421:2026-07-22T05:37:05.326836+00:00",
@@ -29226,8 +29249,8 @@
     "strike": 66032.23,
     "hold_gain_gate_per_contract": 0.1,
     "activation_comparison_key": "0.10",
-    "last_entry_quote_state": "executable_top_of_book",
-    "last_exit_quote_state": "executable_top_of_book",
+    "last_entry_quote_state": "no_book_quote",
+    "last_exit_quote_state": "no_book_quote",
     "last_actual_top_of_book": {
       "observed_at": "2026-07-22T05:37:05.326836+00:00",
       "quote_id": "KXBTC15M-26JUL220145-45:421:2026-07-22T05:37:05.326836+00:00",
@@ -29869,8 +29892,8 @@
     "strike": 66032.23,
     "hold_gain_gate_per_contract": 0.2,
     "activation_comparison_key": "0.20",
-    "last_entry_quote_state": "executable_top_of_book",
-    "last_exit_quote_state": "executable_top_of_book",
+    "last_entry_quote_state": "no_book_quote",
+    "last_exit_quote_state": "no_book_quote",
     "last_actual_top_of_book": {
       "observed_at": "2026-07-22T05:37:05.326836+00:00",
       "quote_id": "KXBTC15M-26JUL220145-45:421:2026-07-22T05:37:05.326836+00:00",
@@ -30512,8 +30535,8 @@
     "strike": 66032.23,
     "hold_gain_gate_per_contract": 0.3,
     "activation_comparison_key": "0.30",
-    "last_entry_quote_state": "executable_top_of_book",
-    "last_exit_quote_state": "executable_top_of_book",
+    "last_entry_quote_state": "no_book_quote",
+    "last_exit_quote_state": "no_book_quote",
     "last_actual_top_of_book": {
       "observed_at": "2026-07-22T05:37:05.326836+00:00",
       "quote_id": "KXBTC15M-26JUL220145-45:421:2026-07-22T05:37:05.326836+00:00",
@@ -31155,8 +31178,8 @@
     "strike": 66032.23,
     "hold_gain_gate_per_contract": 0.4,
     "activation_comparison_key": "0.40",
-    "last_entry_quote_state": "executable_top_of_book",
-    "last_exit_quote_state": "executable_top_of_book",
+    "last_entry_quote_state": "no_book_quote",
+    "last_exit_quote_state": "no_book_quote",
     "last_actual_top_of_book": {
       "observed_at": "2026-07-22T05:37:05.326836+00:00",
       "quote_id": "KXBTC15M-26JUL220145-45:421:2026-07-22T05:37:05.326836+00:00",
@@ -31798,8 +31821,8 @@
     "strike": 66032.23,
     "hold_gain_gate_per_contract": 0.5,
     "activation_comparison_key": "0.50",
-    "last_entry_quote_state": "executable_top_of_book",
-    "last_exit_quote_state": "executable_top_of_book",
+    "last_entry_quote_state": "no_book_quote",
+    "last_exit_quote_state": "no_book_quote",
     "last_actual_top_of_book": {
       "observed_at": "2026-07-22T05:37:05.326836+00:00",
       "quote_id": "KXBTC15M-26JUL220145-45:421:2026-07-22T05:37:05.326836+00:00",
@@ -32441,8 +32464,8 @@
     "strike": 66032.23,
     "hold_gain_gate_per_contract": 0.6,
     "activation_comparison_key": "0.60",
-    "last_entry_quote_state": "executable_top_of_book",
-    "last_exit_quote_state": "executable_top_of_book",
+    "last_entry_quote_state": "no_book_quote",
+    "last_exit_quote_state": "no_book_quote",
     "last_actual_top_of_book": {
       "observed_at": "2026-07-22T05:37:05.326836+00:00",
       "quote_id": "KXBTC15M-26JUL220145-45:421:2026-07-22T05:37:05.326836+00:00",
@@ -33084,8 +33107,8 @@
     "strike": 66032.23,
     "hold_gain_gate_per_contract": 0.7,
     "activation_comparison_key": "0.70",
-    "last_entry_quote_state": "executable_top_of_book",
-    "last_exit_quote_state": "executable_top_of_book",
+    "last_entry_quote_state": "no_book_quote",
+    "last_exit_quote_state": "no_book_quote",
     "last_actual_top_of_book": {
       "observed_at": "2026-07-22T05:37:05.326836+00:00",
       "quote_id": "KXBTC15M-26JUL220145-45:421:2026-07-22T05:37:05.326836+00:00",
@@ -33727,8 +33750,8 @@
     "strike": 66032.23,
     "hold_gain_gate_per_contract": 0.8,
     "activation_comparison_key": "0.80",
-    "last_entry_quote_state": "executable_top_of_book",
-    "last_exit_quote_state": "executable_top_of_book",
+    "last_entry_quote_state": "no_book_quote",
+    "last_exit_quote_state": "no_book_quote",
     "last_actual_top_of_book": {
       "observed_at": "2026-07-22T05:37:05.326836+00:00",
       "quote_id": "KXBTC15M-26JUL220145-45:421:2026-07-22T05:37:05.326836+00:00",
