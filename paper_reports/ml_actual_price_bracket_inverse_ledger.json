@@ -1,33 +1,23 @@
 {
-  "generated_at": "2026-07-22T04:20:36.168303+00:00",
+  "generated_at": "2026-07-22T04:20:36.169024+00:00",
   "locked_side_policy": "side is fixed before open and never changes on later quotes",
   "model_variant": "inverse_ml",
   "paper_only": true,
   "records": [],
-  "schema": "ml_weighted_1234_trailing_paper_ledger_v1",
-  "strategy": "inverse_ml_weighted_1234_trailing_scalp_shadow_v1",
+  "schema": "ml_weighted_1234_fixed_stop_and_trailing_paper_ledger_v2",
+  "strategy": "inverse_ml_weighted_1234_fixed_stop_and_trailing_shadow_v2",
   "strategy_definition": {
     "entry_rule": "fresh executable side ask at or below each rung with displayed ask depth; shared quote depth is consumed across the 1/2/3/4 fills",
-    "exit_rule": "after a fresh full-depth executable bid establishes a high, a later fresh full-depth bid at or below high minus the trailing gap closes at that observed bid",
+    "exit_rule": "record both actual YES/NO top-of-book prices; close all paper contracts at the observed full-depth selected-side bid if it is at/below average filled entry minus 5c, or after a full-depth +10c gain arms a later 10c trailing retracement",
     "fee_treatment": "excluded_no_exchange_fill",
+    "fixed_stop_loss_per_contract": 0.05,
     "rung_quantities": {
       "0.10": 4.0,
       "0.20": 3.0,
       "0.30": 2.0,
       "0.40": 1.0
     },
-    "target_opportunities_per_contract": [
-      0.01,
-      0.02,
-      0.03,
-      0.05,
-      0.1,
-      0.2,
-      0.3,
-      0.4,
-      0.5,
-      0.6
-    ],
+    "trailing_activation_gain_per_contract": 0.1,
     "trailing_stop_per_contract": 0.1
   },
   "summary": {
@@ -116,7 +106,7 @@
     "scalp_exits": 0,
     "settlement_exits_without_take_profit": 0,
     "source": "opposite_frozen_ml_side",
-    "strategy": "inverse_ml_weighted_1234_trailing_scalp_shadow_v1",
+    "strategy": "inverse_ml_weighted_1234_fixed_stop_and_trailing_shadow_v2",
     "total_entry_cost": 0,
     "total_exit_proceeds": 0,
     "total_simulated_contracts": 0,
