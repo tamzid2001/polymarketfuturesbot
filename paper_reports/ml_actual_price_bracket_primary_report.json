@@ -33,7 +33,7 @@
     "weighted_scalp_trailing_enabled": false,
     "weighted_scalp_trailing_stop_per_contract": 0.1
   },
-  "generated_at": "2026-07-22T04:20:36.167561+00:00",
+  "generated_at": "2026-07-22T04:30:22.837644+00:00",
   "inverse_ml_shadow_performance": {
     "active_shadow_markets": 0,
     "average_contracts_per_filled_market": null,
@@ -129,14 +129,14 @@
     "winning_trades": 0
   },
   "inverse_ml_weighted_fixed_stop_loss_performance": {
-    "active_paper_markets": 0,
+    "active_paper_markets": 1,
     "average_entry_profiles": {},
     "current_streak": 0,
     "current_streak_kind": "none",
     "excursion_observer": {
       "completed_position_states": 0,
       "depth_observed_position_states": 0,
-      "enabled": false,
+      "enabled": true,
       "maximum_gross_per_contract": {
         "average": null,
         "maximum": null,
@@ -182,6 +182,41 @@
           "hit_position_states": 0,
           "hit_rate_given_depth_observation": null,
           "target_per_contract": 0.1
+        },
+        "0.20": {
+          "completed_position_states": 0,
+          "depth_observed_position_states": 0,
+          "hit_position_states": 0,
+          "hit_rate_given_depth_observation": null,
+          "target_per_contract": 0.2
+        },
+        "0.30": {
+          "completed_position_states": 0,
+          "depth_observed_position_states": 0,
+          "hit_position_states": 0,
+          "hit_rate_given_depth_observation": null,
+          "target_per_contract": 0.3
+        },
+        "0.40": {
+          "completed_position_states": 0,
+          "depth_observed_position_states": 0,
+          "hit_position_states": 0,
+          "hit_rate_given_depth_observation": null,
+          "target_per_contract": 0.4
+        },
+        "0.50": {
+          "completed_position_states": 0,
+          "depth_observed_position_states": 0,
+          "hit_position_states": 0,
+          "hit_rate_given_depth_observation": null,
+          "target_per_contract": 0.5
+        },
+        "0.60": {
+          "completed_position_states": 0,
+          "depth_observed_position_states": 0,
+          "hit_position_states": 0,
+          "hit_rate_given_depth_observation": null,
+          "target_per_contract": 0.6
         }
       },
       "unit": "gross dollars per contract; fees, queue position, latency, and price impact excluded"
@@ -190,8 +225,10 @@
     "fill_rule": "buy at a fresh actual executable ask <= rung with displayed ask depth; maintains the latest fresh YES and NO top-of-book snapshot, requires displayed bid depth for the whole filled position on every exit, closes a fixed loss only at average filled entry minus its configured gap, and closes a trailing stop only after its average-filled-entry gain activation and later configured retracement",
     "filled_market_trades": 0,
     "fixed_stop_loss": {
-      "configured_gaps_per_contract": [],
-      "enabled": false,
+      "configured_gaps_per_contract": [
+        0.05
+      ],
+      "enabled": true,
       "execution_rule": "after a weighted position forms, a fresh full-depth executable bid at or below average entry minus the configured gap exits the whole paper position at that observed bid",
       "fixed_stop_loss_exits": 0
     },
@@ -208,7 +245,7 @@
     "maximum_drawdown": 0.0,
     "mode": "paper_only_no_exchange_orders",
     "net_profit": 0,
-    "paper_markets_started": 0,
+    "paper_markets_started": 1,
     "pnl_time_series": [],
     "return_on_simulated_capital": null,
     "scalp_exits": 0,
@@ -219,9 +256,13 @@
     "total_exit_proceeds": 0,
     "total_simulated_contracts": 0,
     "trailing_stop": {
-      "configured_activation_gains_per_contract": [],
-      "configured_gaps_per_contract": [],
-      "enabled": false,
+      "configured_activation_gains_per_contract": [
+        0.1
+      ],
+      "configured_gaps_per_contract": [
+        0.1
+      ],
+      "enabled": true,
       "execution_rule": "after a fresh full-depth bid first reaches average filled entry plus the configured activation gain, a later fresh full-depth bid at or below the maximum minus the configured gap exits the whole paper position at that observed bid",
       "trailing_stop_exits": 0
     },
@@ -473,19 +514,37 @@
     "strategy": "paired_model_transition_executable_quote_shadow_v1"
   },
   "ml_model_transition_side_comparison": {
-    "comparisons": [],
+    "comparisons": [
+      {
+        "average_probability_yes_delta": -0.0018,
+        "compared_markets": 1,
+        "current_directional_win_rate": null,
+        "current_directional_wins": 0,
+        "current_minus_previous_directional_wins": 0,
+        "current_model_run_id": "29889729268",
+        "no_to_yes": 0,
+        "previous_directional_win_rate": null,
+        "previous_directional_wins": 0,
+        "previous_model_run_id": "29799769912",
+        "same_side": 1,
+        "settled_markets": 0,
+        "side_change_rate": 0.0,
+        "side_changed": 0,
+        "yes_to_no": 0
+      }
+    ],
     "method": "same_frozen_input_model_transition_comparison_v1",
     "note": "This is prospective deployment-transition tracking. It compares model sides on the same frozen feature vector; it is not a retraining promotion test or executable P&L estimate."
   },
   "ml_weighted_fixed_stop_loss_performance": {
-    "active_paper_markets": 0,
+    "active_paper_markets": 1,
     "average_entry_profiles": {},
     "current_streak": 0,
     "current_streak_kind": "none",
     "excursion_observer": {
       "completed_position_states": 0,
       "depth_observed_position_states": 0,
-      "enabled": false,
+      "enabled": true,
       "maximum_gross_per_contract": {
         "average": null,
         "maximum": null,
@@ -531,6 +590,41 @@
           "hit_position_states": 0,
           "hit_rate_given_depth_observation": null,
           "target_per_contract": 0.1
+        },
+        "0.20": {
+          "completed_position_states": 0,
+          "depth_observed_position_states": 0,
+          "hit_position_states": 0,
+          "hit_rate_given_depth_observation": null,
+          "target_per_contract": 0.2
+        },
+        "0.30": {
+          "completed_position_states": 0,
+          "depth_observed_position_states": 0,
+          "hit_position_states": 0,
+          "hit_rate_given_depth_observation": null,
+          "target_per_contract": 0.3
+        },
+        "0.40": {
+          "completed_position_states": 0,
+          "depth_observed_position_states": 0,
+          "hit_position_states": 0,
+          "hit_rate_given_depth_observation": null,
+          "target_per_contract": 0.4
+        },
+        "0.50": {
+          "completed_position_states": 0,
+          "depth_observed_position_states": 0,
+          "hit_position_states": 0,
+          "hit_rate_given_depth_observation": null,
+          "target_per_contract": 0.5
+        },
+        "0.60": {
+          "completed_position_states": 0,
+          "depth_observed_position_states": 0,
+          "hit_position_states": 0,
+          "hit_rate_given_depth_observation": null,
+          "target_per_contract": 0.6
         }
       },
       "unit": "gross dollars per contract; fees, queue position, latency, and price impact excluded"
@@ -539,8 +633,10 @@
     "fill_rule": "buy at a fresh actual executable ask <= rung with displayed ask depth; maintains the latest fresh YES and NO top-of-book snapshot, requires displayed bid depth for the whole filled position on every exit, closes a fixed loss only at average filled entry minus its configured gap, and closes a trailing stop only after its average-filled-entry gain activation and later configured retracement",
     "filled_market_trades": 0,
     "fixed_stop_loss": {
-      "configured_gaps_per_contract": [],
-      "enabled": false,
+      "configured_gaps_per_contract": [
+        0.05
+      ],
+      "enabled": true,
       "execution_rule": "after a weighted position forms, a fresh full-depth executable bid at or below average entry minus the configured gap exits the whole paper position at that observed bid",
       "fixed_stop_loss_exits": 0
     },
@@ -557,7 +653,7 @@
     "maximum_drawdown": 0.0,
     "mode": "paper_only_no_exchange_orders",
     "net_profit": 0,
-    "paper_markets_started": 0,
+    "paper_markets_started": 1,
     "pnl_time_series": [],
     "return_on_simulated_capital": null,
     "scalp_exits": 0,
@@ -568,9 +664,13 @@
     "total_exit_proceeds": 0,
     "total_simulated_contracts": 0,
     "trailing_stop": {
-      "configured_activation_gains_per_contract": [],
-      "configured_gaps_per_contract": [],
-      "enabled": false,
+      "configured_activation_gains_per_contract": [
+        0.1
+      ],
+      "configured_gaps_per_contract": [
+        0.1
+      ],
+      "enabled": true,
       "execution_rule": "after a fresh full-depth bid first reaches average filled entry plus the configured activation gain, a later fresh full-depth bid at or below the maximum minus the configured gap exits the whole paper position at that observed bid",
       "trailing_stop_exits": 0
     },
