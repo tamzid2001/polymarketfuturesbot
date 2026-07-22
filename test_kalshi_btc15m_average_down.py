@@ -33,6 +33,7 @@ from kalshi_btc15m_average_down import (
     ladder_principal,
     ladder_principal_for_rungs,
     live_rung_quantities,
+    live_settlement_contrarian_enabled,
     mark_live_exit_if_flat,
     monitor_live_inverse_ml_weighted_hold_gate,
     performance_report,
@@ -40,6 +41,7 @@ from kalshi_btc15m_average_down import (
     reconcile_orders,
     recover_exchange_state,
     scheduled_trading_pause_active,
+    settlement_contrarian_side_for_market,
     settle_or_cancel,
     side_api_price,
     submit_ladder,
@@ -166,6 +168,87 @@ class MechanicalAverageDownTests(unittest.TestCase):
                 self.assertNotIn(ticker, selector.tasks)
 
         asyncio.run(scenario())
+
+    def test_settlement_contrarian_freezes_only_the_result_available_at_open_plus_45_seconds(self):
+        class FakeRest:
+            def __init__(self):
+                self.cutoffs: list[float] = []
+
+            async def latest_settled_btc15m_before(self, cutoff):
+                self.cutoffs.append(cutoff)
+                return {
+                    "ticker": "KXBTC15M-26JUL221130-30", "result": "yes",
+                    "settlement_ts": "2026-07-22T11:30:41Z", "settlement_epoch": cutoff - 4,
+                    "source": "test",
+                }
+
+        async def scenario():
+            config, _ = apply_config_overrides(
+                validate_config(DEFAULT_CONFIG),
+                SimpleNamespace(live_execution_strategy="settlement_contrarian_weighted_hold_gate"),
+            )
+            self.assertTrue(live_settlement_contrarian_enabled(config))
+            opened = time.time() - 46
+            market = SimpleNamespace(ticker="KXBTC15M-TEST-CONTRARIAN", open_time=opened)
+            record = {"ticker": market.ticker, "market_open_time": opened}
+            rest = FakeRest()
+            side = await settlement_contrarian_side_for_market(
+                rest, market, record, config, now_epoch=opened + 45.1,
+            )
+            resumed = await settlement_contrarian_side_for_market(
+                rest, market, record, config, now_epoch=opened + 50,
+            )
+            return side, resumed, record, rest.cutoffs
+
+        side, resumed, record, cutoffs = asyncio.run(scenario())
+        self.assertEqual((side, resumed), ("no", "no"))
+        self.assertEqual(len(cutoffs), 1)
+        signal = record["settlement_contrarian_signal"]
+        self.assertEqual((signal["source_result"], signal["side"]), ("yes", "no"))
+        self.assertLessEqual(signal["source_settlement_epoch"], signal["decision_cutoff_epoch"])
+
+    def test_settlement_contrarian_posts_weighted_side_without_an_ml_signal(self):
+        class FakeRest:
+            async def balance_dollars(self):
+                return 10.0
+
+            async def position_for_ticker(self, _ticker):
+                return 0.0
+
+            async def create_order(self, **kwargs):
+                return {
+                    "order_id": f"order-{kwargs['position_price']}", "side": kwargs["side"],
+                    "position_price": kwargs["position_price"], "quantity": kwargs["quantity"],
+                    "fill_count": 0.0, "remaining_count": kwargs["quantity"], "fees_paid": 0.0, "status": "resting",
+                }
+
+        async def scenario():
+            config, _ = apply_config_overrides(
+                validate_config(DEFAULT_CONFIG),
+                SimpleNamespace(live_execution_strategy="settlement_contrarian_weighted_hold_gate"),
+            )
+            state = default_state()
+            market = SimpleNamespace(
+                ticker="KXBTC15M-TEST-CONTRARIAN-LIVE", status="active", open_time=time.time() - 46,
+                close_time=time.time() + 895,
+            )
+            record = market_record(state, market.ticker)
+            record["settlement_contrarian_signal"] = {
+                "source": "test", "source_ticker": "KXBTC15M-TEST-PRIOR", "source_result": "yes",
+                "source_settlement_epoch": time.time() - 60,
+                "decision_cutoff_epoch": float(market.open_time) + 45.0, "side": "no",
+            }
+            entered = await consider_initial_entry(
+                FakeRest(), state, market, config, dry_run=False, ml_side="no", signal_source="settlement_contrarian",
+            )
+            return entered, state["markets"][market.ticker]
+
+        entered, record = asyncio.run(scenario())
+        self.assertTrue(entered)
+        self.assertEqual(record["strategy"], "settlement_contrarian_weighted_hold_gate_live_v1")
+        self.assertEqual(record["locked_side"], "no")
+        self.assertNotIn("source_ml_side", record)
+        self.assertEqual([record["orders"][f"{level:.4f}"]["quantity"] for level in LADDER_LEVELS], [1.0, 2.0, 3.0, 4.0])
 
     def test_fresh_websocket_quote_supplies_both_executable_sides(self):
         feed = KalshiLiveFeed(auth=None)
