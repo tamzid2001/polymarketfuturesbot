@@ -204,6 +204,40 @@ class LadderScalpShadowTests(unittest.TestCase):
             point["fixed_stop_loss"]["fixed_stop_loss_bid"], point["fixed_stop_loss"]["observed_exit_bid"],
         ))
 
+    def test_weighted_bracket_arms_ten_cent_trailing_stop_only_after_ten_cent_gain(self) -> None:
+        shadow = new_ladder_average_entry_scalp_shadow(
+            strategy="weighted-bracket", ticker="KXBTC15M-TEST", side="yes", quantity_per_rung=1.0,
+            profit_target_per_contract=0.01, quote_max_age_seconds=3.0, market_close_time="later",
+            profit_targets_per_contract=EXTENDED_PROFIT_TARGETS,
+            rung_quantities={0.40: 1.0, 0.30: 2.0, 0.20: 3.0, 0.10: 4.0},
+            fixed_stop_loss_per_contract=0.05,
+            trailing_stop_per_contract=0.10,
+            trailing_activation_gain_per_contract=0.10,
+        )
+        simulate_ladder_average_entry_scalp(
+            shadow, entry_quote=quote(0.20, 6.0, "entry"), entry_quote_state="fresh",
+            exit_quote=quote(0.36, 6.0, "not-armed"), exit_quote_state="fresh",
+        )
+        self.assertEqual("active", shadow["status"])
+        self.assertNotIn("trailing_armed_at", shadow["position_epochs"][0])
+        simulate_ladder_average_entry_scalp(
+            shadow, entry_quote=None, entry_quote_state="fresh",
+            exit_quote=quote(0.37, 6.0, "armed"), exit_quote_state="fresh",
+        )
+        epoch = shadow["position_epochs"][0]
+        self.assertEqual((0.366667, 0.37), (epoch["trailing_activation_bid"], epoch["trailing_armed_high_bid"]))
+        events = simulate_ladder_average_entry_scalp(
+            shadow, entry_quote=None, entry_quote_state="fresh",
+            exit_quote=quote(0.27, 6.0, "trailing-exit"), exit_quote_state="fresh",
+        )
+        self.assertEqual(("scalp_exited", "paper_scalp_trailing_stop_exit", 0.27), (
+            shadow["status"], events[-1]["kind"], events[-1]["exit_price"],
+        ))
+        report = scalp_performance([shadow])
+        self.assertEqual((1, [0.1]), (
+            report["trailing_stop_exits"], report["trailing_stop"]["configured_activation_gains_per_contract"],
+        ))
+
 
 if __name__ == "__main__":
     unittest.main()

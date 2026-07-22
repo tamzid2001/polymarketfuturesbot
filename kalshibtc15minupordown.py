@@ -146,7 +146,7 @@ PROPHET_LADDER_SCALP_SHADOW_ENABLED = (
 # Normal and inverse weighted studies remain paper-only even when a manually
 # confirmed primary selector runs live. Each freezes its own side pre-open.
 PROPHET_WEIGHTED_TRAILING_SHADOW_ENABLED = (
-    DRY_RUN and os.getenv("PROPHET_WEIGHTED_TRAILING_SHADOW_ENABLED", "true").lower()
+    DRY_RUN and os.getenv("PROPHET_WEIGHTED_TRAILING_SHADOW_ENABLED", "false").lower()
     in ("1", "true", "yes")
 )
 # Parallel to the trailing study, this is a regular 5c fixed-loss paper exit.
@@ -246,6 +246,8 @@ PROPHET_WEIGHTED_FIXED_STOP_INVERSE_REPORT_FILE = os.getenv(
     "PROPHET_WEIGHTED_FIXED_STOP_INVERSE_REPORT_FILE", "prophet_btc_weighted_fixed_stop_inverse_report.json")
 PROPHET_WEIGHTED_FIXED_STOP_PER_CONTRACT = max(
     0.001, float(os.getenv("PROPHET_WEIGHTED_FIXED_STOP_PER_CONTRACT", "0.05")))
+PROPHET_WEIGHTED_TRAILING_ACTIVATION_GAIN_PER_CONTRACT = max(
+    0.001, float(os.getenv("PROPHET_WEIGHTED_TRAILING_ACTIVATION_GAIN_PER_CONTRACT", "0.10")))
 WEIGHTED_SCALP_RUNG_QUANTITIES = {0.40: 1.0, 0.30: 2.0, 0.20: 3.0, 0.10: 4.0}
 
 ORDER_TIF      = "good_till_canceled"    # resting limit through market close
@@ -1469,12 +1471,12 @@ def prophet_weighted_trailing_shadow_performance(records: list[dict], *, inverse
 
 
 def prophet_weighted_fixed_stop_shadow_performance(records: list[dict], *, inverse: bool) -> dict:
-    """Report one frozen Prophet-side 1/2/3/4 regular fixed-stop study."""
+    """Report one frozen Prophet-side actual-price 5c/10c bracket study."""
     report = scalp_performance(records)
     report.update({
         "generated_at": datetime.now(tz=timezone.utc).isoformat(),
-        "strategy": "inverse_prophet_weighted_1234_fixed_stop_loss_shadow_v1" if inverse
-        else "normal_prophet_weighted_1234_fixed_stop_loss_shadow_v1",
+        "strategy": "inverse_prophet_weighted_1234_fixed_stop_and_trailing_shadow_v2" if inverse
+        else "normal_prophet_weighted_1234_fixed_stop_and_trailing_shadow_v2",
         "source": "opposite_frozen_prophet_side" if inverse else "same_frozen_prophet_side_as_primary_ladder",
         "locked_side_policy": "side is fixed before open and never changes on later quotes",
         "weighted_rungs": {"0.40": 1.0, "0.30": 2.0, "0.20": 3.0, "0.10": 4.0},
@@ -1976,19 +1978,24 @@ def print_active_prophet_weighted_trailing_shadow_status(
 def print_prophet_weighted_fixed_stop_shadow_performance(
     tracker_: ProphetLadderScalpShadowTracker, *, inverse: bool, label: str,
 ) -> None:
-    """Print the parallel fixed 5c-loss study without blending it with trailing."""
+    """Print the actual-price 5c loss / 10c activated trailing study."""
     report = prophet_weighted_fixed_stop_shadow_performance(tracker_.trades, inverse=inverse)
     roi = "n/a" if report["return_on_simulated_capital"] is None else f"{100 * report['return_on_simulated_capital']:.1f}%"
     current_streak = "none" if report["current_streak"] <= 0 else f"{report['current_streak']} {report['current_streak_kind']}"
     configured = report["fixed_stop_loss"]["configured_gaps_per_contract"]
     stop_gap = configured[0] if configured else PROPHET_WEIGHTED_FIXED_STOP_PER_CONTRACT
+    trailing = report["trailing_stop"]
+    trailing_gaps = trailing["configured_gaps_per_contract"]
+    activations = trailing["configured_activation_gains_per_contract"]
+    trailing_gap = trailing_gaps[0] if trailing_gaps else PROPHET_WEIGHTED_TRAILING_STOP_PER_CONTRACT
+    activation_gain = activations[0] if activations else PROPHET_WEIGHTED_TRAILING_ACTIVATION_GAIN_PER_CONTRACT
     log.info(
         "\n"
-        f"╔═══ {label} WEIGHTED FIXED STOP — PAPER ONLY ═════════════\n"
+        f"╔═══ {label} WEIGHTED ACTUAL-PRICE BRACKET — PAPER ONLY ══\n"
         f"║  Locked side      : {'inverse of Prophet' if inverse else 'Prophet prediction'}\n"
         "║  Ladder           : 1×40¢, 2×30¢, 3×20¢, 4×10¢ (10 max)\n"
         f"║  Started / Active : {report['paper_markets_started']} / {report['active_paper_markets']}\n"
-        f"║  Filled / Stops   : {report['filled_market_trades']} / {report['fixed_stop_loss_exits']} fixed exits\n"
+        f"║  Filled / Exits   : {report['filled_market_trades']} / {report['fixed_stop_loss_exits']} loss, {report['trailing_stop_exits']} trailing\n"
         f"║  W / L            : {report['winning_trades']} / {report['losing_trades']}\n"
         f"║  Current streak   : {current_streak}\n"
         f"║  Longest W / L    : {report['longest_winning_streak']} / {report['longest_losing_streak']}\n"
@@ -1996,7 +2003,9 @@ def print_prophet_weighted_fixed_stop_shadow_performance(
         f"║  Simulated P&L    : ${report['net_profit']:+,.4f}  (fees excluded)\n"
         f"║  Simulated ROI    : {roi}\n"
         f"║  Max drawdown     : ${-report['maximum_drawdown']:.4f}\n"
-        f"║  Fixed-stop rule  : fresh full-depth bid ≤ VWAP − ${stop_gap:.2f}; closes at observed bid\n"
+        f"║  Loss rule        : fresh full-depth bid ≤ average filled entry − ${stop_gap:.2f}\n"
+        f"║  Trailing rule    : arms at average filled entry + ${activation_gain:.2f}; then retraces ${trailing_gap:.2f}\n"
+        "║  Quote evidence   : actual YES and NO bid/ask + displayed depth are retained\n"
         "╚════════════════════════════════════════════════════════════"
     )
 
@@ -2008,13 +2017,22 @@ def print_active_prophet_weighted_fixed_stop_shadow_status(
         position = scalp_entry_summary(shadow)
         epochs = shadow.get("position_epochs") if isinstance(shadow.get("position_epochs"), list) else []
         epoch = epochs[-1] if epochs and isinstance(epochs[-1], dict) else {}
-        stop_bid = epoch.get("fixed_stop_loss_bid")
+        loss_bid = epoch.get("fixed_stop_loss_bid")
+        activation_bid = epoch.get("trailing_activation_bid")
+        trailing_bid = epoch.get("trailing_stop_bid")
+        book = shadow.get("last_actual_top_of_book") if isinstance(shadow.get("last_actual_top_of_book"), dict) else {}
         log.info(
-            "%s WEIGHTED FIXED STOP STATUS | ticker=%s locked_side=%s filled=%.2f avg_cost=%s fixed_stop_bid=%s "
-            "entry_quote_state=%s exit_quote_state=%s; no exchange order or close.",
+            "%s ACTUAL-PRICE STATUS | ticker=%s locked_side=%s filled=%.2f avg_filled_entry=%s loss_bid=%s "
+            "trail_arms_at=%s trailing_bid=%s yes_bid/ask=%s/%s no_bid/ask=%s/%s entry_quote_state=%s exit_quote_state=%s; no exchange order or close.",
             label, shadow.get("ticker", "?"), str(shadow.get("side") or "?").upper(), _f(position.get("filled_contracts")),
             "none" if position.get("average_entry_price") is None else f"${_f(position['average_entry_price']):.4f}",
-            "none" if stop_bid is None else f"${_f(stop_bid):.4f}",
+            "none" if loss_bid is None else f"${_f(loss_bid):.4f}",
+            "none" if activation_bid is None else f"${_f(activation_bid):.4f}",
+            "none" if trailing_bid is None else f"${_f(trailing_bid):.4f}",
+            "none" if book.get("yes_bid") is None else f"${_f(book['yes_bid']):.4f}",
+            "none" if book.get("yes_ask") is None else f"${_f(book['yes_ask']):.4f}",
+            "none" if book.get("no_bid") is None else f"${_f(book['no_bid']):.4f}",
+            "none" if book.get("no_ask") is None else f"${_f(book['no_ask']):.4f}",
             shadow.get("last_entry_quote_state", "awaiting_quote"), shadow.get("last_exit_quote_state", "awaiting_quote"),
         )
 
@@ -2286,7 +2304,7 @@ def create_prophet_weighted_trailing_shadows(primary: dict) -> None:
 
 
 def create_prophet_weighted_fixed_stop_shadows(primary: dict) -> None:
-    """Create normal/inverse 5c fixed-stop shadows from the frozen Prophet side."""
+    """Create normal/inverse actual-price 5c/10c shadows from a frozen side."""
     if not PROPHET_WEIGHTED_FIXED_STOP_SHADOW_ENABLED:
         return
     ticker = str(primary.get("ticker") or "")
@@ -2301,8 +2319,8 @@ def create_prophet_weighted_fixed_stop_shadows(primary: dict) -> None:
         if tracker_.already_shadowed(ticker):
             continue
         shadow = new_ladder_average_entry_scalp_shadow(
-            strategy="inverse_prophet_weighted_1234_fixed_stop_loss_shadow_v1" if inverse
-            else "normal_prophet_weighted_1234_fixed_stop_loss_shadow_v1",
+            strategy="inverse_prophet_weighted_1234_fixed_stop_and_trailing_shadow_v2" if inverse
+            else "normal_prophet_weighted_1234_fixed_stop_and_trailing_shadow_v2",
             ticker=ticker,
             side=side,
             quantity_per_rung=1.0,
@@ -2312,6 +2330,8 @@ def create_prophet_weighted_fixed_stop_shadows(primary: dict) -> None:
             profit_targets_per_contract=EXTENDED_PROFIT_TARGETS,
             rung_quantities=WEIGHTED_SCALP_RUNG_QUANTITIES,
             fixed_stop_loss_per_contract=PROPHET_WEIGHTED_FIXED_STOP_PER_CONTRACT,
+            trailing_stop_per_contract=PROPHET_WEIGHTED_TRAILING_STOP_PER_CONTRACT,
+            trailing_activation_gain_per_contract=PROPHET_WEIGHTED_TRAILING_ACTIVATION_GAIN_PER_CONTRACT,
             extra={
                 "source_prophet_side": source_side,
                 "locked_study_side": side,
@@ -2323,9 +2343,11 @@ def create_prophet_weighted_fixed_stop_shadows(primary: dict) -> None:
         )
         if tracker_.record_open(shadow):
             log.info(
-                "%s WEIGHTED FIXED STOP STUDY STARTED | %s locked_side=%s rungs=1x$0.40/2x$0.30/3x$0.20/4x$0.10 "
-                "fixed_stop=$%.2f below VWAP; fresh full-depth executable bid only; paper only, no exchange order.",
+                "%s WEIGHTED ACTUAL-PRICE BRACKET STARTED | %s locked_side=%s rungs=1x$0.40/2x$0.30/3x$0.20/4x$0.10 "
+                "loss=$%.2f below average filled entry; trailing=$%.2f only after +$%.2f gain; fresh full-depth bid only; paper only.",
                 label, ticker, side.upper(), PROPHET_WEIGHTED_FIXED_STOP_PER_CONTRACT,
+                PROPHET_WEIGHTED_TRAILING_STOP_PER_CONTRACT,
+                PROPHET_WEIGHTED_TRAILING_ACTIVATION_GAIN_PER_CONTRACT,
             )
 
 
@@ -2501,9 +2523,9 @@ async def _settle_record_if_ready(rest: KalshiREST, rec: dict) -> bool:
     if DRY_RUN and PROPHET_WEIGHTED_FIXED_STOP_SHADOW_ENABLED:
         ticker = str(rec.get("ticker") or "")
         finalize_prophet_weighted_trailing_shadow(
-            ticker, result, prophet_weighted_fixed_stop_normal_tracker, "PROPHET NORMAL FIXED STOP")
+            ticker, result, prophet_weighted_fixed_stop_normal_tracker, "PROPHET NORMAL BRACKET")
         finalize_prophet_weighted_trailing_shadow(
-            ticker, result, prophet_weighted_fixed_stop_inverse_tracker, "PROPHET INVERSE FIXED STOP")
+            ticker, result, prophet_weighted_fixed_stop_inverse_tracker, "PROPHET INVERSE BRACKET")
 
     # Another task can settle while this coroutine awaits get_market.
     if rec.get("result") != "pending":
@@ -2581,8 +2603,8 @@ async def settlement_checker(rest: KalshiREST) -> None:
                         log.warning("%s weighted trailing update failed for %s: %s", label, shadow.get("ticker"), exc)
         if PROPHET_WEIGHTED_FIXED_STOP_SHADOW_ENABLED:
             for tracker_, label in (
-                (prophet_weighted_fixed_stop_normal_tracker, "PROPHET NORMAL FIXED STOP"),
-                (prophet_weighted_fixed_stop_inverse_tracker, "PROPHET INVERSE FIXED STOP"),
+                (prophet_weighted_fixed_stop_normal_tracker, "PROPHET NORMAL BRACKET"),
+                (prophet_weighted_fixed_stop_inverse_tracker, "PROPHET INVERSE BRACKET"),
             ):
                 for shadow in tracker_.find_active():
                     try:

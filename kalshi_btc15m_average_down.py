@@ -137,14 +137,17 @@ DEFAULT_CONFIG = {
     "scalp_shadow_profit_target": 0.01,
     "scalp_shadow_quote_max_age_seconds": 3.0,
     # A second, independent paper strategy with 1/2/3/4 contracts at
-    # 40c/30c/20c/10c. It locks the ML (or inverse-ML) side before open,
-    # observes extended targets, and closes only on a full-depth 10c trailing
-    # retracement. It can never create or alter a real order.
+    # 40c/30c/20c/10c. Historical trailing results are retained but this
+    # legacy study is disabled for new markets; the active comparison uses
+    # the 5c fixed-loss / 10c activated-trailing bracket below.
     "weighted_scalp_shadow_enabled": True,
+    "weighted_scalp_trailing_enabled": False,
     "weighted_scalp_trailing_stop_per_contract": 0.10,
-    # A parallel paper-only comparison: exit a completed weighted position
-    # when a fresh full-depth bid is at least 5c below its VWAP.  This is not
-    # a live stop order and never changes the existing trailing study.
+    "weighted_scalp_trailing_activation_gain_per_contract": 0.10,
+    # The active paper-only bracket: exit a completed weighted position when
+    # its actual full-depth bid is 5c below its average filled entry; arm the
+    # separate 10c trailing stop only after an actual 10c gain. This is never
+    # a live stop order.
     "weighted_scalp_fixed_stop_loss_enabled": True,
     "weighted_scalp_fixed_stop_loss_per_contract": 0.05,
     # When a retrain publishes a new artifact, paper-test both the retained
@@ -163,10 +166,10 @@ DEFAULT_WEIGHTED_TRAILING_NORMAL_LEDGER = Path("kalshi_btc15m_weighted_trailing_
 DEFAULT_WEIGHTED_TRAILING_NORMAL_REPORT = Path("kalshi_btc15m_weighted_trailing_normal_report.json")
 DEFAULT_WEIGHTED_TRAILING_INVERSE_LEDGER = Path("kalshi_btc15m_weighted_trailing_inverse_ledger.json")
 DEFAULT_WEIGHTED_TRAILING_INVERSE_REPORT = Path("kalshi_btc15m_weighted_trailing_inverse_report.json")
-DEFAULT_WEIGHTED_FIXED_STOP_NORMAL_LEDGER = Path("kalshi_btc15m_weighted_fixed_stop_normal_ledger.json")
-DEFAULT_WEIGHTED_FIXED_STOP_NORMAL_REPORT = Path("kalshi_btc15m_weighted_fixed_stop_normal_report.json")
-DEFAULT_WEIGHTED_FIXED_STOP_INVERSE_LEDGER = Path("kalshi_btc15m_weighted_fixed_stop_inverse_ledger.json")
-DEFAULT_WEIGHTED_FIXED_STOP_INVERSE_REPORT = Path("kalshi_btc15m_weighted_fixed_stop_inverse_report.json")
+DEFAULT_WEIGHTED_FIXED_STOP_NORMAL_LEDGER = Path("kalshi_btc15m_actual_price_bracket_normal_ledger.json")
+DEFAULT_WEIGHTED_FIXED_STOP_NORMAL_REPORT = Path("kalshi_btc15m_actual_price_bracket_normal_report.json")
+DEFAULT_WEIGHTED_FIXED_STOP_INVERSE_LEDGER = Path("kalshi_btc15m_actual_price_bracket_inverse_ledger.json")
+DEFAULT_WEIGHTED_FIXED_STOP_INVERSE_REPORT = Path("kalshi_btc15m_actual_price_bracket_inverse_report.json")
 
 
 def configure_logging() -> None:
@@ -543,7 +546,8 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         "watch_start_grace_seconds", "ml_preopen_lead_seconds", "ml_min_confidence",
         "inverse_shadow_position_size", "inverse_shadow_quote_max_age_seconds",
         "scalp_shadow_position_size", "scalp_shadow_profit_target", "scalp_shadow_quote_max_age_seconds",
-        "weighted_scalp_trailing_stop_per_contract", "weighted_scalp_fixed_stop_loss_per_contract",
+        "weighted_scalp_trailing_stop_per_contract", "weighted_scalp_trailing_activation_gain_per_contract",
+        "weighted_scalp_fixed_stop_loss_per_contract",
         "model_transition_shadow_position_size", "status_log_seconds",
     ):
         value = as_float(merged.get(name))
@@ -564,6 +568,10 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
     if isinstance(weighted_scalp_enabled, str):
         weighted_scalp_enabled = weighted_scalp_enabled.strip().lower() in {"1", "true", "yes", "on"}
     merged["weighted_scalp_shadow_enabled"] = bool(weighted_scalp_enabled)
+    trailing_enabled = merged.get("weighted_scalp_trailing_enabled", False)
+    if isinstance(trailing_enabled, str):
+        trailing_enabled = trailing_enabled.strip().lower() in {"1", "true", "yes", "on"}
+    merged["weighted_scalp_trailing_enabled"] = bool(trailing_enabled)
     fixed_stop_enabled = merged.get("weighted_scalp_fixed_stop_loss_enabled", True)
     if isinstance(fixed_stop_enabled, str):
         fixed_stop_enabled = fixed_stop_enabled.strip().lower() in {"1", "true", "yes", "on"}
@@ -1905,7 +1913,9 @@ def ensure_ml_weighted_trailing_scalp_shadow(
     record: dict[str, Any], market: Any, config: dict[str, Any], *, side: str, record_key: str, label: str,
 ) -> dict[str, Any] | None:
     """Create a frozen-side 1/2/3/4 paper ladder with a 10c trailing stop."""
-    if not config.get("weighted_scalp_shadow_enabled", True) or side not in {"yes", "no"}:
+    if (not config.get("weighted_scalp_shadow_enabled", True)
+            or not config.get("weighted_scalp_trailing_enabled", False)
+            or side not in {"yes", "no"}):
         return None
     existing = record.get(record_key)
     if isinstance(existing, dict):
@@ -1956,7 +1966,7 @@ def ensure_ml_weighted_trailing_scalp_shadows(
 def ensure_ml_weighted_fixed_stop_loss_shadow(
     record: dict[str, Any], market: Any, config: dict[str, Any], *, side: str, record_key: str, label: str,
 ) -> dict[str, Any] | None:
-    """Create a frozen-side 1/2/3/4 paper ladder with a regular 5c stop."""
+    """Create a frozen-side 1/2/3/4 actual-price 5c/10c paper bracket."""
     if (not config.get("weighted_scalp_shadow_enabled", True)
             or not config.get("weighted_scalp_fixed_stop_loss_enabled", True)
             or side not in {"yes", "no"}):
@@ -1965,7 +1975,7 @@ def ensure_ml_weighted_fixed_stop_loss_shadow(
     if isinstance(existing, dict):
         return existing
     shadow = new_ladder_average_entry_scalp_shadow(
-        strategy=f"{label.lower().replace(' ', '_')}_weighted_fixed_stop_loss_shadow_v1",
+        strategy=f"{label.lower().replace(' ', '_')}_weighted_fixed_stop_and_trailing_shadow_v2",
         ticker=str(record.get("ticker") or ""),
         side=side,
         quantity_per_rung=1.0,
@@ -1975,6 +1985,8 @@ def ensure_ml_weighted_fixed_stop_loss_shadow(
         profit_targets_per_contract=EXTENDED_PROFIT_TARGETS,
         rung_quantities=WEIGHTED_SCALP_RUNG_QUANTITIES,
         fixed_stop_loss_per_contract=float(config["weighted_scalp_fixed_stop_loss_per_contract"]),
+        trailing_stop_per_contract=float(config["weighted_scalp_trailing_stop_per_contract"]),
+        trailing_activation_gain_per_contract=float(config["weighted_scalp_trailing_activation_gain_per_contract"]),
         extra={
             "source_ml_side": str(record.get("ml_inference", {}).get("side") or "").lower(),
             "source_model_run_id": record.get("ml_inference", {}).get("model_run_id"),
@@ -1984,9 +1996,11 @@ def ensure_ml_weighted_fixed_stop_loss_shadow(
     )
     record[record_key] = shadow
     LOG.info(
-        "%s WEIGHTED FIXED STOP STUDY STARTED | %s locked_side=%s rungs=1x$0.40/2x$0.30/3x$0.20/4x$0.10 "
-        "fixed_stop=$%.2f below VWAP; fresh full-depth executable bid only; paper only, no exchange order.",
+        "%s WEIGHTED ACTUAL-PRICE BRACKET STARTED | %s locked_side=%s rungs=1x$0.40/2x$0.30/3x$0.20/4x$0.10 "
+        "loss=$%.2f below average filled entry; trailing=$%.2f only after +$%.2f gain; fresh full-depth bid only; paper only.",
         label, record.get("ticker", "?"), side.upper(), float(config["weighted_scalp_fixed_stop_loss_per_contract"]),
+        float(config["weighted_scalp_trailing_stop_per_contract"]),
+        float(config["weighted_scalp_trailing_activation_gain_per_contract"]),
     )
     return shadow
 
@@ -2485,9 +2499,9 @@ async def settle_or_cancel(rest: KalshiREST, record: dict[str, Any], market: Any
         finalize_ml_weighted_trailing_scalp_shadow(
             record, result, record_key="inverse_ml_weighted_trailing_scalp_shadow", label="ML INVERSE")
         finalize_ml_weighted_trailing_scalp_shadow(
-            record, result, record_key="ml_weighted_fixed_stop_loss_shadow", label="ML NORMAL FIXED STOP")
+            record, result, record_key="ml_weighted_fixed_stop_loss_shadow", label="ML NORMAL BRACKET")
         finalize_ml_weighted_trailing_scalp_shadow(
-            record, result, record_key="inverse_ml_weighted_fixed_stop_loss_shadow", label="ML INVERSE FIXED STOP")
+            record, result, record_key="inverse_ml_weighted_fixed_stop_loss_shadow", label="ML INVERSE BRACKET")
         finalize_model_transition_shadow(record, result)
     if not record.get("candidate_side") and not orders_for_market(record):
         if result is None or market_status != "finalized":
@@ -2611,8 +2625,8 @@ async def consider_initial_entry(
             "market_close_time": field(market, "close_time", "expected_expiration_time"),
         })
         LOG.info(
-            "WEIGHTED ML MONITOR STARTED | %s frozen_side=%s; subscribing only for normal/inverse "
-            "1x$0.40/2x$0.30/3x$0.20/4x$0.10 paper fills, 10c trailing exits, and 5c fixed stops. No order exists.",
+            "WEIGHTED ML MONITOR STARTED | %s frozen_side=%s; subscribing to each actual YES/NO book for normal/inverse "
+            "1x$0.40/2x$0.30/3x$0.20/4x$0.10 fills, 5c fixed-loss exits, and 10c trailing exits armed after a 10c gain. No order exists.",
             ticker, ml_side.upper(),
         )
         return True
@@ -3149,7 +3163,7 @@ def save_ml_weighted_trailing_outputs(
 
 
 def ml_weighted_fixed_stop_loss_performance(state: dict[str, Any], *, inverse: bool) -> dict[str, Any]:
-    """Summarize the parallel normal or inverse ML 5c fixed-stop study."""
+    """Summarize the normal or inverse ML 5c/10c actual-price bracket."""
     record_key = "inverse_ml_weighted_fixed_stop_loss_shadow" if inverse else "ml_weighted_fixed_stop_loss_shadow"
     shadows = [
         record[record_key]
@@ -3158,8 +3172,8 @@ def ml_weighted_fixed_stop_loss_performance(state: dict[str, Any], *, inverse: b
     ]
     report = scalp_performance(shadows)
     report.update({
-        "strategy": "inverse_ml_weighted_1234_fixed_stop_loss_shadow_v1" if inverse
-        else "normal_ml_weighted_1234_fixed_stop_loss_shadow_v1",
+        "strategy": "inverse_ml_weighted_1234_fixed_stop_and_trailing_shadow_v2" if inverse
+        else "normal_ml_weighted_1234_fixed_stop_and_trailing_shadow_v2",
         "source": "opposite_frozen_ml_side" if inverse else "same_frozen_ml_side_as_primary_ladder",
         "locked_side_policy": "side is fixed before open and never changes on later quotes",
         "weighted_rungs": {"0.40": 1.0, "0.30": 2.0, "0.20": 3.0, "0.10": 4.0},
@@ -3181,10 +3195,10 @@ def ml_weighted_fixed_stop_loss_shadows(state: dict[str, Any], *, inverse: bool)
 
 
 def ml_weighted_fixed_stop_loss_ledger(state: dict[str, Any], config: dict[str, Any], *, inverse: bool) -> dict[str, Any]:
-    """Emit a complete 5c-stop ledger with every quote/depth exit record."""
+    """Emit a complete actual-price 5c fixed-loss / 10c trailing ledger."""
     report = ml_weighted_fixed_stop_loss_performance(state, inverse=inverse)
     return {
-        "schema": "ml_weighted_1234_fixed_stop_loss_paper_ledger_v1",
+        "schema": "ml_weighted_1234_fixed_stop_and_trailing_paper_ledger_v2",
         "generated_at": now_iso(),
         "paper_only": True,
         "model_variant": "inverse_ml" if inverse else "normal_ml",
@@ -3193,8 +3207,10 @@ def ml_weighted_fixed_stop_loss_ledger(state: dict[str, Any], config: dict[str, 
         "strategy_definition": {
             "rung_quantities": {f"{level:.2f}": quantity for level, quantity in WEIGHTED_SCALP_RUNG_QUANTITIES.items()},
             "fixed_stop_loss_per_contract": float(config["weighted_scalp_fixed_stop_loss_per_contract"]),
+            "trailing_stop_per_contract": float(config["weighted_scalp_trailing_stop_per_contract"]),
+            "trailing_activation_gain_per_contract": float(config["weighted_scalp_trailing_activation_gain_per_contract"]),
             "entry_rule": "fresh executable side ask at or below each rung with displayed ask depth; shared quote depth is consumed across the 1/2/3/4 fills",
-            "exit_rule": "after a weighted position forms, a fresh full-depth executable bid at or below VWAP minus the fixed-stop gap closes all paper contracts at that observed bid",
+            "exit_rule": "record both actual YES/NO top-of-book prices; close all paper contracts at the observed full-depth selected-side bid if it is at/below average filled entry minus 5c, or after a full-depth +10c gain arms a later 10c trailing retracement",
             "fee_treatment": "excluded_no_exchange_fill",
         },
         "summary": report,
@@ -3207,7 +3223,7 @@ def save_ml_weighted_fixed_stop_outputs(
     normal_ledger_path: Path, normal_report_path: Path,
     inverse_ledger_path: Path, inverse_report_path: Path,
 ) -> None:
-    """Persist viewable normal/inverse 5c fixed-stop comparison ledgers."""
+    """Persist normal/inverse 5c fixed-loss / 10c trailing comparison ledgers."""
     normal_ledger = ml_weighted_fixed_stop_loss_ledger(state, config, inverse=False)
     inverse_ledger = ml_weighted_fixed_stop_loss_ledger(state, config, inverse=True)
     save_json(normal_ledger_path, normal_ledger)
@@ -3584,25 +3600,30 @@ def log_performance_summary(report: dict[str, Any], context: str) -> None:
                 "n/a" if profile["p90_maximum_gross_per_contract"] is None else f"${profile['p90_maximum_gross_per_contract']:+.4f}",
             )
     for label, fixed in (
-        ("ML NORMAL WEIGHTED FIXED STOP", report["ml_weighted_fixed_stop_loss_performance"]),
-        ("ML INVERSE WEIGHTED FIXED STOP", report["inverse_ml_weighted_fixed_stop_loss_performance"]),
+        ("ML NORMAL WEIGHTED BRACKET", report["ml_weighted_fixed_stop_loss_performance"]),
+        ("ML INVERSE WEIGHTED BRACKET", report["inverse_ml_weighted_fixed_stop_loss_performance"]),
     ):
         current_streak = (
             "none" if fixed["current_streak"] <= 0
             else f"{fixed['current_streak']} {fixed['current_streak_kind']}"
         )
         stop = fixed["fixed_stop_loss"]
+        trailing = fixed["trailing_stop"]
+        activation = trailing["configured_activation_gains_per_contract"]
         LOG.info(
-            "%s PERFORMANCE | %s started=%d active=%d filled=%d fixed_stop_exits=%d settlement_exits=%d "
-            "W/L=%d/%d streak=%s longest_W/L=%d/%d net=$%+.4f roi=%s max_dd=$%.4f stop_gap=$%.2f "
-            "| locked side; 1x40c/2x30c/3x20c/4x10c; fresh full-depth bid <= VWAP-gap; paper only.",
+            "%s ACTUAL-PRICE BRACKET | %s started=%d active=%d filled=%d loss_exits=%d trailing_exits=%d settlement_exits=%d "
+            "W/L=%d/%d streak=%s longest_W/L=%d/%d net=$%+.4f roi=%s max_dd=$%.4f loss_gap=$%.2f trailing_gap=$%.2f activation_gain=$%.2f "
+            "| both YES/NO books recorded; selected-side fresh full-depth bid only; paper only.",
             label, context, fixed["paper_markets_started"], fixed["active_paper_markets"],
             fixed["filled_market_trades"], stop["fixed_stop_loss_exits"],
+            trailing["trailing_stop_exits"],
             fixed["settlement_exits_without_take_profit"], fixed["winning_trades"], fixed["losing_trades"],
             current_streak, fixed["longest_winning_streak"], fixed["longest_losing_streak"], fixed["net_profit"],
             "n/a" if fixed["return_on_simulated_capital"] is None
             else f"{100 * fixed['return_on_simulated_capital']:.2f}%", fixed["maximum_drawdown"],
             stop["configured_gaps_per_contract"][0] if stop["configured_gaps_per_contract"] else 0.0,
+            trailing["configured_gaps_per_contract"][0] if trailing["configured_gaps_per_contract"] else 0.0,
+            activation[0] if activation else 0.0,
         )
 
 
@@ -3772,8 +3793,8 @@ async def log_heartbeat(
                 weighted.get("last_exit_quote_state", "awaiting_quote"),
             )
         for fixed_key, fixed_label in (
-            ("ml_weighted_fixed_stop_loss_shadow", "ML NORMAL WEIGHTED FIXED STOP"),
-            ("inverse_ml_weighted_fixed_stop_loss_shadow", "ML INVERSE WEIGHTED FIXED STOP"),
+            ("ml_weighted_fixed_stop_loss_shadow", "ML NORMAL WEIGHTED BRACKET"),
+            ("inverse_ml_weighted_fixed_stop_loss_shadow", "ML INVERSE WEIGHTED BRACKET"),
         ):
             fixed = record.get(fixed_key)
             if not isinstance(fixed, dict):
@@ -3781,14 +3802,24 @@ async def log_heartbeat(
             position = scalp_entry_summary(fixed)
             epochs = fixed.get("position_epochs") if isinstance(fixed.get("position_epochs"), list) else []
             epoch = epochs[-1] if epochs and isinstance(epochs[-1], dict) else {}
-            stop_bid = epoch.get("fixed_stop_loss_bid")
+            loss_bid = epoch.get("fixed_stop_loss_bid")
+            activation_bid = epoch.get("trailing_activation_bid")
+            trailing_bid = epoch.get("trailing_stop_bid")
+            book = fixed.get("last_actual_top_of_book") if isinstance(fixed.get("last_actual_top_of_book"), dict) else {}
             LOG.info(
-                "%s STATUS | %s locked_side=%s status=%s filled=%.2f avg_cost=%s fixed_stop_bid=%s "
+                "%s ACTUAL-PRICE STATUS | %s locked_side=%s status=%s filled=%.2f avg_filled_entry=%s "
+                "loss_bid=%s trail_arms_at=%s trailing_bid=%s yes_bid/ask=%s/%s no_bid/ask=%s/%s "
                 "entry_quote_state=%s exit_quote_state=%s; no exchange order or close.",
                 fixed_label, record.get("ticker", "?"), str(fixed.get("side") or "?").upper(),
                 fixed.get("status", "?"), float(position["filled_contracts"] or 0.0),
                 "none" if position["average_entry_price"] is None else f"${float(position['average_entry_price']):.4f}",
-                "none" if stop_bid is None else f"${float(stop_bid):.4f}",
+                "none" if loss_bid is None else f"${float(loss_bid):.4f}",
+                "none" if activation_bid is None else f"${float(activation_bid):.4f}",
+                "none" if trailing_bid is None else f"${float(trailing_bid):.4f}",
+                "none" if book.get("yes_bid") is None else f"${float(book['yes_bid']):.4f}",
+                "none" if book.get("yes_ask") is None else f"${float(book['yes_ask']):.4f}",
+                "none" if book.get("no_bid") is None else f"${float(book['no_bid']):.4f}",
+                "none" if book.get("no_ask") is None else f"${float(book['no_ask']):.4f}",
                 fixed.get("last_entry_quote_state", "awaiting_quote"),
                 fixed.get("last_exit_quote_state", "awaiting_quote"),
             )
@@ -4025,9 +4056,9 @@ async def run(args: argparse.Namespace) -> int:
                     simulate_ml_weighted_trailing_scalp_shadow(
                         record, feed, record_key="inverse_ml_weighted_trailing_scalp_shadow", label="ML INVERSE")
                     simulate_ml_weighted_trailing_scalp_shadow(
-                        record, feed, record_key="ml_weighted_fixed_stop_loss_shadow", label="ML NORMAL FIXED STOP")
+                        record, feed, record_key="ml_weighted_fixed_stop_loss_shadow", label="ML NORMAL BRACKET")
                     simulate_ml_weighted_trailing_scalp_shadow(
-                        record, feed, record_key="inverse_ml_weighted_fixed_stop_loss_shadow", label="ML INVERSE FIXED STOP")
+                        record, feed, record_key="inverse_ml_weighted_fixed_stop_loss_shadow", label="ML INVERSE BRACKET")
                     simulate_model_transition_shadow(record, feed, config)
             monotonic_now = asyncio.get_running_loop().time()
             if monotonic_now - last_heartbeat_at >= config["status_log_seconds"]:

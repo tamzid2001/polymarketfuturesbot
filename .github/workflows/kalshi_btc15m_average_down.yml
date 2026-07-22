@@ -208,8 +208,8 @@ jobs:
           for file in kalshi_btc15m_average_down_state.json kalshi_btc15m_average_down_report.json \
                       kalshi_btc15m_weighted_trailing_normal_ledger.json kalshi_btc15m_weighted_trailing_normal_report.json \
                       kalshi_btc15m_weighted_trailing_inverse_ledger.json kalshi_btc15m_weighted_trailing_inverse_report.json \
-                      kalshi_btc15m_weighted_fixed_stop_normal_ledger.json kalshi_btc15m_weighted_fixed_stop_normal_report.json \
-                      kalshi_btc15m_weighted_fixed_stop_inverse_ledger.json kalshi_btc15m_weighted_fixed_stop_inverse_report.json; do
+                      kalshi_btc15m_actual_price_bracket_normal_ledger.json kalshi_btc15m_actual_price_bracket_normal_report.json \
+                      kalshi_btc15m_actual_price_bracket_inverse_ledger.json kalshi_btc15m_actual_price_bracket_inverse_report.json; do
             test ! -f "$file" || git add "$file"
           done
           if ! git diff --cached --quiet; then
@@ -248,9 +248,9 @@ jobs:
             kalshi_btc15m_weighted_trailing_normal_report.json
             kalshi_btc15m_weighted_trailing_inverse_ledger.json
             kalshi_btc15m_weighted_trailing_inverse_report.json
-            kalshi_btc15m_weighted_fixed_stop_normal_ledger.json
-            kalshi_btc15m_weighted_fixed_stop_normal_report.json
-            kalshi_btc15m_weighted_fixed_stop_inverse_ledger.json
-            kalshi_btc15m_weighted_fixed_stop_inverse_report.json
+            kalshi_btc15m_actual_price_bracket_normal_ledger.json
+            kalshi_btc15m_actual_price_bracket_normal_report.json
+            kalshi_btc15m_actual_price_bracket_inverse_ledger.json
+            kalshi_btc15m_actual_price_bracket_inverse_report.json
           if-no-files-found: warn
           retention-days: 90
