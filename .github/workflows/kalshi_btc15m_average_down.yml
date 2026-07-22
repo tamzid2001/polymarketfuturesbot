@@ -120,8 +120,8 @@ jobs:
 
       - name: Verify mechanical strategy
         run: |
-          python -m py_compile kalshi_btc15m_average_down.py
-          python -m unittest -v test_kalshi_btc15m_average_down.py
+          python -m py_compile kalshi_ladder_scalp_shadow.py kalshi_btc15m_average_down.py
+          python -m unittest -v test_kalshi_btc15m_average_down.py test_kalshi_ladder_scalp_shadow.py
 
       - name: Download stored ML model and frozen feature ledger
         env:

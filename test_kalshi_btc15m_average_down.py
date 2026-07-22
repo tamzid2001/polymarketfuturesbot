@@ -21,6 +21,7 @@ from kalshi_btc15m_average_down import (
     default_state,
     ensure_model_transition_shadow,
     ensure_inverse_shadow,
+    ensure_ml_scalp_shadow,
     exchange_position_guard,
     exchange_outcome_side,
     ladder_principal,
@@ -40,11 +41,13 @@ from kalshi_btc15m_average_down import (
     model_transition_side_comparison,
     ml_live_directional_performance,
     inverse_shadow_performance,
+    ml_scalp_shadow_performance,
     model_transition_shadow_performance,
     normalized_order_status,
     normalized_outcome_side,
     rung_order_activity,
     simulate_inverse_shadow,
+    simulate_ml_scalp_shadow,
     simulate_model_transition_shadow,
     finalize_inverse_shadow,
     finalize_model_transition_shadow,
@@ -225,6 +228,41 @@ class MechanicalAverageDownTests(unittest.TestCase):
         self.assertEqual(rung["simulated_quote_hits"], 1)
         self.assertEqual(rung["unsettled_quote_hits"], 1)
         self.assertEqual((rung["winning_orders"], rung["losing_orders"], rung["net_profit"]), (0, 0, 0.0))
+
+    def test_ml_scalp_shadow_exits_only_after_a_depth_supported_vwap_profit(self):
+        class FakeFeed:
+            def __init__(self):
+                self.entry = [
+                    ({"quote_id": "entry", "economic_price": 0.30, "displayed_depth": 2.0}, "executable_top_of_book"),
+                    ({"quote_id": "later", "economic_price": 0.50, "displayed_depth": 2.0}, "executable_top_of_book"),
+                ]
+                self.exit = [
+                    ({"quote_id": "bid-low", "economic_price": 0.35, "displayed_depth": 2.0}, "executable_top_of_book"),
+                    ({"quote_id": "bid-target", "economic_price": 0.36, "displayed_depth": 2.0}, "executable_top_of_book"),
+                ]
+
+            def executable_shadow_quote(self, *_args):
+                return self.entry.pop(0)
+
+            def executable_shadow_exit_quote(self, *_args):
+                return self.exit.pop(0)
+
+        config = validate_config(DEFAULT_CONFIG)
+        state = default_state()
+        record = market_record(state, "KXBTC15M-TEST-SCALP")
+        shadow = ensure_ml_scalp_shadow(
+            record, SimpleNamespace(close_time="2099-07-20T00:15:00Z"), config, "yes")
+        self.assertIsNotNone(shadow)
+        assert shadow is not None
+        self.assertEqual(record["orders"], {})
+        feed = FakeFeed()
+        self.assertTrue(simulate_ml_scalp_shadow(record, feed, config))
+        self.assertEqual((shadow["status"], shadow["entry_summary"]["average_entry_price"]), ("active", 0.35))
+        self.assertTrue(simulate_ml_scalp_shadow(record, feed, config))
+        self.assertEqual((shadow["status"], shadow["net_profit_loss"]), ("scalp_exited", 0.02))
+        summary = ml_scalp_shadow_performance(state)
+        self.assertEqual((summary["scalp_exits"], summary["total_entry_cost"], summary["net_profit"]), (1, 0.7, 0.02))
+        self.assertEqual(summary["average_entry_profiles"]["0.35"]["scalp_exits"], 1)
 
     def test_model_transition_shadow_paper_tests_predecessor_and_current_model_separately(self):
         class FakeFeed:

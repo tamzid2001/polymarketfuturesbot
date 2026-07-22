@@ -100,6 +100,13 @@ import pandas as pd
 import yfinance as yf
 from prophet import Prophet
 
+from kalshi_ladder_scalp_shadow import (
+    entry_summary as scalp_entry_summary,
+    finalize_ladder_average_entry_scalp,
+    new_ladder_average_entry_scalp_shadow,
+    scalp_performance,
+    simulate_ladder_average_entry_scalp,
+)
 from kalshi_python_async import (
     BookSide,
     Configuration,
@@ -127,6 +134,12 @@ DRY_RUN           = os.getenv("DRY_RUN", "true").lower() in ("1", "true", "yes")
 # creates no Kalshi order and is not a switch for live opposite-side trading.
 INVERSE_PROPHET_SHADOW_ENABLED = (
     DRY_RUN and os.getenv("INVERSE_PROPHET_SHADOW_ENABLED", "true").lower()
+    in ("1", "true", "yes")
+)
+# A normal-side, one-round-trip paper exit study.  This is confined to paper
+# mode and cannot cancel, close, or otherwise modify any primary order.
+PROPHET_LADDER_SCALP_SHADOW_ENABLED = (
+    DRY_RUN and os.getenv("PROPHET_LADDER_SCALP_SHADOW_ENABLED", "true").lower()
     in ("1", "true", "yes")
 )
 # The selector is a third, independently paper-filled ladder during a dry run.
@@ -183,6 +196,14 @@ INVERSE_PROPHET_SHADOW_HISTORY_FILE = os.getenv(
     "INVERSE_PROPHET_SHADOW_HISTORY_FILE", "prophet_btc_inverse_shadow_history.json")
 INVERSE_PROPHET_SHADOW_REPORT_FILE = os.getenv(
     "INVERSE_PROPHET_SHADOW_REPORT_FILE", "prophet_btc_inverse_shadow_report.json")
+PROPHET_LADDER_SCALP_SHADOW_HISTORY_FILE = os.getenv(
+    "PROPHET_LADDER_SCALP_SHADOW_HISTORY_FILE", "prophet_btc_ladder_scalp_shadow_history.json")
+PROPHET_LADDER_SCALP_SHADOW_REPORT_FILE = os.getenv(
+    "PROPHET_LADDER_SCALP_SHADOW_REPORT_FILE", "prophet_btc_ladder_scalp_shadow_report.json")
+PROPHET_LADDER_SCALP_SHADOW_POSITION_SIZE = max(
+    0.01, float(os.getenv("PROPHET_LADDER_SCALP_SHADOW_POSITION_SIZE", "1")))
+PROPHET_LADDER_SCALP_SHADOW_PROFIT_TARGET = max(
+    0.001, float(os.getenv("PROPHET_LADDER_SCALP_SHADOW_PROFIT_TARGET", "0.01")))
 
 ORDER_TIF      = "good_till_canceled"    # resting limit through market close
 SERIES_TICKER  = "KXBTC15M"
@@ -793,6 +814,77 @@ def fresh_executable_dry_quote(
     }, "executable_top_of_book"
 
 
+def fresh_executable_dry_exit_quote(
+    ticker: str,
+    side: str,
+    required_count: float = 0.0,
+    *,
+    now: Optional[datetime] = None,
+) -> tuple[Optional[dict], str]:
+    """Return fresh bid/depth evidence for closing a dry YES/NO position.
+
+    YES exits use the displayed YES bid; NO exits use the displayed NO bid
+    (``1 - yes_ask``).  A zero requested count is valid for a first quote
+    observation; the scalp simulator then requires bid depth for the exact
+    position it filled during that update.
+    """
+    q = get_kalshi_quote(ticker)
+    if not q:
+        return None, "no_book_quote"
+    received_at = q.get("book_received_at")
+    if not isinstance(received_at, datetime):
+        return None, "missing_book_timestamp"
+    reference_time = now or datetime.now(tz=timezone.utc)
+    age_seconds = (reference_time - received_at).total_seconds()
+    if age_seconds < -0.5 or age_seconds > DRY_QUOTE_MAX_AGE_S:
+        return None, "stale_book_quote"
+    yes_bid = _to_contract_count(q.get("yes_bid"))
+    yes_ask = _to_contract_count(q.get("yes_ask"))
+    yes_bid_size = _to_contract_count(q.get("yes_bid_size"))
+    yes_ask_size = _to_contract_count(q.get("yes_ask_size"))
+    if None in (yes_bid, yes_ask, yes_bid_size, yes_ask_size):
+        return None, "incomplete_top_of_book"
+    if not (0.0 <= yes_bid <= yes_ask <= 1.0):
+        return None, "invalid_top_of_book"
+    required = float(required_count)
+    if required < 0.0:
+        return None, "invalid_required_count"
+    normalized_side = str(side).lower()
+    if normalized_side == "yes":
+        executable_yes_price = yes_bid
+        displayed_depth = yes_bid_size
+        executable_field = "yes_bid"
+    elif normalized_side == "no":
+        executable_yes_price = yes_ask
+        displayed_depth = yes_ask_size
+        executable_field = "yes_ask"
+    else:
+        return None, "invalid_position_side"
+    economic_price = position_price_from_yes(normalized_side, executable_yes_price)
+    if not 0.0 < economic_price < 1.0:
+        return None, "invalid_executable_exit_price"
+    if displayed_depth + 1e-9 < required:
+        return None, "insufficient_exit_depth"
+    received_at_iso = received_at.isoformat()
+    return {
+        "quote_id": f"{ticker}:{q.get('book_sequence', 0)}:{received_at_iso}",
+        "side": normalized_side,
+        "economic_price": round(economic_price, 4),
+        "executable_yes_price": round(executable_yes_price, 4),
+        "executable_field": executable_field,
+        "displayed_depth": round(displayed_depth, 2),
+        "required_count": round(required, 2),
+        "yes_bid": round(yes_bid, 4),
+        "yes_bid_size": round(yes_bid_size, 2),
+        "yes_ask": round(yes_ask, 4),
+        "yes_ask_size": round(yes_ask_size, 2),
+        "quote_received_at": received_at_iso,
+        "quote_source_time": q.get("book_source_time"),
+        "quote_source_ts_ms": q.get("book_source_ts_ms"),
+        "quote_age_seconds": round(max(0.0, age_seconds), 3),
+    }, "executable_top_of_book"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Kalshi async REST wrapper
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1308,6 +1400,18 @@ def inverse_shadow_performance(records: list[dict]) -> dict:
     }
 
 
+def prophet_ladder_scalp_shadow_performance(records: list[dict]) -> dict:
+    """Report the normal-side Prophet average-entry scalp study by itself."""
+    report = scalp_performance(records)
+    report.update({
+        "generated_at": datetime.now(tz=timezone.utc).isoformat(),
+        "strategy": "prophet_ladder_average_entry_scalp_executable_quote_shadow_v1",
+        "source": "same_frozen_prophet_side_as_primary_paper_ladder",
+        "quote_max_age_seconds": DRY_QUOTE_MAX_AGE_S,
+    })
+    return report
+
+
 class InverseProphetShadowTracker:
     """Separate durable ledger for paper-only inverse Prophet ladders."""
 
@@ -1374,12 +1478,61 @@ class ProphetSelectorTracker(InverseProphetShadowTracker):
             log.warning("Could not write Prophet selector ledger/report: %s", exc)
 
 
+class ProphetLadderScalpShadowTracker:
+    """Durable, normal-Prophet-side paper scalp ledger.
+
+    It is intentionally not a ``PerformanceTracker``: it has no order IDs,
+    never calls the exchange, and its P&L arises only from paper bid/ask
+    evidence or settlement after the take-profit was not observed.
+    """
+
+    def __init__(self, history_path: str, report_path: str):
+        self.history_path = history_path
+        self.report_path = report_path
+        self.trades: list[dict] = []
+        self._load()
+
+    def _load(self) -> None:
+        if not os.path.exists(self.history_path):
+            return
+        try:
+            with open(self.history_path, "r", encoding="utf-8") as fh:
+                payload = json.load(fh)
+            self.trades = payload if isinstance(payload, list) else []
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Could not read Prophet scalp shadow ledger %s: %s", self.history_path, exc)
+
+    def already_shadowed(self, ticker: str) -> bool:
+        return any(str(rec.get("ticker") or "") == ticker for rec in self.trades)
+
+    def find_active(self) -> list[dict]:
+        return [rec for rec in self.trades if rec.get("status") == "active"]
+
+    def record_open(self, rec: dict) -> bool:
+        if self.already_shadowed(str(rec.get("ticker") or "")):
+            return False
+        self.trades.append(rec)
+        self.save()
+        return True
+
+    def save(self) -> None:
+        try:
+            with open(self.history_path, "w", encoding="utf-8") as fh:
+                json.dump(self.trades, fh, indent=2, default=str)
+            with open(self.report_path, "w", encoding="utf-8") as fh:
+                json.dump(prophet_ladder_scalp_shadow_performance(self.trades), fh, indent=2, default=str)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Could not write Prophet scalp shadow ledger/report: %s", exc)
+
+
 # Module-level ledgers (created here so all coroutines share them).
 tracker = PerformanceTracker(TRADE_HISTORY_FILE, TRADED_TICKERS_FILE)
 inverse_shadow_tracker = InverseProphetShadowTracker(
     INVERSE_PROPHET_SHADOW_HISTORY_FILE, INVERSE_PROPHET_SHADOW_REPORT_FILE)
 selector_tracker = ProphetSelectorTracker(
     PROPHET_SELECTOR_HISTORY_FILE, PROPHET_SELECTOR_REPORT_FILE)
+prophet_ladder_scalp_tracker = ProphetLadderScalpShadowTracker(
+    PROPHET_LADDER_SCALP_SHADOW_HISTORY_FILE, PROPHET_LADDER_SCALP_SHADOW_REPORT_FILE)
 
 
 def paired_prophet_directional_records() -> list[dict]:
@@ -1587,6 +1740,56 @@ def print_inverse_prophet_shadow_performance() -> None:
         )
 
 
+def print_prophet_ladder_scalp_shadow_performance() -> None:
+    """Print the normal-side, average-entry take-profit paper audit."""
+    report = prophet_ladder_scalp_shadow_performance(prophet_ladder_scalp_tracker.trades)
+    roi = (
+        "n/a" if report["return_on_simulated_capital"] is None
+        else f"{100 * report['return_on_simulated_capital']:.1f}%"
+    )
+    log.info(
+        "\n"
+        "╔═══ BTC PROPHET LADDER SCALP SHADOW — PAPER ONLY ═══════════\n"
+        f"║  Signals Started : {report['paper_markets_started']}\n"
+        f"║  Active / Filled : {report['active_paper_markets']} / {report['filled_market_trades']}\n"
+        f"║  Take-profit exits: {report['scalp_exits']}  (avg entry + $0.01 bid)\n"
+        f"║  Settlement exits : {report['settlement_exits_without_take_profit']}\n"
+        f"║  W / L            : {report['winning_trades']} / {report['losing_trades']}\n"
+        f"║  Cash flow        : spent ${report['total_entry_cost']:.4f} → proceeds ${report['total_exit_proceeds']:.4f}\n"
+        f"║  Simulated P&L    : ${report['net_profit']:+,.4f}  (fees excluded)\n"
+        f"║  Simulated ROI    : {roi}\n"
+        f"║  Max Drawdown     : ${-report['maximum_drawdown']:,.4f}\n"
+        "║  Exit evidence    : fresh complete bid + displayed depth for the full paper position\n"
+        "╚════════════════════════════════════════════════════════════"
+    )
+    for average, profile in report["average_entry_profiles"].items():
+        log.info(
+            "PROPHET SCALP AVG ENTRY | avg=%sc observed=%d active=%d scalp_exits=%d settlement_exits=%d net=$%+.4f",
+            average, profile["observed_positions"], profile["active_positions"], profile["scalp_exits"],
+            profile["settlement_exits"], profile["net_profit"],
+        )
+
+
+def print_active_prophet_ladder_scalp_shadow_status() -> None:
+    """Log the current 40c/35c/30c/25c average-entry take-profit level."""
+    pending = prophet_ladder_scalp_tracker.find_active()
+    if not pending:
+        log.info("PROPHET LADDER SCALP SHADOW STATUS | no active paper scalp position.")
+        return
+    for shadow in pending:
+        position = scalp_entry_summary(shadow)
+        log.info(
+            "PROPHET SCALP SHADOW STATUS | ticker=%s side=%s filled=%.2f avg_entry=%s target_bid=%s "
+            "entry_quote_state=%s exit_quote_state=%s; no exchange order or close.",
+            shadow.get("ticker", "?"), str(shadow.get("side") or "?").upper(),
+            _f(position.get("filled_contracts")),
+            "none" if position.get("average_entry_price") is None else f"${_f(position['average_entry_price']):.4f}",
+            "none" if position.get("take_profit_bid") is None else f"${_f(position['take_profit_bid']):.4f}",
+            shadow.get("last_entry_quote_state", "awaiting_quote"),
+            shadow.get("last_exit_quote_state", "awaiting_quote"),
+        )
+
+
 _selector_pnl_series_logged_count = -1
 
 
@@ -1740,6 +1943,9 @@ async def report_portfolio(rest: KalshiREST) -> None:
     if INVERSE_PROPHET_SHADOW_ENABLED:
         print_inverse_prophet_shadow_performance()
         print_active_inverse_prophet_shadow_status()
+    if PROPHET_LADDER_SCALP_SHADOW_ENABLED:
+        print_prophet_ladder_scalp_shadow_performance()
+        print_active_prophet_ladder_scalp_shadow_status()
     if PROPHET_SELECTOR_ENABLED:
         print_prophet_selector_performance()
         print_active_prophet_selector_status()
@@ -1752,6 +1958,95 @@ async def portfolio_reporter(rest: KalshiREST) -> None:
             await report_portfolio(rest)
         except Exception as exc:  # noqa: BLE001
             log.warning("portfolio report failed: %s", exc)
+
+
+def create_prophet_ladder_scalp_shadow(primary: dict) -> Optional[dict]:
+    """Create a normal-Prophet-side, paper-only VWAP scalp alternative."""
+    if not PROPHET_LADDER_SCALP_SHADOW_ENABLED:
+        return None
+    ticker = str(primary.get("ticker") or "")
+    side = str(primary.get("side") or "").lower()
+    if not ticker or side not in {"yes", "no"} or prophet_ladder_scalp_tracker.already_shadowed(ticker):
+        return None
+    shadow = new_ladder_average_entry_scalp_shadow(
+        strategy="prophet_ladder_average_entry_scalp_executable_quote_shadow_v1",
+        ticker=ticker,
+        side=side,
+        quantity_per_rung=PROPHET_LADDER_SCALP_SHADOW_POSITION_SIZE,
+        profit_target_per_contract=PROPHET_LADDER_SCALP_SHADOW_PROFIT_TARGET,
+        quote_max_age_seconds=DRY_QUOTE_MAX_AGE_S,
+        market_close_time=primary.get("settle_et"),
+        extra={
+            "source_prophet_side": str(primary.get("source_prophet_side") or side).lower(),
+            "source_decision_basis": primary.get("source_decision_basis"),
+            "p50_prediction": primary.get("p50_prediction"),
+            "strike": primary.get("strike"),
+        },
+    )
+    if prophet_ladder_scalp_tracker.record_open(shadow):
+        log.info(
+            "PROPHET LADDER SCALP SHADOW STARTED | %s side=%s rungs=$0.40/$0.30/$0.20/$0.10 qty=%.2f "
+            "take_profit=average_entry+$%.2f; paper only, no exchange order or close.",
+            ticker, side.upper(), PROPHET_LADDER_SCALP_SHADOW_POSITION_SIZE,
+            PROPHET_LADDER_SCALP_SHADOW_PROFIT_TARGET,
+        )
+        return shadow
+    return None
+
+
+def simulate_prophet_ladder_scalp_shadow(shadow: dict) -> bool:
+    """Advance one Prophet scalp alternative from fresh, executable book data."""
+    if shadow.get("status") != "active":
+        return False
+    ticker = str(shadow.get("ticker") or "")
+    side = str(shadow.get("side") or "").lower()
+    quantity = _f(shadow.get("quantity_per_rung"), 0.0)
+    if not ticker or side not in {"yes", "no"} or quantity <= 0.0:
+        return False
+    entry_quote, entry_state = fresh_executable_dry_quote(ticker, side, quantity)
+    exit_quote, exit_state = fresh_executable_dry_exit_quote(ticker, side)
+    events = simulate_ladder_average_entry_scalp(
+        shadow,
+        entry_quote=entry_quote,
+        entry_quote_state=entry_state,
+        exit_quote=exit_quote,
+        exit_quote_state=exit_state,
+    )
+    for event in events:
+        if event.get("kind") == "paper_scalp_entry_rung_hit":
+            log.info(
+                "PROPHET SCALP PAPER ENTRY | %s %s rung=$%.2f ask=$%.4f depth=%.2f; paper only.",
+                ticker, side.upper(), _f(event.get("rung_price")),
+                _f((event.get("entry_quote") or {}).get("economic_price")),
+                _f((event.get("entry_quote") or {}).get("displayed_depth")),
+            )
+        elif event.get("kind") == "paper_scalp_take_profit_exit":
+            log.info(
+                "PROPHET SCALP PAPER EXIT | %s %s contracts=%.2f avg=$%.4f target_bid=$%.4f bid=$%.4f "
+                "gross=$%+.4f; fresh depth evidence only, no exchange close.",
+                ticker, side.upper(), _f(event.get("filled_contracts")), _f(event.get("average_entry_price")),
+                _f(event.get("take_profit_bid")), _f(event.get("exit_price")), _f(event.get("gross_profit_loss")),
+            )
+    if events:
+        prophet_ladder_scalp_tracker.save()
+    return bool(events)
+
+
+def finalize_prophet_ladder_scalp_shadow(ticker: str, result: str) -> bool:
+    """Settle the matching paper scalp record when Kalshi finalizes a market."""
+    for shadow in prophet_ladder_scalp_tracker.find_active():
+        if str(shadow.get("ticker") or "") != str(ticker):
+            continue
+        changed = finalize_ladder_average_entry_scalp(shadow, result)
+        if changed:
+            prophet_ladder_scalp_tracker.save()
+            log.info(
+                "PROPHET SCALP PAPER SETTLED | %s side=%s method=%s net=$%+.4f; no exchange fill.",
+                ticker, str(shadow.get("side") or "?").upper(), shadow.get("exit_method", "?"),
+                _f(shadow.get("net_profit_loss")),
+            )
+        return changed
+    return False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1781,6 +2076,8 @@ async def _settle_record_if_ready(rest: KalshiREST, rec: dict) -> bool:
     result = str(result).lower()
     if result not in ("yes", "no"):
         return False
+    if DRY_RUN and PROPHET_LADDER_SCALP_SHADOW_ENABLED:
+        finalize_prophet_ladder_scalp_shadow(str(rec.get("ticker") or ""), result)
 
     # Another task can settle while this coroutine awaits get_market.
     if rec.get("result") != "pending":
@@ -1840,6 +2137,12 @@ async def settlement_checker(rest: KalshiREST) -> None:
     """
     while True:
         await asyncio.sleep(SETTLE_CHECK_S)
+        if PROPHET_LADDER_SCALP_SHADOW_ENABLED:
+            for shadow in prophet_ladder_scalp_tracker.find_active():
+                try:
+                    simulate_prophet_ladder_scalp_shadow(shadow)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("Prophet scalp shadow update failed for %s: %s", shadow.get("ticker"), exc)
         pending = tracker.find_pending()
         if DRY_RUN:
             pending += inverse_shadow_tracker.find_pending()
@@ -2337,6 +2640,7 @@ async def execute_locked_ladder(rest: KalshiREST, ct: str) -> None:
     # This must follow the primary record creation so it inherits exactly the
     # frozen Prophet decision. It never calls _submit or creates an order ID.
     create_inverse_prophet_shadow(rec)
+    create_prophet_ladder_scalp_shadow(rec)
     create_prophet_selector_shadow(rec, selection)
     log.info("%s | %s %s accepted=%d/%d. The side remains locked through settlement.",
              "GTC LADDER PAPER-POSTED" if DRY_RUN else "GTC LADDER POSTED",

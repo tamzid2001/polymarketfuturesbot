@@ -15,6 +15,8 @@ The continuous runners use GitHub Actions for up to 5 h 45 min per job before se
 
 Use **Actions → “Kalshi BTC 15m ML-Side Average Down” → Run workflow**. It uses the persisted contract quantity (default **0.01 contract per rung**) and monitors only `KXBTC15M`. Its separate inverse ML shadow uses **1.00 paper contract per rung** for readable counterfactual P&L; that value is stored independently and cannot change, reserve capital for, or submit a primary live order. The ML-only runner accepts only the schema `ml_only_raw_candles_settled_outcomes_v1`: BTC candle returns/volatility/range, strike distance, clock, and previously settled outcomes. It does not fit, call, or consume Prophet or another price forecast. It rejects a saved model whose schema is not exactly ML-only; there is no fallback model or forecast path.
 
+It also runs a separate **ML ladder scalp shadow** at one paper share per rung. This alternative fills only against a fresh displayed executable ask, tracks the actual paper VWAP of the filled 40¢/30¢/20¢/10¢ rungs, and closes the whole hypothetical position only at a fresh displayed bid with enough depth and at least **1¢ above VWAP**. That means the four possible target bids are 41¢, 36¢, 31¢, and 26¢ after one, two, three, or four equal rungs. It is research-only: it never creates, cancels, reduces, or otherwise changes a live Kalshi order.
+
 ### Deployed model, coverage, and evidence
 
 The live runner resolves its artifact from [`kalshi_ml_model_registry.json`](kalshi_ml_model_registry.json) at every 5h45m handoff. The active model is a regularized logistic regression with isotonic probability calibration, trained and published by the ML-only daily retraining workflow. Its schema lock prevents a model with any non-ML-only feature from being substituted. The runner records the artifact ID, training cutoff, model `p_yes`, confidence, and selected side with every ML-backed market record.
@@ -40,7 +42,7 @@ The feature builder requires at least 61 continuous one-minute BTC candles. It u
 
 ### What the Action logs
 
-At startup the runner prints `ML MODEL`, `ML VALIDATION`, and `ML EXECUTION POLICY` lines with the exact artifact, calibration method, training rows/cutoff, schema, and active gate. Before each market it prints `ML INPUT READY` to confirm no forecast input was used, then `ML SIDE READY` (`p_yes`, confidence, selected side). A candle fetch is capped at 45 seconds and an unfinished pre-open task logs `ML SIDE FAILED` at the open; neither condition can fall back to Prophet, stale inference, or price-side selection. The runner then logs `SIDE LOCKED`, four `GTC LADDER LIMIT` submissions, `GTC LADDER POSTED`, order IDs/fills, exchange-position guards, settlement, rung P&L, and `ML LIVE PERFORMANCE`.
+At startup the runner prints `ML MODEL`, `ML VALIDATION`, and `ML EXECUTION POLICY` lines with the exact artifact, calibration method, training rows/cutoff, schema, and active gate. Before each market it prints `ML INPUT READY` to confirm no forecast input was used, then `ML SIDE READY` (`p_yes`, confidence, selected side). A candle fetch is capped at 45 seconds and an unfinished pre-open task logs `ML SIDE FAILED` at the open; neither condition can fall back to Prophet, stale inference, or price-side selection. The runner then logs `SIDE LOCKED`, four `GTC LADDER LIMIT` submissions, order IDs/fills, exchange-position guards, settlement, rung P&L, and separate `ML LADDER SCALP SHADOW` status/performance lines. The scalp report shows each 40¢/35¢/30¢/25¢ average-entry profile separately; it remains paper-only and excludes fees, queue priority, cancellation, latency, hidden liquidity, and partial-fill risk.
 
 ### ML-only retraining
 
@@ -71,7 +73,7 @@ The 12-hour result is nominally below 0.05 when compared with a coin flip alone 
 3. **Lock the frozen ML side before sending any order.** Once a valid ML YES/NO side is ready, the other side is never considered. The exchange-position guard must confirm a compatible, within-cap position and the account must cover the complete ladder principal plus configured fee reserve.
 4. **Immediately pre-post four GTC limits.** For that one locked side, the runner sends exactly one GTC buy at each fixed economic price: **40¢, 30¢, 20¢, and 10¢**. Every order has the market's explicit close timestamp as its expiry. It sends no opposite-side order, does not reverse, and has no quote-trigger wait.
 5. **Fill behavior is intentional.** If the selected side is already cheap enough that one or more limits cross the book, those GTCs may fill immediately at their limit or a better available price. Otherwise they provide liquidity and rest in Kalshi's book. A partial fill remains attached to that same rung; an unfilled rung remains resting until close, rejection, or explicit cancellation.
-6. **Hold to settlement and clear the ladder.** At market close the runner stops new orders and explicitly cancels all remaining GTC rungs. Filled contracts remain through settlement; then the runner records payout, fees, net P&L, streaks, drawdown, and per-rung results. A closed prior market cannot block the next fresh watcher.
+6. **Hold to settlement and clear the live ladder.** At market close the runner stops new orders and explicitly cancels all remaining GTC rungs. Filled contracts remain through settlement; then the runner records payout, fees, net P&L, streaks, drawdown, and per-rung results. The separate paper scalp shadow may instead record a qualifying bid exit, but it cannot affect this live lifecycle. A closed prior market cannot block the next fresh watcher.
 
 ### Pre-posted GTC ladder semantics
 
@@ -418,10 +420,11 @@ forecast with **Facebook Prophet**. At the fresh market open it compares the
 forecast p50 with the live strike, locks exactly one BTC side, then immediately
 pre-posts four market-close-expiring GTC limits at **40¢, 30¢, 20¢, and 10¢
 economic cost** on that one side. Every rung uses `BET_AMOUNT_SHARES` (default
-**1 contract**, not dollars). In paper mode it also keeps independent inverse
-and selector paper portfolios. It has no ETH contract, hedge, multiplier, or
-loss-progression rule. Positions ride to settlement; there is no take-profit
-monitor.
+**1 contract**, not dollars). In paper mode it also keeps independent inverse,
+selector, and normal-side scalp paper portfolios. It has no ETH contract,
+hedge, multiplier, or loss-progression rule. The primary ladder rides to
+settlement; the scalp portfolio is a separate paper-only average-entry exit
+audit and cannot affect a primary order.
 
 > The previous version of this bot used an Alpaca price feed and a momentum
 > signal (delta vs a rolling 60-second average). That strategy — and the Alpaca
@@ -487,8 +490,11 @@ For every 15-minute Kalshi window:
 ## Performance tracking
 
 Every portfolio report (every 30 s) prints the normal BTC-only stats block, the
-independent inverse paper report, and a separate **BTC PROPHET WIN-RATE
-SELECTOR** report. The selector report includes frozen normal/inverse choices,
+independent inverse paper report, a **BTC PROPHET LADDER SCALP SHADOW** report,
+and a separate **BTC PROPHET WIN-RATE SELECTOR** report. The scalp report
+requires a fresh complete executable ask for each paper entry and a fresh bid
+with depth for the entire paper position before taking a 1¢-over-VWAP exit; it
+breaks out the 40¢/35¢/30¢/25¢ average-entry profiles. The selector report includes frozen normal/inverse choices,
 directional and executable-quote paper P&L, drawdown, per-rung P&L, and one
 line for every requested window showing normal/inverse W/L, win rate, and the
 current leader. Its durable files are `prophet_btc_selector_history.json` and
@@ -527,6 +533,9 @@ Environment **variables** (not secrets) tune behavior:
 | `PROPHET_SELECTOR_ENABLED` | `true` | Enables the paired trailing 3/5/7/10/25/50 win-rate selector. In paper mode it is a third paper ladder; in confirmed live mode it supplies the one actual locked side. |
 | `PROPHET_SELECTOR_START_INVERSE` | `true` | Forces the first selector market after deployment to inverse, then hands control to the frozen trailing-window vote. |
 | `PROPHET_SELECTOR_TIME_SERIES_LOG_ROWS` | `8` | Number of recent selector cash-flow points printed after a runner restart; the report JSON always retains the full series. |
+| `PROPHET_LADDER_SCALP_SHADOW_ENABLED` | `true` in paper mode | Enables the separate normal-Prophet paper scalp audit; it has no live-order path. |
+| `PROPHET_LADDER_SCALP_SHADOW_POSITION_SIZE` | `1` | Paper contracts per scalp rung, independent of `BET_AMOUNT_SHARES`. |
+| `PROPHET_LADDER_SCALP_SHADOW_PROFIT_TARGET` | `0.01` | Minimum executable bid gain over the paper position's volume-weighted average entry. |
 | `HISTORY_MINUTES` | `500` | 1-minute candles fed to Prophet |
 | `FORECAST_MINUTES` | `17` | Fixed Prophet horizon in one-minute timesteps for every cached forecast |
 | `PREOPEN_FORECAST_LEAD_S` | `120` | Seconds before the next market opens to pre-compute its 17-step forecast |
@@ -556,7 +565,7 @@ The old hedged Prophet execution workflow was removed so it cannot overlap the
 ML-side BTC runner. This BTC-only ladder has **no scheduled workflow** and a
 dedicated **“Kalshi Prophet BTC-only GTC Ladder — Selector”** workflow. It
 defaults to `execution_mode=paper`, has its own concurrency group, and
-self-handoffs every 5 h 45 min while persisting the normal, inverse, and
+self-handoffs every 5 h 45 min while persisting the normal, inverse, scalp, and
 selector ledgers as audit artifacts. A `simulated_executable_quote_hit` means
 the observed selected-side quote reached a rung with a fresh complete
 top-of-book and displayed depth; it is not an exchange fill or queue claim.

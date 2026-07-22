@@ -60,6 +60,18 @@ class ExecutableDryQuoteTests(unittest.TestCase):
         self.assertEqual(quote["quote_received_at"], NOW.isoformat())
         self.assertEqual(quote["quote_source_ts_ms"], 1784655000000)
 
+    def test_exit_quote_uses_the_executable_bid_for_each_contract_side(self) -> None:
+        self.set_book()
+        yes_quote, yes_state = runner.fresh_executable_dry_exit_quote(
+            TICKER, "yes", 0.01, now=NOW + timedelta(seconds=1))
+        no_quote, no_state = runner.fresh_executable_dry_exit_quote(
+            TICKER, "no", 0.01, now=NOW + timedelta(seconds=1))
+
+        self.assertEqual((yes_state, yes_quote["executable_field"], yes_quote["economic_price"]),
+                         ("executable_top_of_book", "yes_bid", 0.80))
+        self.assertEqual((no_state, no_quote["executable_field"], no_quote["economic_price"]),
+                         ("executable_top_of_book", "yes_ask", 0.19))
+
     def test_complete_ticker_message_records_fixed_point_top_of_book_depth(self) -> None:
         ws = runner.KalshiMarketWS(auth=None)
         ws._handle(json.dumps({

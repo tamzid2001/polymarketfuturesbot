@@ -31,6 +31,13 @@ from typing import Any
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
+from kalshi_ladder_scalp_shadow import (
+    entry_summary as scalp_entry_summary,
+    finalize_ladder_average_entry_scalp,
+    new_ladder_average_entry_scalp_shadow,
+    scalp_performance,
+    simulate_ladder_average_entry_scalp,
+)
 from kalshi_ml_features import FEATURE_SCHEMA, ML_ONLY_FEATURE_COLUMNS
 
 try:  # Installed by the dedicated live-runner requirements file.
@@ -58,7 +65,7 @@ except ImportError:  # pragma: no cover - exercised only in minimal local enviro
 LOG = logging.getLogger("kalshi_btc15m_average_down")
 SERIES_TICKER = "KXBTC15M"
 LADDER_LEVELS = (0.40, 0.30, 0.20, 0.10)
-CONFIG_VERSION = 10
+CONFIG_VERSION = 11
 STATE_VERSION = 7
 ORDER_NAMESPACE = uuid.UUID("4d85857e-4dc6-43ec-960f-0b342523bdb7")
 KALSHI_WS_URL = os.getenv(
@@ -120,6 +127,14 @@ DEFAULT_CONFIG = {
     # single live order or risk limit.
     "inverse_shadow_position_size": 1.0,
     "inverse_shadow_quote_max_age_seconds": 3.0,
+    # An alternate paper-only exit study for the frozen ML side.  It mirrors
+    # the 40c/30c/20c/10c entries at one share each, then exits only when a
+    # fresh bid has enough displayed depth to close the entire paper position
+    # one cent above its current VWAP.  It cannot touch live orders.
+    "scalp_shadow_enabled": True,
+    "scalp_shadow_position_size": 1.0,
+    "scalp_shadow_profit_target": 0.01,
+    "scalp_shadow_quote_max_age_seconds": 3.0,
     # When a retrain publishes a new artifact, paper-test both the retained
     # predecessor and the new model at the same readable size. Neither side
     # can create or alter an exchange order.
@@ -464,6 +479,7 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         "fee_reserve", "poll_seconds", "market_refresh_seconds", "order_reconcile_seconds",
         "watch_start_grace_seconds", "ml_preopen_lead_seconds", "ml_min_confidence",
         "inverse_shadow_position_size", "inverse_shadow_quote_max_age_seconds",
+        "scalp_shadow_position_size", "scalp_shadow_profit_target", "scalp_shadow_quote_max_age_seconds",
         "model_transition_shadow_position_size", "status_log_seconds",
     ):
         value = as_float(merged.get(name))
@@ -476,6 +492,10 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
     if isinstance(shadow_enabled, str):
         shadow_enabled = shadow_enabled.strip().lower() in {"1", "true", "yes", "on"}
     merged["inverse_shadow_enabled"] = bool(shadow_enabled)
+    scalp_shadow_enabled = merged.get("scalp_shadow_enabled", True)
+    if isinstance(scalp_shadow_enabled, str):
+        scalp_shadow_enabled = scalp_shadow_enabled.strip().lower() in {"1", "true", "yes", "on"}
+    merged["scalp_shadow_enabled"] = bool(scalp_shadow_enabled)
     transition_shadow_enabled = merged.get("model_transition_shadow_enabled", True)
     if isinstance(transition_shadow_enabled, str):
         transition_shadow_enabled = transition_shadow_enabled.strip().lower() in {"1", "true", "yes", "on"}
@@ -675,6 +695,61 @@ class KalshiLiveFeed:
             return None, "invalid_executable_price"
         if displayed_depth + 1e-9 < required_count:
             return None, "insufficient_displayed_depth"
+        return {
+            "quote_id": str(book.get("quote_id")),
+            "ticker": ticker,
+            "side": normalized_side,
+            "economic_price": round(price, 4),
+            "displayed_depth": round(displayed_depth, 4),
+            "yes_bid": round(yes_bid, 4),
+            "yes_ask": round(yes_ask, 4),
+            "yes_bid_size": round(yes_bid_size, 4),
+            "yes_ask_size": round(yes_ask_size, 4),
+            "source_server_timestamp": book.get("source_server_timestamp"),
+            "source_timestamp_ms": book.get("source_timestamp_ms"),
+            "received_at": book.get("received_at"),
+            "quote_age_seconds": round(max(0.0, age), 6),
+        }, "executable_top_of_book"
+
+    def executable_shadow_exit_quote(
+        self, ticker: str, side: str, required_count: float, max_age_seconds: float,
+    ) -> tuple[dict[str, Any] | None, str]:
+        """Return fresh complete-book evidence for selling a paper YES/NO position.
+
+        A YES exit takes the displayed YES bid; a NO exit takes the displayed
+        NO bid, which is ``1 - yes_ask``.  ``required_count`` may be zero so a
+        caller can first observe a valid bid and then let the paper simulator
+        require depth for the position that actually filled on this update.
+        """
+        normalized_side = str(side).lower()
+        if normalized_side not in {"yes", "no"}:
+            return None, "invalid_side"
+        if required_count < 0:
+            return None, "invalid_required_count"
+        quote = self.quotes.get(ticker)
+        book = quote.get("complete_book") if isinstance(quote, dict) else None
+        if not isinstance(book, dict):
+            return None, "missing_complete_top_of_book"
+        received = as_float(book.get("received_monotonic"))
+        age = time.monotonic() - received if received is not None else float("inf")
+        if age > max_age_seconds:
+            return None, "stale_top_of_book"
+        yes_bid = as_float(book.get("yes_bid"))
+        yes_ask = as_float(book.get("yes_ask"))
+        yes_bid_size = as_float(book.get("yes_bid_size"))
+        yes_ask_size = as_float(book.get("yes_ask_size"))
+        if any(value is None for value in (yes_bid, yes_ask, yes_bid_size, yes_ask_size)):
+            return None, "incomplete_top_of_book"
+        assert yes_bid is not None and yes_ask is not None
+        assert yes_bid_size is not None and yes_ask_size is not None
+        if not (0.0 < yes_bid <= yes_ask < 1.0 and yes_bid_size >= 0.0 and yes_ask_size >= 0.0):
+            return None, "invalid_top_of_book"
+        price = yes_bid if normalized_side == "yes" else 1.0 - yes_ask
+        displayed_depth = yes_bid_size if normalized_side == "yes" else yes_ask_size
+        if not (0.0 < price < 1.0):
+            return None, "invalid_executable_exit_price"
+        if displayed_depth + 1e-9 < required_count:
+            return None, "insufficient_displayed_exit_depth"
         return {
             "quote_id": str(book.get("quote_id")),
             "ticker": ticker,
@@ -1656,6 +1731,97 @@ def finalize_inverse_shadow(record: dict[str, Any], result: str | None) -> bool:
     return finalize_quote_paper_shadow(record, shadow, result, label="INVERSE SHADOW")
 
 
+def ensure_ml_scalp_shadow(
+    record: dict[str, Any], market: Any, config: dict[str, Any], ml_side: str,
+) -> dict[str, Any] | None:
+    """Start the normal-ML, one-round-trip paper scalp study.
+
+    The live GTC ladder remains completely independent.  This shadow is an
+    alternative paper scenario with readable one-share rungs, created from the
+    same pre-open-frozen ML side before any intramarket quote is inspected.
+    """
+    if not config.get("scalp_shadow_enabled", True) or ml_side not in {"yes", "no"}:
+        return None
+    existing = record.get("ml_ladder_scalp_shadow")
+    if isinstance(existing, dict):
+        return existing
+    shadow = new_ladder_average_entry_scalp_shadow(
+        strategy="ml_ladder_average_entry_scalp_executable_quote_shadow_v1",
+        ticker=str(record.get("ticker") or ""), side=ml_side,
+        quantity_per_rung=float(config["scalp_shadow_position_size"]),
+        profit_target_per_contract=float(config["scalp_shadow_profit_target"]),
+        quote_max_age_seconds=float(config["scalp_shadow_quote_max_age_seconds"]),
+        market_close_time=field(market, "close_time", "expected_expiration_time"),
+        extra={"source_ml_side": ml_side, "source_model_run_id": record.get("ml_inference", {}).get("model_run_id")},
+    )
+    record["ml_ladder_scalp_shadow"] = shadow
+    LOG.info(
+        "ML LADDER SCALP SHADOW STARTED | %s side=%s rungs=$0.40/$0.30/$0.20/$0.10 qty=%.2f "
+        "take_profit=average_entry+$%.2f; paper only, no exchange order or close.",
+        record.get("ticker", "?"), ml_side.upper(), float(config["scalp_shadow_position_size"]),
+        float(config["scalp_shadow_profit_target"]),
+    )
+    return shadow
+
+
+def simulate_ml_scalp_shadow(
+    record: dict[str, Any], feed: KalshiLiveFeed | None, config: dict[str, Any],
+) -> bool:
+    """Advance the separate ML scalp audit with fresh bid/ask/depth evidence."""
+    shadow = record.get("ml_ladder_scalp_shadow")
+    if not isinstance(shadow, dict) or shadow.get("status") != "active":
+        return False
+    if feed is None:
+        shadow["last_entry_quote_state"] = "websocket_unavailable"
+        shadow["last_exit_quote_state"] = "websocket_unavailable"
+        return False
+    ticker = str(record.get("ticker") or "")
+    side = str(shadow.get("side") or "").lower()
+    quantity = float(shadow.get("quantity_per_rung") or 0.0)
+    quote_age = float(shadow.get("quote_max_age_seconds") or 0.0)
+    if not ticker or side not in {"yes", "no"} or quantity <= 0.0 or quote_age <= 0.0:
+        shadow["last_entry_quote_state"] = "invalid_shadow_state"
+        shadow["last_exit_quote_state"] = "invalid_shadow_state"
+        return False
+    entry_quote, entry_state = feed.executable_shadow_quote(ticker, side, quantity, quote_age)
+    # Query a valid bid independently of depth; the common simulator checks
+    # that it can close the exact filled position after entry rungs are added.
+    exit_quote, exit_state = feed.executable_shadow_exit_quote(ticker, side, 0.0, quote_age)
+    events = simulate_ladder_average_entry_scalp(
+        shadow, entry_quote=entry_quote, entry_quote_state=entry_state,
+        exit_quote=exit_quote, exit_quote_state=exit_state,
+    )
+    for event in events:
+        if event.get("kind") == "paper_scalp_entry_rung_hit":
+            LOG.info(
+                "ML SCALP PAPER ENTRY | %s %s rung=$%.2f ask=$%.4f depth=%.2f; paper only.",
+                ticker, side.upper(), float(event["rung_price"]),
+                float(event["entry_quote"]["economic_price"]), float(event["entry_quote"]["displayed_depth"]),
+            )
+        elif event.get("kind") == "paper_scalp_take_profit_exit":
+            LOG.info(
+                "ML SCALP PAPER EXIT | %s %s contracts=%.2f avg=$%.4f target_bid=$%.4f bid=$%.4f "
+                "gross=$%+.4f; fresh depth evidence only, no exchange close.",
+                ticker, side.upper(), float(event["filled_contracts"]), float(event["average_entry_price"]),
+                float(event["take_profit_bid"]), float(event["exit_price"]), float(event["gross_profit_loss"]),
+            )
+    return bool(events)
+
+
+def finalize_ml_scalp_shadow(record: dict[str, Any], result: str | None) -> bool:
+    shadow = record.get("ml_ladder_scalp_shadow")
+    if not isinstance(shadow, dict):
+        return False
+    changed = finalize_ladder_average_entry_scalp(shadow, result)
+    if changed:
+        LOG.info(
+            "ML SCALP PAPER SETTLED | %s side=%s method=%s net=$%+.4f; no exchange fill.",
+            record.get("ticker", "?"), str(shadow.get("side") or "?").upper(),
+            shadow.get("exit_method", "?"), float(shadow.get("net_profit_loss") or 0.0),
+        )
+    return changed
+
+
 def ensure_model_transition_shadow(record: dict[str, Any], market: Any, config: dict[str, Any]) -> dict[str, Any] | None:
     """Paper-test both retained predecessor and new model on identical inputs.
 
@@ -2049,6 +2215,7 @@ async def settle_or_cancel(rest: KalshiREST, record: dict[str, Any], market: Any
     market_status = str(field(market, "status") or "").lower()
     if result is not None and market_status == "finalized":
         finalize_inverse_shadow(record, result)
+        finalize_ml_scalp_shadow(record, result)
         finalize_model_transition_shadow(record, result)
     if not record.get("candidate_side") and not orders_for_market(record):
         if result is None or market_status != "finalized":
@@ -2153,6 +2320,7 @@ async def consider_initial_entry(
     # fresh-market policy even if the live ladder is later blocked by balance,
     # capacity, or exchange recovery. It remains paper-only in all modes.
     ensure_inverse_shadow(record, market, config, ml_side)
+    ensure_ml_scalp_shadow(record, market, config, ml_side)
     ensure_model_transition_shadow(record, market, config)
     other_active = [candidate for candidate in active_strategy_records(state) if candidate is not record]
     if len(other_active) >= config["max_active_markets"]:
@@ -2593,6 +2761,21 @@ def inverse_shadow_performance(state: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def ml_scalp_shadow_performance(state: dict[str, Any]) -> dict[str, Any]:
+    """Summarize the normal-side paper scalp alternative separately from live P&L."""
+    shadows = [
+        record["ml_ladder_scalp_shadow"]
+        for record in state.get("markets", {}).values()
+        if isinstance(record, dict) and isinstance(record.get("ml_ladder_scalp_shadow"), dict)
+    ]
+    report = scalp_performance(shadows)
+    report.update({
+        "strategy": "ml_ladder_average_entry_scalp_executable_quote_shadow_v1",
+        "source": "same_frozen_ml_side_as_primary_ladder",
+    })
+    return report
+
+
 def paper_shadow_summary(shadows: list[dict[str, Any]]) -> dict[str, Any]:
     """Return comparable settled paper metrics for any one-model shadow set."""
     settled_signals = sorted(
@@ -2751,6 +2934,7 @@ def performance_report(state: dict[str, Any], config: dict[str, Any]) -> dict[st
         "ml_model_transition_side_comparison": model_transition_side_comparison(state),
         "ml_model_transition_shadow_performance": model_transition_shadow_performance(state),
         "inverse_ml_shadow_performance": inverse_shadow_performance(state),
+        "ml_ladder_scalp_shadow_performance": ml_scalp_shadow_performance(state),
         "note": "Only finalized records with filled contracts count as trades. The pre-open ML side is an execution filter; this report is realized live-ledger data, not a profitability proof.",
     }
     if settled:
@@ -2880,6 +3064,23 @@ def log_performance_summary(report: dict[str, Any], context: str) -> None:
             level, rung["paper_orders"], rung["simulated_quote_hits"], rung["filled_contracts"],
             rung["resting_or_unfilled"], rung["winning_orders"], rung["losing_orders"], rung["net_profit"],
         )
+    scalp = report["ml_ladder_scalp_shadow_performance"]
+    LOG.info(
+        "ML LADDER SCALP SHADOW PERFORMANCE | %s started=%d active=%d scalp_exits=%d settlement_exits=%d "
+        "filled_markets=%d wins=%d losses=%d net=$%+.4f roi=%s max_drawdown=$%.4f "
+        "| paper only; fresh bid/ask/depth required; fees/queue excluded.",
+        context, scalp["paper_markets_started"], scalp["active_paper_markets"], scalp["scalp_exits"],
+        scalp["settlement_exits_without_take_profit"], scalp["filled_market_trades"],
+        scalp["winning_trades"], scalp["losing_trades"], scalp["net_profit"],
+        "n/a" if scalp["return_on_simulated_capital"] is None else f"{100 * scalp['return_on_simulated_capital']:.2f}%",
+        scalp["maximum_drawdown"],
+    )
+    for average, profile in scalp["average_entry_profiles"].items():
+        LOG.info(
+            "ML SCALP AVG ENTRY | avg=%sc observed=%d active=%d scalp_exits=%d settlement_exits=%d net=$%+.4f",
+            average, profile["observed_positions"], profile["active_positions"], profile["scalp_exits"],
+            profile["settlement_exits"], profile["net_profit"],
+        )
 
 
 def log_ml_deployment(
@@ -3005,6 +3206,19 @@ async def log_heartbeat(
                 shadow.get("last_quote_state", "awaiting_quote"), filled_rungs, len(LADDER_LEVELS),
                 "none" if quote_evidence is None else f"${float(quote_evidence.get('economic_price') or 0.0):.4f}",
                 "none" if quote_evidence is None else f"{float(quote_evidence.get('quote_age_seconds') or 0.0):.3f}s",
+            )
+        scalp = record.get("ml_ladder_scalp_shadow")
+        if isinstance(scalp, dict):
+            position = scalp_entry_summary(scalp)
+            LOG.info(
+                "ML SCALP SHADOW STATUS | %s side=%s status=%s filled=%.2f avg_entry=%s target_bid=%s "
+                "entry_quote_state=%s exit_quote_state=%s; no exchange order or close.",
+                record.get("ticker", "?"), str(scalp.get("side") or "?").upper(), scalp.get("status", "?"),
+                float(position["filled_contracts"] or 0.0),
+                "none" if position["average_entry_price"] is None else f"${float(position['average_entry_price']):.4f}",
+                "none" if position["take_profit_bid"] is None else f"${float(position['take_profit_bid']):.4f}",
+                scalp.get("last_entry_quote_state", "awaiting_quote"),
+                scalp.get("last_exit_quote_state", "awaiting_quote"),
             )
         if record.get("status") == "watching":
             ml_signal = record.get("ml_inference") if isinstance(record.get("ml_inference"), dict) else {}
@@ -3203,6 +3417,7 @@ async def run(args: argparse.Namespace) -> int:
             for record in state["markets"].values():
                 if isinstance(record, dict):
                     simulate_inverse_shadow(record, feed, config)
+                    simulate_ml_scalp_shadow(record, feed, config)
                     simulate_model_transition_shadow(record, feed, config)
             monotonic_now = asyncio.get_running_loop().time()
             if monotonic_now - last_heartbeat_at >= config["status_log_seconds"]:

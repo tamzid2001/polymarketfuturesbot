@@ -59,8 +59,8 @@ jobs:
 
       - name: Verify locked-ladder safety checks
         run: |
-          python -m py_compile kalshibtc15minupordown.py kalshi_btc15m_prophet_btc_only.py
-          python -m unittest -v test_kalshi_bot.py test_kalshi_dry_quote_simulation.py
+          python -m py_compile kalshi_ladder_scalp_shadow.py kalshibtc15minupordown.py kalshi_btc15m_prophet_btc_only.py
+          python -m unittest -v test_kalshi_bot.py test_kalshi_dry_quote_simulation.py test_kalshi_ladder_scalp_shadow.py
 
       - name: Write Kalshi RSA private key
         env:
@@ -90,6 +90,11 @@ jobs:
           INVERSE_PROPHET_SHADOW_ENABLED: "true"
           INVERSE_PROPHET_SHADOW_HISTORY_FILE: prophet_btc_inverse_shadow_history.json
           INVERSE_PROPHET_SHADOW_REPORT_FILE: prophet_btc_inverse_shadow_report.json
+          PROPHET_LADDER_SCALP_SHADOW_ENABLED: "true"
+          PROPHET_LADDER_SCALP_SHADOW_HISTORY_FILE: prophet_btc_ladder_scalp_shadow_history.json
+          PROPHET_LADDER_SCALP_SHADOW_REPORT_FILE: prophet_btc_ladder_scalp_shadow_report.json
+          PROPHET_LADDER_SCALP_SHADOW_POSITION_SIZE: "1"
+          PROPHET_LADDER_SCALP_SHADOW_PROFIT_TARGET: "0.01"
           PROPHET_SELECTOR_ENABLED: "true"
           PROPHET_SELECTOR_HISTORY_FILE: prophet_btc_selector_history.json
           PROPHET_SELECTOR_REPORT_FILE: prophet_btc_selector_report.json
@@ -122,6 +127,7 @@ jobs:
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           for file in prophet_btc_only_trade_history.json prophet_btc_only_traded_market_tickers.json \
                       prophet_btc_inverse_shadow_history.json prophet_btc_inverse_shadow_report.json \
+                      prophet_btc_ladder_scalp_shadow_history.json prophet_btc_ladder_scalp_shadow_report.json \
                       prophet_btc_selector_history.json prophet_btc_selector_report.json; do
             test ! -f "$file" || git add "$file"
           done
@@ -157,6 +163,8 @@ jobs:
             prophet_btc_only_traded_market_tickers.json
             prophet_btc_inverse_shadow_history.json
             prophet_btc_inverse_shadow_report.json
+            prophet_btc_ladder_scalp_shadow_history.json
+            prophet_btc_ladder_scalp_shadow_report.json
             prophet_btc_selector_history.json
             prophet_btc_selector_report.json
           if-no-files-found: warn
