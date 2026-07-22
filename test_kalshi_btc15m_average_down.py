@@ -34,6 +34,7 @@ from kalshi_btc15m_average_down import (
     ladder_principal_for_rungs,
     live_rung_quantities,
     mark_live_exit_if_flat,
+    monitor_live_inverse_ml_weighted_hold_gate,
     performance_report,
     pause_error,
     reconcile_orders,
@@ -765,6 +766,115 @@ class MechanicalAverageDownTests(unittest.TestCase):
         self.assertEqual(record["status"], "exited_early")
         self.assertEqual((record["total_cost"], record["gross_payout"], record["kalshi_fees"]), (1.0, 2.1, 0.06))
         self.assertEqual(record["net_profit_loss"], 1.04)
+
+    def test_live_inverse_exit_latches_through_a_rebound_after_entry_cancels(self):
+        class FakeFeed:
+            def __init__(self):
+                self.bids = iter((0.05, 0.06))
+
+            def executable_shadow_exit_quote(self, _ticker, _side, required_count, _max_age):
+                return {
+                    "economic_price": next(self.bids), "displayed_depth": required_count,
+                }, "executable_top_of_book"
+
+        class FakeRest:
+            def __init__(self):
+                self.canceled: list[str] = []
+                self.exit_requests: list[dict] = []
+
+            async def cancel_order(self, order, _dry_run):
+                self.canceled.append(str(order.get("order_id")))
+                order["remaining_count"] = 0.0
+                order["status"] = "canceled"
+
+            async def refresh_order(self, _order):
+                return None
+
+            async def position_for_ticker(self, _ticker):
+                return -1.0
+
+            async def create_reduce_only_exit(self, **kwargs):
+                self.exit_requests.append(kwargs)
+                return {
+                    "order_id": "close", "fill_count": 1.0, "remaining_count": 0.0,
+                    "average_fill_price": kwargs["economic_exit_price"], "fees_paid": 0.0,
+                    "status": "filled",
+                }
+
+        async def scenario():
+            config, _ = apply_config_overrides(
+                validate_config(DEFAULT_CONFIG), SimpleNamespace(live_execution_strategy="inverse_ml_weighted_hold_gate"),
+            )
+            record = {
+                "ticker": "KXBTC15M-TEST-LATCH", "strategy": "inverse_ml_weighted_hold_gate_live_v1",
+                "status": "ladder_active", "locked_side": "no", "orders": {
+                    "0.4000": {
+                        "order_id": "filled", "side": "no", "position_price": 0.40, "quantity": 1.0,
+                        "fill_count": 1.0, "remaining_count": 0.0, "average_fill_price": 0.40, "fees_paid": 0.0,
+                    },
+                    "0.3000": {
+                        "order_id": "resting", "side": "no", "position_price": 0.30, "quantity": 2.0,
+                        "fill_count": 0.0, "remaining_count": 2.0, "average_fill_price": 0.30, "fees_paid": 0.0,
+                    },
+                },
+            }
+            rest = FakeRest()
+            await monitor_live_inverse_ml_weighted_hold_gate(rest, record, FakeFeed(), config, dry_run=False)
+            return record, rest
+
+        record, rest = asyncio.run(scenario())
+        self.assertEqual(rest.canceled, ["resting"])
+        self.assertEqual(len(rest.exit_requests), 1)
+        self.assertEqual(rest.exit_requests[0]["economic_exit_price"], 0.06)
+        self.assertEqual(record["status"], "exited_early")
+        self.assertEqual(record["live_exit_protection"]["trigger"], "absolute_5c_stop")
+
+    def test_live_inverse_exit_never_sends_close_while_an_entry_cancel_is_unconfirmed(self):
+        class FakeFeed:
+            def executable_shadow_exit_quote(self, _ticker, _side, required_count, _max_age):
+                return {"economic_price": 0.05, "displayed_depth": required_count}, "executable_top_of_book"
+
+        class FakeRest:
+            async def cancel_order(self, _order, _dry_run):
+                # Simulate a cancellation failure that leaves the GTC entry resting.
+                return None
+
+            async def refresh_order(self, _order):
+                return None
+
+            async def position_for_ticker(self, _ticker):
+                raise AssertionError("position lookup must wait for entry cancel confirmation")
+
+            async def create_reduce_only_exit(self, **_kwargs):
+                raise AssertionError("must not close while an entry can still fill")
+
+        async def scenario():
+            config, _ = apply_config_overrides(
+                validate_config(DEFAULT_CONFIG), SimpleNamespace(live_execution_strategy="inverse_ml_weighted_hold_gate"),
+            )
+            record = {
+                "ticker": "KXBTC15M-TEST-CANCEL", "strategy": "inverse_ml_weighted_hold_gate_live_v1",
+                "status": "ladder_active", "locked_side": "no", "orders": {
+                    "0.4000": {
+                        "order_id": "filled", "side": "no", "position_price": 0.40, "quantity": 1.0,
+                        "fill_count": 1.0, "remaining_count": 0.0, "average_fill_price": 0.40, "fees_paid": 0.0,
+                    },
+                    "0.3000": {
+                        "order_id": "resting", "side": "no", "position_price": 0.30, "quantity": 2.0,
+                        "fill_count": 0.0, "remaining_count": 2.0, "average_fill_price": 0.30, "fees_paid": 0.0,
+                    },
+                },
+            }
+            changed = await monitor_live_inverse_ml_weighted_hold_gate(
+                FakeRest(), record, FakeFeed(), config, dry_run=False,
+            )
+            return changed, record
+
+        changed, record = asyncio.run(scenario())
+        self.assertFalse(changed)
+        self.assertEqual(record["status"], "live_exit_pending")
+        self.assertTrue(record["live_exit_protection"]["exit_latched"])
+        self.assertEqual(record["live_exit_protection"]["entry_cancel_pending"], "resting")
 
     def test_weighted_paper_monitor_locks_ml_side_without_primary_order_or_balance_call(self):
         class NoOrderRest:

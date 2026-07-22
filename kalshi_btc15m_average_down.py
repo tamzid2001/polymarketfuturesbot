@@ -3043,19 +3043,39 @@ async def monitor_live_inverse_ml_weighted_hold_gate(
         protection["trailing_high_bid"] = bid
         protection["high_depth_contracts"] = remaining
         high = bid
-    trigger: str | None = None
-    if bid <= hard_stop + 1e-9:
-        trigger = "absolute_5c_stop"
-    elif armed and high is not None and bid <= high - trail + 1e-9:
-        trigger = "60c_gate_10c_trail"
-    if trigger is None:
-        return False
-    protection.update({"trigger": trigger, "triggered_at": now_iso(), "trigger_bid": bid})
-    LOG.critical(
-        "LIVE INVERSE ML EXIT TRIGGER | %s %s reason=%s bid=$%.4f avg=$%.4f high=%s remaining=%.2f; canceling entries before reduce-only IOC.",
-        ticker, side.upper(), trigger, bid, average_entry,
-        "none" if high is None else f"${high:.4f}", remaining,
+    latched_trigger = str(protection.get("trigger") or "")
+    exit_latched = bool(protection.get("exit_latched")) or (
+        record.get("status") == "live_exit_pending"
+        and latched_trigger in {"absolute_5c_stop", "60c_gate_10c_trail"}
     )
+    trigger: str | None = latched_trigger if exit_latched else None
+    if not exit_latched:
+        if bid <= hard_stop + 1e-9:
+            trigger = "absolute_5c_stop"
+        elif armed and high is not None and bid <= high - trail + 1e-9:
+            trigger = "60c_gate_10c_trail"
+        if trigger is None:
+            return False
+        protection.update({
+            "trigger": trigger,
+            "triggered_at": now_iso(),
+            "trigger_bid": bid,
+            # A stop is terminal.  Once observed on a fresh full-depth book,
+            # a rebound during cancellation/reconfirmation must not silently
+            # abandon the close and leave a partially filled position behind.
+            "exit_latched": True,
+            "exit_latched_at": now_iso(),
+        })
+        record["status"] = "live_exit_pending"
+        LOG.critical(
+            "LIVE INVERSE ML EXIT TRIGGER | %s %s reason=%s bid=$%.4f avg=$%.4f high=%s remaining=%.2f; canceling entries before reduce-only IOC.",
+            ticker, side.upper(), trigger, bid, average_entry,
+            "none" if high is None else f"${high:.4f}", remaining,
+        )
+    if trigger not in {"absolute_5c_stop", "60c_gate_10c_trail"}:
+        protection["exit_blocked"] = "invalid latched exit trigger"
+        LOG.critical("LIVE EXIT BLOCKED | %s %s", ticker, protection["exit_blocked"])
+        return False
     # Kalshi does not permit a reduce-only close while this runner's entry
     # limits could still add exposure. Cancel every remaining entry first.
     for entry in orders_for_market(record):
@@ -3065,6 +3085,28 @@ async def monitor_live_inverse_ml_weighted_hold_gate(
     # relying on the ledger quantity for a reduce-only close.
     for entry in orders_for_market(record):
         await rest.refresh_order(entry)
+    outstanding_entries = [
+        entry for entry in orders_for_market(record)
+        if float(entry.get("remaining_count") or 0.0) > 0.004
+    ]
+    if outstanding_entries:
+        pending_ids = ",".join(
+            str(entry.get("order_id") or entry.get("client_order_id") or "?")
+            for entry in outstanding_entries
+        )
+        if protection.get("entry_cancel_pending") != pending_ids:
+            LOG.critical(
+                "LIVE EXIT WAITING FOR ENTRY CANCELS | %s trigger=%s outstanding=%s; no reduce-only exit will be sent yet.",
+                ticker, trigger, pending_ids,
+            )
+        protection.update({
+            "entry_cancel_pending": pending_ids,
+            "exit_blocked": "waiting for all entry cancels to be confirmed",
+        })
+        record["status"] = "live_exit_pending"
+        return False
+    protection.pop("entry_cancel_pending", None)
+    protection.pop("exit_blocked", None)
     entries = filled_contracts(record)
     exits = live_exit_filled_contracts(record)
     remaining = round(max(0.0, entries - exits), 2)
@@ -3083,11 +3125,10 @@ async def monitor_live_inverse_ml_weighted_hold_gate(
         protection["trailing_high_bid"] = bid
         protection["high_depth_contracts"] = remaining
         high = bid
-    still_triggered = bid <= hard_stop + 1e-9 or (armed and high is not None and bid <= high - trail + 1e-9)
-    if not still_triggered:
-        protection.pop("trigger", None)
-        protection.pop("triggered_at", None)
-        return False
+    # ``exit_latched`` intentionally survives this fresh quote even if it is
+    # better than the original stop.  The stop was already triggered from a
+    # depth-supported quote, so the fresh bid is now the safer executable
+    # price for completing that already-requested exit.
     position = await rest.position_for_ticker(ticker)
     if position is None:
         protection["exit_blocked"] = "exchange position unavailable after entry cancels"
