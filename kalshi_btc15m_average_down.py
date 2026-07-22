@@ -447,6 +447,64 @@ class StateCheckpointPublisher:
     enabled: bool
     last_attempt_at: float = float("-inf")
 
+    @staticmethod
+    def _rebase_checkpoint_paths(paths: list[str]) -> None:
+        """Rebase a checkpoint, retaining only this publisher's own files.
+
+        Independent Actions can publish a state snapshot at almost the same
+        moment.  A plain `git pull --rebase` then leaves U entries in the
+        worktree, which turns every later checkpoint into an error.  The paths
+        passed here are isolated ledger files owned by this runner; during a
+        rebase, `--theirs` is the local checkpoint commit being replayed.
+        """
+        pull = subprocess.run(
+            ["git", "pull", "--rebase", "--autostash", "origin", "main"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if not pull.returncode:
+            return
+        diagnostic = (pull.stderr or pull.stdout).strip()
+        allowed = set(paths)
+        resolved_conflict = False
+        while subprocess.run(
+            ["git", "rev-parse", "-q", "--verify", "REBASE_HEAD"],
+            check=False,
+            capture_output=True,
+            text=True,
+        ).returncode == 0:
+            conflicts = subprocess.run(
+                ["git", "diff", "--name-only", "--diff-filter=U"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.splitlines()
+            if not conflicts or any(path not in allowed for path in conflicts):
+                subprocess.run(["git", "rebase", "--abort"], check=False, capture_output=True, text=True)
+                raise RuntimeError(
+                    "git pull --rebase could not safely resolve checkpoint conflict: "
+                    + (", ".join(conflicts) if conflicts else diagnostic or "no conflicted paths")
+                )
+            try:
+                subprocess.run(["git", "checkout", "--theirs", "--", *conflicts], check=True, capture_output=True, text=True)
+                subprocess.run(["git", "add", "--", *conflicts], check=True, capture_output=True, text=True)
+                subprocess.run(
+                    ["git", "-c", "core.editor=true", "rebase", "--continue"],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                resolved_conflict = True
+            except subprocess.CalledProcessError as exc:
+                subprocess.run(["git", "rebase", "--abort"], check=False, capture_output=True, text=True)
+                raise RuntimeError("git rebase conflict resolution failed") from exc
+        if resolved_conflict:
+            return
+        # A non-conflict pull failure (for example a transient network issue)
+        # is still reported, but no unresolved index entries are left behind.
+        raise RuntimeError(f"git pull --rebase failed: {diagnostic or 'no diagnostic'}")
+
     @classmethod
     def create(
         cls, config_path: Path, state_path: Path, report_path: Path,
@@ -527,25 +585,16 @@ class StateCheckpointPublisher:
                     ["git", "commit", "-m", "chore: checkpoint BTC average-down state [skip ci]"],
                     check=True, capture_output=True, text=True,
                 )
-            # A concurrent checkpoint can advance main while this isolated
-            # paper job is writing. Abort a failed rebase immediately so it
-            # cannot strand the runner with unmerged files on every later
-            # event. Include Git's diagnostic in the warning for audit.
-            pull = subprocess.run(
-                ["git", "pull", "--rebase", "--autostash", "origin", "main"],
-                check=False, capture_output=True, text=True,
-            )
-            if pull.returncode:
-                abort = subprocess.run(
-                    ["git", "rebase", "--abort"], check=False, capture_output=True, text=True,
+            for attempt in range(3):
+                self._rebase_checkpoint_paths(paths)
+                push = subprocess.run(
+                    ["git", "push", "origin", "HEAD:main"], check=False, capture_output=True, text=True,
                 )
-                diagnostic = (pull.stderr or pull.stdout).strip()
-                abort_diagnostic = (abort.stderr or abort.stdout).strip()
-                raise RuntimeError(
-                    f"git pull --rebase failed (exit {pull.returncode}): {diagnostic or 'no diagnostic'}"
-                    + (f"; rebase abort: {abort_diagnostic}" if abort.returncode else "")
-                )
-            subprocess.run(["git", "push", "origin", "HEAD:main"], check=True, capture_output=True, text=True)
+                if not push.returncode:
+                    break
+                if attempt == 2:
+                    raise RuntimeError(push.stderr.strip() or "git push failed")
+                time.sleep(attempt + 1)
         except Exception as exc:  # noqa: BLE001
             LOG.warning("STATE CHECKPOINT FAILED | reason=%s error=%s; retrying after a later material event.", reason, exc)
             return False

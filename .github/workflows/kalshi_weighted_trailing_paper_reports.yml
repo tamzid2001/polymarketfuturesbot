@@ -253,19 +253,69 @@ jobs:
               echo "::warning::Paper-ledger checkpoint still has unmerged files; retrying without a commit."
               return 0
             fi
-            # The source envelope contains no rungs/orders in monitor mode;
-            # it is retained only so a later report action can settle a market
-            # that was still open when this run ended.
-            git add -A paper_reports
+            # Never stage the whole directory.  The runner writes JSON by
+            # atomically replacing a temporary file, so `git add -A
+            # paper_reports` can race a disappearing *.tmp file and make the
+            # checkpoint fail even though the ledger itself is valid.
+            local files=(
+              paper_reports/prophet_hold_gate_primary_history.json
+              paper_reports/prophet_hold_gate_primary_tickers.json
+              paper_reports/prophet_weighted_trailing_normal_ledger.json
+              paper_reports/prophet_weighted_trailing_normal_report.json
+              paper_reports/prophet_weighted_trailing_inverse_ledger.json
+              paper_reports/prophet_weighted_trailing_inverse_report.json
+              paper_reports/prophet_hold_gate_normal_ledger.json
+              paper_reports/prophet_hold_gate_normal_report.json
+              paper_reports/prophet_hold_gate_inverse_ledger.json
+              paper_reports/prophet_hold_gate_inverse_report.json
+            )
+            local file
+            for file in "${files[@]}"; do
+              test ! -f "$file" || git add -- "$file" || true
+            done
             if ! git diff --cached --quiet; then
               git commit -m "chore: checkpoint Prophet weighted paper report [skip ci]"
             fi
-            if ! git pull --rebase --autostash origin main; then
-              git rebase --abort 2>/dev/null || true
-              echo "::warning::Paper-ledger checkpoint rebase failed; aborted cleanly and will retry."
+            rebase_checkpoint() {
+              if git pull --rebase --autostash origin main; then
+                return 0
+              fi
+              while git rev-parse -q --verify REBASE_HEAD >/dev/null; do
+                local conflicts
+                mapfile -t conflicts < <(git diff --name-only --diff-filter=U)
+                if [ "${#conflicts[@]}" -eq 0 ]; then
+                  git rebase --abort 2>/dev/null || true
+                  return 1
+                fi
+                for file in "${conflicts[@]}"; do
+                  case " ${files[*]} " in
+                    *" $file "*) ;;
+                    *)
+                      echo "::warning::Unexpected checkpoint conflict: $file"
+                      git rebase --abort 2>/dev/null || true
+                      return 1
+                      ;;
+                  esac
+                done
+                # During a rebase, --theirs is this job's commit being
+                # replayed.  Keeping it preserves the most recent paper
+                # snapshot; no live-trading state is in this path set.
+                git checkout --theirs -- "${conflicts[@]}"
+                git add -- "${conflicts[@]}"
+                GIT_EDITOR=true git rebase --continue || {
+                  git rebase --abort 2>/dev/null || true
+                  return 1
+                }
+              done
               return 0
-            fi
-            git push origin HEAD:main || true
+            }
+            for attempt in 1 2 3; do
+              if rebase_checkpoint && git push origin HEAD:main; then
+                return 0
+              fi
+              sleep "$attempt"
+            done
+            echo "::warning::Paper-ledger checkpoint could not publish after retries; the runner continues and the final sync will retry."
           }
           python kalshi_btc15m_prophet_btc_only.py &
           runner_pid=$!

@@ -202,21 +202,60 @@ jobs:
       - name: Persist mechanical strategy state and configuration
         if: always()
         run: |
+          set -euo pipefail
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add kalshi_btc15m_average_down_config.json
-          for file in kalshi_btc15m_average_down_state.json kalshi_btc15m_average_down_report.json \
-                      kalshi_btc15m_weighted_trailing_normal_ledger.json kalshi_btc15m_weighted_trailing_normal_report.json \
-                      kalshi_btc15m_weighted_trailing_inverse_ledger.json kalshi_btc15m_weighted_trailing_inverse_report.json \
-                      kalshi_btc15m_actual_price_bracket_normal_ledger.json kalshi_btc15m_actual_price_bracket_normal_report.json \
-                      kalshi_btc15m_actual_price_bracket_inverse_ledger.json kalshi_btc15m_actual_price_bracket_inverse_report.json; do
+          files=(
+            kalshi_btc15m_average_down_config.json
+            kalshi_btc15m_average_down_state.json kalshi_btc15m_average_down_report.json
+            kalshi_btc15m_weighted_trailing_normal_ledger.json kalshi_btc15m_weighted_trailing_normal_report.json
+            kalshi_btc15m_weighted_trailing_inverse_ledger.json kalshi_btc15m_weighted_trailing_inverse_report.json
+            kalshi_btc15m_actual_price_bracket_normal_ledger.json kalshi_btc15m_actual_price_bracket_normal_report.json
+            kalshi_btc15m_actual_price_bracket_inverse_ledger.json kalshi_btc15m_actual_price_bracket_inverse_report.json
+          )
+          for file in "${files[@]}"; do
             test ! -f "$file" || git add "$file"
           done
-          if ! git diff --cached --quiet; then
-            git commit -m "chore: record BTC average-down state [skip ci]"
+          if git diff --cached --quiet; then
+            exit 0
           fi
-          git pull --rebase --autostash origin main
-          git push origin HEAD:main
+          git commit -m "chore: record BTC average-down state [skip ci]"
+          rebase_checkpoint() {
+            if git pull --rebase --autostash origin main; then
+              return 0
+            fi
+            while git rev-parse -q --verify REBASE_HEAD >/dev/null; do
+              local conflicts
+              mapfile -t conflicts < <(git diff --name-only --diff-filter=U)
+              if [ "${#conflicts[@]}" -eq 0 ]; then
+                git rebase --abort 2>/dev/null || true
+                return 1
+              fi
+              for file in "${conflicts[@]}"; do
+                case " ${files[*]} " in
+                  *" $file "*) ;;
+                  *) git rebase --abort 2>/dev/null || true; return 1 ;;
+                esac
+              done
+              # Keep this runner's newest local state snapshot while
+              # replaying it; reject any conflict outside its owned files.
+              git checkout --theirs -- "${conflicts[@]}"
+              git add -- "${conflicts[@]}"
+              GIT_EDITOR=true git rebase --continue || {
+                git rebase --abort 2>/dev/null || true
+                return 1
+              }
+            done
+            return 0
+          }
+          for attempt in 1 2 3; do
+            if rebase_checkpoint && git push origin HEAD:main; then
+              exit 0
+            fi
+            sleep "$attempt"
+          done
+          echo "::error::Unable to publish ML state after three safe retries."
+          exit 1
 
       - name: Queue the next 5h45m live handoff
         # A requested dry run remains a one-off safety check. Scheduled and

@@ -129,19 +129,61 @@ jobs:
       - name: Persist paper-monitor state
         if: always()
         run: |
+          set -euo pipefail
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          for file in prophet_btc_only_trade_history.json prophet_btc_only_traded_market_tickers.json \
-                      prophet_btc_inverse_shadow_history.json prophet_btc_inverse_shadow_report.json \
-                      prophet_btc_ladder_scalp_shadow_history.json prophet_btc_ladder_scalp_shadow_report.json \
-                      prophet_btc_weighted_trailing_normal_history.json prophet_btc_weighted_trailing_normal_report.json \
-                      prophet_btc_weighted_trailing_inverse_history.json prophet_btc_weighted_trailing_inverse_report.json \
-                      prophet_btc_selector_history.json prophet_btc_selector_report.json; do
+          files=(
+            prophet_btc_only_trade_history.json prophet_btc_only_traded_market_tickers.json
+            prophet_btc_inverse_shadow_history.json prophet_btc_inverse_shadow_report.json
+            prophet_btc_ladder_scalp_shadow_history.json prophet_btc_ladder_scalp_shadow_report.json
+            prophet_btc_weighted_trailing_normal_history.json prophet_btc_weighted_trailing_normal_report.json
+            prophet_btc_weighted_trailing_inverse_history.json prophet_btc_weighted_trailing_inverse_report.json
+            prophet_btc_selector_history.json prophet_btc_selector_report.json
+          )
+          for file in "${files[@]}"; do
             test ! -f "$file" || git add "$file"
           done
-          git diff-index --quiet HEAD || \
-            (git commit -m "chore: record Prophet BTC paper ladder [skip ci]" && \
-             git pull --rebase --autostash origin main && git push)
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git commit -m "chore: record Prophet BTC paper ladder [skip ci]"
+          rebase_checkpoint() {
+            if git pull --rebase --autostash origin main; then
+              return 0
+            fi
+            while git rev-parse -q --verify REBASE_HEAD >/dev/null; do
+              local conflicts
+              mapfile -t conflicts < <(git diff --name-only --diff-filter=U)
+              if [ "${#conflicts[@]}" -eq 0 ]; then
+                git rebase --abort 2>/dev/null || true
+                return 1
+              fi
+              for file in "${conflicts[@]}"; do
+                case " ${files[*]} " in
+                  *" $file "*) ;;
+                  *) git rebase --abort 2>/dev/null || true; return 1 ;;
+                esac
+              done
+              # `--theirs` is the local ledger commit while rebasing.  These
+              # are this workflow's owned report files, so retain its newest
+              # snapshot and continue rather than leaving U files behind.
+              git checkout --theirs -- "${conflicts[@]}"
+              git add -- "${conflicts[@]}"
+              GIT_EDITOR=true git rebase --continue || {
+                git rebase --abort 2>/dev/null || true
+                return 1
+              }
+            done
+            return 0
+          }
+          for attempt in 1 2 3; do
+            if rebase_checkpoint && git push origin HEAD:main; then
+              exit 0
+            fi
+            sleep "$attempt"
+          done
+          echo "::error::Unable to publish Prophet state after three safe retries."
+          exit 1
 
       - name: Queue next 5h45m dry-run handoff
         if: success()
