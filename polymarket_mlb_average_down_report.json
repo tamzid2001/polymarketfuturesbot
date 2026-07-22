@@ -1,11 +1,12 @@
 {
   "active_ladders": 0,
   "configuration": {
-    "format_version": 2,
+    "format_version": 3,
     "initial_position_size": 1,
     "max_active_games": 15,
     "max_contracts_per_game": 10,
     "max_total_capital": 50.0,
+    "ml_inverse_shadow_enabled": true,
     "ml_min_confidence": 0.5,
     "ml_model_path": "",
     "poll_seconds": 20.0,
@@ -14,10 +15,29 @@
     "strategy_mode": "mechanical"
   },
   "contracts_filled": 0,
-  "game_started_records": 15,
-  "games_observed": 30,
+  "game_started_records": 30,
+  "games_observed": 45,
   "games_with_filled_entry": 0,
-  "generated_at": "2026-07-21T18:39:51.090660+00:00",
-  "note": "Entry and ladder audit only. This runner intentionally does not forecast games or add an exit strategy.",
-  "strategy": "mechanical_mlb_price_average_down_v1"
+  "generated_at": "2026-07-22T06:11:18.776623+00:00",
+  "ml_inverse_shadow_performance": {
+    "active_quote_shadows": 0,
+    "enabled_for_this_run": false,
+    "fill_policy": "quote_hit_is_not_an_exchange_fill_no_displayed_depth",
+    "inverse_directional_losses": 0,
+    "inverse_directional_win_rate": null,
+    "inverse_directional_wins": 0,
+    "limitation": "Quote hits use a fresh Polymarket BBO poll but this endpoint exposes no displayed depth here. They are trigger observations, not exchange fills or executable-P&L evidence.",
+    "mode": "dry_run_ml_inverse_bbo_quote_shadow_v1",
+    "order_policy": "paper_only_no_order_submission",
+    "selection_settled": 0,
+    "shadow_selections": 0,
+    "simulated_quote_hit_cost": 0,
+    "simulated_quote_hit_payout": 0,
+    "simulated_quote_hit_pnl_before_fees": 0,
+    "simulated_quote_hit_rungs": 0,
+    "waiting_for_settlement": 0
+  },
+  "note": "Entry and ladder audit only. Mechanical mode makes no forecast; ML mode has no exit strategy. Inverse quote hits are paper observations, not exchange fills.",
+  "strategy": "polymarket_mlb_average_down_v2",
+  "strategy_mode": "mechanical"
 }
