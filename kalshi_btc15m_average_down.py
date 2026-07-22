@@ -474,10 +474,10 @@ class StateCheckpointPublisher:
     config: dict[str, Any]
     last_fingerprint: str
     enabled: bool
+    target_branch: str = "main"
     last_attempt_at: float = float("-inf")
 
-    @staticmethod
-    def _rebase_checkpoint_paths(paths: list[str]) -> None:
+    def _rebase_checkpoint_paths(self, paths: list[str]) -> None:
         """Rebase a checkpoint, retaining only this publisher's own files.
 
         Independent Actions can publish a state snapshot at almost the same
@@ -486,8 +486,20 @@ class StateCheckpointPublisher:
         passed here are isolated ledger files owned by this runner; during a
         rebase, `--theirs` is the local checkpoint commit being replayed.
         """
+        # A dedicated paper-report branch is created lazily on its first
+        # checkpoint. Skipping the pull in that case avoids treating a
+        # missing remote branch as a failed checkpoint.
+        if self.target_branch != "main":
+            target_exists = subprocess.run(
+                ["git", "ls-remote", "--exit-code", "--heads", "origin", self.target_branch],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            if target_exists.returncode:
+                return
         pull = subprocess.run(
-            ["git", "pull", "--rebase", "--autostash", "origin", "main"],
+            ["git", "pull", "--rebase", "--autostash", "origin", self.target_branch],
             check=False,
             capture_output=True,
             text=True,
@@ -547,6 +559,10 @@ class StateCheckpointPublisher:
             os.getenv("GITHUB_ACTIONS", "").lower() == "true"
             and os.getenv("KALSHI_CHECKPOINT_PUBLISH", "false").lower() in {"1", "true", "yes"}
         )
+        target_branch = os.getenv("KALSHI_CHECKPOINT_BRANCH", "main").strip() or "main"
+        allowed_branch_characters = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._/-")
+        if target_branch.startswith("-") or any(char not in allowed_branch_characters for char in target_branch):
+            raise ValueError("KALSHI_CHECKPOINT_BRANCH contains an invalid Git ref name")
         return cls(
             config_path=config_path,
             state_path=state_path,
@@ -562,6 +578,7 @@ class StateCheckpointPublisher:
             config=config,
             last_fingerprint=checkpoint_fingerprint(state, config),
             enabled=enabled,
+            target_branch=target_branch,
         )
 
     def publish_if_changed(self, state: dict[str, Any], reason: str) -> bool:
@@ -617,7 +634,7 @@ class StateCheckpointPublisher:
             for attempt in range(3):
                 self._rebase_checkpoint_paths(paths)
                 push = subprocess.run(
-                    ["git", "push", "origin", "HEAD:main"], check=False, capture_output=True, text=True,
+                    ["git", "push", "origin", f"HEAD:{self.target_branch}"], check=False, capture_output=True, text=True,
                 )
                 if not push.returncode:
                     break
@@ -628,7 +645,7 @@ class StateCheckpointPublisher:
             LOG.warning("STATE CHECKPOINT FAILED | reason=%s error=%s; retrying after a later material event.", reason, exc)
             return False
         self.last_fingerprint = current
-        LOG.info("STATE CHECKPOINTED | reason=%s fingerprint=%s", reason, current[:12])
+        LOG.info("STATE CHECKPOINTED | branch=%s reason=%s fingerprint=%s", self.target_branch, reason, current[:12])
         return True
 
 

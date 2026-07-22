@@ -112,6 +112,9 @@ jobs:
           # report files, so the ledger can be viewed while the job runs.
           KALSHI_CHECKPOINT_PUBLISH: "true"
           KALSHI_CHECKPOINT_RETRY_SECONDS: "10"
+          # The paper ledger never commits to main. This branch is restored
+          # at startup and receives only this job's paper-report snapshots.
+          KALSHI_CHECKPOINT_BRANCH: "kalshi-ml-hold-gate-paper-reports"
           GITHUB_TOKEN: ${{ github.token }}
           KALSHI_API_KEY_ID: ${{ secrets.KALSHI_PROD_API_KEY }}
           KALSHI_PEM_PATH: kalshi_private_key.pem
@@ -119,7 +122,14 @@ jobs:
           RUN_MINUTES: ${{ inputs.run_minutes }}
         run: |
           set -euo pipefail
+          paper_branch="$KALSHI_CHECKPOINT_BRANCH"
           mkdir -p paper_reports
+          if git ls-remote --exit-code --heads origin "$paper_branch" >/dev/null 2>&1; then
+            git fetch --no-tags origin "$paper_branch"
+            if git cat-file -e "origin/$paper_branch:paper_reports" 2>/dev/null; then
+              git archive "origin/$paper_branch" paper_reports | tar -x
+            fi
+          fi
           cp kalshi_btc15m_average_down_config.json paper_reports/ml_hold_gate_config.json
           args=(--config paper_reports/ml_hold_gate_config.json
                 --state-file paper_reports/ml_hold_gate_state.json
@@ -239,9 +249,19 @@ jobs:
           PROPHET_WEIGHTED_TRAILING_STOP_PER_CONTRACT: "0.10"
           PROPHET_WEIGHTED_TRAILING_ACTIVATION_GAINS: "0.01,0.02,0.03,0.04,0.05,0.06,0.07,0.08,0.09,0.10,0.20,0.30,0.40,0.50,0.60,0.70,0.80"
           PROPHET_SELECTOR_ENABLED: "false"
+          # Prophet paper snapshots use their own branch too, so neither
+          # paper job competes with the executable ML state publisher.
+          PAPER_CHECKPOINT_BRANCH: "kalshi-prophet-hold-gate-paper-reports"
         run: |
           set -euo pipefail
           mkdir -p paper_reports
+          paper_branch="$PAPER_CHECKPOINT_BRANCH"
+          if git ls-remote --exit-code --heads origin "$paper_branch" >/dev/null 2>&1; then
+            git fetch --no-tags origin "$paper_branch"
+            if git cat-file -e "origin/$paper_branch:paper_reports" 2>/dev/null; then
+              git archive "origin/$paper_branch" paper_reports | tar -x
+            fi
+          fi
           sync_paper_ledgers() {
             # If a previous rebase raced a different checkpoint publisher,
             # abort it before staging again. This paper Action owns only
@@ -277,7 +297,10 @@ jobs:
               git commit -m "chore: checkpoint Prophet weighted paper report [skip ci]"
             fi
             rebase_checkpoint() {
-              if git pull --rebase --autostash origin main; then
+              if ! git ls-remote --exit-code --heads origin "$paper_branch" >/dev/null 2>&1; then
+                return 0
+              fi
+              if git pull --rebase --autostash origin "$paper_branch"; then
                 return 0
               fi
               while git rev-parse -q --verify REBASE_HEAD >/dev/null; do
@@ -310,7 +333,7 @@ jobs:
               return 0
             }
             for attempt in 1 2 3; do
-              if rebase_checkpoint && git push origin HEAD:main; then
+              if rebase_checkpoint && git push origin "HEAD:$paper_branch"; then
                 return 0
               fi
               sleep "$attempt"
