@@ -5,7 +5,7 @@
   "average_profit_per_market": -0.180361,
   "configuration": {
     "fee_reserve": 0.05,
-    "format_version": 9,
+    "format_version": 10,
     "initial_position_size": 0.01,
     "inverse_shadow_enabled": true,
     "inverse_shadow_position_size": 1.0,
@@ -16,12 +16,14 @@
     "max_total_capital": 0.01,
     "ml_min_confidence": 0.5,
     "ml_preopen_lead_seconds": 120.0,
+    "model_transition_shadow_enabled": true,
+    "model_transition_shadow_position_size": 1.0,
     "order_reconcile_seconds": 5.0,
     "poll_seconds": 2.0,
     "status_log_seconds": 30.0,
     "watch_start_grace_seconds": 45.0
   },
-  "generated_at": "2026-07-22T00:31:40.492239+00:00",
+  "generated_at": "2026-07-22T00:32:49.724476+00:00",
   "inverse_ml_shadow_performance": {
     "active_shadow_markets": 1,
     "average_contracts_per_filled_market": 2.564444,
@@ -130,6 +132,19 @@
     "directional_wins": 25,
     "settled_markets": 81
   },
+  "ml_model_transition_shadow_performance": {
+    "comparisons": [],
+    "fee_treatment": "excluded_no_exchange_fill",
+    "fill_rule": "fresh top-of-book only: YES buy yes_ask <= rung; NO buy 1 - yes_bid <= rung; displayed depth >= rung quantity",
+    "limitations": [
+      "The predecessor and new model score the same frozen pre-open feature vector.",
+      "Each model uses an independent hypothetical ladder; no exchange order is submitted or modified.",
+      "Quote hits require fresh displayed depth but do not model queue priority, cancellations, hidden liquidity, or fees."
+    ],
+    "mode": "paper_only_no_exchange_orders",
+    "note": "Prospective transition evidence only; it is not a promotion rule or executable-P&L claim.",
+    "strategy": "paired_model_transition_executable_quote_shadow_v1"
+  },
   "ml_model_transition_side_comparison": {
     "comparisons": [],
     "method": "same_frozen_input_model_transition_comparison_v1",
@@ -146,28 +161,28 @@
   "return_on_capital": -0.23344,
   "rung_order_activity": {
     "0.10": {
-      "canceled_unfilled_orders": 54,
+      "canceled_unfilled_orders": 55,
       "filled_contracts": 83.13,
       "filled_order_submissions": 96,
-      "resting_orders": 1,
+      "resting_orders": 0,
       "rung_price": 0.1,
       "submitted_contracts": 123.28,
       "submitted_orders": 151
     },
     "0.20": {
-      "canceled_unfilled_orders": 46,
+      "canceled_unfilled_orders": 47,
       "filled_contracts": 90.14,
       "filled_order_submissions": 104,
-      "resting_orders": 1,
+      "resting_orders": 0,
       "rung_price": 0.2,
       "submitted_contracts": 123.28,
       "submitted_orders": 151
     },
     "0.30": {
-      "canceled_unfilled_orders": 37,
+      "canceled_unfilled_orders": 38,
       "filled_contracts": 96.16,
       "filled_order_submissions": 112,
-      "resting_orders": 1,
+      "resting_orders": 0,
       "rung_price": 0.3,
       "submitted_contracts": 122.28,
       "submitted_orders": 150
