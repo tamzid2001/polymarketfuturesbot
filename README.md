@@ -617,6 +617,22 @@ every 100 predictions by default, including the current win/loss streak and
 the longest win/loss streak. Set the workflow's `metrics_every` input to
 change that cadence.
 
+### Prophet normal/inverse selector replay
+
+**“Kalshi Prophet Selector Historical Backtest”** is a separate manual Action
+that replays a completed `prophet_ml_backtest_rows.csv` artifact (by default,
+the stored run `29698207476`). It does not refit Prophet, fetch prices, submit
+an order, or change the running selector. At every historical forecast it sees
+only outcomes whose recorded settlement time had already occurred, evaluates
+fixed normal and inverse sides, each 3/5/7/10/25/50 trailing window, and the
+six-window majority vote. A window/fixed-side choice is made from the first
+80% of signals and evaluated only on the final chronological 20% holdout.
+
+The Action uploads the full per-signal decision audit, JSON, and Markdown
+report. It reports directional accuracy only: the stored artifact has no
+executable quote, fill, queue, spread, slippage, or fee data, so it cannot
+approve a live configuration or estimate dollar P&L.
+
 The final summary also ranks directional win/loss rate by Eastern-Time hour,
 weekday, weekday-hour, and 15-minute market-open slot. It excludes groups with
 fewer than 100 observations by default; use `time_group_min_samples` to set a
