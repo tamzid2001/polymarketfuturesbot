@@ -91,7 +91,7 @@ class ProphetLockedLadderStaticTests(unittest.TestCase):
             self.source, self.functions["create_prophet_weighted_fixed_stop_shadows"])
         self.assertIn("PROPHET_WEIGHTED_FIXED_STOP_SHADOW_ENABLED", self.source)
         self.assertIn("DRY_RUN and", self.source)
-        self.assertIn("fixed_stop_loss_per_contract", fixed)
+        self.assertIn("absolute_stop_price", fixed)
         self.assertNotIn("_submit(", fixed)
         self.assertNotIn("_ladder_order_terms(", fixed)
 

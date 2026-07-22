@@ -42,6 +42,7 @@ def new_ladder_average_entry_scalp_shadow(
     trailing_stop_per_contract: float | None = None,
     trailing_activation_gain_per_contract: float = 0.0,
     fixed_stop_loss_per_contract: float | None = None,
+    absolute_stop_price: float | None = None,
     extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return a paper ladder with a fixed, range, or trailing-stop exit study."""
@@ -75,8 +76,14 @@ def new_ladder_average_entry_scalp_shadow(
         fixed_stop_loss_per_contract = round(float(fixed_stop_loss_per_contract), 6)
         if not 0.0 < fixed_stop_loss_per_contract < 1.0:
             raise ValueError("fixed_stop_loss_per_contract must be between zero and one")
+    if absolute_stop_price is not None:
+        absolute_stop_price = round(float(absolute_stop_price), 6)
+        if not 0.0 < absolute_stop_price < 1.0:
+            raise ValueError("absolute_stop_price must be between zero and one")
+    if fixed_stop_loss_per_contract is not None and absolute_stop_price is not None:
+        raise ValueError("choose either fixed_stop_loss_per_contract or absolute_stop_price")
     if observation_only and any(value is not None for value in (
-        trailing_stop_per_contract, fixed_stop_loss_per_contract,
+        trailing_stop_per_contract, fixed_stop_loss_per_contract, absolute_stop_price,
     )):
         raise ValueError("range observation cannot select an exit")
     return {
@@ -94,6 +101,7 @@ def new_ladder_average_entry_scalp_shadow(
         "trailing_stop_per_contract": trailing_stop_per_contract,
         "trailing_activation_gain_per_contract": trailing_activation_gain_per_contract,
         "fixed_stop_loss_per_contract": fixed_stop_loss_per_contract,
+        "absolute_stop_price": absolute_stop_price,
         "rung_quantities": {f"{level:.4f}": normalized_quantities.get(level, round(float(quantity_per_rung), 4))
                             for level in LADDER_LEVELS},
         "quote_max_age_seconds": round(float(quote_max_age_seconds), 4),
@@ -329,13 +337,30 @@ def _simulate_trailing_stop(
         return events
     bid = float(exit_quote.get("economic_price") or 0.0)
     depth = float(exit_quote.get("displayed_depth") or 0.0)
-    high_bid = epoch.get("max_executable_exit_bid")
     stop_gap = float(shadow.get("trailing_stop_per_contract") or 0.0)
-    if depth + 1e-9 < contracts or high_bid is None or stop_gap <= 0.0:
+    if depth + 1e-9 < contracts or stop_gap <= 0.0:
         return events
+    # Once an activation gate is reached, the trail remains armed for the
+    # market.  Later averaging fills may change the current average/size, but
+    # never de-arm the paper stop.  An exit still needs a *current* fresh bid
+    # with depth for the entire then-current position.
+    if shadow.get("market_trailing_armed_at"):
+        market_high = shadow.get("market_trailing_high_bid")
+        if market_high is None or bid > float(market_high) + 1e-9:
+            market_high = round(bid, 6)
+            shadow["market_trailing_high_bid"] = market_high
+            shadow["market_trailing_high_at"] = now_iso()
+        high_bid = float(market_high)
+    else:
+        # Before arming, a gain must be observed after the current weighted
+        # position formed; a high from before a later averaging fill cannot
+        # arm its new average entry.
+        high_bid = float(epoch.get("max_executable_exit_bid") or 0.0)
     fixed_loss_gap = float(shadow.get("fixed_stop_loss_per_contract") or 0.0)
-    if fixed_loss_gap > 0.0:
-        fixed_loss_bid = max(0.0, float(average) - fixed_loss_gap)
+    absolute_stop_price = shadow.get("absolute_stop_price")
+    if absolute_stop_price is not None or fixed_loss_gap > 0.0:
+        fixed_loss_bid = (float(absolute_stop_price) if absolute_stop_price is not None
+                          else max(0.0, float(average) - fixed_loss_gap))
         epoch["fixed_stop_loss_bid"] = round(fixed_loss_bid, 6)
         if bid <= fixed_loss_bid + 1e-9:
             exit_event = _close_paper_position(
@@ -344,6 +369,8 @@ def _simulate_trailing_stop(
                 exit_method="fresh_executable_bid_fixed_stop_loss",
                 extra={
                     "fixed_stop_loss_per_contract": round(fixed_loss_gap, 6),
+                    "absolute_stop_price": (round(float(absolute_stop_price), 6)
+                                            if absolute_stop_price is not None else None),
                     "fixed_stop_loss_bid": round(fixed_loss_bid, 6),
                 },
             )
@@ -354,12 +381,19 @@ def _simulate_trailing_stop(
     activation_gain = float(shadow.get("trailing_activation_gain_per_contract") or 0.0)
     activation_bid = float(average) + activation_gain
     epoch["trailing_activation_bid"] = round(activation_bid, 6)
-    if float(high_bid) + 1e-9 < activation_bid:
-        return events
-    if not epoch.get("trailing_armed_at"):
-        epoch["trailing_armed_at"] = now_iso()
-        epoch["trailing_armed_high_bid"] = round(float(high_bid), 6)
-    stop_bid = max(0.0, float(high_bid) - stop_gap)
+    if not shadow.get("market_trailing_armed_at"):
+        if high_bid + 1e-9 < activation_bid:
+            return events
+        shadow["market_trailing_armed_at"] = now_iso()
+        shadow["market_trailing_activation_bid"] = round(activation_bid, 6)
+        shadow["market_trailing_armed_high_bid"] = round(high_bid, 6)
+        shadow["market_trailing_high_bid"] = round(high_bid, 6)
+        shadow["market_trailing_high_at"] = shadow["market_trailing_armed_at"]
+    epoch["trailing_armed_at"] = shadow["market_trailing_armed_at"]
+    epoch["trailing_armed_high_bid"] = shadow.get("market_trailing_armed_high_bid")
+    epoch["trailing_activation_bid"] = shadow.get("market_trailing_activation_bid", round(activation_bid, 6))
+    epoch["market_trailing_high_bid"] = round(high_bid, 6)
+    stop_bid = max(0.0, high_bid - stop_gap)
     epoch["trailing_stop_bid"] = round(stop_bid, 6)
     # A new high cannot trigger its own trailing stop. A later full-depth bid
     # at or below the stop closes at the observed bid, conservatively.
@@ -370,11 +404,13 @@ def _simulate_trailing_stop(
         kind="paper_scalp_trailing_stop_exit",
         exit_method="fresh_executable_bid_trailing_stop",
         extra={
-            "highest_executable_bid": round(float(high_bid), 6),
+            "highest_executable_bid": round(high_bid, 6),
             "trailing_stop_per_contract": round(stop_gap, 6),
             "trailing_activation_gain_per_contract": round(activation_gain, 6),
             "trailing_activation_bid": round(activation_bid, 6),
             "trailing_stop_bid": round(stop_bid, 6),
+            "trailing_armed_at": shadow.get("market_trailing_armed_at"),
+            "market_wide_trailing": True,
         },
     )
     epoch["ended_at"] = exit_event["at"]
@@ -386,7 +422,7 @@ def _simulate_trailing_stop(
 def _simulate_fixed_stop_loss(
     shadow: dict[str, Any], position: dict[str, float | None], exit_quote: dict[str, Any] | None,
 ) -> list[dict[str, Any]]:
-    """Close only on a fresh, full-depth bid at least the fixed gap below average entry."""
+    """Close only on a fresh full-depth absolute stop price or legacy loss gap."""
     events = _observe_executable_exit(shadow, position, exit_quote)
     epoch = _observation_epoch(shadow, position)
     contracts = float(position["filled_contracts"] or 0.0)
@@ -396,9 +432,11 @@ def _simulate_fixed_stop_loss(
     bid = float(exit_quote.get("economic_price") or 0.0)
     depth = float(exit_quote.get("displayed_depth") or 0.0)
     stop_gap = float(shadow.get("fixed_stop_loss_per_contract") or 0.0)
-    if depth + 1e-9 < contracts or stop_gap <= 0.0:
+    absolute_stop_price = shadow.get("absolute_stop_price")
+    if depth + 1e-9 < contracts or (absolute_stop_price is None and stop_gap <= 0.0):
         return events
-    stop_bid = max(0.0, float(average) - stop_gap)
+    stop_bid = (float(absolute_stop_price) if absolute_stop_price is not None
+                else max(0.0, float(average) - stop_gap))
     epoch["fixed_stop_loss_bid"] = round(stop_bid, 6)
     if bid > stop_bid + 1e-9:
         return events
@@ -408,6 +446,8 @@ def _simulate_fixed_stop_loss(
         exit_method="fresh_executable_bid_fixed_stop_loss",
         extra={
             "fixed_stop_loss_per_contract": round(stop_gap, 6),
+            "absolute_stop_price": (round(float(absolute_stop_price), 6)
+                                    if absolute_stop_price is not None else None),
             "fixed_stop_loss_bid": round(stop_bid, 6),
         },
     )
@@ -481,7 +521,7 @@ def simulate_ladder_average_entry_scalp(
         return events + _observe_executable_exit(shadow, position, exit_quote)
     if shadow.get("trailing_stop_per_contract") is not None:
         return events + _simulate_trailing_stop(shadow, position, exit_quote)
-    if shadow.get("fixed_stop_loss_per_contract") is not None:
+    if shadow.get("fixed_stop_loss_per_contract") is not None or shadow.get("absolute_stop_price") is not None:
         return events + _simulate_fixed_stop_loss(shadow, position, exit_quote)
     if contracts <= EPSILON or target_bid is None or exit_quote is None:
         return events
@@ -510,7 +550,8 @@ def finalize_ladder_average_entry_scalp(shadow: dict[str, Any], result: str | No
     position = entry_summary(shadow)
     finalized_at = now_iso()
     if (shadow.get("observation_only") or shadow.get("trailing_stop_per_contract") is not None
-            or shadow.get("fixed_stop_loss_per_contract") is not None):
+            or shadow.get("fixed_stop_loss_per_contract") is not None
+            or shadow.get("absolute_stop_price") is not None):
         for epoch in shadow.get("position_epochs", []):
             if isinstance(epoch, dict) and not epoch.get("ended_at"):
                 epoch["ended_at"] = finalized_at
@@ -687,7 +728,8 @@ def scalp_performance(shadows: list[dict[str, Any]]) -> dict[str, Any]:
         # A state that is immediately superseded by another rung gets no later
         # quote attribution; it has no executable holding interval to study.
         if (shadow.get("observation_only") or shadow.get("trailing_stop_per_contract") is not None
-                or shadow.get("fixed_stop_loss_per_contract") is not None):
+                or shadow.get("fixed_stop_loss_per_contract") is not None
+                or shadow.get("absolute_stop_price") is not None):
             for epoch in shadow.get("position_epochs", []):
                 if not isinstance(epoch, dict):
                     continue
@@ -724,7 +766,8 @@ def scalp_performance(shadows: list[dict[str, Any]]) -> dict[str, Any]:
             continue
         profile = profile_for(float(average))
         if (shadow.get("observation_only") or shadow.get("trailing_stop_per_contract") is not None
-                or shadow.get("fixed_stop_loss_per_contract") is not None):
+                or shadow.get("fixed_stop_loss_per_contract") is not None
+                or shadow.get("absolute_stop_price") is not None):
             profile["scalp_exits"] += shadow.get("exit_method") == "fresh_executable_bid_take_profit"
             profile["trailing_stop_exits"] += shadow.get("exit_method") == "fresh_executable_bid_trailing_stop"
             profile["fixed_stop_loss_exits"] += shadow.get("exit_method") == "fresh_executable_bid_fixed_stop_loss"
@@ -737,7 +780,8 @@ def scalp_performance(shadows: list[dict[str, Any]]) -> dict[str, Any]:
     completed_observers = {
         id(shadow) for shadow in finalized
         if (shadow.get("observation_only") or shadow.get("trailing_stop_per_contract") is not None
-            or shadow.get("fixed_stop_loss_per_contract") is not None)
+            or shadow.get("fixed_stop_loss_per_contract") is not None
+            or shadow.get("absolute_stop_price") is not None)
     }
     completed_epochs = [epoch for shadow, epoch in observation_epochs if id(shadow) in completed_observers]
     maxima = [float(epoch["max_executable_gross_per_contract"])
@@ -746,7 +790,8 @@ def scalp_performance(shadows: list[dict[str, Any]]) -> dict[str, Any]:
         round(float(target), 6)
         for shadow in shadows
         if (shadow.get("observation_only") or shadow.get("trailing_stop_per_contract") is not None
-            or shadow.get("fixed_stop_loss_per_contract") is not None)
+            or shadow.get("fixed_stop_loss_per_contract") is not None
+            or shadow.get("absolute_stop_price") is not None)
         for target in shadow.get("profit_targets_per_contract", DEFAULT_PROFIT_TARGETS)
         if 0.0 < float(target) < 1.0
     }) or list(DEFAULT_PROFIT_TARGETS)
@@ -774,7 +819,7 @@ def scalp_performance(shadows: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "strategy": "ladder_average_entry_scalp_executable_quote_shadow_v1",
         "mode": "paper_only_no_exchange_orders",
-        "fill_rule": "buy at a fresh actual executable ask <= rung with displayed ask depth; maintains the latest fresh YES and NO top-of-book snapshot, requires displayed bid depth for the whole filled position on every exit, closes a fixed loss only at average filled entry minus its configured gap, and closes a trailing stop only after its average-filled-entry gain activation and later configured retracement",
+        "fill_rule": "buy at a fresh actual executable ask <= rung with displayed ask depth; maintains the latest fresh YES and NO top-of-book snapshot, requires displayed bid depth for the whole filled position on every exit, closes an absolute stop only at its configured selected-side price, and closes a trailing stop only after its average-filled-entry gain activation and later configured retracement",
         "fee_treatment": "excluded_no_exchange_fill",
         "limitations": [
             "A quote hit or exit is a paper event, not a Kalshi exchange fill.",
@@ -805,7 +850,7 @@ def scalp_performance(shadows: list[dict[str, Any]]) -> dict[str, Any]:
         "pnl_time_series": pnl_time_series,
         "average_entry_profiles": profiles,
         "excursion_observer": {
-            "enabled": any(bool(shadow.get("observation_only")) or shadow.get("trailing_stop_per_contract") is not None or shadow.get("fixed_stop_loss_per_contract") is not None for shadow in shadows),
+            "enabled": any(bool(shadow.get("observation_only")) or shadow.get("trailing_stop_per_contract") is not None or shadow.get("fixed_stop_loss_per_contract") is not None or shadow.get("absolute_stop_price") is not None for shadow in shadows),
             "method": "records the maximum later fresh executable bid with displayed depth for each unchanged filled-average/size; range shadows do not select an exit, trailing shadows may close on their configured retracement, and fixed-stop shadows may close at their configured loss threshold",
             "unit": "gross dollars per contract; fees, queue position, latency, and price impact excluded",
             "completed_position_states": len(completed_epochs),
@@ -835,13 +880,17 @@ def scalp_performance(shadows: list[dict[str, Any]]) -> dict[str, Any]:
             "execution_rule": "after a fresh full-depth bid first reaches average filled entry plus the configured activation gain, a later fresh full-depth bid at or below the maximum minus the configured gap exits the whole paper position at that observed bid",
         },
         "fixed_stop_loss": {
-            "enabled": any(shadow.get("fixed_stop_loss_per_contract") is not None for shadow in shadows),
+            "enabled": any(shadow.get("fixed_stop_loss_per_contract") is not None or shadow.get("absolute_stop_price") is not None for shadow in shadows),
             "configured_gaps_per_contract": sorted({
                 round(float(shadow["fixed_stop_loss_per_contract"]), 6)
                 for shadow in shadows if shadow.get("fixed_stop_loss_per_contract") is not None
             }),
+            "configured_absolute_prices": sorted({
+                round(float(shadow["absolute_stop_price"]), 6)
+                for shadow in shadows if shadow.get("absolute_stop_price") is not None
+            }),
             "fixed_stop_loss_exits": len(fixed_stops),
-            "execution_rule": "after a weighted position forms, a fresh full-depth executable bid at or below average entry minus the configured gap exits the whole paper position at that observed bid",
+            "execution_rule": "a fresh full-depth selected-side bid at or below the configured absolute price exits the whole paper position at that observed bid; legacy average-entry-gap records remain distinguishable in configured_gaps_per_contract",
         },
     }
 

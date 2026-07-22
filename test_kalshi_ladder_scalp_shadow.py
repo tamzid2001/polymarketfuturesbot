@@ -210,7 +210,7 @@ class LadderScalpShadowTests(unittest.TestCase):
             profit_target_per_contract=0.01, quote_max_age_seconds=3.0, market_close_time="later",
             profit_targets_per_contract=EXTENDED_PROFIT_TARGETS,
             rung_quantities={0.40: 1.0, 0.30: 2.0, 0.20: 3.0, 0.10: 4.0},
-            fixed_stop_loss_per_contract=0.05,
+            absolute_stop_price=0.05,
             trailing_stop_per_contract=0.10,
             trailing_activation_gain_per_contract=0.10,
         )
@@ -237,6 +237,35 @@ class LadderScalpShadowTests(unittest.TestCase):
         self.assertEqual((1, [0.1]), (
             report["trailing_stop_exits"], report["trailing_stop"]["configured_activation_gains_per_contract"],
         ))
+        self.assertEqual([0.05], report["fixed_stop_loss"]["configured_absolute_prices"])
+
+    def test_absolute_five_cent_stop_is_independent_of_average_and_armed_trail_survives_averaging(self) -> None:
+        shadow = new_ladder_average_entry_scalp_shadow(
+            strategy="absolute-stop-market-wide-trail", ticker="KXBTC15M-TEST", side="yes", quantity_per_rung=1.0,
+            profit_target_per_contract=0.01, quote_max_age_seconds=3.0, market_close_time="later",
+            profit_targets_per_contract=EXTENDED_PROFIT_TARGETS,
+            rung_quantities={0.40: 1.0, 0.30: 2.0, 0.20: 3.0, 0.10: 4.0},
+            absolute_stop_price=0.05, trailing_stop_per_contract=0.10,
+            trailing_activation_gain_per_contract=0.10,
+        )
+        # First two rungs average 33.3333c. A 44c bid arms the trail.
+        simulate_ladder_average_entry_scalp(
+            shadow, entry_quote=quote(0.30, 3.0, "entry-high"), entry_quote_state="fresh",
+            exit_quote=quote(0.44, 3.0, "arm"), exit_quote_state="fresh",
+        )
+        self.assertTrue(shadow.get("market_trailing_armed_at"))
+        self.assertEqual(0.44, shadow["market_trailing_high_bid"])
+        # Averaging into the 20c rung changes the average to 26.6667c, but
+        # it must not de-arm the market-wide trail. The 25c full-depth bid
+        # exits below the retained 34c trailing price, not via the 5c stop.
+        events = simulate_ladder_average_entry_scalp(
+            shadow, entry_quote=quote(0.20, 3.0, "average-down"), entry_quote_state="fresh",
+            exit_quote=quote(0.25, 6.0, "armed-retrace"), exit_quote_state="fresh",
+        )
+        self.assertEqual(("scalp_exited", "paper_scalp_trailing_stop_exit", 0.25), (
+            shadow["status"], events[-1]["kind"], events[-1]["exit_price"],
+        ))
+        self.assertEqual(0.34, events[-1]["trailing_stop_bid"])
 
 
 if __name__ == "__main__":
