@@ -448,19 +448,90 @@ def finalize_ladder_average_entry_scalp(shadow: dict[str, Any], result: str | No
 
 
 def scalp_performance(shadows: list[dict[str, Any]]) -> dict[str, Any]:
-    """Return a compact, cash-flow-correct report across paper scalp shadows."""
-    finalized = [
+    """Return a cash-flow-correct report and auditable chronological P&L ledger."""
+    finalized = sorted([
         shadow for shadow in shadows
         if str(shadow.get("status")) in {"scalp_exited", "finalized_settlement", "finalized_unfilled"}
-    ]
+    ], key=lambda shadow: (
+        str(shadow.get("settled_at") or shadow.get("scalp_exit", {}).get("at") or ""),
+        str(shadow.get("ticker") or ""),
+    ))
     filled = [shadow for shadow in finalized if float(shadow.get("contracts") or 0.0) > EPSILON]
     pnls = [float(shadow.get("net_profit_loss") or 0.0) for shadow in filled]
     costs = [float(shadow.get("total_cost") or 0.0) for shadow in filled]
     equity = peak = drawdown = 0.0
-    for value in pnls:
+    longest_winning_streak = longest_losing_streak = current_streak = 0
+    current_streak_kind = "none"
+    pnl_time_series: list[dict[str, Any]] = []
+    for sequence, (shadow, value, cost) in enumerate(zip(filled, pnls, costs), start=1):
         equity += value
         peak = max(peak, equity)
-        drawdown = max(drawdown, peak - equity)
+        running_drawdown = peak - equity
+        drawdown = max(drawdown, running_drawdown)
+        if value > EPSILON:
+            outcome = "win"
+        elif value < -EPSILON:
+            outcome = "loss"
+        else:
+            outcome = "flat"
+        if outcome == "flat":
+            current_streak = 0
+            current_streak_kind = "none"
+        elif outcome == current_streak_kind:
+            current_streak += 1
+        else:
+            current_streak_kind = outcome
+            current_streak = 1
+        if outcome == "win":
+            longest_winning_streak = max(longest_winning_streak, current_streak)
+        elif outcome == "loss":
+            longest_losing_streak = max(longest_losing_streak, current_streak)
+        position = shadow.get("entry_summary") if isinstance(shadow.get("entry_summary"), dict) else entry_summary(shadow)
+        final_epoch = next(
+            (epoch for epoch in reversed(shadow.get("position_epochs") or []) if isinstance(epoch, dict)),
+            {},
+        )
+        scalp_exit = shadow.get("scalp_exit") if isinstance(shadow.get("scalp_exit"), dict) else {}
+        rungs = []
+        for rung_key, rung in sorted((shadow.get("rungs") or {}).items(), key=lambda item: float(item[0]), reverse=True):
+            if not isinstance(rung, dict):
+                continue
+            rungs.append({
+                "rung_price": round(float(rung.get("rung_price") or rung_key), 6),
+                "quantity": round(float(rung.get("quantity") or 0.0), 4),
+                "filled_contracts": round(float(rung.get("fill_count") or 0.0), 4),
+                "average_fill_price": rung.get("average_fill_price"),
+                "status": rung.get("status"),
+                "filled_at": rung.get("filled_at"),
+            })
+        pnl_time_series.append({
+            "sequence": sequence,
+            "ticker": shadow.get("ticker"),
+            "settled_at": shadow.get("settled_at"),
+            "source_signal_side": shadow.get("source_ml_side") or shadow.get("source_prophet_side"),
+            "locked_study_side": shadow.get("locked_study_side") or shadow.get("side"),
+            "side": shadow.get("side"),
+            "settlement_outcome": shadow.get("settlement_outcome"),
+            "status": shadow.get("status"),
+            "exit_method": shadow.get("exit_method"),
+            "trade_outcome": outcome,
+            "filled_contracts": round(float(shadow.get("contracts") or 0.0), 4),
+            "average_entry_price": shadow.get("average_entry") or position.get("average_entry_price"),
+            "entry_cost": round(cost, 6),
+            "exit_proceeds": round(float(shadow.get("gross_payout") or 0.0), 6),
+            "net_profit": round(value, 6),
+            "cumulative_net_profit": round(equity, 6),
+            "running_drawdown": round(running_drawdown, 6),
+            "current_streak_kind": current_streak_kind,
+            "current_streak": current_streak,
+            "rungs": rungs,
+            "trailing_stop": {
+                "highest_executable_bid": scalp_exit.get("highest_executable_bid") or final_epoch.get("max_executable_exit_bid"),
+                "trailing_stop_bid": scalp_exit.get("trailing_stop_bid") or final_epoch.get("trailing_stop_bid"),
+                "observed_exit_bid": scalp_exit.get("exit_price"),
+            },
+            "target_hits": final_epoch.get("target_hits") or {},
+        })
     wins = sum(value > 1e-9 for value in pnls)
     losses = sum(value < -1e-9 for value in pnls)
     scalps = [shadow for shadow in filled if shadow.get("exit_method") == "fresh_executable_bid_take_profit"]
@@ -517,6 +588,19 @@ def scalp_performance(shadows: list[dict[str, Any]]) -> dict[str, Any]:
         profile["trailing_stop_exits"] += shadow.get("exit_method") == "fresh_executable_bid_trailing_stop"
         profile["settlement_exits"] += shadow.get("exit_method") == "settlement_no_take_profit_exit"
         profile["net_profit"] += float(shadow.get("net_profit_loss") or 0.0)
+    # Trailing/range studies visit every held VWAP state above. Attribute the
+    # completed market P&L and exit method once to its final averaged state.
+    for shadow in filled:
+        position = shadow.get("entry_summary") if isinstance(shadow.get("entry_summary"), dict) else entry_summary(shadow)
+        average = shadow.get("average_entry") or position.get("average_entry_price")
+        if average is None:
+            continue
+        profile = profile_for(float(average))
+        if shadow.get("observation_only") or shadow.get("trailing_stop_per_contract") is not None:
+            profile["scalp_exits"] += shadow.get("exit_method") == "fresh_executable_bid_take_profit"
+            profile["trailing_stop_exits"] += shadow.get("exit_method") == "fresh_executable_bid_trailing_stop"
+            profile["settlement_exits"] += shadow.get("exit_method") == "settlement_no_take_profit_exit"
+            profile["net_profit"] += float(shadow.get("net_profit_loss") or 0.0)
     for profile in profiles.values():
         profile["net_profit"] = round(profile["net_profit"], 6)
     # Excursion statistics use only completed markets, preventing an active
@@ -576,12 +660,17 @@ def scalp_performance(shadows: list[dict[str, Any]]) -> dict[str, Any]:
         "winning_trades": wins,
         "losing_trades": losses,
         "win_rate": round(wins / len(filled), 6) if filled else None,
+        "current_streak_kind": current_streak_kind,
+        "current_streak": current_streak,
+        "longest_winning_streak": longest_winning_streak,
+        "longest_losing_streak": longest_losing_streak,
         "total_simulated_contracts": round(sum(float(shadow.get("contracts") or 0.0) for shadow in filled), 4),
         "total_entry_cost": round(sum(costs), 6),
         "total_exit_proceeds": round(sum(float(shadow.get("gross_payout") or 0.0) for shadow in filled), 6),
         "net_profit": round(sum(pnls), 6),
         "return_on_simulated_capital": round(sum(pnls) / sum(costs), 6) if sum(costs) else None,
         "maximum_drawdown": round(drawdown, 6),
+        "pnl_time_series": pnl_time_series,
         "average_entry_profiles": profiles,
         "excursion_observer": {
             "enabled": any(bool(shadow.get("observation_only")) or shadow.get("trailing_stop_per_contract") is not None for shadow in shadows),

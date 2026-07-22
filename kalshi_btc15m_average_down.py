@@ -154,6 +154,10 @@ DEFAULT_CONFIG = {
 # study.  It deliberately has no relationship to the 0.01-contract live GTC
 # ladder or its capital limits.
 WEIGHTED_SCALP_RUNG_QUANTITIES = {0.40: 1.0, 0.30: 2.0, 0.20: 3.0, 0.10: 4.0}
+DEFAULT_WEIGHTED_TRAILING_NORMAL_LEDGER = Path("kalshi_btc15m_weighted_trailing_normal_ledger.json")
+DEFAULT_WEIGHTED_TRAILING_NORMAL_REPORT = Path("kalshi_btc15m_weighted_trailing_normal_report.json")
+DEFAULT_WEIGHTED_TRAILING_INVERSE_LEDGER = Path("kalshi_btc15m_weighted_trailing_inverse_ledger.json")
+DEFAULT_WEIGHTED_TRAILING_INVERSE_REPORT = Path("kalshi_btc15m_weighted_trailing_inverse_report.json")
 
 
 def configure_logging() -> None:
@@ -410,6 +414,10 @@ class StateCheckpointPublisher:
     config_path: Path
     state_path: Path
     report_path: Path
+    weighted_normal_ledger_path: Path
+    weighted_normal_report_path: Path
+    weighted_inverse_ledger_path: Path
+    weighted_inverse_report_path: Path
     config: dict[str, Any]
     last_fingerprint: str
     enabled: bool
@@ -418,6 +426,8 @@ class StateCheckpointPublisher:
     @classmethod
     def create(
         cls, config_path: Path, state_path: Path, report_path: Path,
+        weighted_normal_ledger_path: Path, weighted_normal_report_path: Path,
+        weighted_inverse_ledger_path: Path, weighted_inverse_report_path: Path,
         config: dict[str, Any], state: dict[str, Any],
     ) -> "StateCheckpointPublisher":
         enabled = (
@@ -428,6 +438,10 @@ class StateCheckpointPublisher:
             config_path=config_path,
             state_path=state_path,
             report_path=report_path,
+            weighted_normal_ledger_path=weighted_normal_ledger_path,
+            weighted_normal_report_path=weighted_normal_report_path,
+            weighted_inverse_ledger_path=weighted_inverse_ledger_path,
+            weighted_inverse_report_path=weighted_inverse_report_path,
             config=config,
             last_fingerprint=checkpoint_fingerprint(state, config),
             enabled=enabled,
@@ -447,12 +461,21 @@ class StateCheckpointPublisher:
         try:
             save_json(self.state_path, state)
             save_json(self.report_path, performance_report(state, self.config))
+            save_ml_weighted_trailing_outputs(
+                state, self.config,
+                normal_ledger_path=self.weighted_normal_ledger_path,
+                normal_report_path=self.weighted_normal_report_path,
+                inverse_ledger_path=self.weighted_inverse_ledger_path,
+                inverse_report_path=self.weighted_inverse_report_path,
+            )
             repository = subprocess.run(
                 ["git", "rev-parse", "--show-toplevel"], check=True, capture_output=True, text=True,
             ).stdout.strip()
             root = Path(repository).resolve()
             paths = [str(path.resolve().relative_to(root)) for path in (
                 self.config_path, self.state_path, self.report_path,
+                self.weighted_normal_ledger_path, self.weighted_normal_report_path,
+                self.weighted_inverse_ledger_path, self.weighted_inverse_report_path,
             )]
             subprocess.run(["git", "add", *paths], check=True, capture_output=True, text=True)
             diff = subprocess.run(
@@ -2948,6 +2971,62 @@ def ml_weighted_trailing_scalp_performance(state: dict[str, Any], *, inverse: bo
     return report
 
 
+def ml_weighted_trailing_shadows(state: dict[str, Any], *, inverse: bool) -> list[dict[str, Any]]:
+    """Return one chronological, model-specific paper ledger from durable state."""
+    record_key = "inverse_ml_weighted_trailing_scalp_shadow" if inverse else "ml_weighted_trailing_scalp_shadow"
+    return sorted([
+        record[record_key]
+        for record in state.get("markets", {}).values()
+        if isinstance(record, dict) and isinstance(record.get(record_key), dict)
+    ], key=lambda shadow: (
+        str(shadow.get("settled_at") or shadow.get("created_at") or ""),
+        str(shadow.get("ticker") or ""),
+    ))
+
+
+def ml_weighted_trailing_ledger(state: dict[str, Any], config: dict[str, Any], *, inverse: bool) -> dict[str, Any]:
+    """Emit the complete auditable normal or inverse ML paper ledger.
+
+    Each record preserves the frozen source side, locked study side, every
+    entry rung/quote/depth event, all VWAP position epochs, trailing-stop
+    evidence, and the final cash-flow result.  The paired report remains a
+    compact view; this is the detailed source-of-truth file for review.
+    """
+    report = ml_weighted_trailing_scalp_performance(state, inverse=inverse)
+    return {
+        "schema": "ml_weighted_1234_trailing_paper_ledger_v1",
+        "generated_at": now_iso(),
+        "paper_only": True,
+        "model_variant": "inverse_ml" if inverse else "normal_ml",
+        "strategy": report["strategy"],
+        "locked_side_policy": report["locked_side_policy"],
+        "strategy_definition": {
+            "rung_quantities": {f"{level:.2f}": quantity for level, quantity in WEIGHTED_SCALP_RUNG_QUANTITIES.items()},
+            "target_opportunities_per_contract": [round(target, 2) for target in EXTENDED_PROFIT_TARGETS],
+            "trailing_stop_per_contract": float(config["weighted_scalp_trailing_stop_per_contract"]),
+            "entry_rule": "fresh executable side ask at or below each rung with displayed ask depth; shared quote depth is consumed across the 1/2/3/4 fills",
+            "exit_rule": "after a fresh full-depth executable bid establishes a high, a later fresh full-depth bid at or below high minus the trailing gap closes at that observed bid",
+            "fee_treatment": "excluded_no_exchange_fill",
+        },
+        "summary": report,
+        "records": ml_weighted_trailing_shadows(state, inverse=inverse),
+    }
+
+
+def save_ml_weighted_trailing_outputs(
+    state: dict[str, Any], config: dict[str, Any], *,
+    normal_ledger_path: Path, normal_report_path: Path,
+    inverse_ledger_path: Path, inverse_report_path: Path,
+) -> None:
+    """Persist viewable, model-specific weighted trailing ledgers and reports."""
+    normal_ledger = ml_weighted_trailing_ledger(state, config, inverse=False)
+    inverse_ledger = ml_weighted_trailing_ledger(state, config, inverse=True)
+    save_json(normal_ledger_path, normal_ledger)
+    save_json(normal_report_path, normal_ledger["summary"])
+    save_json(inverse_ledger_path, inverse_ledger)
+    save_json(inverse_report_path, inverse_ledger["summary"])
+
+
 def paper_shadow_summary(shadows: list[dict[str, Any]]) -> dict[str, Any]:
     """Return comparable settled paper metrics for any one-model shadow set."""
     settled_signals = sorted(
@@ -3276,13 +3355,19 @@ def log_performance_summary(report: dict[str, Any], context: str) -> None:
         weighted_excursion = weighted["excursion_observer"]
         weighted_maximum = weighted_excursion["maximum_gross_per_contract"]
         trailing = weighted["trailing_stop"]
+        current_streak = (
+            "none" if weighted["current_streak"] <= 0
+            else f"{weighted['current_streak']} {weighted['current_streak_kind']}"
+        )
         LOG.info(
             "%s PERFORMANCE | %s started=%d active=%d filled=%d trailing_exits=%d settlement_exits=%d "
-            "W/L=%d/%d net=$%+.4f roi=%s max_dd=$%.4f mfe_median=%s p75=%s p90=%s "
+            "W/L=%d/%d streak=%s longest_W/L=%d/%d net=$%+.4f roi=%s max_dd=$%.4f mfe_median=%s p75=%s p90=%s "
             "| locked side; 1x40c/2x30c/3x20c/4x10c; full-depth paper only; fees/queue excluded.",
             label, context, weighted["paper_markets_started"], weighted["active_paper_markets"],
             weighted["filled_market_trades"], trailing["trailing_stop_exits"],
             weighted["settlement_exits_without_take_profit"], weighted["winning_trades"], weighted["losing_trades"],
+            current_streak,
+            weighted["longest_winning_streak"], weighted["longest_losing_streak"],
             weighted["net_profit"], "n/a" if weighted["return_on_simulated_capital"] is None
             else f"{100 * weighted['return_on_simulated_capital']:.2f}%", weighted["maximum_drawdown"],
             "n/a" if weighted_maximum["median"] is None else f"${weighted_maximum['median']:+.4f}",
@@ -3536,11 +3621,18 @@ async def run(args: argparse.Namespace) -> int:
     if not dry_run and not live_allowed and not control_only:
         raise SystemExit("Refusing live orders: pass both --submit and --allow-live with DRY_RUN=false")
     state_path = args.state_file.expanduser()
+    weighted_normal_ledger_path = args.weighted_trailing_normal_ledger.expanduser()
+    weighted_normal_report_path = args.weighted_trailing_normal_report.expanduser()
+    weighted_inverse_ledger_path = args.weighted_trailing_inverse_ledger.expanduser()
+    weighted_inverse_report_path = args.weighted_trailing_inverse_report.expanduser()
     state = load_json(state_path, default_state())
     state["format_version"] = STATE_VERSION
     state.setdefault("markets", {})
     checkpoint = StateCheckpointPublisher.create(
-        config_path, state_path, args.report.expanduser(), config, state,
+        config_path, state_path, args.report.expanduser(),
+        weighted_normal_ledger_path, weighted_normal_report_path,
+        weighted_inverse_ledger_path, weighted_inverse_report_path,
+        config, state,
     )
     api_key = os.getenv("KALSHI_API_KEY_ID", "")
     pem_path = Path(os.getenv("KALSHI_PEM_PATH", "kalshi_private_key.pem"))
@@ -3556,6 +3648,13 @@ async def run(args: argparse.Namespace) -> int:
             )
             save_json(state_path, state)
             save_json(args.report.expanduser(), performance_report(state, config))
+            save_ml_weighted_trailing_outputs(
+                state, config,
+                normal_ledger_path=weighted_normal_ledger_path,
+                normal_report_path=weighted_normal_report_path,
+                inverse_ledger_path=weighted_inverse_ledger_path,
+                inverse_report_path=weighted_inverse_report_path,
+            )
             LOG.warning("CANCEL-ONLY COMPLETE | canceled_open_mechanical_orders=%d", canceled)
             return 0
         finally:
@@ -3683,6 +3782,13 @@ async def run(args: argparse.Namespace) -> int:
                 last_heartbeat_at = monotonic_now
             save_json(state_path, state)
             save_json(args.report.expanduser(), performance_report(state, config))
+            save_ml_weighted_trailing_outputs(
+                state, config,
+                normal_ledger_path=weighted_normal_ledger_path,
+                normal_report_path=weighted_normal_report_path,
+                inverse_ledger_path=weighted_inverse_ledger_path,
+                inverse_report_path=weighted_inverse_report_path,
+            )
             checkpoint.publish_if_changed(state, "material_strategy_event")
             if monotonic_now >= deadline:
                 break
@@ -3702,6 +3808,13 @@ async def run(args: argparse.Namespace) -> int:
         save_json(state_path, state)
         final_report = performance_report(state, config)
         save_json(args.report.expanduser(), final_report)
+        save_ml_weighted_trailing_outputs(
+            state, config,
+            normal_ledger_path=weighted_normal_ledger_path,
+            normal_report_path=weighted_normal_report_path,
+            inverse_ledger_path=weighted_inverse_ledger_path,
+            inverse_report_path=weighted_inverse_report_path,
+        )
         log_performance_summary(final_report, "run_complete")
         await rest.close()
     LOG.info("Average-down run complete | mode=%s active_records=%d", "DRY_RUN" if dry_run else "LIVE", len(active_strategy_records(state)))
@@ -3713,6 +3826,26 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", type=Path, default=Path("kalshi_btc15m_average_down_config.json"))
     parser.add_argument("--state-file", type=Path, default=Path("kalshi_btc15m_average_down_state.json"))
     parser.add_argument("--report", type=Path, default=Path("kalshi_btc15m_average_down_report.json"))
+    parser.add_argument(
+        "--weighted-trailing-normal-ledger", type=Path,
+        default=DEFAULT_WEIGHTED_TRAILING_NORMAL_LEDGER,
+        help="Detailed normal-ML weighted trailing paper ledger JSON.",
+    )
+    parser.add_argument(
+        "--weighted-trailing-normal-report", type=Path,
+        default=DEFAULT_WEIGHTED_TRAILING_NORMAL_REPORT,
+        help="Compact normal-ML weighted trailing paper report JSON.",
+    )
+    parser.add_argument(
+        "--weighted-trailing-inverse-ledger", type=Path,
+        default=DEFAULT_WEIGHTED_TRAILING_INVERSE_LEDGER,
+        help="Detailed inverse-ML weighted trailing paper ledger JSON.",
+    )
+    parser.add_argument(
+        "--weighted-trailing-inverse-report", type=Path,
+        default=DEFAULT_WEIGHTED_TRAILING_INVERSE_REPORT,
+        help="Compact inverse-ML weighted trailing paper report JSON.",
+    )
     parser.add_argument("--run-seconds", type=float, default=840.0)
     parser.add_argument("--cancel-open-orders", action="store_true")
     parser.add_argument(

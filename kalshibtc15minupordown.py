@@ -1857,6 +1857,10 @@ def print_prophet_weighted_trailing_shadow_performance(
     excursion = report["excursion_observer"]
     maximum = excursion["maximum_gross_per_contract"]
     roi = "n/a" if report["return_on_simulated_capital"] is None else f"{100 * report['return_on_simulated_capital']:.1f}%"
+    current_streak = (
+        "none" if report["current_streak"] <= 0
+        else f"{report['current_streak']} {report['current_streak_kind']}"
+    )
     log.info(
         "\n"
         f"╔═══ {label} WEIGHTED TRAILING — PAPER ONLY ═══════════════\n"
@@ -1865,9 +1869,12 @@ def print_prophet_weighted_trailing_shadow_performance(
         f"║  Started / Active : {report['paper_markets_started']} / {report['active_paper_markets']}\n"
         f"║  Filled / Stops   : {report['filled_market_trades']} / {report['trailing_stop_exits']} trailing exits\n"
         f"║  W / L            : {report['winning_trades']} / {report['losing_trades']}\n"
+        f"║  Current streak   : {current_streak}\n"
+        f"║  Longest W / L    : {report['longest_winning_streak']} / {report['longest_losing_streak']}\n"
         f"║  Cash flow        : spent ${report['total_entry_cost']:.4f} → proceeds ${report['total_exit_proceeds']:.4f}\n"
         f"║  Simulated P&L    : ${report['net_profit']:+,.4f}  (fees excluded)\n"
         f"║  Simulated ROI    : {roi}\n"
+        f"║  Max drawdown     : ${-report['maximum_drawdown']:.4f}\n"
         f"║  MFE / contract   : median {'n/a' if maximum['median'] is None else f'${maximum["median"]:+.4f}'}\n"
         "║  Trailing rule    : full-depth bid ≤ prior high − $0.10; closes at observed bid\n"
         "╚════════════════════════════════════════════════════════════"

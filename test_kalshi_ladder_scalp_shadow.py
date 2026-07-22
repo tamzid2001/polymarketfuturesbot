@@ -147,6 +147,23 @@ class LadderScalpShadowTests(unittest.TestCase):
         ))
         self.assertEqual(0.8, report["net_profit"])
         self.assertIn("0.2667", report["average_entry_profiles"])
+        self.assertEqual((1, 0.8), (
+            report["average_entry_profiles"]["0.2667"]["trailing_stop_exits"],
+            report["average_entry_profiles"]["0.2667"]["net_profit"],
+        ))
+        self.assertEqual(("win", 1, 1, 0), (
+            report["current_streak_kind"], report["current_streak"],
+            report["longest_winning_streak"], report["longest_losing_streak"],
+        ))
+        point = report["pnl_time_series"][0]
+        self.assertEqual(("KXBTC15M-TEST", "win", 6.0, 0.8), (
+            point["ticker"], point["trade_outcome"], point["filled_contracts"], point["net_profit"],
+        ))
+        self.assertEqual((0.5, 0.4, 0.4), (
+            point["trailing_stop"]["highest_executable_bid"],
+            point["trailing_stop"]["trailing_stop_bid"],
+            point["trailing_stop"]["observed_exit_bid"],
+        ))
 
 
 if __name__ == "__main__":

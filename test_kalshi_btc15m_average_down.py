@@ -1,8 +1,11 @@
 import asyncio
 import importlib
+import json
 import sys
+import tempfile
 import time
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 
 import pandas as pd
@@ -43,6 +46,8 @@ from kalshi_btc15m_average_down import (
     ml_live_directional_performance,
     inverse_shadow_performance,
     ml_scalp_shadow_performance,
+    ml_weighted_trailing_ledger,
+    save_ml_weighted_trailing_outputs,
     model_transition_shadow_performance,
     normalized_order_status,
     normalized_outcome_side,
@@ -284,6 +289,29 @@ class MechanicalAverageDownTests(unittest.TestCase):
         self.assertEqual((1.0, 2.0, 3.0, 4.0), tuple(
             normal["rungs"][f"{level:.4f}"]["quantity"] for level in (0.40, 0.30, 0.20, 0.10)))
         self.assertEqual({}, record["orders"])
+        normal_ledger = ml_weighted_trailing_ledger(state, config, inverse=False)
+        inverse_ledger = ml_weighted_trailing_ledger(state, config, inverse=True)
+        self.assertEqual(("normal_ml", "inverse_ml"), (
+            normal_ledger["model_variant"], inverse_ledger["model_variant"],
+        ))
+        self.assertEqual(("yes", "no"), (
+            normal_ledger["records"][0]["locked_study_side"],
+            inverse_ledger["records"][0]["locked_study_side"],
+        ))
+        self.assertEqual({"0.40": 1.0, "0.30": 2.0, "0.20": 3.0, "0.10": 4.0},
+                         normal_ledger["strategy_definition"]["rung_quantities"])
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            save_ml_weighted_trailing_outputs(
+                state, config,
+                normal_ledger_path=root / "normal-ledger.json",
+                normal_report_path=root / "normal-report.json",
+                inverse_ledger_path=root / "inverse-ledger.json",
+                inverse_report_path=root / "inverse-report.json",
+            )
+            payload = json.loads((root / "normal-ledger.json").read_text(encoding="utf-8"))
+            self.assertEqual("ml_weighted_1234_trailing_paper_ledger_v1", payload["schema"])
+            self.assertEqual("yes", payload["records"][0]["locked_study_side"])
 
     def test_model_transition_shadow_paper_tests_predecessor_and_current_model_separately(self):
         class FakeFeed:
