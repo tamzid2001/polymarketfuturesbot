@@ -17,6 +17,8 @@ Use **Actions → “Kalshi BTC 15m ML-Side Average Down” → Run workflow**. 
 
 It also runs a separate **ML ladder scalp range shadow** at one paper share per rung. This alternative fills only against a fresh displayed executable ask and tracks the actual paper VWAP of the filled 40¢/30¢/20¢/10¢ rungs. Rather than stopping at a fixed 1¢ exit, it leaves the paper position through settlement and records the maximum later fresh executable bid with enough displayed depth for the whole position, plus whether **1¢, 2¢, 3¢, 5¢, or 10¢ above VWAP** was available. It is research-only: it never creates, cancels, reduces, or otherwise changes a live Kalshi order. These are gross quote opportunities—not executable profit claims—because fees, queue position, latency, cancellations, hidden liquidity, and price impact remain excluded.
 
+The ML and Prophet Actions also run four independent **weighted trailing paper studies**: normal ML, inverse ML, normal Prophet, and inverse Prophet. Each locks its side before the market opens: normal uses the prediction and inverse uses its exact opposite; later quotes cannot switch either side. Each ladder buys **1 contract at 40¢, 2 at 30¢, 3 at 20¢, and 4 at 10¢** (10 maximum). Its held VWAPs are 40¢ for 1 contract, 33.33¢ for 3, 26.67¢ for 6, and 20¢ for 10. It tracks gross opportunities at 1¢/2¢/3¢/5¢/10¢ and 20¢ through 60¢ above VWAP. After a full-position executable bid sets a high, a later fresh full-depth bid at least 10¢ below that high exits at the **observed bid**, never an assumed stop price. These are separate paper-only ledgers: they cannot submit, close, cancel, reserve, or change a live order.
+
 ### Deployed model, coverage, and evidence
 
 The live runner resolves its artifact from [`kalshi_ml_model_registry.json`](kalshi_ml_model_registry.json) at every 5h45m handoff. The active model is a regularized logistic regression with isotonic probability calibration, trained and published by the ML-only daily retraining workflow. Its schema lock prevents a model with any non-ML-only feature from being substituted. The runner records the artifact ID, training cutoff, model `p_yes`, confidence, and selected side with every ML-backed market record.
@@ -42,7 +44,7 @@ The feature builder requires at least 61 continuous one-minute BTC candles. It u
 
 ### What the Action logs
 
-At startup the runner prints `ML MODEL`, `ML VALIDATION`, and `ML EXECUTION POLICY` lines with the exact artifact, calibration method, training rows/cutoff, schema, and active gate. Before each market it prints `ML INPUT READY` to confirm no forecast input was used, then `ML SIDE READY` (`p_yes`, confidence, selected side). A candle fetch is capped at 45 seconds and an unfinished pre-open task logs `ML SIDE FAILED` at the open; neither condition can fall back to Prophet, stale inference, or price-side selection. The runner then logs `SIDE LOCKED`, four `GTC LADDER LIMIT` submissions, order IDs/fills, exchange-position guards, settlement, rung P&L, and separate `ML LADDER SCALP RANGE` status/performance lines. The range report shows each 40¢/35¢/30¢/25¢ average-entry profile separately, with median/p75/p90 maximum gross excursion and 1¢/2¢/3¢/5¢/10¢ opportunity rates after only completed position states; it remains paper-only and excludes fees, queue priority, cancellation, latency, hidden liquidity, and partial-fill risk.
+At startup the runner prints `ML MODEL`, `ML VALIDATION`, and `ML EXECUTION POLICY` lines with the exact artifact, calibration method, training rows/cutoff, schema, and active gate. Before each market it prints `ML INPUT READY` to confirm no forecast input was used, then `ML SIDE READY` (`p_yes`, confidence, selected side). A candle fetch is capped at 45 seconds and an unfinished pre-open task logs `ML SIDE FAILED` at the open; neither condition can fall back to Prophet, stale inference, or price-side selection. The runner then logs `SIDE LOCKED`, four `GTC LADDER LIMIT` submissions, order IDs/fills, exchange-position guards, settlement, rung P&L, the equal-share `ML LADDER SCALP RANGE`, and separate normal/inverse `WEIGHTED TRAILING` reports. The weighted reports show each held 40¢/33.33¢/26.67¢/20¢ average-cost state, maximum excursion, all requested target-opportunity rates, and the paper trailing-stop result; they remain paper-only and exclude fees, queue priority, cancellation, latency, hidden liquidity, and partial-fill risk.
 
 ### ML-only retraining
 
@@ -491,11 +493,15 @@ For every 15-minute Kalshi window:
 
 Every portfolio report (every 30 s) prints the normal BTC-only stats block, the
 independent inverse paper report, a **BTC PROPHET LADDER SCALP RANGE** report,
-and a separate **BTC PROPHET WIN-RATE SELECTOR** report. The scalp report
+separate normal/inverse **BTC PROPHET WEIGHTED TRAILING** reports, and a
+**BTC PROPHET WIN-RATE SELECTOR** report. The range report
 requires a fresh complete executable ask for each paper entry and a fresh bid
 with depth for the entire paper position before counting its full later
 maximum favorable excursion or a 1¢/2¢/3¢/5¢/10¢ target opportunity; it breaks
-out the 40¢/35¢/30¢/25¢ average-entry profiles. The selector report includes frozen normal/inverse choices,
+out the 40¢/35¢/30¢/25¢ average-entry profiles. Each weighted report locks its
+normal or inverse Prophet side before open, uses 1×40¢/2×30¢/3×20¢/4×10¢, tracks
+1¢–10¢ and 20¢–60¢ gross opportunities, and exits its paper position only after
+a full-depth 10¢ trailing retracement. The selector report includes frozen normal/inverse choices,
 directional and executable-quote paper P&L, drawdown, per-rung P&L, and one
 line for every requested window showing normal/inverse W/L, win rate, and the
 current leader. Its durable files are `prophet_btc_selector_history.json` and
@@ -537,6 +543,8 @@ Environment **variables** (not secrets) tune behavior:
 | `PROPHET_LADDER_SCALP_SHADOW_ENABLED` | `true` in paper mode | Enables the separate normal-Prophet paper scalp audit; it has no live-order path. |
 | `PROPHET_LADDER_SCALP_SHADOW_POSITION_SIZE` | `1` | Paper contracts per scalp rung, independent of `BET_AMOUNT_SHARES`. |
 | `PROPHET_LADDER_SCALP_SHADOW_PROFIT_TARGET` | `0.01` | Retained for compatibility; the current range observer reports 1¢/2¢/3¢/5¢/10¢ gross opportunities rather than selecting this exit. |
+| `PROPHET_WEIGHTED_TRAILING_SHADOW_ENABLED` | `true` in paper mode | Enables the independent locked-side normal and inverse 1/2/3/4 weighted trailing studies. |
+| `PROPHET_WEIGHTED_TRAILING_STOP_PER_CONTRACT` | `0.10` | Full-depth trailing retracement used to close an entire weighted paper position at the observed bid. |
 | `HISTORY_MINUTES` | `500` | 1-minute candles fed to Prophet |
 | `FORECAST_MINUTES` | `17` | Fixed Prophet horizon in one-minute timesteps for every cached forecast |
 | `PREOPEN_FORECAST_LEAD_S` | `120` | Seconds before the next market opens to pre-compute its 17-step forecast |

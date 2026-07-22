@@ -19,6 +19,7 @@ from typing import Any
 
 LADDER_LEVELS = (0.40, 0.30, 0.20, 0.10)
 DEFAULT_PROFIT_TARGETS = (0.01, 0.02, 0.03, 0.05, 0.10)
+EXTENDED_PROFIT_TARGETS = DEFAULT_PROFIT_TARGETS + (0.20, 0.30, 0.40, 0.50, 0.60)
 EPSILON = 0.004
 
 
@@ -37,9 +38,11 @@ def new_ladder_average_entry_scalp_shadow(
     market_close_time: Any,
     observation_only: bool = False,
     profit_targets_per_contract: tuple[float, ...] = DEFAULT_PROFIT_TARGETS,
+    rung_quantities: dict[float, float] | None = None,
+    trailing_stop_per_contract: float | None = None,
     extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Return a paper ladder with either a fixed exit or a range observer."""
+    """Return a paper ladder with a fixed, range, or trailing-stop exit study."""
     normalized_side = str(side).lower()
     if normalized_side not in {"yes", "no"}:
         raise ValueError("side must be yes or no")
@@ -50,6 +53,19 @@ def new_ladder_average_entry_scalp_shadow(
     targets = tuple(sorted({round(float(target), 6) for target in profit_targets_per_contract}))
     if not targets or any(not 0.0 < target < 1.0 for target in targets):
         raise ValueError("profit_targets_per_contract must contain valid probabilities")
+    normalized_quantities: dict[float, float] = {}
+    for raw_level, raw_quantity in (rung_quantities or {}).items():
+        level = round(float(raw_level), 4)
+        quantity = round(float(raw_quantity), 4)
+        if level not in LADDER_LEVELS or quantity <= 0.0:
+            raise ValueError("rung_quantities must contain positive quantities for ladder levels only")
+        normalized_quantities[level] = quantity
+    if trailing_stop_per_contract is not None:
+        trailing_stop_per_contract = round(float(trailing_stop_per_contract), 6)
+        if not 0.0 < trailing_stop_per_contract < 1.0:
+            raise ValueError("trailing_stop_per_contract must be between zero and one")
+    if observation_only and trailing_stop_per_contract is not None:
+        raise ValueError("range observation and trailing-stop exit modes are mutually exclusive")
     return {
         "strategy": strategy,
         "mode": "paper_only_no_exchange_orders",
@@ -62,11 +78,14 @@ def new_ladder_average_entry_scalp_shadow(
         "profit_target_per_contract": round(float(profit_target_per_contract), 4),
         "observation_only": bool(observation_only),
         "profit_targets_per_contract": list(targets),
+        "trailing_stop_per_contract": trailing_stop_per_contract,
+        "rung_quantities": {f"{level:.4f}": normalized_quantities.get(level, round(float(quantity_per_rung), 4))
+                            for level in LADDER_LEVELS},
         "quote_max_age_seconds": round(float(quote_max_age_seconds), 4),
         "rungs": {
             f"{level:.4f}": {
                 "rung_price": level,
-                "quantity": round(float(quantity_per_rung), 4),
+                "quantity": normalized_quantities.get(level, round(float(quantity_per_rung), 4)),
                 "fill_count": 0.0,
                 "average_fill_price": None,
                 "status": "simulated_resting",
@@ -203,6 +222,94 @@ def _observe_executable_exit(
     return events
 
 
+def _close_paper_position(
+    shadow: dict[str, Any], position: dict[str, float | None], exit_quote: dict[str, Any],
+    *, kind: str, exit_method: str, extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Close one hypothetical position at the observed bid only.
+
+    This helper mutates only the isolated paper record.  It deliberately uses
+    the observed bid, not the stop level, so a trailing-stop result never
+    assumes favorable execution that the book did not show.
+    """
+    contracts = float(position["filled_contracts"] or 0.0)
+    entry_cost = float(position["entry_cost"] or 0.0)
+    bid = float(exit_quote.get("economic_price") or 0.0)
+    proceeds = bid * contracts
+    gross = proceeds - entry_cost
+    for rung in (shadow.get("rungs") or {}).values():
+        if isinstance(rung, dict) and float(rung.get("fill_count") or 0.0) <= EPSILON:
+            rung["status"] = "paper_canceled_after_scalp_exit"
+            rung["paper_canceled_at"] = now_iso()
+    exit_event = {
+        "kind": kind,
+        "at": now_iso(),
+        "exit_quote": dict(exit_quote),
+        "filled_contracts": round(contracts, 4),
+        "average_entry_price": position["average_entry_price"],
+        "exit_price": round(bid, 6),
+        "entry_cost": round(entry_cost, 6),
+        "exit_proceeds": round(proceeds, 6),
+        "gross_profit_loss": round(gross, 6),
+        "fees_model": "excluded_no_exchange_fill",
+        **(extra or {}),
+    }
+    shadow.update({
+        "status": "scalp_exited",
+        "scalp_exit": exit_event,
+        "settled_at": exit_event["at"],
+        "contracts": round(contracts, 4),
+        "total_cost": round(entry_cost, 6),
+        "average_entry": position["average_entry_price"],
+        "gross_payout": round(proceeds, 6),
+        "gross_profit_loss": round(gross, 6),
+        "net_profit_loss": round(gross, 6),
+        "estimated_fees": 0.0,
+        "fees_model": "excluded_no_exchange_fill",
+        "return_percentage": round(100.0 * gross / entry_cost, 4) if entry_cost > 0 else None,
+        "exit_method": exit_method,
+    })
+    _record_event(shadow, exit_event)
+    return exit_event
+
+
+def _simulate_trailing_stop(
+    shadow: dict[str, Any], position: dict[str, float | None], exit_quote: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """Observe MFE, then close on a later full-depth 10c (configured) retracement."""
+    events = _observe_executable_exit(shadow, position, exit_quote)
+    epoch = _observation_epoch(shadow, position)
+    contracts = float(position["filled_contracts"] or 0.0)
+    if epoch is None or exit_quote is None or contracts <= EPSILON:
+        return events
+    bid = float(exit_quote.get("economic_price") or 0.0)
+    depth = float(exit_quote.get("displayed_depth") or 0.0)
+    high_bid = epoch.get("max_executable_exit_bid")
+    stop_gap = float(shadow.get("trailing_stop_per_contract") or 0.0)
+    if depth + 1e-9 < contracts or high_bid is None or stop_gap <= 0.0:
+        return events
+    stop_bid = max(0.0, float(high_bid) - stop_gap)
+    epoch["trailing_stop_bid"] = round(stop_bid, 6)
+    # A new high cannot trigger its own trailing stop. A later full-depth bid
+    # at or below the stop closes at the observed bid, conservatively.
+    if bid > stop_bid + 1e-9:
+        return events
+    exit_event = _close_paper_position(
+        shadow, position, exit_quote,
+        kind="paper_scalp_trailing_stop_exit",
+        exit_method="fresh_executable_bid_trailing_stop",
+        extra={
+            "highest_executable_bid": round(float(high_bid), 6),
+            "trailing_stop_per_contract": round(stop_gap, 6),
+            "trailing_stop_bid": round(stop_bid, 6),
+        },
+    )
+    epoch["ended_at"] = exit_event["at"]
+    epoch["ended_by"] = "trailing_stop"
+    events.append(exit_event)
+    return events
+
+
 def simulate_ladder_average_entry_scalp(
     shadow: dict[str, Any],
     *,
@@ -264,6 +371,8 @@ def simulate_ladder_average_entry_scalp(
     target_bid = position["take_profit_bid"]
     if shadow.get("observation_only"):
         return events + _observe_executable_exit(shadow, position, exit_quote)
+    if shadow.get("trailing_stop_per_contract") is not None:
+        return events + _simulate_trailing_stop(shadow, position, exit_quote)
     if contracts <= EPSILON or target_bid is None or exit_quote is None:
         return events
     bid = float(exit_quote.get("economic_price") or 0.0)
@@ -271,44 +380,12 @@ def simulate_ladder_average_entry_scalp(
     if bid + 1e-9 < float(target_bid) or depth + 1e-9 < contracts:
         return events
 
-    entry_cost = float(position["entry_cost"] or 0.0)
-    proceeds = bid * contracts
-    gross = proceeds - entry_cost
-    # Mark any unfilled GTC rungs as canceled only inside this alternate paper
-    # scenario.  No exchange order is created, canceled, or otherwise touched.
-    for rung in rungs.values():
-        if isinstance(rung, dict) and float(rung.get("fill_count") or 0.0) <= EPSILON:
-            rung["status"] = "paper_canceled_after_scalp_exit"
-            rung["paper_canceled_at"] = now_iso()
-    exit_event = {
-        "kind": "paper_scalp_take_profit_exit",
-        "at": now_iso(),
-        "exit_quote": dict(exit_quote),
-        "filled_contracts": round(contracts, 4),
-        "average_entry_price": position["average_entry_price"],
-        "take_profit_bid": target_bid,
-        "exit_price": round(bid, 6),
-        "entry_cost": round(entry_cost, 6),
-        "exit_proceeds": round(proceeds, 6),
-        "gross_profit_loss": round(gross, 6),
-        "fees_model": "excluded_no_exchange_fill",
-    }
-    shadow.update({
-        "status": "scalp_exited",
-        "scalp_exit": exit_event,
-        "settled_at": exit_event["at"],
-        "contracts": round(contracts, 4),
-        "total_cost": round(entry_cost, 6),
-        "average_entry": position["average_entry_price"],
-        "gross_payout": round(proceeds, 6),
-        "gross_profit_loss": round(gross, 6),
-        "net_profit_loss": round(gross, 6),
-        "estimated_fees": 0.0,
-        "fees_model": "excluded_no_exchange_fill",
-        "return_percentage": round(100.0 * gross / entry_cost, 4) if entry_cost > 0 else None,
-        "exit_method": "fresh_executable_bid_take_profit",
-    })
-    _record_event(shadow, exit_event)
+    exit_event = _close_paper_position(
+        shadow, position, exit_quote,
+        kind="paper_scalp_take_profit_exit",
+        exit_method="fresh_executable_bid_take_profit",
+        extra={"take_profit_bid": target_bid},
+    )
     events.append(exit_event)
     return events
 
@@ -322,7 +399,7 @@ def finalize_ladder_average_entry_scalp(shadow: dict[str, Any], result: str | No
         return False
     position = entry_summary(shadow)
     finalized_at = now_iso()
-    if shadow.get("observation_only"):
+    if shadow.get("observation_only") or shadow.get("trailing_stop_per_contract") is not None:
         for epoch in shadow.get("position_epochs", []):
             if isinstance(epoch, dict) and not epoch.get("ended_at"):
                 epoch["ended_at"] = finalized_at
@@ -387,37 +464,41 @@ def scalp_performance(shadows: list[dict[str, Any]]) -> dict[str, Any]:
     wins = sum(value > 1e-9 for value in pnls)
     losses = sum(value < -1e-9 for value in pnls)
     scalps = [shadow for shadow in filled if shadow.get("exit_method") == "fresh_executable_bid_take_profit"]
+    trailing_stops = [shadow for shadow in filled if shadow.get("exit_method") == "fresh_executable_bid_trailing_stop"]
     settlements = [shadow for shadow in filled if shadow.get("exit_method") == "settlement_no_take_profit_exit"]
-    profiles = {
-        f"{price:.2f}": {
-            "average_entry_price": price,
-            "observed_positions": 0,
-            "active_positions": 0,
-            "completed_position_states": 0,
-            "scalp_exits": 0,
-            "settlement_exits": 0,
-            "net_profit": 0.0,
-            "depth_observed_positions": 0,
-            "maximum_gross_per_contract_values": [],
-        }
-        for price in (0.40, 0.35, 0.30, 0.25)
-    }
+    profiles: dict[str, dict[str, Any]] = {}
+
+    def profile_for(average: float) -> dict[str, Any]:
+        key = f"{round(average, 4):.4f}".rstrip("0").rstrip(".")
+        if key not in profiles:
+            profiles[key] = {
+                "average_entry_price": round(float(average), 6),
+                "observed_positions": 0,
+                "active_positions": 0,
+                "completed_position_states": 0,
+                "scalp_exits": 0,
+                "trailing_stop_exits": 0,
+                "settlement_exits": 0,
+                "net_profit": 0.0,
+                "depth_observed_positions": 0,
+                "maximum_gross_per_contract_values": [],
+                "filled_contracts_values": [],
+            }
+        return profiles[key]
     observation_epochs: list[tuple[dict[str, Any], dict[str, Any]]] = []
     for shadow in shadows:
         # The observation audit reports every VWAP/size state actually held.
         # A state that is immediately superseded by another rung gets no later
         # quote attribution; it has no executable holding interval to study.
-        if shadow.get("observation_only"):
+        if shadow.get("observation_only") or shadow.get("trailing_stop_per_contract") is not None:
             for epoch in shadow.get("position_epochs", []):
                 if not isinstance(epoch, dict):
                     continue
-                key = f"{float(epoch.get('average_entry_price') or 0.0):.2f}"
-                profile = profiles.get(key)
-                if profile is None:
-                    continue
+                profile = profile_for(float(epoch.get("average_entry_price") or 0.0))
                 profile["observed_positions"] += 1
                 profile["active_positions"] += str(shadow.get("status")) == "active"
                 profile["completed_position_states"] += str(shadow.get("status")) != "active"
+                profile["filled_contracts_values"].append(float(epoch.get("filled_contracts") or 0.0))
                 maximum = epoch.get("max_executable_gross_per_contract")
                 if maximum is not None:
                     profile["depth_observed_positions"] += 1
@@ -428,13 +509,12 @@ def scalp_performance(shadows: list[dict[str, Any]]) -> dict[str, Any]:
         average = position["average_entry_price"]
         if average is None:
             continue
-        key = f"{float(average):.2f}"
-        profile = profiles.get(key)
-        if profile is None:
-            continue
+        profile = profile_for(float(average))
         profile["observed_positions"] += 1
         profile["active_positions"] += str(shadow.get("status")) == "active"
+        profile["filled_contracts_values"].append(float(position.get("filled_contracts") or 0.0))
         profile["scalp_exits"] += shadow.get("exit_method") == "fresh_executable_bid_take_profit"
+        profile["trailing_stop_exits"] += shadow.get("exit_method") == "fresh_executable_bid_trailing_stop"
         profile["settlement_exits"] += shadow.get("exit_method") == "settlement_no_take_profit_exit"
         profile["net_profit"] += float(shadow.get("net_profit_loss") or 0.0)
     for profile in profiles.values():
@@ -442,14 +522,16 @@ def scalp_performance(shadows: list[dict[str, Any]]) -> dict[str, Any]:
     # Excursion statistics use only completed markets, preventing an active
     # position from overstating the typical maximum it could ultimately reach.
     completed_observers = {
-        id(shadow) for shadow in finalized if shadow.get("observation_only")
+        id(shadow) for shadow in finalized
+        if shadow.get("observation_only") or shadow.get("trailing_stop_per_contract") is not None
     }
     completed_epochs = [epoch for shadow, epoch in observation_epochs if id(shadow) in completed_observers]
     maxima = [float(epoch["max_executable_gross_per_contract"])
               for epoch in completed_epochs if epoch.get("max_executable_gross_per_contract") is not None]
     observation_targets = sorted({
         round(float(target), 6)
-        for shadow in shadows if shadow.get("observation_only")
+        for shadow in shadows
+        if shadow.get("observation_only") or shadow.get("trailing_stop_per_contract") is not None
         for target in shadow.get("profit_targets_per_contract", DEFAULT_PROFIT_TARGETS)
         if 0.0 < float(target) < 1.0
     }) or list(DEFAULT_PROFIT_TARGETS)
@@ -467,15 +549,17 @@ def scalp_performance(shadows: list[dict[str, Any]]) -> dict[str, Any]:
         }
     for profile in profiles.values():
         values = profile.pop("maximum_gross_per_contract_values")
+        contract_values = profile.pop("filled_contracts_values")
         profile["median_maximum_gross_per_contract"] = _quantile(values, 0.50)
         profile["p75_maximum_gross_per_contract"] = _quantile(values, 0.75)
         profile["p90_maximum_gross_per_contract"] = _quantile(values, 0.90)
         profile["maximum_gross_per_contract"] = _quantile(values, 1.0)
         profile["average_maximum_gross_per_contract"] = round(sum(values) / len(values), 6) if values else None
+        profile["median_filled_contracts"] = _quantile(contract_values, 0.50)
     return {
         "strategy": "ladder_average_entry_scalp_executable_quote_shadow_v1",
         "mode": "paper_only_no_exchange_orders",
-        "fill_rule": "buy at fresh executable ask <= rung with displayed ask depth; fixed-exit shadows close all filled rungs at their target, while observation shadows record later executable bids with displayed bid depth >= the full position",
+        "fill_rule": "buy at fresh executable ask <= rung with displayed ask depth; fixed-exit shadows close all filled rungs at their target, range shadows record later executable bids with displayed bid depth >= the full position, and trailing shadows close only after a full-depth bid retraces by the configured gap from the prior maximum",
         "fee_treatment": "excluded_no_exchange_fill",
         "limitations": [
             "A quote hit or exit is a paper event, not a Kalshi exchange fill.",
@@ -485,6 +569,7 @@ def scalp_performance(shadows: list[dict[str, Any]]) -> dict[str, Any]:
         "paper_markets_started": len(shadows),
         "active_paper_markets": sum(str(shadow.get("status")) == "active" for shadow in shadows),
         "scalp_exits": len(scalps),
+        "trailing_stop_exits": len(trailing_stops),
         "settlement_exits_without_take_profit": len(settlements),
         "unfilled_markets": sum(str(shadow.get("status")) == "finalized_unfilled" for shadow in shadows),
         "filled_market_trades": len(filled),
@@ -499,8 +584,8 @@ def scalp_performance(shadows: list[dict[str, Any]]) -> dict[str, Any]:
         "maximum_drawdown": round(drawdown, 6),
         "average_entry_profiles": profiles,
         "excursion_observer": {
-            "enabled": any(bool(shadow.get("observation_only")) for shadow in shadows),
-            "method": "records the maximum later fresh executable bid with displayed depth for each unchanged filled VWAP/size; it does not select or simulate one exit target",
+            "enabled": any(bool(shadow.get("observation_only")) or shadow.get("trailing_stop_per_contract") is not None for shadow in shadows),
+            "method": "records the maximum later fresh executable bid with displayed depth for each unchanged filled VWAP/size; range shadows do not select an exit while trailing shadows may later close on their configured retracement",
             "unit": "gross dollars per contract; fees, queue position, latency, and price impact excluded",
             "completed_position_states": len(completed_epochs),
             "depth_observed_position_states": len(maxima),
@@ -514,6 +599,15 @@ def scalp_performance(shadows: list[dict[str, Any]]) -> dict[str, Any]:
                 "average": round(sum(maxima) / len(maxima), 6) if maxima else None,
             },
             "target_opportunities": target_summary,
+        },
+        "trailing_stop": {
+            "enabled": any(shadow.get("trailing_stop_per_contract") is not None for shadow in shadows),
+            "configured_gaps_per_contract": sorted({
+                round(float(shadow["trailing_stop_per_contract"]), 6)
+                for shadow in shadows if shadow.get("trailing_stop_per_contract") is not None
+            }),
+            "trailing_stop_exits": len(trailing_stops),
+            "execution_rule": "after a fresh full-depth bid establishes a maximum, a later fresh full-depth bid at or below maximum minus the configured gap exits the whole paper position at that observed bid",
         },
     }
 

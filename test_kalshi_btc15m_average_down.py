@@ -22,6 +22,7 @@ from kalshi_btc15m_average_down import (
     ensure_model_transition_shadow,
     ensure_inverse_shadow,
     ensure_ml_scalp_shadow,
+    ensure_ml_weighted_trailing_scalp_shadows,
     exchange_position_guard,
     exchange_outcome_side,
     ladder_principal,
@@ -268,6 +269,21 @@ class MechanicalAverageDownTests(unittest.TestCase):
         self.assertEqual(0, summary["scalp_exits"])
         self.assertEqual(0.01, summary["excursion_observer"]["maximum_gross_per_contract"]["median"])
         self.assertEqual(1, summary["excursion_observer"]["target_opportunities"]["0.01"]["hit_position_states"])
+
+    def test_ml_weighted_trailing_studies_lock_normal_and_inverse_sides_before_quotes(self):
+        config = validate_config(DEFAULT_CONFIG)
+        state = default_state()
+        record = market_record(state, "KXBTC15M-TEST-WEIGHTED")
+        record["ml_inference"] = {"side": "yes", "model_run_id": "test-model"}
+        ensure_ml_weighted_trailing_scalp_shadows(
+            record, SimpleNamespace(close_time="2099-07-20T00:15:00Z"), config, "yes")
+        normal = record["ml_weighted_trailing_scalp_shadow"]
+        inverse = record["inverse_ml_weighted_trailing_scalp_shadow"]
+        self.assertEqual(("yes", "no"), (normal["side"], inverse["side"]))
+        self.assertEqual(0.10, normal["trailing_stop_per_contract"])
+        self.assertEqual((1.0, 2.0, 3.0, 4.0), tuple(
+            normal["rungs"][f"{level:.4f}"]["quantity"] for level in (0.40, 0.30, 0.20, 0.10)))
+        self.assertEqual({}, record["orders"])
 
     def test_model_transition_shadow_paper_tests_predecessor_and_current_model_separately(self):
         class FakeFeed:

@@ -32,6 +32,7 @@ from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
 from kalshi_ladder_scalp_shadow import (
+    EXTENDED_PROFIT_TARGETS,
     entry_summary as scalp_entry_summary,
     finalize_ladder_average_entry_scalp,
     new_ladder_average_entry_scalp_shadow,
@@ -135,6 +136,12 @@ DEFAULT_CONFIG = {
     "scalp_shadow_position_size": 1.0,
     "scalp_shadow_profit_target": 0.01,
     "scalp_shadow_quote_max_age_seconds": 3.0,
+    # A second, independent paper strategy with 1/2/3/4 contracts at
+    # 40c/30c/20c/10c. It locks the ML (or inverse-ML) side before open,
+    # observes extended targets, and closes only on a full-depth 10c trailing
+    # retracement. It can never create or alter a real order.
+    "weighted_scalp_shadow_enabled": True,
+    "weighted_scalp_trailing_stop_per_contract": 0.10,
     # When a retrain publishes a new artifact, paper-test both the retained
     # predecessor and the new model at the same readable size. Neither side
     # can create or alter an exchange order.
@@ -142,6 +149,11 @@ DEFAULT_CONFIG = {
     "model_transition_shadow_position_size": 1.0,
     "status_log_seconds": 30.0,
 }
+
+# Paper-only asymmetric averaging schedule requested for the extended scalp
+# study.  It deliberately has no relationship to the 0.01-contract live GTC
+# ladder or its capital limits.
+WEIGHTED_SCALP_RUNG_QUANTITIES = {0.40: 1.0, 0.30: 2.0, 0.20: 3.0, 0.10: 4.0}
 
 
 def configure_logging() -> None:
@@ -480,6 +492,7 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         "watch_start_grace_seconds", "ml_preopen_lead_seconds", "ml_min_confidence",
         "inverse_shadow_position_size", "inverse_shadow_quote_max_age_seconds",
         "scalp_shadow_position_size", "scalp_shadow_profit_target", "scalp_shadow_quote_max_age_seconds",
+        "weighted_scalp_trailing_stop_per_contract",
         "model_transition_shadow_position_size", "status_log_seconds",
     ):
         value = as_float(merged.get(name))
@@ -496,6 +509,10 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
     if isinstance(scalp_shadow_enabled, str):
         scalp_shadow_enabled = scalp_shadow_enabled.strip().lower() in {"1", "true", "yes", "on"}
     merged["scalp_shadow_enabled"] = bool(scalp_shadow_enabled)
+    weighted_scalp_enabled = merged.get("weighted_scalp_shadow_enabled", True)
+    if isinstance(weighted_scalp_enabled, str):
+        weighted_scalp_enabled = weighted_scalp_enabled.strip().lower() in {"1", "true", "yes", "on"}
+    merged["weighted_scalp_shadow_enabled"] = bool(weighted_scalp_enabled)
     transition_shadow_enabled = merged.get("model_transition_shadow_enabled", True)
     if isinstance(transition_shadow_enabled, str):
         transition_shadow_enabled = transition_shadow_enabled.strip().lower() in {"1", "true", "yes", "on"}
@@ -1829,6 +1846,130 @@ def finalize_ml_scalp_shadow(record: dict[str, Any], result: str | None) -> bool
     return changed
 
 
+def ensure_ml_weighted_trailing_scalp_shadow(
+    record: dict[str, Any], market: Any, config: dict[str, Any], *, side: str, record_key: str, label: str,
+) -> dict[str, Any] | None:
+    """Create a frozen-side 1/2/3/4 paper ladder with a 10c trailing stop."""
+    if not config.get("weighted_scalp_shadow_enabled", True) or side not in {"yes", "no"}:
+        return None
+    existing = record.get(record_key)
+    if isinstance(existing, dict):
+        return existing
+    shadow = new_ladder_average_entry_scalp_shadow(
+        strategy=f"{label.lower().replace(' ', '_')}_weighted_trailing_scalp_shadow_v1",
+        ticker=str(record.get("ticker") or ""),
+        side=side,
+        quantity_per_rung=1.0,
+        profit_target_per_contract=float(config["scalp_shadow_profit_target"]),
+        quote_max_age_seconds=float(config["scalp_shadow_quote_max_age_seconds"]),
+        market_close_time=field(market, "close_time", "expected_expiration_time"),
+        profit_targets_per_contract=EXTENDED_PROFIT_TARGETS,
+        rung_quantities=WEIGHTED_SCALP_RUNG_QUANTITIES,
+        trailing_stop_per_contract=float(config["weighted_scalp_trailing_stop_per_contract"]),
+        extra={
+            "source_ml_side": str(record.get("ml_inference", {}).get("side") or "").lower(),
+            "source_model_run_id": record.get("ml_inference", {}).get("model_run_id"),
+            "locked_study_side": side,
+            "study_variant": label,
+        },
+    )
+    record[record_key] = shadow
+    LOG.info(
+        "%s WEIGHTED TRAILING STUDY STARTED | %s locked_side=%s rungs=1x$0.40/2x$0.30/3x$0.20/4x$0.10 "
+        "targets=1c/2c/3c/5c/10c/20c/30c/40c/50c/60c trailing_gap=$%.2f; paper only, no exchange order.",
+        label, record.get("ticker", "?"), side.upper(), float(config["weighted_scalp_trailing_stop_per_contract"]),
+    )
+    return shadow
+
+
+def ensure_ml_weighted_trailing_scalp_shadows(
+    record: dict[str, Any], market: Any, config: dict[str, Any], ml_side: str,
+) -> None:
+    """Start separate normal and inverse studies from the same frozen ML signal."""
+    ensure_ml_weighted_trailing_scalp_shadow(
+        record, market, config, side=ml_side,
+        record_key="ml_weighted_trailing_scalp_shadow", label="ML NORMAL",
+    )
+    inverse_side = opposite_side(ml_side)
+    if inverse_side:
+        ensure_ml_weighted_trailing_scalp_shadow(
+            record, market, config, side=inverse_side,
+            record_key="inverse_ml_weighted_trailing_scalp_shadow", label="ML INVERSE",
+        )
+
+
+def simulate_ml_weighted_trailing_scalp_shadow(
+    record: dict[str, Any], feed: KalshiLiveFeed | None, *, record_key: str, label: str,
+) -> bool:
+    """Advance one locked-side weighted trailing paper position from fresh quotes."""
+    shadow = record.get(record_key)
+    if not isinstance(shadow, dict) or shadow.get("status") != "active":
+        return False
+    if feed is None:
+        shadow["last_entry_quote_state"] = "websocket_unavailable"
+        shadow["last_exit_quote_state"] = "websocket_unavailable"
+        return False
+    ticker = str(record.get("ticker") or "")
+    side = str(shadow.get("side") or "").lower()
+    quote_age = float(shadow.get("quote_max_age_seconds") or 0.0)
+    if not ticker or side not in {"yes", "no"} or quote_age <= 0.0:
+        shadow["last_entry_quote_state"] = "invalid_shadow_state"
+        shadow["last_exit_quote_state"] = "invalid_shadow_state"
+        return False
+    # The first rung is one contract. The common simulator then consumes the
+    # same quote's displayed depth across 1/2/3/4 contracts without reuse.
+    entry_quote, entry_state = feed.executable_shadow_quote(ticker, side, 1.0, quote_age)
+    exit_quote, exit_state = feed.executable_shadow_exit_quote(ticker, side, 0.0, quote_age)
+    events = simulate_ladder_average_entry_scalp(
+        shadow, entry_quote=entry_quote, entry_quote_state=entry_state,
+        exit_quote=exit_quote, exit_quote_state=exit_state,
+    )
+    for event in events:
+        if event.get("kind") == "paper_scalp_entry_rung_hit":
+            LOG.info(
+                "%s WEIGHTED ENTRY | %s %s rung=$%.2f qty=%.2f ask=$%.4f depth=%.2f; paper only.",
+                label, ticker, side.upper(), float(event["rung_price"]), float(event["quantity"]),
+                float(event["entry_quote"]["economic_price"]), float(event["entry_quote"]["displayed_depth"]),
+            )
+        elif event.get("kind") == "paper_scalp_maximum_update":
+            LOG.info(
+                "%s WEIGHTED MAX | %s %s contracts=%.2f avg=$%.4f bid=$%.4f gross_per_contract=$%+.4f "
+                "gross_total=$%+.4f; fresh full-depth evidence only.",
+                label, ticker, side.upper(), float(event["filled_contracts"]), float(event["average_entry_price"]),
+                float(event["exit_price"]), float(event["gross_per_contract"]), float(event["gross_total"]),
+            )
+        elif event.get("kind") == "paper_scalp_target_hit":
+            LOG.info(
+                "%s WEIGHTED TARGET HIT | %s %s avg=$%.4f target=+$%.2f bid=$%.4f gross_total=$%+.4f; paper only.",
+                label, ticker, side.upper(), float(event["average_entry_price"]), float(event["target_per_contract"]),
+                float(event["observed_bid"]), float(event["observed_gross_total"]),
+            )
+        elif event.get("kind") == "paper_scalp_trailing_stop_exit":
+            LOG.info(
+                "%s WEIGHTED TRAILING STOP | %s %s contracts=%.2f high_bid=$%.4f stop_bid=$%.4f "
+                "observed_bid=$%.4f net=$%+.4f; paper only, no exchange close.",
+                label, ticker, side.upper(), float(event["filled_contracts"]), float(event["highest_executable_bid"]),
+                float(event["trailing_stop_bid"]), float(event["exit_price"]), float(event["gross_profit_loss"]),
+            )
+    return bool(events)
+
+
+def finalize_ml_weighted_trailing_scalp_shadow(
+    record: dict[str, Any], result: str | None, *, record_key: str, label: str,
+) -> bool:
+    shadow = record.get(record_key)
+    if not isinstance(shadow, dict):
+        return False
+    changed = finalize_ladder_average_entry_scalp(shadow, result)
+    if changed:
+        LOG.info(
+            "%s WEIGHTED PAPER SETTLED | %s side=%s method=%s net=$%+.4f; no exchange fill.",
+            label, record.get("ticker", "?"), str(shadow.get("side") or "?").upper(),
+            shadow.get("exit_method", "?"), float(shadow.get("net_profit_loss") or 0.0),
+        )
+    return changed
+
+
 def ensure_model_transition_shadow(record: dict[str, Any], market: Any, config: dict[str, Any]) -> dict[str, Any] | None:
     """Paper-test both retained predecessor and new model on identical inputs.
 
@@ -2223,6 +2364,10 @@ async def settle_or_cancel(rest: KalshiREST, record: dict[str, Any], market: Any
     if result is not None and market_status == "finalized":
         finalize_inverse_shadow(record, result)
         finalize_ml_scalp_shadow(record, result)
+        finalize_ml_weighted_trailing_scalp_shadow(
+            record, result, record_key="ml_weighted_trailing_scalp_shadow", label="ML NORMAL")
+        finalize_ml_weighted_trailing_scalp_shadow(
+            record, result, record_key="inverse_ml_weighted_trailing_scalp_shadow", label="ML INVERSE")
         finalize_model_transition_shadow(record, result)
     if not record.get("candidate_side") and not orders_for_market(record):
         if result is None or market_status != "finalized":
@@ -2328,6 +2473,7 @@ async def consider_initial_entry(
     # capacity, or exchange recovery. It remains paper-only in all modes.
     ensure_inverse_shadow(record, market, config, ml_side)
     ensure_ml_scalp_shadow(record, market, config, ml_side)
+    ensure_ml_weighted_trailing_scalp_shadows(record, market, config, ml_side)
     ensure_model_transition_shadow(record, market, config)
     other_active = [candidate for candidate in active_strategy_records(state) if candidate is not record]
     if len(other_active) >= config["max_active_markets"]:
@@ -2783,6 +2929,25 @@ def ml_scalp_shadow_performance(state: dict[str, Any]) -> dict[str, Any]:
     return report
 
 
+def ml_weighted_trailing_scalp_performance(state: dict[str, Any], *, inverse: bool) -> dict[str, Any]:
+    """Summarize the frozen normal or inverse ML 1/2/3/4 trailing study."""
+    record_key = "inverse_ml_weighted_trailing_scalp_shadow" if inverse else "ml_weighted_trailing_scalp_shadow"
+    shadows = [
+        record[record_key]
+        for record in state.get("markets", {}).values()
+        if isinstance(record, dict) and isinstance(record.get(record_key), dict)
+    ]
+    report = scalp_performance(shadows)
+    report.update({
+        "strategy": "inverse_ml_weighted_1234_trailing_scalp_shadow_v1" if inverse
+        else "normal_ml_weighted_1234_trailing_scalp_shadow_v1",
+        "source": "opposite_frozen_ml_side" if inverse else "same_frozen_ml_side_as_primary_ladder",
+        "locked_side_policy": "side is fixed before open and never changes on later quotes",
+        "weighted_rungs": {"0.40": 1.0, "0.30": 2.0, "0.20": 3.0, "0.10": 4.0},
+    })
+    return report
+
+
 def paper_shadow_summary(shadows: list[dict[str, Any]]) -> dict[str, Any]:
     """Return comparable settled paper metrics for any one-model shadow set."""
     settled_signals = sorted(
@@ -2942,6 +3107,8 @@ def performance_report(state: dict[str, Any], config: dict[str, Any]) -> dict[st
         "ml_model_transition_shadow_performance": model_transition_shadow_performance(state),
         "inverse_ml_shadow_performance": inverse_shadow_performance(state),
         "ml_ladder_scalp_shadow_performance": ml_scalp_shadow_performance(state),
+        "ml_weighted_trailing_scalp_performance": ml_weighted_trailing_scalp_performance(state, inverse=False),
+        "inverse_ml_weighted_trailing_scalp_performance": ml_weighted_trailing_scalp_performance(state, inverse=True),
         "note": "Only finalized records with filled contracts count as trades. The pre-open ML side is an execution filter; this report is realized live-ledger data, not a profitability proof.",
     }
     if settled:
@@ -3102,6 +3269,44 @@ def log_performance_summary(report: dict[str, Any], context: str) -> None:
             "n/a" if profile["p75_maximum_gross_per_contract"] is None else f"${profile['p75_maximum_gross_per_contract']:+.4f}",
             "n/a" if profile["p90_maximum_gross_per_contract"] is None else f"${profile['p90_maximum_gross_per_contract']:+.4f}",
         )
+    for label, weighted in (
+        ("ML NORMAL WEIGHTED TRAILING", report["ml_weighted_trailing_scalp_performance"]),
+        ("ML INVERSE WEIGHTED TRAILING", report["inverse_ml_weighted_trailing_scalp_performance"]),
+    ):
+        weighted_excursion = weighted["excursion_observer"]
+        weighted_maximum = weighted_excursion["maximum_gross_per_contract"]
+        trailing = weighted["trailing_stop"]
+        LOG.info(
+            "%s PERFORMANCE | %s started=%d active=%d filled=%d trailing_exits=%d settlement_exits=%d "
+            "W/L=%d/%d net=$%+.4f roi=%s max_dd=$%.4f mfe_median=%s p75=%s p90=%s "
+            "| locked side; 1x40c/2x30c/3x20c/4x10c; full-depth paper only; fees/queue excluded.",
+            label, context, weighted["paper_markets_started"], weighted["active_paper_markets"],
+            weighted["filled_market_trades"], trailing["trailing_stop_exits"],
+            weighted["settlement_exits_without_take_profit"], weighted["winning_trades"], weighted["losing_trades"],
+            weighted["net_profit"], "n/a" if weighted["return_on_simulated_capital"] is None
+            else f"{100 * weighted['return_on_simulated_capital']:.2f}%", weighted["maximum_drawdown"],
+            "n/a" if weighted_maximum["median"] is None else f"${weighted_maximum['median']:+.4f}",
+            "n/a" if weighted_maximum["p75"] is None else f"${weighted_maximum['p75']:+.4f}",
+            "n/a" if weighted_maximum["p90"] is None else f"${weighted_maximum['p90']:+.4f}",
+        )
+        for target, opportunity in weighted_excursion["target_opportunities"].items():
+            rate = opportunity["hit_rate_given_depth_observation"]
+            LOG.info(
+                "%s TARGET | +%sc completed_states=%d depth_observed=%d hits=%d hit_rate=%s",
+                label, target, opportunity["completed_position_states"], opportunity["depth_observed_position_states"],
+                opportunity["hit_position_states"], "n/a" if rate is None else f"{100 * rate:.1f}%",
+            )
+        for average, profile in weighted["average_entry_profiles"].items():
+            LOG.info(
+                "%s AVG COST | avg=$%s contracts=%s states=%d completed=%d depth_observed=%d "
+                "mfe_median=%s mfe_p75=%s mfe_p90=%s",
+                label, average,
+                "n/a" if profile["median_filled_contracts"] is None else f"{profile['median_filled_contracts']:.2f}",
+                profile["observed_positions"], profile["completed_position_states"], profile["depth_observed_positions"],
+                "n/a" if profile["median_maximum_gross_per_contract"] is None else f"${profile['median_maximum_gross_per_contract']:+.4f}",
+                "n/a" if profile["p75_maximum_gross_per_contract"] is None else f"${profile['p75_maximum_gross_per_contract']:+.4f}",
+                "n/a" if profile["p90_maximum_gross_per_contract"] is None else f"${profile['p90_maximum_gross_per_contract']:+.4f}",
+            )
 
 
 def log_ml_deployment(
@@ -3245,6 +3450,29 @@ async def log_heartbeat(
                 "/".join(sorted(target_hits)) if target_hits else "none",
                 scalp.get("last_entry_quote_state", "awaiting_quote"),
                 scalp.get("last_exit_quote_state", "awaiting_quote"),
+            )
+        for weighted_key, weighted_label in (
+            ("ml_weighted_trailing_scalp_shadow", "ML NORMAL WEIGHTED"),
+            ("inverse_ml_weighted_trailing_scalp_shadow", "ML INVERSE WEIGHTED"),
+        ):
+            weighted = record.get(weighted_key)
+            if not isinstance(weighted, dict):
+                continue
+            position = scalp_entry_summary(weighted)
+            epochs = weighted.get("position_epochs") if isinstance(weighted.get("position_epochs"), list) else []
+            epoch = epochs[-1] if epochs and isinstance(epochs[-1], dict) else {}
+            maximum = epoch.get("max_executable_gross_per_contract")
+            stop_bid = epoch.get("trailing_stop_bid")
+            LOG.info(
+                "%s STATUS | %s locked_side=%s status=%s filled=%.2f avg_cost=%s highest_gross=%s trailing_stop_bid=%s "
+                "entry_quote_state=%s exit_quote_state=%s; no exchange order or close.",
+                weighted_label, record.get("ticker", "?"), str(weighted.get("side") or "?").upper(),
+                weighted.get("status", "?"), float(position["filled_contracts"] or 0.0),
+                "none" if position["average_entry_price"] is None else f"${float(position['average_entry_price']):.4f}",
+                "none" if maximum is None else f"${float(maximum):+.4f}",
+                "none" if stop_bid is None else f"${float(stop_bid):.4f}",
+                weighted.get("last_entry_quote_state", "awaiting_quote"),
+                weighted.get("last_exit_quote_state", "awaiting_quote"),
             )
         if record.get("status") == "watching":
             ml_signal = record.get("ml_inference") if isinstance(record.get("ml_inference"), dict) else {}
@@ -3444,6 +3672,10 @@ async def run(args: argparse.Namespace) -> int:
                 if isinstance(record, dict):
                     simulate_inverse_shadow(record, feed, config)
                     simulate_ml_scalp_shadow(record, feed, config)
+                    simulate_ml_weighted_trailing_scalp_shadow(
+                        record, feed, record_key="ml_weighted_trailing_scalp_shadow", label="ML NORMAL")
+                    simulate_ml_weighted_trailing_scalp_shadow(
+                        record, feed, record_key="inverse_ml_weighted_trailing_scalp_shadow", label="ML INVERSE")
                     simulate_model_transition_shadow(record, feed, config)
             monotonic_now = asyncio.get_running_loop().time()
             if monotonic_now - last_heartbeat_at >= config["status_log_seconds"]:

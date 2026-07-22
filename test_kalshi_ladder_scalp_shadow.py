@@ -5,6 +5,7 @@ from __future__ import annotations
 import unittest
 
 from kalshi_ladder_scalp_shadow import (
+    EXTENDED_PROFIT_TARGETS,
     finalize_ladder_average_entry_scalp,
     new_ladder_average_entry_scalp_shadow,
     scalp_performance,
@@ -101,6 +102,51 @@ class LadderScalpShadowTests(unittest.TestCase):
             excursion["target_opportunities"]["0.05"]["depth_observed_position_states"],
         ))
         self.assertEqual(0, excursion["target_opportunities"]["0.10"]["hit_position_states"])
+
+    def test_weighted_ladder_uses_full_depth_and_closes_on_ten_cent_trailing_stop(self) -> None:
+        shadow = new_ladder_average_entry_scalp_shadow(
+            strategy="weighted-trailing", ticker="KXBTC15M-TEST", side="yes", quantity_per_rung=1.0,
+            profit_target_per_contract=0.01, quote_max_age_seconds=3.0, market_close_time="later",
+            profit_targets_per_contract=EXTENDED_PROFIT_TARGETS,
+            rung_quantities={0.40: 1.0, 0.30: 2.0, 0.20: 3.0, 0.10: 4.0},
+            trailing_stop_per_contract=0.10,
+        )
+        # A 20c ask can fill the 40c/30c/20c weighted rungs: 6 contracts,
+        # $1.60 cost, and a 26.6667c average. The final 10c rung remains out.
+        events = simulate_ladder_average_entry_scalp(
+            shadow, entry_quote=quote(0.20, 6.0, "weighted-entry"), entry_quote_state="fresh",
+            exit_quote=quote(0.50, 6.0, "high"), exit_quote_state="fresh",
+        )
+        self.assertEqual("active", shadow["status"])
+        self.assertEqual((6.0, 1.6, 0.266667), (
+            shadow["entry_summary"]["filled_contracts"], shadow["entry_summary"]["entry_cost"],
+            shadow["entry_summary"]["average_entry_price"],
+        ))
+        self.assertIn("0.20", shadow["position_epochs"][0]["target_hits"])
+        self.assertFalse(any(event["kind"] == "paper_scalp_trailing_stop_exit" for event in events))
+
+        # A 10c retracement is not counted unless the whole 6-contract paper
+        # position is executable at that bid.
+        simulate_ladder_average_entry_scalp(
+            shadow, entry_quote=None, entry_quote_state="fresh",
+            exit_quote=quote(0.40, 5.99, "thin-stop"), exit_quote_state="insufficient_depth",
+        )
+        self.assertEqual("active", shadow["status"])
+        events = simulate_ladder_average_entry_scalp(
+            shadow, entry_quote=None, entry_quote_state="fresh",
+            exit_quote=quote(0.40, 6.0, "stop"), exit_quote_state="fresh",
+        )
+        self.assertEqual("scalp_exited", shadow["status"])
+        self.assertEqual("paper_scalp_trailing_stop_exit", events[-1]["kind"])
+        self.assertEqual((0.50, 0.40, 0.40), (
+            events[-1]["highest_executable_bid"], events[-1]["trailing_stop_bid"], events[-1]["exit_price"],
+        ))
+        report = scalp_performance([shadow])
+        self.assertEqual((1, 0, 1), (
+            report["trailing_stop_exits"], report["scalp_exits"], report["filled_market_trades"],
+        ))
+        self.assertEqual(0.8, report["net_profit"])
+        self.assertIn("0.2667", report["average_entry_profiles"])
 
 
 if __name__ == "__main__":
