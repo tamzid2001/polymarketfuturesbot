@@ -32,7 +32,10 @@ permissions:
 
 jobs:
   ml-weighted-paper:
-    name: ML normal + inverse weighted paper study
+    # The ML live path was retired.  Keep the job disabled so a queued paper
+    # handoff cannot invoke the old, model-coupled runner by accident.
+    name: Retired ML weighted paper study
+    if: ${{ false }}
     runs-on: ubuntu-latest
     environment: "Kalshi"
     timeout-minutes: 370

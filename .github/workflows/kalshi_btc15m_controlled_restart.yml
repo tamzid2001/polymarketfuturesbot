@@ -1,9 +1,9 @@
-name: Controlled Restart — Kalshi BTC 15m ML-Side Average Down
+name: Controlled Restart — Kalshi BTC 15m Settlement Contrarian
 
 # This workflow is intentionally manual.  It provides a safe live-code
-# handoff: stop one known older runner, cancel only resting orders that carry
-# this runner's deterministic client IDs, then queue the current ML-side
-# runner.  Filled contracts and manual orders are never modified.
+# handoff: stop one known older runner, retain its resting deterministic ladder
+# for exchange recovery, then queue the current settlement-only runner.
+# Filled contracts and manual orders are never modified.
 on:
   workflow_dispatch:
     inputs:
@@ -27,7 +27,7 @@ jobs:
     environment: "Kalshi"
     timeout-minutes: 12
     steps:
-      - name: Checkout current ML-side code
+      - name: Checkout current settlement-trader code
         uses: actions/checkout@v7
 
       - name: Stop the specified older runner
@@ -54,7 +54,7 @@ jobs:
       - name: Install controlled-handoff dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements_kalshi_average_down.txt
+          pip install -r requirements_kalshi_settlement_trader.txt
 
       - name: Write Kalshi RSA private key
         env:
@@ -63,21 +63,11 @@ jobs:
           printf '%s\n' "$KALSHI_PRIVATE_KEY" > kalshi_private_key.pem
           chmod 600 kalshi_private_key.pem
 
-      - name: Cancel only resting orders owned by this runner
-        env:
-          KALSHI_API_KEY_ID: ${{ secrets.KALSHI_PROD_API_KEY }}
-          KALSHI_PEM_PATH: kalshi_private_key.pem
-          KALSHI_DEMO: "false"
-          DRY_RUN: "false"
-        run: |
-          set -euo pipefail
-          python kalshi_btc15m_average_down.py --cancel-all-resting-mechanical-orders
-
-      - name: Start the current ML-side runner
+      - name: Start the current settlement-only runner
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           gh workflow run kalshi_btc15m_average_down.yml \
             --repo "$GITHUB_REPOSITORY" --ref main -f live_trading=true
-          echo "ML-SIDE RUNNER QUEUED | no overlapping Kalshi average-down run remains."
+          echo "SETTLEMENT RUNNER QUEUED | existing deterministic orders will be recovered; no overlap remains."

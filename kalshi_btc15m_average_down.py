@@ -1,10 +1,10 @@
-"""KXBTC15M mechanical average-down trader.
+"""KXBTC15M settlement-contrarian average-down trader.
 
-The default execution source is stored ML inference, but the explicit live
-``settlement_contrarian_weighted_hold_gate`` mode makes no ML call.  Exactly
-45 seconds after a new market opens, it uses the most recent KXBTC15M market
-that had already settled by that cutoff and locks the *opposite* outcome side.
-It then mechanically posts the weighted 40c -> 30c -> 20c -> 10c ladder.
+Exactly 45 seconds after a new market opens, the trader reads the most recent
+KXBTC15M outcome that was already final at that causal cutoff and locks the
+opposite side. It then posts one frozen weighted ladder: 40c -> 30c -> 20c ->
+10c. The only discretionary live exit is an absolute selected-side 5c stop;
+otherwise every filled contract is held through settlement.
 
 Live submission is deliberately opt-in: ``DRY_RUN`` must be false and both
 ``--submit`` and ``--allow-live`` are required.  The GitHub workflow persists
@@ -21,6 +21,7 @@ import json
 import logging
 import math
 import os
+import signal
 import subprocess
 import time
 import uuid
@@ -30,16 +31,6 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
-
-from kalshi_ladder_scalp_shadow import (
-    EXTENDED_PROFIT_TARGETS,
-    entry_summary as scalp_entry_summary,
-    finalize_ladder_average_entry_scalp,
-    new_ladder_average_entry_scalp_shadow,
-    scalp_performance,
-    simulate_ladder_average_entry_scalp,
-)
-from kalshi_ml_features import FEATURE_SCHEMA, ML_ONLY_FEATURE_COLUMNS
 
 try:  # Installed by the dedicated live-runner requirements file.
     import aiohttp
@@ -66,7 +57,7 @@ except ImportError:  # pragma: no cover - exercised only in minimal local enviro
 LOG = logging.getLogger("kalshi_btc15m_average_down")
 SERIES_TICKER = "KXBTC15M"
 LADDER_LEVELS = (0.40, 0.30, 0.20, 0.10)
-CONFIG_VERSION = 12
+CONFIG_VERSION = 13
 STATE_VERSION = 7
 ORDER_NAMESPACE = uuid.UUID("4d85857e-4dc6-43ec-960f-0b342523bdb7")
 KALSHI_WS_URL = os.getenv(
@@ -93,13 +84,12 @@ CHECKPOINT_IGNORED_KEYS = {
 
 DEFAULT_CONFIG = {
     "format_version": CONFIG_VERSION,
-    # Contracts per rung.  This is a quantity, not a dollar amount.
-    "initial_position_size": 0.01,
+    # Share multiplier for the 1/2/3/4 ladder.  The default therefore posts
+    # 3 at 40c, 6 at 30c, 9 at 20c, and 12 at 10c (30 total / $6 maximum).
+    "initial_position_size": 3.0,
     "max_active_markets": 1,
-    "max_contracts_per_market": 0.04,
-    # Principal reserved for all four possible rungs.  Fees are checked against
-    # available balance separately with fee_reserve.
-    "max_total_capital": 0.01,
+    "max_contracts_per_market": 30.0,
+    "max_total_capital": 6.0,
     "fee_reserve": 0.05,
     # Upper bound on sleep while waiting for the WebSocket; it is not a REST
     # quote-poll interval. Quote changes wake the runner immediately.
@@ -108,94 +98,25 @@ DEFAULT_CONFIG = {
     # order reconciliation if the stream is interrupted.
     "market_refresh_seconds": 15.0,
     "order_reconcile_seconds": 5.0,
-    # This is *not* an entry window.  It is only the short allowance for
-    # observing a brand-new market and starting its watcher. Once started,
-    # a frozen ML side immediately receives its four-rung GTC ladder.
     "watch_start_grace_seconds": 45.0,
-    # ML is computed before the next market opens from raw candles and settled
-    # outcomes only. A watcher never chooses a side from prices; it only acts
-    # after this frozen model side is ready.
-    "ml_preopen_lead_seconds": 120.0,
-    # Inclusive 50% confidence: every valid binary-model direction receives
-    # the fixed GTC ladder once its market is active.
-    "ml_min_confidence": 0.50,
-    # A paper-only counterfactual of the *opposite* frozen ML side. It never
-    # creates an exchange order. A simulated fill requires a fresh complete
-    # top-of-book quote and displayed executable depth at the posted rung.
-    "inverse_shadow_enabled": True,
-    # Paper-only size is intentionally independent of the 0.01-contract live
-    # ladder. It makes the counterfactual P&L readable without changing a
-    # single live order or risk limit.
-    "inverse_shadow_position_size": 1.0,
-    "inverse_shadow_quote_max_age_seconds": 3.0,
-    # An alternate paper-only range study for the frozen ML side. It mirrors
-    # the 40c/30c/20c/10c entries at one share each and records the full
-    # depth-supported favorable excursion at each held VWAP/size. It tracks
-    # 1c/2c/3c/5c/10c targets but never submits an exchange close.
-    "scalp_shadow_enabled": True,
-    "scalp_shadow_position_size": 1.0,
-    "scalp_shadow_profit_target": 0.01,
-    "scalp_shadow_quote_max_age_seconds": 3.0,
-    # A second, independent paper strategy with 1/2/3/4 contracts at
-    # 40c/30c/20c/10c. Historical trailing results are retained but this
-    # legacy study is disabled for new markets; the active comparison uses
-    # the 5c fixed-loss / 10c activated-trailing bracket below.
-    "weighted_scalp_shadow_enabled": True,
-    "weighted_scalp_trailing_enabled": False,
-    "weighted_scalp_trailing_stop_per_contract": 0.10,
-    "weighted_scalp_trailing_activation_gain_per_contract": 0.10,
-    # The active paper-only comparison holds identical weighted positions
-    # until each separate +1c through +9c, then +10c/+20c/.../+80c gain gate
-    # has been reached, then applies the same 10c trailing retracement. Every gate retains an
-    # absolute selected-side 5c stop, rather than an average-entry loss gap.
-    # It is never a live stop order.
-    "weighted_scalp_activation_comparison_enabled": True,
-    "weighted_scalp_trailing_activation_gains_per_contract": [
-        0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.09,
-        0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80,
-    ],
-    "weighted_scalp_absolute_stop_price": 0.05,
-    # Legacy one-gate bracket retained for archived/manual comparisons only.
-    "weighted_scalp_fixed_stop_loss_enabled": False,
-    "weighted_scalp_fixed_stop_loss_per_contract": 0.05,
-    # When a retrain publishes a new artifact, paper-test both the retained
-    # predecessor and the new model at the same readable size. Neither side
-    # can create or alter an exchange order.
-    "model_transition_shadow_enabled": True,
-    "model_transition_shadow_position_size": 1.0,
-    # Live execution is deliberately explicit and persisted separately from
-    # the paper-only weighted studies above.  The two weighted modes use a
-    # 1/2/3/4-contract ladder, an absolute 5c selected-side bid stop, then a
-    # 10c trailing exit only after a 60c gain over the *current* average
-    # filled entry.  ``settlement_contrarian_weighted_hold_gate`` freezes the
-    # opposite of the latest causally available settled KXBTC15M outcome at
-    # this market's open + 45 seconds; it never loads or queries the ML model.
-    "live_execution_strategy": "normal_ml_ladder",
-    "live_inverse_ml_hold_gate": 0.60,
-    "live_inverse_ml_absolute_stop_price": 0.05,
-    "live_inverse_ml_trailing_stop": 0.10,
-    "live_inverse_ml_quote_max_age_seconds": 3.0,
+    "live_execution_strategy": "settlement_contrarian_settlement_v2",
+    "live_absolute_stop_price": 0.05,
+    "live_quote_max_age_seconds": 3.0,
     "settlement_contrarian_decision_delay_seconds": 45.0,
     "settlement_contrarian_entry_grace_seconds": 90.0,
-    "status_log_seconds": 30.0,
+    "status_log_seconds": 60.0,
 }
 
 # Paper-only asymmetric averaging schedule requested for the extended scalp
 # study.  It deliberately has no relationship to the 0.01-contract live GTC
 # ladder or its capital limits.
 WEIGHTED_SCALP_RUNG_QUANTITIES = {0.40: 1.0, 0.30: 2.0, 0.20: 3.0, 0.10: 4.0}
-LIVE_EXECUTION_STRATEGIES = {
-    "normal_ml_ladder",
-    "inverse_ml_weighted_hold_gate",
-    "settlement_contrarian_weighted_hold_gate",
-}
-LIVE_WEIGHTED_HOLD_GATE_STRATEGIES = {
-    "inverse_ml_weighted_hold_gate",
-    "settlement_contrarian_weighted_hold_gate",
-}
-LIVE_WEIGHTED_HOLD_GATE_RECORD_STRATEGIES = {
-    "inverse_ml_weighted_hold_gate_live_v1",
+LIVE_EXECUTION_STRATEGY = "settlement_contrarian_settlement_v2"
+# Records created by the prior live settlement runner remain recoverable. Its
+# retired trail fields are ignored; they are never allowed to create a close.
+LIVE_SETTLEMENT_RECORD_STRATEGIES = {
     "settlement_contrarian_weighted_hold_gate_live_v1",
+    "settlement_contrarian_settlement_v2",
 }
 DEFAULT_WEIGHTED_TRAILING_NORMAL_LEDGER = Path("kalshi_btc15m_weighted_trailing_normal_ledger.json")
 DEFAULT_WEIGHTED_TRAILING_NORMAL_REPORT = Path("kalshi_btc15m_weighted_trailing_normal_report.json")
@@ -335,16 +256,8 @@ def market_can_start_watcher(market: Any, start_grace_seconds: float) -> bool:
 
 
 def entry_start_grace_seconds(config: dict[str, Any]) -> float:
-    """Return the latest allowed new-ladder time for the selected source.
-
-    Settlement-contrarian signals are intentionally not knowable until the
-    documented open+45s cutoff.  Its longer grace therefore permits the one
-    causal lookup and order submission, but still rejects a stale mid-market
-    entry.  ML and ordinary ladders retain the existing 45-second policy.
-    """
-    if live_settlement_contrarian_enabled(config):
-        return float(config["settlement_contrarian_entry_grace_seconds"])
-    return float(config["watch_start_grace_seconds"])
+    """Settlement signals need a short, causal post-open entry grace."""
+    return float(config["settlement_contrarian_entry_grace_seconds"])
 
 
 def market_result(market: Any) -> str | None:
@@ -424,30 +337,22 @@ def ladder_principal_for_rungs(rung_quantities: dict[float, float]) -> float:
     return round(sum(level * float(rung_quantities.get(level) or 0.0) for level in LADDER_LEVELS), 6)
 
 
-def live_weighted_inverse_enabled(config: dict[str, Any]) -> bool:
-    return str(config.get("live_execution_strategy") or "").strip() == "inverse_ml_weighted_hold_gate"
-
-
 def live_settlement_contrarian_enabled(config: dict[str, Any]) -> bool:
-    """Return whether the explicit non-ML weighted live source is selected."""
-    return str(config.get("live_execution_strategy") or "").strip() == "settlement_contrarian_weighted_hold_gate"
-
-
-def live_weighted_hold_gate_enabled(config: dict[str, Any]) -> bool:
-    return str(config.get("live_execution_strategy") or "").strip() in LIVE_WEIGHTED_HOLD_GATE_STRATEGIES
+    """The live runner has one fixed, model-free execution source."""
+    return str(config.get("live_execution_strategy") or "").strip() == LIVE_EXECUTION_STRATEGY
 
 
 def live_weighted_strategy_name(config: dict[str, Any]) -> str:
-    """Human-readable source label for durable live-order logs."""
-    return "SETTLEMENT CONTRARIAN" if live_settlement_contrarian_enabled(config) else "INVERSE ML"
+    return "SETTLEMENT CONTRARIAN"
 
 
 def live_rung_quantities(config: dict[str, Any]) -> dict[float, float]:
-    """Use the authorized weighted schedule only for the explicit live mode."""
-    if live_weighted_hold_gate_enabled(config):
-        return dict(WEIGHTED_SCALP_RUNG_QUANTITIES)
-    quantity = float(config["initial_position_size"])
-    return {level: quantity for level in LADDER_LEVELS}
+    """Return the persistent 1/2/3/4 ladder scaled by the chosen shares."""
+    shares = float(config["initial_position_size"])
+    return {
+        level: round(shares * WEIGHTED_SCALP_RUNG_QUANTITIES[level], 2)
+        for level in LADDER_LEVELS
+    }
 
 
 def load_json(path: Path, default: dict[str, Any]) -> dict[str, Any]:
@@ -505,14 +410,6 @@ class StateCheckpointPublisher:
     config_path: Path
     state_path: Path
     report_path: Path
-    weighted_normal_ledger_path: Path
-    weighted_normal_report_path: Path
-    weighted_inverse_ledger_path: Path
-    weighted_inverse_report_path: Path
-    weighted_fixed_normal_ledger_path: Path
-    weighted_fixed_normal_report_path: Path
-    weighted_fixed_inverse_ledger_path: Path
-    weighted_fixed_inverse_report_path: Path
     config: dict[str, Any]
     last_fingerprint: str
     enabled: bool
@@ -591,10 +488,6 @@ class StateCheckpointPublisher:
     @classmethod
     def create(
         cls, config_path: Path, state_path: Path, report_path: Path,
-        weighted_normal_ledger_path: Path, weighted_normal_report_path: Path,
-        weighted_inverse_ledger_path: Path, weighted_inverse_report_path: Path,
-        weighted_fixed_normal_ledger_path: Path, weighted_fixed_normal_report_path: Path,
-        weighted_fixed_inverse_ledger_path: Path, weighted_fixed_inverse_report_path: Path,
         config: dict[str, Any], state: dict[str, Any],
     ) -> "StateCheckpointPublisher":
         enabled = (
@@ -609,14 +502,6 @@ class StateCheckpointPublisher:
             config_path=config_path,
             state_path=state_path,
             report_path=report_path,
-            weighted_normal_ledger_path=weighted_normal_ledger_path,
-            weighted_normal_report_path=weighted_normal_report_path,
-            weighted_inverse_ledger_path=weighted_inverse_ledger_path,
-            weighted_inverse_report_path=weighted_inverse_report_path,
-            weighted_fixed_normal_ledger_path=weighted_fixed_normal_ledger_path,
-            weighted_fixed_normal_report_path=weighted_fixed_normal_report_path,
-            weighted_fixed_inverse_ledger_path=weighted_fixed_inverse_ledger_path,
-            weighted_fixed_inverse_report_path=weighted_fixed_inverse_report_path,
             config=config,
             last_fingerprint=checkpoint_fingerprint(state, config),
             enabled=enabled,
@@ -637,30 +522,12 @@ class StateCheckpointPublisher:
         try:
             save_json(self.state_path, state)
             save_json(self.report_path, performance_report(state, self.config))
-            save_ml_weighted_trailing_outputs(
-                state, self.config,
-                normal_ledger_path=self.weighted_normal_ledger_path,
-                normal_report_path=self.weighted_normal_report_path,
-                inverse_ledger_path=self.weighted_inverse_ledger_path,
-                inverse_report_path=self.weighted_inverse_report_path,
-            )
-            save_ml_weighted_fixed_stop_outputs(
-                state, self.config,
-                normal_ledger_path=self.weighted_fixed_normal_ledger_path,
-                normal_report_path=self.weighted_fixed_normal_report_path,
-                inverse_ledger_path=self.weighted_fixed_inverse_ledger_path,
-                inverse_report_path=self.weighted_fixed_inverse_report_path,
-            )
             repository = subprocess.run(
                 ["git", "rev-parse", "--show-toplevel"], check=True, capture_output=True, text=True,
             ).stdout.strip()
             root = Path(repository).resolve()
             paths = [str(path.resolve().relative_to(root)) for path in (
                 self.config_path, self.state_path, self.report_path,
-                self.weighted_normal_ledger_path, self.weighted_normal_report_path,
-                self.weighted_inverse_ledger_path, self.weighted_inverse_report_path,
-                self.weighted_fixed_normal_ledger_path, self.weighted_fixed_normal_report_path,
-                self.weighted_fixed_inverse_ledger_path, self.weighted_fixed_inverse_report_path,
             )]
             subprocess.run(["git", "add", *paths], check=True, capture_output=True, text=True)
             diff = subprocess.run(
@@ -692,83 +559,41 @@ class StateCheckpointPublisher:
 
 
 def validate_config(config: dict[str, Any]) -> dict[str, Any]:
-    merged = {**DEFAULT_CONFIG, **config, "format_version": CONFIG_VERSION}
-    # Earlier versions used a short price-entry window. The persisted watcher
-    # now exists only to attach the frozen ML direction and post the full GTC
-    # ladder, so remove the retired setting when an old config is handed on.
-    merged.pop("initial_entry_window_seconds", None)
+    # A version-12 config contained model, paper-study, and hold-gate keys.
+    # Do not carry those settings forward into a real settlement-only runner.
+    legacy = dict(config)
+    prior_version = int(as_float(legacy.get("format_version")) or 0)
+    merged = {**DEFAULT_CONFIG, **{key: value for key, value in legacy.items() if key in DEFAULT_CONFIG}}
+    merged["format_version"] = CONFIG_VERSION
+    if prior_version < CONFIG_VERSION and as_float(legacy.get("initial_position_size")) == 0.01:
+        merged["initial_position_size"] = DEFAULT_CONFIG["initial_position_size"]
+    # A deployment may not select its source dynamically. This prevents an
+    # inherited Action input from restoring a retired model/gate strategy.
+    merged["live_execution_strategy"] = LIVE_EXECUTION_STRATEGY
     for name in (
         "initial_position_size", "max_contracts_per_market", "max_total_capital",
         "fee_reserve", "poll_seconds", "market_refresh_seconds", "order_reconcile_seconds",
-        "watch_start_grace_seconds", "ml_preopen_lead_seconds", "ml_min_confidence",
-        "inverse_shadow_position_size", "inverse_shadow_quote_max_age_seconds",
-        "scalp_shadow_position_size", "scalp_shadow_profit_target", "scalp_shadow_quote_max_age_seconds",
-        "weighted_scalp_trailing_stop_per_contract", "weighted_scalp_trailing_activation_gain_per_contract",
-        "weighted_scalp_fixed_stop_loss_per_contract", "weighted_scalp_absolute_stop_price",
-        "model_transition_shadow_position_size", "status_log_seconds",
-        "live_inverse_ml_hold_gate", "live_inverse_ml_absolute_stop_price",
-        "live_inverse_ml_trailing_stop", "live_inverse_ml_quote_max_age_seconds",
+        "watch_start_grace_seconds", "live_absolute_stop_price", "live_quote_max_age_seconds",
         "settlement_contrarian_decision_delay_seconds", "settlement_contrarian_entry_grace_seconds",
+        "status_log_seconds",
     ):
         value = as_float(merged.get(name))
         if value is None or value <= 0:
             raise ValueError(f"{name} must be positive")
         merged[name] = value
-    if merged["ml_min_confidence"] < 0.5 or merged["ml_min_confidence"] > 1.0:
-        raise ValueError("ml_min_confidence must be between 0.5 and 1.0")
-    execution_strategy = str(merged.get("live_execution_strategy") or "").strip()
-    if execution_strategy not in LIVE_EXECUTION_STRATEGIES:
-        raise ValueError(f"live_execution_strategy must be one of {sorted(LIVE_EXECUTION_STRATEGIES)}")
-    merged["live_execution_strategy"] = execution_strategy
-    shadow_enabled = merged.get("inverse_shadow_enabled", True)
-    if isinstance(shadow_enabled, str):
-        shadow_enabled = shadow_enabled.strip().lower() in {"1", "true", "yes", "on"}
-    merged["inverse_shadow_enabled"] = bool(shadow_enabled)
-    scalp_shadow_enabled = merged.get("scalp_shadow_enabled", True)
-    if isinstance(scalp_shadow_enabled, str):
-        scalp_shadow_enabled = scalp_shadow_enabled.strip().lower() in {"1", "true", "yes", "on"}
-    merged["scalp_shadow_enabled"] = bool(scalp_shadow_enabled)
-    weighted_scalp_enabled = merged.get("weighted_scalp_shadow_enabled", True)
-    if isinstance(weighted_scalp_enabled, str):
-        weighted_scalp_enabled = weighted_scalp_enabled.strip().lower() in {"1", "true", "yes", "on"}
-    merged["weighted_scalp_shadow_enabled"] = bool(weighted_scalp_enabled)
-    trailing_enabled = merged.get("weighted_scalp_trailing_enabled", False)
-    if isinstance(trailing_enabled, str):
-        trailing_enabled = trailing_enabled.strip().lower() in {"1", "true", "yes", "on"}
-    merged["weighted_scalp_trailing_enabled"] = bool(trailing_enabled)
-    fixed_stop_enabled = merged.get("weighted_scalp_fixed_stop_loss_enabled", True)
-    if isinstance(fixed_stop_enabled, str):
-        fixed_stop_enabled = fixed_stop_enabled.strip().lower() in {"1", "true", "yes", "on"}
-    merged["weighted_scalp_fixed_stop_loss_enabled"] = bool(fixed_stop_enabled)
-    activation_comparison_enabled = merged.get("weighted_scalp_activation_comparison_enabled", True)
-    if isinstance(activation_comparison_enabled, str):
-        activation_comparison_enabled = activation_comparison_enabled.strip().lower() in {"1", "true", "yes", "on"}
-    merged["weighted_scalp_activation_comparison_enabled"] = bool(activation_comparison_enabled)
-    raw_gains = merged.get("weighted_scalp_trailing_activation_gains_per_contract", [])
-    if isinstance(raw_gains, str):
-        raw_gains = [part.strip() for part in raw_gains.split(",") if part.strip()]
-    if not isinstance(raw_gains, (list, tuple)):
-        raise ValueError("weighted_scalp_trailing_activation_gains_per_contract must be a list")
-    try:
-        gains = sorted({round(float(gain), 6) for gain in raw_gains})
-    except (TypeError, ValueError) as exc:
-        raise ValueError("weighted_scalp_trailing_activation_gains_per_contract must contain numbers") from exc
-    if not gains or any(gain <= 0.0 or gain >= 1.0 for gain in gains):
-        raise ValueError("weighted_scalp_trailing_activation_gains_per_contract must be between zero and one")
-    merged["weighted_scalp_trailing_activation_gains_per_contract"] = gains
-    transition_shadow_enabled = merged.get("model_transition_shadow_enabled", True)
-    if isinstance(transition_shadow_enabled, str):
-        transition_shadow_enabled = transition_shadow_enabled.strip().lower() in {"1", "true", "yes", "on"}
-    merged["model_transition_shadow_enabled"] = bool(transition_shadow_enabled)
     active = int(merged.get("max_active_markets", 0))
     if active < 1:
         raise ValueError("max_active_markets must be at least one")
     merged["max_active_markets"] = active
-    quantity = merged["initial_position_size"]
-    if round(quantity * len(LADDER_LEVELS), 2) > merged["max_contracts_per_market"] + 1e-9:
-        raise ValueError("initial_position_size * four ladder levels exceeds max_contracts_per_market")
-    if ladder_principal(quantity) > merged["max_total_capital"] + 1e-9:
-        raise ValueError("max_total_capital cannot fund the complete four-level ladder")
+    rungs = live_rung_quantities(merged)
+    required_contracts = round(sum(rungs.values()), 2)
+    required_principal = ladder_principal_for_rungs(rungs)
+    if required_contracts > merged["max_contracts_per_market"] + 1e-9:
+        raise ValueError(
+            f"max_contracts_per_market must fund the {required_contracts:.2f}-contract 1/2/3/4 ladder"
+        )
+    if required_principal > merged["max_total_capital"] + 1e-9:
+        raise ValueError(f"max_total_capital must fund the ${required_principal:.2f} complete ladder")
     return merged
 
 
@@ -776,8 +601,7 @@ def apply_config_overrides(config: dict[str, Any], args: argparse.Namespace) -> 
     names = (
         "initial_position_size", "max_active_markets", "max_contracts_per_market",
         "max_total_capital", "fee_reserve", "poll_seconds", "market_refresh_seconds",
-        "order_reconcile_seconds", "watch_start_grace_seconds", "ml_preopen_lead_seconds",
-        "ml_min_confidence", "status_log_seconds", "live_inverse_ml_hold_gate",
+        "order_reconcile_seconds", "watch_start_grace_seconds", "status_log_seconds",
     )
     changed = False
     updated = dict(config)
@@ -786,28 +610,18 @@ def apply_config_overrides(config: dict[str, Any], args: argparse.Namespace) -> 
         if value is not None:
             updated[name] = value
             changed = True
-    # The share input is the primary sizing control.  When it is changed by
-    # itself, carry the complete four-rung contract cap and principal reserve
-    # with it: 10 contracts per rung becomes a 40-contract/$10 ladder, not an
-    # invalid 10-contract request against the old one-contract defaults.
+    # The share multiplier is persistent.  Change it alone and both capacity
+    # limits follow the real 1/2/3/4 structure, not four equal rungs.
     rung_override = as_float(getattr(args, "initial_position_size", None))
     if rung_override is not None and rung_override > 0:
+        scaled_rungs = {
+            level: rung_override * WEIGHTED_SCALP_RUNG_QUANTITIES[level]
+            for level in LADDER_LEVELS
+        }
         if getattr(args, "max_contracts_per_market", None) is None:
-            updated["max_contracts_per_market"] = round(rung_override * len(LADDER_LEVELS), 2)
+            updated["max_contracts_per_market"] = round(sum(scaled_rungs.values()), 2)
         if getattr(args, "max_total_capital", None) is None:
-            updated["max_total_capital"] = ladder_principal(rung_override)
-    strategy_override = getattr(args, "live_execution_strategy", None)
-    if strategy_override is not None:
-        updated["live_execution_strategy"] = strategy_override
-        changed = True
-        if strategy_override in LIVE_WEIGHTED_HOLD_GATE_STRATEGIES:
-            # These modes have no fractional 0.01 ladder: they reserve the
-            # full 1/2/3/4 schedule, i.e. 10 contracts and $2.00 maximum
-            # principal.
-            if getattr(args, "max_contracts_per_market", None) is None:
-                updated["max_contracts_per_market"] = round(sum(WEIGHTED_SCALP_RUNG_QUANTITIES.values()), 2)
-            if getattr(args, "max_total_capital", None) is None:
-                updated["max_total_capital"] = ladder_principal_for_rungs(WEIGHTED_SCALP_RUNG_QUANTITIES)
+            updated["max_total_capital"] = ladder_principal_for_rungs(scaled_rungs)
     return validate_config(updated), changed
 
 
@@ -1949,7 +1763,7 @@ def market_record(state: dict[str, Any], ticker: str) -> dict[str, Any]:
         markets[ticker] = {
             "ticker": ticker,
             "created_at": now_iso(),
-            "strategy": "ml_side_preposted_gtc_ladder_v2",
+            "strategy": LIVE_EXECUTION_STRATEGY,
             "orders": {},
             "locked_side": None,
             "status": "watching",
@@ -1982,16 +1796,10 @@ def start_market_watcher(state: dict[str, Any], market: Any, config: dict[str, A
         "market_close_time": field(market, "close_time", "expected_expiration_time"),
         "watch_started_at": now_iso(),
     })
-    if live_settlement_contrarian_enabled(config):
-        LOG.info(
-            "WATCH STARTED | %s awaiting the open+%.0fs causally settled outcome; it will lock the opposite side and then post the 1x/2x/3x/4x GTC ladder.",
-            ticker, float(config["settlement_contrarian_decision_delay_seconds"]),
-        )
-    else:
-        LOG.info(
-            "WATCH STARTED | %s awaiting its frozen ML side; once ready, it will immediately post that side's 40c/30c/20c/10c GTC ladder.",
-            ticker,
-        )
+    LOG.info(
+        "WATCH STARTED | %s awaiting the open+%.0fs causally settled outcome; it will lock the opposite side and post the persistent 1/2/3/4 GTC ladder.",
+        ticker, float(config["settlement_contrarian_decision_delay_seconds"]),
+    )
     return record
 
 
@@ -2086,7 +1894,7 @@ async def settlement_contrarian_side_for_market(
     }
     record["settlement_contrarian_status"] = "frozen"
     LOG.warning(
-        "SETTLEMENT CONTRARIAN SIDE READY | %s source=%s settled=%s result=%s selected=%s cutoff=%s; no ML inference used.",
+        "SETTLEMENT CONTRARIAN SIDE READY | %s source=%s settled=%s result=%s selected=%s cutoff=%s.",
         ticker, str(field(source, "ticker") or "?"),
         str(field(source, "settlement_ts") or source_epoch), source_side.upper(), side.upper(),
         datetime.fromtimestamp(cutoff_epoch, tz=timezone.utc).isoformat(),
@@ -2902,13 +2710,10 @@ async def recover_exchange_state(rest: KalshiREST, state: dict[str, Any], config
         quantity_by_level = {float(item["ladder_level"]): float(item["quantity"]) for item in typed_orders}
         quantities = set(quantity_by_level.values())
         expected_weighted = live_rung_quantities(config)
-        weighted_ladder = (
-            live_weighted_hold_gate_enabled(config)
-            and all(
-                level in expected_weighted
-                and abs(quantity - expected_weighted[level]) <= 0.004
-                for level, quantity in quantity_by_level.items()
-            )
+        weighted_ladder = all(
+            level in expected_weighted
+            and abs(quantity - expected_weighted[level]) <= 0.004
+            for level, quantity in quantity_by_level.items()
         )
         uniform_ladder = len(quantities) == 1
         if (not (uniform_ladder or weighted_ladder)) or existing_side not in {None, side}:
@@ -2942,25 +2747,18 @@ async def recover_exchange_state(rest: KalshiREST, state: dict[str, Any], config
         if weighted_ladder:
             prior_strategy = str(record.get("strategy") or "")
             recovered_strategy = (
-                prior_strategy if prior_strategy in LIVE_WEIGHTED_HOLD_GATE_RECORD_STRATEGIES
-                else (
-                    "settlement_contrarian_weighted_hold_gate_live_v1"
-                    if live_settlement_contrarian_enabled(config)
-                    else "inverse_ml_weighted_hold_gate_live_v1"
-                )
+                prior_strategy if prior_strategy in LIVE_SETTLEMENT_RECORD_STRATEGIES
+                else LIVE_EXECUTION_STRATEGY
             )
             record.update({
                 "strategy": recovered_strategy,
                 "rung_quantities": {f"{level:.2f}": quantity for level, quantity in expected_weighted.items()},
             })
-            if recovered_strategy == "inverse_ml_weighted_hold_gate_live_v1":
-                record["source_ml_side"] = record.get("source_ml_side") or opposite_side(side)
-            else:
-                record.setdefault("settlement_contrarian_signal", {
-                    "source": "recovered_weighted_ladder_source_unknown",
-                    "side": side,
-                    "recovered_at": now_iso(),
-                })
+            record.setdefault("settlement_contrarian_signal", {
+                "source": "recovered_weighted_ladder_source_unknown",
+                "side": side,
+                "recovered_at": now_iso(),
+            })
         for item in typed_orders:
             record.setdefault("orders", {})[f"{float(item['ladder_level']):.4f}"] = item
         if not await exchange_position_guard(rest, record, config):
@@ -3026,7 +2824,7 @@ async def reconcile_orders(rest: KalshiREST, record: dict[str, Any], dry_run: bo
             )
             prior_fill = float(before[0] or 0.0)
             current_fill = float(order.get("fill_count") or 0.0)
-            if (record.get("strategy") in LIVE_WEIGHTED_HOLD_GATE_RECORD_STRATEGIES
+            if (record.get("strategy") in LIVE_SETTLEMENT_RECORD_STRATEGIES
                     and current_fill > prior_fill + 0.004):
                 total_filled = filled_contracts(record)
                 total_cost = live_entry_cost(record)
@@ -3058,7 +2856,7 @@ async def reconcile_orders(rest: KalshiREST, record: dict[str, Any], dry_run: bo
                 )
                 prior_fill = float(before[0] or 0.0)
                 current_fill = float(exit_order.get("fill_count") or 0.0)
-                if (record.get("strategy") in LIVE_WEIGHTED_HOLD_GATE_RECORD_STRATEGIES
+                if (record.get("strategy") in LIVE_SETTLEMENT_RECORD_STRATEGIES
                         and current_fill > prior_fill + 0.004):
                     entry_total = filled_contracts(record)
                     exit_total = live_exit_filled_contracts(record)
@@ -3174,8 +2972,7 @@ def live_exit_fees(record: dict[str, Any]) -> float:
 
 
 def live_record_source_label(record: dict[str, Any]) -> str:
-    strategy = str(record.get("strategy") or "")
-    return "SETTLEMENT CONTRARIAN" if strategy == "settlement_contrarian_weighted_hold_gate_live_v1" else "INVERSE ML"
+    return "SETTLEMENT CONTRARIAN"
 
 
 def mark_live_exit_if_flat(record: dict[str, Any]) -> bool:
@@ -3221,38 +3018,51 @@ def mark_live_exit_if_flat(record: dict[str, Any]) -> bool:
     return True
 
 
-async def monitor_live_inverse_ml_weighted_hold_gate(
+async def monitor_live_absolute_stop(
     rest: KalshiREST, record: dict[str, Any], feed: KalshiLiveFeed | None,
     config: dict[str, Any], dry_run: bool,
 ) -> bool:
-    """Manage an explicit weighted live hold-gate entry after fills.
+    """Close a live position only at the absolute selected-side 5c stop.
 
-    All trigger decisions are made from a current complete WebSocket top of
-    book with enough displayed depth to close the *whole remaining position*.
-    The hard stop is an absolute selected-side 5c bid.  The trailing exit
-    starts only after bid >= current average entry + 60c; it remains armed
-    after later lower-rung fills, but its high is rebased to a quote that has
-    depth for the enlarged position.
+    No profit gate, trailing high, or trailing retracement is evaluated here.
+    Every other filled position remains open until Kalshi finalizes it.
     """
-    if not live_weighted_hold_gate_enabled(config):
-        return False
-    if record.get("strategy") not in LIVE_WEIGHTED_HOLD_GATE_RECORD_STRATEGIES:
+    if record.get("strategy") not in LIVE_SETTLEMENT_RECORD_STRATEGIES:
         return False
     if record.get("status") not in {"ladder_active", "live_exit_pending"}:
         return False
     side = str(record.get("locked_side") or record.get("candidate_side") or "").lower()
     ticker = str(record.get("ticker") or "")
-    strategy_label = live_record_source_label(record)
+    strategy_label = "SETTLEMENT CONTRARIAN"
     if feed is None or side not in {"yes", "no"} or not ticker:
         return False
     entries = filled_contracts(record)
     exits = live_exit_filled_contracts(record)
     remaining = round(max(0.0, entries - exits), 2)
     protection = record.setdefault("live_exit_protection", {})
+    # A handoff can recover a position while the retired gate/trail was marked
+    # pending. If no reduce-only exit has actually filled, explicitly retire
+    # that intent and continue to settlement under the new policy.
+    retired_trigger = str(protection.get("trigger") or "")
+    if (
+        record.get("status") == "live_exit_pending"
+        and retired_trigger
+        and retired_trigger != "absolute_5c_stop"
+        and exits <= 0.004
+    ):
+        record["status"] = "ladder_active"
+        protection.update({
+            "retired_exit_trigger": retired_trigger,
+            "retired_exit_at": now_iso(),
+            "retired_exit_reason": "profit gate and trailing exits removed; hold to settlement",
+        })
+        for key in ("trigger", "triggered_at", "trigger_bid", "exit_latched", "exit_latched_at", "armed", "trailing_high_bid"):
+            protection.pop(key, None)
+        LOG.warning("LIVE POLICY MIGRATION | %s retired pending %s exit; holding filled position to settlement.", ticker, retired_trigger)
     if remaining <= 0.004:
         return mark_live_exit_if_flat(record)
     quote, quote_state = feed.executable_shadow_exit_quote(
-        ticker, side, remaining, float(config["live_inverse_ml_quote_max_age_seconds"]),
+        ticker, side, remaining, float(config["live_quote_max_age_seconds"]),
     )
     protection["last_quote_state"] = quote_state
     protection["last_checked_at"] = now_iso()
@@ -3266,43 +3076,16 @@ async def monitor_live_inverse_ml_weighted_hold_gate(
     if average_entry is None:
         return False
     protection["average_filled_entry"] = round(average_entry, 6)
-    prior_quantity = float(protection.get("high_depth_contracts") or 0.0)
-    # A high that was only executable for a smaller position must not be used
-    # as the trailing reference after a new rung increases exposure.
-    if remaining > prior_quantity + 0.004:
-        protection["trailing_high_bid"] = None
-        protection["high_depth_contracts"] = remaining
-        protection["rebaselined_at"] = now_iso()
-    gate = float(config["live_inverse_ml_hold_gate"])
-    trail = float(config["live_inverse_ml_trailing_stop"])
-    hard_stop = float(config["live_inverse_ml_absolute_stop_price"])
-    armed = bool(protection.get("armed"))
-    if not armed and bid + 1e-9 >= average_entry + gate:
-        protection.update({
-            "armed": True, "armed_at": now_iso(), "armed_average_entry": round(average_entry, 6),
-            "trailing_high_bid": bid, "high_depth_contracts": remaining,
-        })
-        armed = True
-        LOG.warning(
-            "LIVE %s TRAIL ARMED | %s %s avg=$%.4f gate=+$%.2f bid=$%.4f stop=$%.4f qty=%.2f",
-            strategy_label, ticker, side.upper(), average_entry, gate, bid, bid - trail, remaining,
-        )
-    high = as_float(protection.get("trailing_high_bid"))
-    if armed and (high is None or bid > high + 1e-9):
-        protection["trailing_high_bid"] = bid
-        protection["high_depth_contracts"] = remaining
-        high = bid
+    hard_stop = float(config["live_absolute_stop_price"])
     latched_trigger = str(protection.get("trigger") or "")
     exit_latched = bool(protection.get("exit_latched")) or (
         record.get("status") == "live_exit_pending"
-        and latched_trigger in {"absolute_5c_stop", "60c_gate_10c_trail"}
+        and latched_trigger == "absolute_5c_stop"
     )
     trigger: str | None = latched_trigger if exit_latched else None
     if not exit_latched:
         if bid <= hard_stop + 1e-9:
             trigger = "absolute_5c_stop"
-        elif armed and high is not None and bid <= high - trail + 1e-9:
-            trigger = "60c_gate_10c_trail"
         if trigger is None:
             return False
         protection.update({
@@ -3317,11 +3100,10 @@ async def monitor_live_inverse_ml_weighted_hold_gate(
         })
         record["status"] = "live_exit_pending"
         LOG.critical(
-            "LIVE %s EXIT TRIGGER | %s %s reason=%s bid=$%.4f avg=$%.4f high=%s remaining=%.2f; canceling entries before reduce-only IOC.",
-            strategy_label, ticker, side.upper(), trigger, bid, average_entry,
-            "none" if high is None else f"${high:.4f}", remaining,
+            "LIVE 5C STOP TRIGGER | %s side=%s bid=$%.4f avg=$%.4f remaining=%.2f; canceling entries before reduce-only IOC.",
+            ticker, side.upper(), bid, average_entry, remaining,
         )
-    if trigger not in {"absolute_5c_stop", "60c_gate_10c_trail"}:
+    if trigger != "absolute_5c_stop":
         protection["exit_blocked"] = "invalid latched exit trigger"
         LOG.critical("LIVE EXIT BLOCKED | %s %s", ticker, protection["exit_blocked"])
         return False
@@ -3362,18 +3144,13 @@ async def monitor_live_inverse_ml_weighted_hold_gate(
     if remaining <= 0.004:
         return mark_live_exit_if_flat(record)
     confirm_quote, confirm_state = feed.executable_shadow_exit_quote(
-        ticker, side, remaining, float(config["live_inverse_ml_quote_max_age_seconds"]),
+        ticker, side, remaining, float(config["live_quote_max_age_seconds"]),
     )
     protection["last_quote_state"] = confirm_state
     if confirm_quote is None:
         return False
     bid = float(confirm_quote["economic_price"])
     protection["last_executable_bid"] = bid
-    high = as_float(protection.get("trailing_high_bid"))
-    if high is None or bid > high + 1e-9:
-        protection["trailing_high_bid"] = bid
-        protection["high_depth_contracts"] = remaining
-        high = bid
     # ``exit_latched`` intentionally survives this fresh quote even if it is
     # better than the original stop.  The stop was already triggered from a
     # depth-supported quote, so the fresh bid is now the safer executable
@@ -3417,20 +3194,6 @@ async def settle_or_cancel(rest: KalshiREST, record: dict[str, Any], market: Any
     record["closed_at"] = now_iso()
     result = market_result(market)
     market_status = str(field(market, "status") or "").lower()
-    if result is not None and market_status == "finalized":
-        finalize_inverse_shadow(record, result)
-        finalize_ml_scalp_shadow(record, result)
-        finalize_ml_weighted_trailing_scalp_shadow(
-            record, result, record_key="ml_weighted_trailing_scalp_shadow", label="ML NORMAL")
-        finalize_ml_weighted_trailing_scalp_shadow(
-            record, result, record_key="inverse_ml_weighted_trailing_scalp_shadow", label="ML INVERSE")
-        finalize_ml_weighted_trailing_scalp_shadow(
-            record, result, record_key="ml_weighted_fixed_stop_loss_shadow", label="ML NORMAL BRACKET")
-        finalize_ml_weighted_trailing_scalp_shadow(
-            record, result, record_key="inverse_ml_weighted_fixed_stop_loss_shadow", label="ML INVERSE BRACKET")
-        finalize_ml_weighted_activation_comparison(record, result, inverse=False)
-        finalize_ml_weighted_activation_comparison(record, result, inverse=True)
-        finalize_model_transition_shadow(record, result)
     if not record.get("candidate_side") and not orders_for_market(record):
         if result is None or market_status != "finalized":
             if prior_status != "closed_waiting_finalization":
@@ -3442,7 +3205,7 @@ async def settle_or_cancel(rest: KalshiREST, record: dict[str, Any], market: Any
             "gross_payout": 0.0, "gross_profit_loss": 0.0, "kalshi_fees": 0.0,
             "net_profit_loss": 0.0, "return_percentage": None,
         })
-        LOG.info("WATCH COMPLETE | %s settled %s with no valid frozen ML side; no GTC ladder submitted.",
+        LOG.info("WATCH COMPLETE | %s settled %s with no valid causal settlement signal; no GTC ladder submitted.",
                  record["ticker"], result.upper())
         return
     for order in orders_for_market(record):
@@ -3574,13 +3337,10 @@ async def consider_initial_entry(
     other_active = [candidate for candidate in active_strategy_records(state) if candidate is not record]
     if len(other_active) >= config["max_active_markets"]:
         return False
-    # Quotes remain useful for heartbeat/audit output, but they do not gate
-    # this mode.  Once the frozen ML side is available, every fixed rung is a
-    # market-close-expiring GTC limit on that side.
+    # Quotes are not a directional filter. The causal settlement side alone
+    # selects the complete market-close-expiring GTC ladder.
     _ = live_asks
-    inverse_weighted_live = live_weighted_inverse_enabled(config)
-    contrarian_weighted_live = live_settlement_contrarian_enabled(config)
-    side = opposite_side(ml_side) if inverse_weighted_live else ml_side
+    side = ml_side
     if side not in {"yes", "no"}:
         return False
     rung_quantities = live_rung_quantities(config)
@@ -3612,16 +3372,10 @@ async def consider_initial_entry(
         "ladder_mode": "preposted_gtc_v2",
         "reserved_principal": reserve,
         "rung_quantities": {f"{level:.4f}": rung_quantities[level] for level in LADDER_LEVELS},
-        "strategy": (
-            "inverse_ml_weighted_hold_gate_live_v1" if inverse_weighted_live
-            else ("settlement_contrarian_weighted_hold_gate_live_v1" if contrarian_weighted_live else "ml_side_preposted_gtc_ladder_v2")
-        ),
+        "strategy": LIVE_EXECUTION_STRATEGY,
         "market_close_time": field(market, "close_time", "expected_expiration_time"),
     })
-    if signal_source == "ml":
-        record["source_ml_side"] = ml_side
-    else:
-        record.pop("source_ml_side", None)
+    record.pop("source_ml_side", None)
     if not await exchange_position_guard(rest, record, config):
         record["status"] = "initial_blocked_exchange_position"
         LOG.critical("GTC LADDER BLOCKED | %s no order submitted because the live exchange position is unsafe.", ticker)
@@ -3631,25 +3385,14 @@ async def consider_initial_entry(
         record["status"] = "initial_blocked_no_expiry"
         LOG.critical("GTC LADDER BLOCKED | %s has no market-close expiry; no GTC orders submitted.", ticker)
         return False
-    if inverse_weighted_live:
-        LOG.warning(
-            "LIVE INVERSE ML SIDE LOCKED | %s source_ml=%s selected=%s; posting 1x$0.40/2x$0.30/3x$0.20/4x$0.10 "
-            "GTC ladder through close_epoch=%d; absolute bid stop=$0.05, trail arms at current average+$0.60 then retraces $0.10.",
-            ticker, ml_side.upper(), side.upper(), expiry,
-        )
-    elif contrarian_weighted_live:
-        source = record.get("settlement_contrarian_signal") or {}
-        LOG.warning(
-            "LIVE SETTLEMENT CONTRARIAN SIDE LOCKED | %s prior=%s result=%s selected=%s; posting 1x$0.40/2x$0.30/3x$0.20/4x$0.10 "
-            "GTC ladder through close_epoch=%d; absolute bid stop=$0.05, trail arms at current average+$0.60 then retraces $0.10.",
-            ticker, str(source.get("source_ticker") or "?").upper(),
-            str(source.get("source_result") or "?").upper(), side.upper(), expiry,
-        )
-    else:
-        LOG.info(
-            "SIDE LOCKED | %s %s from frozen ML decision; immediately posting GTC ladder $0.40/$0.30/$0.20/$0.10 through close_epoch=%d.",
-            ticker, side.upper(), expiry,
-        )
+    source = record.get("settlement_contrarian_signal") or {}
+    LOG.warning(
+        "LIVE SIDE LOCKED | %s prior=%s result=%s selected=%s; posting %s GTC ladder through close_epoch=%d; "
+        "only selected-side bid <= $0.05 can exit before settlement.",
+        ticker, str(source.get("source_ticker") or "?").upper(),
+        str(source.get("source_result") or "?").upper(), side.upper(),
+        "/".join(f"{rung_quantities[level]:.0f}x${level:.2f}" for level in LADDER_LEVELS), expiry,
+    )
     for level in LADDER_LEVELS:
         key = f"{level:.4f}"
         prior_order = record["orders"].get(key)
@@ -3678,11 +3421,10 @@ async def consider_initial_entry(
         )
         order["ladder_level"] = level
         order["reason"] = (
-            "Frozen settlement-contrarian side; pre-posted fixed GTC ladder through market close."
-            if contrarian_weighted_live else "Frozen ML side; pre-posted fixed GTC ladder through market close."
+            "Frozen settlement-contrarian side; pre-posted fixed GTC ladder held through market close."
         )
         record["orders"][key] = order
-        if (inverse_weighted_live or contrarian_weighted_live) and float(order.get("fill_count") or 0.0) > 0.004:
+        if float(order.get("fill_count") or 0.0) > 0.004:
             total_filled = filled_contracts(record)
             total_cost = live_entry_cost(record)
             LOG.warning(
@@ -3720,20 +3462,10 @@ async def consider_initial_entry(
             "GTC LADDER INCOMPLETE | %s %s accepted=%d/%d; will retry only missing same-side rungs.",
             ticker, side.upper(), accepted_rungs, len(LADDER_LEVELS),
         )
-    if contrarian_weighted_live:
-        LOG.info(
-            "GTC LADDER POSTED | %s %s source=latest_settlement_opposite rungs=%d/%d; no ML or opposite-side order exists.",
-            ticker, side.upper(), accepted_rungs, len(LADDER_LEVELS),
-        )
-    else:
-        ml_signal = record.get("ml_inference") if isinstance(record.get("ml_inference"), dict) else {}
-        LOG.info(
-            "GTC LADDER POSTED | %s %s p_yes=%s confidence=%s rungs=%d/%d; no opposite-side order exists.",
-            ticker, side.upper(),
-            "unknown" if ml_signal.get("probability_yes") is None else f"{float(ml_signal['probability_yes']):.4f}",
-            "unknown" if ml_signal.get("confidence") is None else f"{float(ml_signal['confidence']):.4f}",
-            accepted_rungs, len(LADDER_LEVELS),
-        )
+    LOG.info(
+        "LIVE LADDER POSTED | %s %s source=latest_settlement_opposite rungs=%d/%d; hold filled contracts to settlement unless bid reaches $0.05.",
+        ticker, side.upper(), accepted_rungs, len(LADDER_LEVELS),
+    )
     return accepted_rungs > 0
 
 
@@ -4476,6 +4208,94 @@ def live_settlement_contrarian_hold_gate_performance(state: dict[str, Any], conf
 
 
 def performance_report(state: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
+    """Return only the current settlement-contrarian live ledger.
+
+    Legacy model/paper records remain in historical state files, but cannot
+    leak into the live report or affect this strategy's P&L.
+    """
+    records = [
+        record for record in state.get("markets", {}).values()
+        if isinstance(record, dict) and record.get("strategy") in LIVE_SETTLEMENT_RECORD_STRATEGIES
+    ]
+    closed = sorted(
+        (record for record in records if record.get("status") in {"finalized", "exited_early"}
+         and float(record.get("contracts") or 0.0) > 0.004),
+        key=lambda record: str(record.get("settled_at") or record.get("exited_at") or ""),
+    )
+    active = [record for record in records if record.get("status") in {
+        "watching", "initial_submitted", "ladder_active", "live_exit_pending",
+    }]
+    unfilled = sum(record.get("status") == "finalized_unfilled" for record in records)
+    pnls = [float(record.get("net_profit_loss") or 0.0) for record in closed]
+    costs = [float(record.get("total_cost") or 0.0) for record in closed]
+    contracts = [float(record.get("contracts") or 0.0) for record in closed]
+    wins = sum(value > 0.0 for value in pnls)
+    losses = sum(value < 0.0 for value in pnls)
+    equity = peak = 0.0
+    drawdowns: list[float] = []
+    for value in pnls:
+        equity += value
+        peak = max(peak, equity)
+        drawdowns.append(peak - equity)
+    five_cent_stops = sum(
+        str(record.get("exit_method") or "").endswith("absolute_5c_stop")
+        for record in closed
+    )
+    settlement_exits = len(closed) - five_cent_stops
+    last_trade = closed[-1] if closed else None
+    current_streak = 0
+    current_streak_kind = "none"
+    if pnls:
+        current_streak_kind = "win" if pnls[-1] > 0.0 else "loss"
+        current_is_win = pnls[-1] > 0.0
+        for value in reversed(pnls):
+            if (value > 0.0) != current_is_win:
+                break
+            current_streak += 1
+    return {
+        "generated_at": now_iso(),
+        "strategy": LIVE_EXECUTION_STRATEGY,
+        "configuration": config,
+        "markets_started": len(records),
+        "active_markets": len(active),
+        "settled_trades": len(closed),
+        "unfilled_markets": int(unfilled),
+        "winning_trades": wins,
+        "losing_trades": losses,
+        "win_rate": round(wins / len(closed), 6) if closed else None,
+        "net_profit": round(sum(pnls), 6),
+        "total_cost": round(sum(costs), 6),
+        "return_on_capital": round(sum(pnls) / sum(costs), 6) if sum(costs) else None,
+        "total_contracts": round(sum(contracts), 2),
+        "average_contracts_per_trade": round(sum(contracts) / len(closed), 4) if closed else None,
+        "average_entry_price": round(sum(costs) / sum(contracts), 6) if sum(contracts) else None,
+        "maximum_drawdown": round(max(drawdowns, default=0.0), 6),
+        "current_streak": current_streak,
+        "current_streak_kind": current_streak_kind,
+        "longest_winning_streak": streak(pnls, True),
+        "longest_losing_streak": streak(pnls, False),
+        "five_cent_stop_exits": five_cent_stops,
+        "settlement_exits": settlement_exits,
+        "rung_performance": rung_performance(closed),
+        "rung_order_activity": rung_order_activity({"markets": {str(index): record for index, record in enumerate(records)}}),
+        "last_closed_trade": None if last_trade is None else {
+            "ticker": last_trade.get("ticker"),
+            "selected_side": last_trade.get("locked_side") or last_trade.get("candidate_side"),
+            "settlement_outcome": last_trade.get("settlement_outcome"),
+            "exit_method": last_trade.get("exit_method") or "settlement",
+            "contracts": float(last_trade.get("contracts") or 0.0),
+            "total_cost": float(last_trade.get("total_cost") or 0.0),
+            "gross_payout": float(last_trade.get("gross_payout") or 0.0),
+            "fees": float(last_trade.get("kalshi_fees") or 0.0),
+            "net_profit_loss": float(last_trade.get("net_profit_loss") or 0.0),
+            "return_percentage": last_trade.get("return_percentage"),
+            "closed_at": last_trade.get("exited_at") or last_trade.get("settled_at"),
+        },
+        "exit_policy": "hold every filled contract to settlement; only fresh full-depth selected-side bid <= $0.05 triggers a reduce-only close",
+    }
+
+    # Historical reporting implementation retained below only so historical
+    # research files can still be read offline; it is unreachable in live use.
     settled = sorted((record for record in state.get("markets", {}).values()
                       if isinstance(record, dict) and record.get("status") in {"finalized", "exited_early"}
                       and float(record.get("contracts") or 0.0) > 0.004),
@@ -4579,7 +4399,29 @@ def performance_report(state: dict[str, Any], config: dict[str, Any]) -> dict[st
 
 
 def log_performance_summary(report: dict[str, Any], context: str) -> None:
-    """Print the realized ledger summary alongside live quote/position logs."""
+    """Emit a compact, periodic summary without model or paper-study noise."""
+    streak = "none" if not report["current_streak"] else f"{report['current_streak']} {report['current_streak_kind']}"
+    LOG.info(
+        "LIVE SETTLEMENT SUMMARY | %s started=%d active=%d settled=%d unfilled=%d W/L=%d/%d win_rate=%s "
+        "net=$%+.4f roi=%s costs=$%.4f contracts=%.2f stops=5c:%d/settlement:%d streak=%s longest_W/L=%d/%d max_dd=$%.4f.",
+        context, report["markets_started"], report["active_markets"], report["settled_trades"], report["unfilled_markets"],
+        report["winning_trades"], report["losing_trades"],
+        "n/a" if report["win_rate"] is None else f"{100 * report['win_rate']:.2f}%",
+        report["net_profit"], "n/a" if report["return_on_capital"] is None else f"{100 * report['return_on_capital']:.2f}%",
+        report["total_cost"], report["total_contracts"], report["five_cent_stop_exits"], report["settlement_exits"],
+        streak, report["longest_winning_streak"], report["longest_losing_streak"], report["maximum_drawdown"],
+    )
+    last = report["last_closed_trade"]
+    if isinstance(last, dict):
+        LOG.info(
+            "LIVE LAST SETTLEMENT | %s side=%s outcome=%s exit=%s contracts=%.2f cost=$%.4f payout=$%.4f fees=$%.4f net=$%+.4f roi=%s.",
+            last["ticker"] or "?", str(last["selected_side"] or "?").upper(), str(last["settlement_outcome"] or "?").upper(),
+            last["exit_method"], last["contracts"], last["total_cost"], last["gross_payout"], last["fees"],
+            last["net_profit_loss"], "n/a" if last["return_percentage"] is None else f"{last['return_percentage']:+.2f}%",
+        )
+    return
+
+    # Historical verbose report retained below for offline research only.
     ratio = report["win_loss_ratio"]
     ratio_text = "n/a (no losses yet)" if ratio is None and report["winning_trades"] else (
         "n/a" if ratio is None else f"{ratio:.2f}"
@@ -4893,8 +4735,48 @@ async def log_heartbeat(
     elapsed_seconds: float,
     feed: KalshiLiveFeed | None = None,
 ) -> None:
-    """Emit enough live context to audit decisions without 2-second log spam."""
+    """Emit one compact summary and active-position detail at the set interval."""
+    report = performance_report(state, config)
     balance = await rest.balance_dollars()
+    LOG.info(
+        "LIVE HEARTBEAT | mode=%s elapsed=%.0fs balance=%s stream=%s messages=%d reserved=$%.2f/$%.2f.",
+        "DRY_RUN" if dry_run else "LIVE", elapsed_seconds,
+        "unknown" if balance is None else f"${balance:.2f}",
+        "connected" if feed and feed.connected else "fallback", 0 if feed is None else feed.message_count,
+        reserved_principal(state), config["max_total_capital"],
+    )
+    log_performance_summary(report, "heartbeat")
+    for record in active_strategy_records(state):
+        if record.get("strategy") not in LIVE_SETTLEMENT_RECORD_STRATEGIES:
+            continue
+        ticker = str(record.get("ticker") or "?")
+        side = str(record.get("locked_side") or record.get("candidate_side") or "?").lower()
+        protection = record.get("live_exit_protection") if isinstance(record.get("live_exit_protection"), dict) else {}
+        filled = filled_contracts(record)
+        quote = None
+        if feed is not None and side in {"yes", "no"}:
+            quote, quote_state = feed.executable_shadow_exit_quote(
+                ticker, side, filled, float(config["live_quote_max_age_seconds"]),
+            )
+        else:
+            quote_state = "awaiting_quote"
+        bid = as_float((quote or {}).get("economic_price"))
+        avg = live_entry_cost(record) / filled if filled > 0.004 else None
+        rung_state = "/".join(
+            f"{float((record.get('orders') or {}).get(f'{level:.4f}', {}).get('fill_count') or 0.0):.2f}/"
+            f"{float((record.get('orders') or {}).get(f'{level:.4f}', {}).get('quantity') or 0.0):.2f}@{int(level * 100)}c"
+            for level in LADDER_LEVELS
+        )
+        LOG.info(
+            "LIVE POSITION | %s side=%s status=%s filled=%.2f avg=%s bid=%s stop=$0.05 quote=%s rungs=%s; holding to settlement unless the 5c stop is hit.",
+            ticker, side.upper(), record.get("status", "?"), filled,
+            "none" if avg is None else f"${avg:.4f}", "none" if bid is None else f"${bid:.4f}",
+            quote_state, rung_state,
+        )
+    return
+
+    # Historical verbose model/paper heartbeat retained below only for
+    # offline research; it is unreachable from the live settlement runner.
     active_records = active_strategy_records(state)
     watching_count = sum(record.get("status") == "watching" for record in active_records)
     active_ladders = sum(record.get("status") in {"initial_submitted", "ladder_active"} for record in active_records)
@@ -5152,7 +5034,183 @@ async def cancel_open_mechanical_orders(rest: KalshiREST, state: dict[str, Any],
     return canceled
 
 
+async def run_settlement_only(args: argparse.Namespace) -> int:
+    """Run the sole supported live strategy: contrarian ladder to settlement."""
+    config_path = args.config.expanduser()
+    config = validate_config(load_json(config_path, DEFAULT_CONFIG))
+    config, config_changed = apply_config_overrides(config, args)
+    if args.persist_config or config_changed:
+        save_json(config_path, config)
+    dry_run = os.getenv("DRY_RUN", "true").lower() in {"1", "true", "yes"}
+    live_allowed = not dry_run and args.submit and args.allow_live
+    control_only = args.cancel_open_orders or args.cancel_all_resting_mechanical_orders
+    if args.paper_monitor_only:
+        raise SystemExit("--paper-monitor-only belongs to the retired paper runner and is unavailable here")
+    if not dry_run and not live_allowed and not control_only:
+        raise SystemExit("Refusing live orders: pass both --submit and --allow-live with DRY_RUN=false")
+
+    state_path = args.state_file.expanduser()
+    state = load_json(state_path, default_state())
+    state.setdefault("markets", {})
+    state["format_version"] = STATE_VERSION
+    for record in state["markets"].values():
+        if (
+            isinstance(record, dict)
+            and record.get("strategy") in {
+                "inverse_ml_weighted_hold_gate_live_v1",
+                "ml_side_preposted_gtc_ladder_v2",
+            }
+            and record.get("status") not in FINAL_RECORD_STATUSES
+        ):
+            record.update({
+                "strategy": LIVE_EXECUTION_STRATEGY,
+                "settlement_only_migrated_at": now_iso(),
+                "settlement_only_migration_note": "retired model/gate path; retain position to settlement with 5c stop only",
+            })
+    checkpoint = StateCheckpointPublisher.create(config_path, state_path, args.report.expanduser(), config, state)
+    api_key = os.getenv("KALSHI_API_KEY_ID", "")
+    pem_path = Path(os.getenv("KALSHI_PEM_PATH", "kalshi_private_key.pem"))
+    if not api_key or not pem_path.exists():
+        raise SystemExit("KALSHI_API_KEY_ID and KALSHI_PEM_PATH are required")
+    rest = KalshiREST(api_key, pem_path, os.getenv("KALSHI_DEMO", "false").lower() in {"1", "true", "yes"})
+    if control_only:
+        try:
+            canceled = (
+                await rest.cancel_resting_mechanical_orders()
+                if args.cancel_all_resting_mechanical_orders
+                else await cancel_open_mechanical_orders(rest, state, dry_run)
+            )
+            save_json(state_path, state)
+            save_json(args.report.expanduser(), performance_report(state, config))
+            LOG.warning("CANCEL-ONLY COMPLETE | canceled_open_mechanical_orders=%d", canceled)
+            return 0
+        finally:
+            await rest.close()
+
+    shutdown_requested = asyncio.Event()
+    shutdown_signal: list[str] = []
+    loop = asyncio.get_running_loop()
+
+    def request_shutdown(signum: int) -> None:
+        name = signal.Signals(signum).name
+        if not shutdown_requested.is_set():
+            shutdown_signal.append(name)
+            LOG.warning("GRACEFUL SHUTDOWN REQUESTED | signal=%s; saving state and allowing open positions to settle.", name)
+        shutdown_requested.set()
+
+    installed_signals: list[signal.Signals] = []
+    for item in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(item, request_shutdown, int(item))
+            installed_signals.append(item)
+        except (NotImplementedError, RuntimeError):  # pragma: no cover - Windows/minimal loops
+            pass
+
+    feed = KalshiLiveFeed(rest.auth)
+    feed_task = asyncio.create_task(feed.run(), name="kalshi-settlement-contrarian-ws")
+    started_at = loop.time()
+    deadline = started_at + args.run_seconds
+    last_heartbeat_at = float("-inf")
+    last_market_refresh_at = float("-inf")
+    last_order_reconcile_at = float("-inf")
+    last_exchange_recovery_at = float("-inf")
+    last_private_update_count = 0
+    last_feed_update_count = feed.update_count
+    active_markets: list[Any] = []
+    recovery_ready = False
+    rungs = live_rung_quantities(config)
+    LOG.warning(
+        "LIVE SETTLEMENT POLICY | enabled=%s ladder=%s total_contracts=%.2f max_principal=$%.2f "
+        "absolute_selected_side_stop=$%.2f; all other filled contracts hold to settlement.",
+        not dry_run, "/".join(f"{rungs[level]:.0f}x${level:.2f}" for level in LADDER_LEVELS),
+        sum(rungs.values()), ladder_principal_for_rungs(rungs), config["live_absolute_stop_price"],
+    )
+    try:
+        while not shutdown_requested.is_set():
+            monotonic_now = loop.time()
+            if not recovery_ready and monotonic_now - last_exchange_recovery_at >= EXCHANGE_RECOVERY_RETRY_SECONDS:
+                recovery_ready = await recover_exchange_state(rest, state, config, dry_run)
+                last_exchange_recovery_at = monotonic_now
+            if monotonic_now - last_market_refresh_at >= config["market_refresh_seconds"]:
+                active_markets = await rest.active_markets()
+                last_market_refresh_at = monotonic_now
+            tracked = [
+                str(ticker) for ticker, record in state["markets"].items()
+                if isinstance(record, dict) and record.get("status") not in FINAL_RECORD_STATUSES
+            ]
+            feed.set_tickers(tracked + [str(field(market, "ticker") or "") for market in active_markets])
+            private_update = feed.private_update_count != last_private_update_count
+            if private_update or monotonic_now - last_order_reconcile_at >= config["order_reconcile_seconds"]:
+                for ticker, record in list(state["markets"].items()):
+                    if not isinstance(record, dict) or record.get("status") in FINAL_RECORD_STATUSES:
+                        continue
+                    market = await rest.get_market(ticker)
+                    if market is None:
+                        continue
+                    await reconcile_orders(rest, record, dry_run)
+                    await settle_or_cancel(rest, record, market, dry_run)
+                    if market_is_tradeable(market) and not record.get("paper_monitor_only"):
+                        await submit_ladder(rest, record, market, config, dry_run)
+                last_order_reconcile_at = monotonic_now
+                last_private_update_count = feed.private_update_count
+            for market in active_markets:
+                ticker = str(field(market, "ticker") or "")
+                record = state["markets"].get(ticker)
+                if not isinstance(record, dict):
+                    record = start_market_watcher(state, market, config)
+                if not isinstance(record, dict) or record.get("status") != "watching":
+                    continue
+                side = await settlement_contrarian_side_for_market(rest, market, record, config)
+                await consider_initial_entry(
+                    rest, state, market, config, dry_run, live_asks=feed.executable_asks(ticker),
+                    ml_side=side, signal_source="settlement_contrarian",
+                )
+            for record in state["markets"].values():
+                if isinstance(record, dict):
+                    await monitor_live_absolute_stop(rest, record, feed, config, dry_run)
+            monotonic_now = loop.time()
+            if monotonic_now - last_heartbeat_at >= config["status_log_seconds"]:
+                await log_heartbeat(rest, state, active_markets, config, dry_run, monotonic_now - started_at, feed)
+                last_heartbeat_at = monotonic_now
+            save_json(state_path, state)
+            save_json(args.report.expanduser(), performance_report(state, config))
+            checkpoint.publish_if_changed(state, "material_strategy_event")
+            if monotonic_now >= deadline:
+                break
+            next_due = min(
+                deadline - monotonic_now,
+                config["market_refresh_seconds"] - (monotonic_now - last_market_refresh_at),
+                config["order_reconcile_seconds"] - (monotonic_now - last_order_reconcile_at),
+                config["status_log_seconds"] - (monotonic_now - last_heartbeat_at),
+            )
+            last_feed_update_count = await feed.wait_for_update(
+                min(config["poll_seconds"], max(0.01, next_due)), last_feed_update_count,
+            )
+    finally:
+        if shutdown_requested.is_set():
+            state["last_graceful_shutdown"] = {
+                "at": now_iso(), "signal": shutdown_signal[0] if shutdown_signal else "requested",
+                "policy": "open positions preserved for settlement; only the 5c stop remains active after handoff",
+            }
+        feed_task.cancel()
+        await asyncio.gather(feed_task, return_exceptions=True)
+        save_json(state_path, state)
+        final_report = performance_report(state, config)
+        save_json(args.report.expanduser(), final_report)
+        checkpoint.publish_if_changed(state, "graceful_shutdown" if shutdown_requested.is_set() else "run_complete")
+        log_performance_summary(final_report, "graceful_shutdown" if shutdown_requested.is_set() else "run_complete")
+        await rest.close()
+        for item in installed_signals:
+            loop.remove_signal_handler(item)
+    LOG.info("SETTLEMENT RUN COMPLETE | mode=%s active_records=%d", "DRY_RUN" if dry_run else "LIVE", len(active_strategy_records(state)))
+    return 0
+
+
 async def run(args: argparse.Namespace) -> int:
+    return await run_settlement_only(args)
+
+    # Legacy model/paper runner retained below for offline historical tooling;
+    # the live workflow cannot reach it.
     config_path = args.config.expanduser()
     config = validate_config(load_json(config_path, DEFAULT_CONFIG))
     config, config_changed = apply_config_overrides(config, args)
@@ -5429,6 +5487,30 @@ async def run(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="KXBTC15M settlement-contrarian live trader")
+    parser.add_argument("--config", type=Path, default=Path("kalshi_btc15m_average_down_config.json"))
+    parser.add_argument("--state-file", type=Path, default=Path("kalshi_btc15m_average_down_state.json"))
+    parser.add_argument("--report", type=Path, default=Path("kalshi_btc15m_average_down_report.json"))
+    parser.add_argument("--run-seconds", type=float, default=840.0)
+    parser.add_argument("--cancel-open-orders", action="store_true")
+    parser.add_argument("--cancel-all-resting-mechanical-orders", action="store_true")
+    parser.add_argument("--persist-config", action="store_true")
+    parser.add_argument("--submit", action="store_true")
+    parser.add_argument("--allow-live", action="store_true")
+    parser.add_argument("--initial-position-size", type=float, help="Persistent share multiplier: 3 means 3/6/9/12 contracts.")
+    parser.add_argument("--max-active-markets", type=int)
+    parser.add_argument("--max-contracts-per-market", type=float)
+    parser.add_argument("--max-total-capital", type=float)
+    parser.add_argument("--fee-reserve", type=float)
+    parser.add_argument("--poll-seconds", type=float)
+    parser.add_argument("--market-refresh-seconds", type=float)
+    parser.add_argument("--order-reconcile-seconds", type=float)
+    parser.add_argument("--watch-start-grace-seconds", type=float)
+    parser.add_argument("--status-log-seconds", type=float)
+    parser.add_argument("--paper-monitor-only", action="store_true", help=argparse.SUPPRESS)
+    return parser
+
+    # Legacy parser retained below for offline historical tooling only.
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=Path("kalshi_btc15m_average_down_config.json"))
     parser.add_argument("--state-file", type=Path, default=Path("kalshi_btc15m_average_down_state.json"))

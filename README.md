@@ -4,10 +4,25 @@ The repository contains the original futures and Prophet runners, plus two separ
 
 1. **Polymarket Futures Bot** (`polymarket_bot.py`) — WebSocket-driven take-profit and re-entry bot for Polymarket US Futures markets (MLB World Series 2026 focus).
 2. **Kalshi BTC 15-Min Prophet BTC-Only Ladder** (`kalshibtc15minupordown.py`, alias `kalshi_btc15m_prophet_btc_only.py`) — pre-forecasts BTC two minutes before each new Kalshi market opens, locks one forecast-selected side, and pre-posts that side's fixed 40¢/30¢/20¢/10¢ GTC ladder. It contains no ETH contract, hedge, multiplier, or loss-progression path. [Jump to docs ↓](#kalshi-btc-15-minute-prophet-bot)
-3. **Kalshi BTC 15-Min Mechanical Average-Down Bot** (`kalshi_btc15m_average_down.py`) — continuous KXBTC15M-only runner. It supports the stored-ML source and an explicit settlement-contrarian source; either locks one YES/NO side before sending its 40¢/30¢/20¢/10¢ economic GTC ladder. [Jump to docs ↓](#kalshi-btc-15-minute-mechanical-average-down-runner)
+3. **Kalshi BTC 15-Min Settlement-Contrarian Bot** (`kalshi_btc15m_average_down.py`) — continuous KXBTC15M-only live runner. It does not load, score, log, or trade an ML signal. It locks the opposite of the latest causally available settled outcome and holds all fills through settlement except for a flat selected-side 5¢ emergency stop. [Jump to docs ↓](#kalshi-btc-15-minute-mechanical-average-down-runner)
 4. **Polymarket US MLB Average-Down Bot** (`polymarket_mlb_average_down.py`) — continuous dry-monitoring runner for same-day MLB full-game moneylines. Its default `mechanical` mode takes no baseball prediction: it snapshots both team costs, waits for the first team to trade 10¢ below its own snapshot, and records the resulting mechanical ladder audit. An explicitly configured `ml_side_average_down` mode is available only after the separate leakage-safe research pipeline produces a versioned model artifact; it freezes one ML-selected team and never substitutes or reverses to the other team. Scheduled runs cannot place orders; a separate manual switch permits a one-off live run.
 
-The continuous runners use GitHub Actions for up to 5 h 45 min per job before self-triggering the next run. The Kalshi ML-side runner also checkpoints material execution state, recovers owned exchange orders at startup, and has a five-minute watchdog for interrupted runs. The Polymarket MLB mechanical runner is now a 24/7 **dry-monitoring** chain: scheduled and handoff jobs are explicitly dry, while live trading remains a separate manual choice.
+The continuous runners use GitHub Actions handoffs. The Kalshi settlement trader runs for 5 h 25 min, leaving explicit time for state persistence and its next handoff before GitHub-hosted job limits. The Polymarket MLB mechanical runner is now a 24/7 **dry-monitoring** chain: scheduled and handoff jobs are explicitly dry, while live trading remains a separate manual choice.
+
+---
+
+## Current Kalshi live policy (authoritative)
+
+Use **Actions → “Kalshi BTC 15m Settlement Contrarian” → Run workflow**.
+
+- Direction: at market open +45 seconds, use the opposite of the newest KXBTC15M outcome finalized no later than that cutoff. The side is frozen for that market.
+- Entries: market-close-expiring GTC limits on that one side at **40¢ / 30¢ / 20¢ / 10¢**.
+- Default share multiplier: **3**, producing **3 / 6 / 9 / 12** contracts (30 total) and **$6.00** maximum principal before fees. A manual share change persists in `kalshi_btc15m_average_down_config.json` and every later handoff uses it.
+- Exits: there is **no profit gate, no 60¢ activation, and no trailing stop**. Filled contracts remain until settlement unless the fresh full-depth bid for the selected side is **≤5¢**, which triggers the only reduce-only emergency close.
+- Reporting: the live action emits a compact periodic settlement-trader summary plus active-position detail, and persists only its config, live state, and report. ML/paper ledgers are not loaded, generated, or published by the live workflow.
+- Shutdown: `SIGTERM`/`SIGINT` are handled gracefully; state and the final report are saved and open positions are retained for the next handoff/settlement.
+
+The detailed ML and trailing-stop material below is historical/paper-research documentation only; it is not part of this live workflow.
 
 ---
 
