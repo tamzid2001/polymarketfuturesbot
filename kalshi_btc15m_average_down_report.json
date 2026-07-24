@@ -4,10 +4,12 @@
   "average_entry_price": 0.21485,
   "configuration": {
     "fee_reserve": 0.05,
-    "format_version": 13,
+    "format_version": 14,
     "initial_position_size": 3.0,
     "live_absolute_stop_price": 0.05,
+    "live_consecutive_loss_limit": 2,
     "live_execution_strategy": "settlement_contrarian_settlement_v2",
+    "live_markets_to_skip_after_loss_limit": 2,
     "live_quote_max_age_seconds": 3.0,
     "market_refresh_seconds": 15.0,
     "max_active_markets": 1,
@@ -22,9 +24,24 @@
   },
   "current_streak": 1,
   "current_streak_kind": "win",
+  "entry_loss_skip": {
+    "consecutive_completed_losses": 0,
+    "last_completed_trade": {
+      "completed_at": "2026-07-24T05:15:11.262176+00:00",
+      "net_profit_loss": 6.0,
+      "ticker": "KXBTC15M-26JUL240115-15"
+    },
+    "last_reset_at": null,
+    "last_reset_reason": null,
+    "loss_limit": 2,
+    "markets_remaining_to_skip": 0,
+    "markets_to_skip_after_limit": 2,
+    "skip_armed_at": null,
+    "triggering_ticker": null
+  },
   "exit_policy": "hold every filled contract to settlement; only fresh full-depth selected-side bid <= $0.05 triggers a reduce-only close",
   "five_cent_stop_exits": 50,
-  "generated_at": "2026-07-24T05:15:26.734401+00:00",
+  "generated_at": "2026-07-24T05:17:07.098675+00:00",
   "last_closed_trade": {
     "closed_at": "2026-07-24T05:15:11.262176+00:00",
     "contracts": 9.0,
@@ -41,6 +58,7 @@
   "longest_losing_streak": 7,
   "longest_winning_streak": 6,
   "losing_trades": 52,
+  "markets_skipped_due_to_loss_circuit_breaker": 0,
   "markets_started": 118,
   "maximum_drawdown": 37.8784,
   "net_profit": 81.571199,
