@@ -33,6 +33,21 @@ on:
         required: false
         type: string
         default: ""
+      enable_dynamic_scaling:
+        description: "Enable dynamic base share scaling. False keeps the configured starting base fixed."
+        required: false
+        type: string
+        default: "false"
+      base_share_increment:
+        description: "Whole number of base shares to add after a scaling threshold."
+        required: false
+        type: string
+        default: "1"
+      scaling_profit_multiplier:
+        description: "Realized profit required per current base share before scaling."
+        required: false
+        type: string
+        default: "16.5"
 
 concurrency:
   group: kalshi-btc15m-average-down-singleton
@@ -90,6 +105,9 @@ jobs:
           MAX_ACTIVE_MARKETS: ${{ inputs.max_active_markets }}
           MAX_CONTRACTS_PER_MARKET: ${{ inputs.max_contracts_per_market }}
           MAX_TOTAL_CAPITAL: ${{ inputs.max_total_capital }}
+          ENABLE_DYNAMIC_SCALING: ${{ inputs.enable_dynamic_scaling }}
+          BASE_SHARE_INCREMENT: ${{ inputs.base_share_increment }}
+          SCALING_PROFIT_MULTIPLIER: ${{ inputs.scaling_profit_multiplier }}
         run: |
           set -euo pipefail
           args=(--config kalshi_btc15m_average_down_config.json
@@ -100,6 +118,9 @@ jobs:
           [ -z "$MAX_ACTIVE_MARKETS" ] || args+=(--max-active-markets "$MAX_ACTIVE_MARKETS")
           [ -z "$MAX_CONTRACTS_PER_MARKET" ] || args+=(--max-contracts-per-market "$MAX_CONTRACTS_PER_MARKET")
           [ -z "$MAX_TOTAL_CAPITAL" ] || args+=(--max-total-capital "$MAX_TOTAL_CAPITAL")
+          [ -z "$ENABLE_DYNAMIC_SCALING" ] || args+=(--enable-dynamic-scaling "$ENABLE_DYNAMIC_SCALING")
+          [ -z "$BASE_SHARE_INCREMENT" ] || args+=(--base-share-increment "$BASE_SHARE_INCREMENT")
+          [ -z "$SCALING_PROFIT_MULTIPLIER" ] || args+=(--scaling-profit-multiplier "$SCALING_PROFIT_MULTIPLIER")
           if [ "$LIVE_TRADING" = "true" ]; then
             DRY_RUN=false python kalshi_btc15m_average_down.py "${args[@]}" --submit --allow-live
           else
@@ -138,8 +159,15 @@ jobs:
           GH_TOKEN: ${{ secrets.GH_PAT || github.token }}
         run: |
           set -euo pipefail
-          gh workflow run kalshi_btc15m_average_down.yml --repo "$GITHUB_REPOSITORY" --ref main -f live_trading=true
-          echo "HANDOFF QUEUED | next run keeps the persisted share multiplier and settlement-only exit policy."
+          scaling_enabled="$(python -c 'import json; c=json.load(open("kalshi_btc15m_average_down_config.json")); print(str(bool(c.get("enable_dynamic_scaling", False))).lower())')"
+          scaling_increment="$(python -c 'import json; c=json.load(open("kalshi_btc15m_average_down_config.json")); print(c.get("base_share_increment", 1))')"
+          scaling_multiplier="$(python -c 'import json; c=json.load(open("kalshi_btc15m_average_down_config.json")); print(c.get("scaling_profit_multiplier", 16.5))')"
+          gh workflow run kalshi_btc15m_average_down.yml --repo "$GITHUB_REPOSITORY" --ref main \
+            -f live_trading=true \
+            -f enable_dynamic_scaling="$scaling_enabled" \
+            -f base_share_increment="$scaling_increment" \
+            -f scaling_profit_multiplier="$scaling_multiplier"
+          echo "HANDOFF QUEUED | next run keeps the persisted base size, dynamic-scaling settings, and settlement-only exit policy."
 
       - name: Upload execution audit artifact
         if: always()

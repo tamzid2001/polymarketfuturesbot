@@ -1,49 +1,53 @@
 # Trading Automation
 
-This repository is organized around the systems that are currently operational. Historical ML, Prophet, paper-trading, and backtest material is preserved in [`archive/`](archive/README.md) and is not part of a live deployment.
+This repository contains a live Kalshi BTC 15-minute settlement-contrarian trader and a separate Polymarket portfolio system. Retired ML, Prophet, paper-trading, and backtest material is preserved under [`archive/`](archive/README.md) and is not deployed.
 
-## Active Kalshi BTC 15-minute trader
+## Kalshi BTC 15-minute trader
 
-[`kalshi_btc15m_average_down.py`](kalshi_btc15m_average_down.py) is the only active Kalshi execution strategy.
+[`kalshi_btc15m_average_down.py`](kalshi_btc15m_average_down.py) is the only active Kalshi execution path.
 
-- At market open, it checks for the **immediately preceding** KXBTC15M market to finalize at the configured polling cadence (two seconds by default). A source is valid only when its `close_time` equals the new market's `open_time`; it never substitutes an older result while that predecessor is still settling.
-- As soon as that predecessor is available, it freezes and persists the opposite YES/NO side, then posts one single-side GTC ladder. There is no fixed 45-second delay; the maximum source-and-entry window is 120 seconds after open.
-- The GTC ladder is 40¢ / 30¢ / 20¢ / 10¢ and expires at that market's close.
-- Default share multiplier is **3**, so the four rungs are **3 / 6 / 9 / 12** contracts: 30 contracts and $6 maximum principal before fees.
-- There is no ML model, profit gate, 60¢ activation, or trailing stop in the live path.
-- Every fill holds to settlement unless the selected-side fresh full-depth bid is **≤5¢**. That is the sole emergency reduce-only exit.
-- After **two consecutive completed realized losses** on filled live trades, it still computes, locks, and records the normal signal but skips the next **two** signaled markets without a balance check or exchange order. The second skip clears the counter, so the following eligible signal submits normally. A completed winner clears the loss count immediately; zero-fill and dry-run records do not count.
-- GitHub-hosted jobs use controlled handoffs: each job checkpoints configuration, open-order state, the loss-skip state, and the compact performance report before queuing the next runner. This provides continuous operation without relying on one indefinite job.
+- At a market open, it waits for the **immediately preceding** KXBTC15M market to finalize. It locks the opposite YES/NO side as soon as that result is available—there is no fixed 45-second wait and no fallback to an older result.
+- It posts a single-side GTC ladder at 40¢ / 30¢ / 20¢ / 10¢, expiring at the market close. The default base is **3**, giving **3 / 6 / 9 / 12** contracts (30 total, $6 principal before fees).
+- Filled contracts hold to settlement. The only early exit is a reduce-only stop when the selected-side fresh full-depth bid is **≤5¢**. There is no ML signal, profit gate, or trailing stop in the live path.
+- After two consecutive realized losses on filled live trades, it still computes and records the normal next two signals, but sends no balance check or exchange orders for those two markets. It then resets and resumes. A realized win resets the loss count immediately.
 
-Use these Actions:
+### Optional dynamic base-share scaling
 
-1. **Kalshi BTC 15m Settlement Contrarian** — continuous live trader.
-2. **Controlled Restart — Kalshi BTC 15m Settlement Contrarian** — stops a specified older runner and queues one safe replacement.
+Dynamic scaling is disabled by default, so the configured starting base stays fixed. Enable it from the **Kalshi BTC 15m Settlement Contrarian** Action with:
+
+- `enable_dynamic_scaling`: `true` or `false` (default `false`)
+- `base_share_increment`: whole base shares added after a threshold (default `1`)
+- `scaling_profit_multiplier`: realized net profit required per current base share (default `16.5`)
+
+When enabled, the runner starts a fresh scaling balance at the configured base. It accumulates realized net P&L from subsequently completed, filled live trades. At:
+
+```text
+profit_since_last_increase >= current_base_share_count × scaling_profit_multiplier
+```
+
+it increases the base by `base_share_increment`, resets that balance to zero, and uses the new **1/2/3/4** ladder only for later markets. Existing GTC ladders retain their original size. Runner-owned contract and principal caps grow as needed; explicitly supplied caps are never overridden and will safely block an oversized full ladder rather than submit it partially.
+
+The live report and periodic `LIVE DYNAMIC BASE SCALING` log include the active base, profit balance, next threshold, increase count, and whether capacity is automatic or explicit. Settings are persisted across controlled GitHub Actions handoffs.
+
+## Operations
+
+Use these active Actions:
+
+1. **Kalshi BTC 15m Settlement Contrarian** — continuous trader and configuration inputs.
+2. **Controlled Restart — Kalshi BTC 15m Settlement Contrarian** — safe runner replacement.
 3. **Kalshi BTC 15m Live Trader Watchdog** — recovery safety net.
-4. **Kalshi BTC 15m Position Audit (Read Only)** — inspect an exact Kalshi position without submitting orders.
+4. **Kalshi BTC 15m Position Audit (Read Only)** — position inspection without orders.
 
-The live action verifies [`tests/live/test_kalshi_btc15m_settlement_trader.py`](tests/live/test_kalshi_btc15m_settlement_trader.py) before it starts. The checks cover immediate-predecessor signal locking, no older-settlement fallback, the 120-second entry window, the 3/6/9/12 ladder, persistent sizing, the flat 5¢ stop, the two-loss/two-signal skip and resume, and the absence of retired trailing/gate exit logic.
-
-## Active Polymarket system
-
-[`polymarket_bot.py`](polymarket_bot.py) and **Polymarket Portfolio Execution Engine** remain a separate active system. Its operational files stay at the root because that runner persists `state.json` and `markets.json` between handoffs.
+Every live start runs [`tests/live/test_kalshi_btc15m_settlement_trader.py`](tests/live/test_kalshi_btc15m_settlement_trader.py) first. The runner checkpoints the configuration, trade state, compact report, loss-skip state, and dynamic-scaling state before handoff.
 
 ## Layout
 
 ```text
-.
-├── .github/workflows/       # only currently operational workflows
-├── archive/                 # retired code, reports, tests, and disabled workflows
-├── tests/live/              # live-trader safety checks
-├── kalshi_btc15m_average_down.py
-├── kalshi_btc15m_average_down_config.json
-├── kalshi_btc15m_average_down_state.json
-├── kalshi_btc15m_average_down_report.json
-├── kalshi_btc15m_position_audit.py
-├── requirements_kalshi_settlement_trader.txt
-├── polymarket_bot.py
-├── markets.json
-└── state.json
+.github/workflows/   active workflows
+archive/             retired code and research
+tests/live/          live-trader safety checks
+kalshi_btc15m_average_down.py
+kalshi_btc15m_average_down_{config,state,report}.json
+kalshi_btc15m_position_audit.py
+polymarket_bot.py
 ```
-
-`archive/workflows/` is intentionally outside `.github/workflows/`, so GitHub Actions no longer discovers or schedules those retired jobs. Historical files remain available for reference without competing with the live trader or cluttering the Actions page.

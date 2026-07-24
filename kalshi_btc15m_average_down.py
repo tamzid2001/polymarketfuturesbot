@@ -1,10 +1,10 @@
 """KXBTC15M settlement-contrarian average-down trader.
 
-Exactly 45 seconds after a new market opens, the trader reads the most recent
-KXBTC15M outcome that was already final at that causal cutoff and locks the
-opposite side. It then posts one frozen weighted ladder: 40c -> 30c -> 20c ->
-10c. The only discretionary live exit is an absolute selected-side 5c stop;
-otherwise every filled contract is held through settlement.
+At each new market open, the trader waits only for the immediately preceding
+KXBTC15M outcome to finalize, locks the opposite side, and posts one frozen
+weighted ladder: 40c -> 30c -> 20c -> 10c. The only discretionary live exit
+is an absolute selected-side 5c stop; otherwise every filled contract is held
+through settlement.
 
 Live submission is deliberately opt-in: ``DRY_RUN`` must be false and both
 ``--submit`` and ``--allow-live`` are required.  The GitHub workflow persists
@@ -57,8 +57,8 @@ except ImportError:  # pragma: no cover - exercised only in minimal local enviro
 LOG = logging.getLogger("kalshi_btc15m_average_down")
 SERIES_TICKER = "KXBTC15M"
 LADDER_LEVELS = (0.40, 0.30, 0.20, 0.10)
-CONFIG_VERSION = 16
-STATE_VERSION = 8
+CONFIG_VERSION = 17
+STATE_VERSION = 9
 ORDER_NAMESPACE = uuid.UUID("4d85857e-4dc6-43ec-960f-0b342523bdb7")
 KALSHI_WS_URL = os.getenv(
     "KALSHI_WS_URL",
@@ -95,6 +95,15 @@ DEFAULT_CONFIG = {
     "max_active_markets": 1,
     "max_contracts_per_market": 30.0,
     "max_total_capital": 6.0,
+    # Capacity values created by this runner may grow with an enabled dynamic
+    # base-share rule.  Explicit Action caps turn the corresponding flag off.
+    "max_contracts_per_market_auto": True,
+    "max_total_capital_auto": True,
+    # Dynamic base-share scaling is deliberately opt-in.  When disabled the
+    # live ladder remains exactly initial_position_size × 1/2/3/4.
+    "enable_dynamic_scaling": False,
+    "base_share_increment": 1.0,
+    "scaling_profit_multiplier": 16.5,
     "fee_reserve": 0.05,
     # Upper bound on sleep while waiting for the WebSocket; it is not a REST
     # quote-poll interval. Quote changes wake the runner immediately.
@@ -156,6 +165,19 @@ def as_float(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return result if math.isfinite(result) else None
+
+
+def as_bool(value: Any) -> bool | None:
+    """Parse persisted booleans and GitHub Action string inputs strictly."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    return None
 
 
 def field(obj: Any, *names: str) -> Any:
@@ -356,13 +378,36 @@ def live_weighted_strategy_name(config: dict[str, Any]) -> str:
     return "SETTLEMENT CONTRARIAN"
 
 
-def live_rung_quantities(config: dict[str, Any]) -> dict[float, float]:
-    """Return the persistent 1/2/3/4 ladder scaled by the chosen shares."""
-    shares = float(config["initial_position_size"])
+def rung_quantities_for_base_share_count(base_share_count: float) -> dict[float, float]:
+    """Return the fixed 1/2/3/4 ladder for one immutable base-size snapshot."""
+    shares = float(base_share_count)
     return {
         level: round(shares * WEIGHTED_SCALP_RUNG_QUANTITIES[level], 2)
         for level in LADDER_LEVELS
     }
+
+
+def dynamic_base_share_count(state: dict[str, Any] | None, config: dict[str, Any]) -> float:
+    """Return the current base only when the persisted dynamic rule is enabled.
+
+    Existing ladders never call this helper to resize themselves: their
+    per-rung quantities are stored on the market record at submission time.
+    """
+    starting = float(config["initial_position_size"])
+    if not bool(config.get("enable_dynamic_scaling")) or not isinstance(state, dict):
+        return starting
+    control = state.get("dynamic_base_share_scaling")
+    if not isinstance(control, dict) or not bool(control.get("enabled")):
+        return starting
+    current = as_float(control.get("current_base_share_count"))
+    return current if current is not None and current > 0.0 else starting
+
+
+def live_rung_quantities(
+    config: dict[str, Any], state: dict[str, Any] | None = None,
+) -> dict[float, float]:
+    """Return the new-entry 1/2/3/4 ladder for the current configured base."""
+    return rung_quantities_for_base_share_count(dynamic_base_share_count(state, config))
 
 
 def load_json(path: Path, default: dict[str, Any]) -> dict[str, Any]:
@@ -530,6 +575,11 @@ class StateCheckpointPublisher:
             return False
         self.last_attempt_at = now
         try:
+            # Dynamic capacity changes are part of the live risk envelope and
+            # must survive the same handoff as the trade state that caused
+            # them. Saving all three files before staging keeps config/report
+            # consistent with the durable ledger.
+            save_json(self.config_path, self.config)
             save_json(self.state_path, state)
             save_json(self.report_path, performance_report(state, self.config))
             repository = subprocess.run(
@@ -589,17 +639,26 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
     # may arrive at any time in this post-open submission window.  This fixed
     # value prevents old state or Action inputs from silently shortening it.
     merged["settlement_contrarian_entry_grace_seconds"] = SETTLEMENT_CONTRARIAN_ENTRY_GRACE_SECONDS
+    for name in ("enable_dynamic_scaling", "max_contracts_per_market_auto", "max_total_capital_auto"):
+        value = as_bool(merged.get(name))
+        if value is None:
+            raise ValueError(f"{name} must be true or false")
+        merged[name] = value
     for name in (
         "initial_position_size", "max_contracts_per_market", "max_total_capital",
         "fee_reserve", "poll_seconds", "market_refresh_seconds", "order_reconcile_seconds",
         "watch_start_grace_seconds", "live_absolute_stop_price", "live_quote_max_age_seconds",
-        "settlement_contrarian_entry_grace_seconds",
+        "settlement_contrarian_entry_grace_seconds", "scaling_profit_multiplier",
         "status_log_seconds",
     ):
         value = as_float(merged.get(name))
         if value is None or value <= 0:
             raise ValueError(f"{name} must be positive")
         merged[name] = value
+    increment = as_float(merged.get("base_share_increment"))
+    if increment is None or increment <= 0.0 or not math.isclose(increment, round(increment), abs_tol=1e-9):
+        raise ValueError("base_share_increment must be a positive whole number of base shares")
+    merged["base_share_increment"] = float(round(increment))
     active = int(merged.get("max_active_markets", 0))
     if active < 1:
         raise ValueError("max_active_markets must be at least one")
@@ -621,6 +680,7 @@ def apply_config_overrides(config: dict[str, Any], args: argparse.Namespace) -> 
         "initial_position_size", "max_active_markets", "max_contracts_per_market",
         "max_total_capital", "fee_reserve", "poll_seconds", "market_refresh_seconds",
         "order_reconcile_seconds", "watch_start_grace_seconds", "status_log_seconds",
+        "enable_dynamic_scaling", "base_share_increment", "scaling_profit_multiplier",
     )
     changed = False
     updated = dict(config)
@@ -633,14 +693,17 @@ def apply_config_overrides(config: dict[str, Any], args: argparse.Namespace) -> 
     # limits follow the real 1/2/3/4 structure, not four equal rungs.
     rung_override = as_float(getattr(args, "initial_position_size", None))
     if rung_override is not None and rung_override > 0:
-        scaled_rungs = {
-            level: rung_override * WEIGHTED_SCALP_RUNG_QUANTITIES[level]
-            for level in LADDER_LEVELS
-        }
+        scaled_rungs = rung_quantities_for_base_share_count(rung_override)
         if getattr(args, "max_contracts_per_market", None) is None:
             updated["max_contracts_per_market"] = round(sum(scaled_rungs.values()), 2)
+            updated["max_contracts_per_market_auto"] = True
         if getattr(args, "max_total_capital", None) is None:
             updated["max_total_capital"] = ladder_principal_for_rungs(scaled_rungs)
+            updated["max_total_capital_auto"] = True
+    if getattr(args, "max_contracts_per_market", None) is not None:
+        updated["max_contracts_per_market_auto"] = False
+    if getattr(args, "max_total_capital", None) is not None:
+        updated["max_total_capital_auto"] = False
     return validate_config(updated), changed
 
 
@@ -1894,6 +1957,223 @@ def live_completed_trade_records(state: dict[str, Any]) -> list[tuple[tuple[int,
     return sorted(completed, key=lambda item: item[0])
 
 
+def _dynamic_scaling_control(state: dict[str, Any]) -> dict[str, Any]:
+    """Return the durable live-only base-share scaling control record."""
+    control = state.get("dynamic_base_share_scaling")
+    if not isinstance(control, dict):
+        control = {}
+        state["dynamic_base_share_scaling"] = control
+    control["format_version"] = 1
+    control.setdefault("enabled", False)
+    control.setdefault("initialized", False)
+    control.setdefault("scale_events", [])
+    if not isinstance(control.get("scale_events"), list):
+        control["scale_events"] = []
+    return control
+
+
+def _dynamic_scaling_cursor(control: dict[str, Any]) -> tuple[int, str] | None:
+    epoch = as_float(control.get("last_processed_completion_epoch"))
+    ticker = control.get("last_processed_completion_ticker")
+    if epoch is None or ticker is None:
+        return None
+    return int(epoch), str(ticker)
+
+
+def _set_dynamic_scaling_cursor_to_latest(
+    control: dict[str, Any], state: dict[str, Any],
+) -> None:
+    completed = live_completed_trade_records(state)
+    if not completed:
+        control.pop("last_processed_completion_epoch", None)
+        control.pop("last_processed_completion_ticker", None)
+        return
+    key, _ = completed[-1]
+    control["last_processed_completion_epoch"] = key[0]
+    control["last_processed_completion_ticker"] = key[1]
+
+
+def _ensure_auto_scaling_capacity(config: dict[str, Any], base_share_count: float) -> bool:
+    """Expand only runner-owned limits needed by a newly increased base.
+
+    A user-supplied explicit cap is never overwritten. In that case the base
+    still records its prescribed increase, but a later entry is safely blocked
+    until the operator raises the explicit cap.
+    """
+    rungs = rung_quantities_for_base_share_count(base_share_count)
+    required_contracts = round(sum(rungs.values()), 2)
+    required_principal = ladder_principal_for_rungs(rungs)
+    changed = False
+    if bool(config.get("max_contracts_per_market_auto")):
+        current = float(config["max_contracts_per_market"])
+        if current + 1e-9 < required_contracts:
+            config["max_contracts_per_market"] = required_contracts
+            changed = True
+    if bool(config.get("max_total_capital_auto")):
+        current = float(config["max_total_capital"])
+        if current + 1e-9 < required_principal:
+            config["max_total_capital"] = required_principal
+            changed = True
+    return changed
+
+
+def dynamic_scaling_snapshot(state: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
+    """Expose current sizing and the next threshold without replaying history."""
+    control = state.get("dynamic_base_share_scaling") if isinstance(state, dict) else None
+    control = control if isinstance(control, dict) else {}
+    enabled = bool(config.get("enable_dynamic_scaling"))
+    starting = float(config["initial_position_size"])
+    current = dynamic_base_share_count(state, config)
+    multiplier = float(config["scaling_profit_multiplier"])
+    profit = float(as_float(control.get("profit_since_last_increase")) or 0.0) if enabled else 0.0
+    required = round(current * multiplier, 6)
+    events = control.get("scale_events") if isinstance(control.get("scale_events"), list) else []
+    return {
+        "enabled": enabled,
+        "starting_base_share_count": starting,
+        "current_base_share_count": current,
+        "base_share_increment": float(config["base_share_increment"]),
+        "scaling_profit_multiplier": multiplier,
+        "profit_since_last_increase": round(profit, 6),
+        "required_profit": required,
+        "profit_remaining_to_increase": round(required - profit, 6),
+        "scale_count": len(events),
+        "last_scale": events[-1] if events else None,
+        "max_contracts_per_market_auto": bool(config.get("max_contracts_per_market_auto")),
+        "max_total_capital_auto": bool(config.get("max_total_capital_auto")),
+        "current_ladder_rungs": {
+            f"{level:.4f}": quantity
+            for level, quantity in rung_quantities_for_base_share_count(current).items()
+        },
+    }
+
+
+def refresh_dynamic_base_share_scaling(
+    state: dict[str, Any], config: dict[str, Any], now_epoch: float | None = None,
+) -> dict[str, Any]:
+    """Apply new realized live P&L to the opt-in dynamic base-share rule.
+
+    Enabling begins from the configured starting base and only counts trades
+    completed after enablement. This deliberately avoids retrospectively
+    resizing from historical ledger P&L. Every completed filled live trade,
+    including a 5c stop, contributes its realized net P&L. A threshold hit
+    produces one base increase and resets the accumulator exactly as specified.
+    """
+    now_epoch = time.time() if now_epoch is None else float(now_epoch)
+    control = _dynamic_scaling_control(state)
+    enabled = bool(config.get("enable_dynamic_scaling"))
+    starting = float(config["initial_position_size"])
+    prior_starting = as_float(control.get("starting_base_share_count"))
+    prior_enabled = bool(control.get("enabled"))
+    if not enabled:
+        already_reset = (
+            bool(control.get("initialized"))
+            and not prior_enabled
+            and prior_starting is not None
+            and math.isclose(prior_starting, starting, abs_tol=1e-9)
+            and math.isclose(as_float(control.get("current_base_share_count")) or starting, starting, abs_tol=1e-9)
+            and math.isclose(as_float(control.get("profit_since_last_increase")) or 0.0, 0.0, abs_tol=1e-9)
+        )
+        if already_reset:
+            return control
+        reset_reason = "dynamic_scaling_disabled"
+        prior_current = as_float(control.get("current_base_share_count"))
+        control.update({
+            "enabled": False,
+            "initialized": True,
+            "initialized_at": datetime.fromtimestamp(now_epoch, tz=timezone.utc).isoformat(),
+            "starting_base_share_count": starting,
+            "current_base_share_count": starting,
+            "profit_since_last_increase": 0.0,
+            "last_reset_at": datetime.fromtimestamp(now_epoch, tz=timezone.utc).isoformat(),
+            "last_reset_reason": reset_reason,
+        })
+        _set_dynamic_scaling_cursor_to_latest(control, state)
+        if prior_enabled or (prior_current is not None and not math.isclose(prior_current, starting, abs_tol=1e-9)):
+            LOG.warning(
+                "DYNAMIC BASE SCALING DISABLED | base reset to %.0f; new ladders remain fixed until re-enabled.",
+                starting,
+            )
+        return control
+
+    if (
+        not prior_enabled
+        or not bool(control.get("initialized"))
+        or prior_starting is None
+        or not math.isclose(prior_starting, starting, abs_tol=1e-9)
+    ):
+        reset_reason = (
+            "configured_starting_base_changed"
+            if prior_starting is not None and not math.isclose(prior_starting, starting, abs_tol=1e-9)
+            else "dynamic_scaling_enabled"
+        )
+        prior_current = as_float(control.get("current_base_share_count"))
+        control.update({
+            "enabled": enabled,
+            "initialized": True,
+            "initialized_at": datetime.fromtimestamp(now_epoch, tz=timezone.utc).isoformat(),
+            "starting_base_share_count": starting,
+            "current_base_share_count": starting,
+            "profit_since_last_increase": 0.0,
+            "last_reset_at": datetime.fromtimestamp(now_epoch, tz=timezone.utc).isoformat(),
+            "last_reset_reason": reset_reason,
+        })
+        _set_dynamic_scaling_cursor_to_latest(control, state)
+        _ensure_auto_scaling_capacity(config, starting)
+        LOG.warning(
+            "DYNAMIC BASE SCALING ENABLED | starting_base=%.0f increment=%.0f threshold=$%.4f; prior ledger P&L is not replayed.",
+            starting, float(config["base_share_increment"]), starting * float(config["scaling_profit_multiplier"]),
+        )
+        return control
+
+    cursor = _dynamic_scaling_cursor(control)
+    for key, record in live_completed_trade_records(state):
+        if cursor is not None and key <= cursor:
+            continue
+        completed_epoch, ticker = key
+        profit_loss = float(record.get("net_profit_loss") or 0.0)
+        accumulated = float(as_float(control.get("profit_since_last_increase")) or 0.0) + profit_loss
+        control["last_processed_completion_epoch"] = completed_epoch
+        control["last_processed_completion_ticker"] = ticker
+        control["last_completed_trade"] = {
+            "ticker": ticker,
+            "completed_at": record.get("exited_at") or record.get("settled_at"),
+            "net_profit_loss": profit_loss,
+        }
+        control["profit_since_last_increase"] = round(accumulated, 6)
+        current = dynamic_base_share_count(state, config)
+        required = current * float(config["scaling_profit_multiplier"])
+        if accumulated + 1e-9 >= required:
+            increased = current + float(config["base_share_increment"])
+            event = {
+                "at": datetime.fromtimestamp(completed_epoch, tz=timezone.utc).isoformat(),
+                "triggering_ticker": ticker,
+                "triggering_net_profit_loss": round(profit_loss, 6),
+                "profit_threshold": round(required, 6),
+                "base_share_count_before": current,
+                "base_share_count_after": increased,
+            }
+            events = control.setdefault("scale_events", [])
+            events.append(event)
+            del events[:-50]
+            control.update({
+                "current_base_share_count": increased,
+                "profit_since_last_increase": 0.0,
+                "last_scale_at": event["at"],
+                "last_scale_ticker": ticker,
+            })
+            auto_capacity_changed = _ensure_auto_scaling_capacity(config, increased)
+            rungs = rung_quantities_for_base_share_count(increased)
+            LOG.warning(
+                "DYNAMIC BASE SCALE INCREASE | %s realized $%+.4f; threshold=$%.4f base=%.0f→%.0f ladder=%s caps=%s.",
+                ticker, profit_loss, required, current, increased,
+                "/".join(f"{rungs[level]:.0f}x${level:.2f}" for level in LADDER_LEVELS),
+                "auto-expanded" if auto_capacity_changed else "unchanged",
+            )
+        cursor = key
+    return control
+
+
 def _entry_loss_skip_control(state: dict[str, Any]) -> dict[str, Any]:
     """Return the durable two-loss/two-signal circuit-breaker state."""
     control = state.get("entry_loss_skip")
@@ -3066,10 +3346,16 @@ async def recover_exchange_state(rest: KalshiREST, state: dict[str, Any], config
         existing_side = record.get("locked_side") or record.get("candidate_side")
         quantity_by_level = {float(item["ladder_level"]): float(item["quantity"]) for item in typed_orders}
         quantities = set(quantity_by_level.values())
-        expected_weighted = live_rung_quantities(config)
+        weighted_bases = [
+            quantity / WEIGHTED_SCALP_RUNG_QUANTITIES[level]
+            for level, quantity in quantity_by_level.items()
+            if level in WEIGHTED_SCALP_RUNG_QUANTITIES
+        ]
+        recovered_base = weighted_bases[0] if weighted_bases else None
         weighted_ladder = all(
-            level in expected_weighted
-            and abs(quantity - expected_weighted[level]) <= 0.004
+            level in WEIGHTED_SCALP_RUNG_QUANTITIES
+            and recovered_base is not None
+            and abs(quantity - recovered_base * WEIGHTED_SCALP_RUNG_QUANTITIES[level]) <= 0.004
             for level, quantity in quantity_by_level.items()
         )
         uniform_ladder = len(quantities) == 1
@@ -3084,10 +3370,14 @@ async def recover_exchange_state(rest: KalshiREST, state: dict[str, Any], config
             continue
 
         market = await rest.get_market(ticker)
-        recovered_quantity = max(expected_weighted.values()) if weighted_ladder else next(iter(quantities))
+        recovered_rungs = (
+            rung_quantities_for_base_share_count(float(recovered_base))
+            if weighted_ladder and recovered_base is not None else None
+        )
+        recovered_quantity = max(recovered_rungs.values()) if recovered_rungs is not None else next(iter(quantities))
         recovered_reserve = (
-            ladder_principal_for_rungs(expected_weighted)
-            if weighted_ladder else ladder_principal(float(typed_orders[0]["quantity"]))
+            ladder_principal_for_rungs(recovered_rungs)
+            if recovered_rungs is not None else ladder_principal(float(typed_orders[0]["quantity"]))
         )
         record.update({
             "candidate_side": side,
@@ -3109,7 +3399,8 @@ async def recover_exchange_state(rest: KalshiREST, state: dict[str, Any], config
             )
             record.update({
                 "strategy": recovered_strategy,
-                "rung_quantities": {f"{level:.2f}": quantity for level, quantity in expected_weighted.items()},
+                "base_share_count": float(recovered_base),
+                "rung_quantities": {f"{level:.4f}": quantity for level, quantity in (recovered_rungs or {}).items()},
             })
             record.setdefault("settlement_contrarian_signal", {
                 "source": "recovered_weighted_ladder_source_unknown",
@@ -3705,9 +3996,17 @@ async def consider_initial_entry(
     side = ml_side
     if side not in {"yes", "no"}:
         return False
-    rung_quantities = live_rung_quantities(config)
+    base_share_count = dynamic_base_share_count(state, config)
+    rung_quantities = rung_quantities_for_base_share_count(base_share_count)
     quantity = max(rung_quantities.values())
     reserve = ladder_principal_for_rungs(rung_quantities)
+    required_contracts = round(sum(rung_quantities.values()), 2)
+    if required_contracts > config["max_contracts_per_market"] + 1e-9:
+        LOG.critical(
+            "DYNAMIC SIZE BLOCKED | %s base=%.0f needs %.2f contracts but configured cap is %.2f; no partial ladder posted.",
+            ticker, base_share_count, required_contracts, config["max_contracts_per_market"],
+        )
+        return False
     # A retried, partially submitted ladder is already included in the active
     # reserve. Replace that record's reserve rather than adding it twice.
     existing_reserve = as_float(record.get("reserved_principal")) if record.get("candidate_side") else None
@@ -3734,6 +4033,11 @@ async def consider_initial_entry(
         "ladder_mode": "preposted_gtc_v2",
         "reserved_principal": reserve,
         "rung_quantities": {f"{level:.4f}": rung_quantities[level] for level in LADDER_LEVELS},
+        # This sizing snapshot is immutable for the life of this market. A
+        # later realized profit may increase the dynamic base for a new
+        # market, never for these already-posted GTC orders.
+        "base_share_count": base_share_count,
+        "dynamic_scaling_at_entry": dynamic_scaling_snapshot(state, config),
         "strategy": LIVE_EXECUTION_STRATEGY,
         "execution_mode": "dry_run" if dry_run else "live",
         "market_close_time": field(market, "close_time", "expected_expiration_time"),
@@ -4642,6 +4946,7 @@ def performance_report(state: dict[str, Any], config: dict[str, Any]) -> dict[st
         "five_cent_stop_exits": five_cent_stops,
         "settlement_exits": settlement_exits,
         "entry_loss_skip": entry_loss_skip_snapshot(state, config),
+        "dynamic_base_share_scaling": dynamic_scaling_snapshot(state, config),
         "rung_performance": rung_performance(closed),
         "rung_order_activity": rung_order_activity({"markets": {str(index): record for index, record in enumerate(records)}}),
         "last_closed_trade": None if last_trade is None else {
@@ -4794,6 +5099,16 @@ def log_performance_summary(report: dict[str, Any], context: str) -> None:
         loss_skip["markets_remaining_to_skip"], loss_skip["markets_to_skip_after_limit"],
         loss_skip["triggering_ticker"] or "none",
         loss_skip["last_reset_reason"] or "none",
+    )
+    scaling = report["dynamic_base_share_scaling"]
+    LOG.info(
+        "LIVE DYNAMIC BASE SCALING | %s enabled=%s base=%.0f(start %.0f) increment=%.0f multiplier=$%.4f "
+        "profit_since_increase=$%+.4f next_threshold=$%.4f remaining=$%.4f increases=%d caps=contracts:%s/capital:%s.",
+        context, scaling["enabled"], scaling["current_base_share_count"], scaling["starting_base_share_count"],
+        scaling["base_share_increment"], scaling["scaling_profit_multiplier"],
+        scaling["profit_since_last_increase"], scaling["required_profit"], scaling["profit_remaining_to_increase"],
+        scaling["scale_count"], "auto" if scaling["max_contracts_per_market_auto"] else "explicit",
+        "auto" if scaling["max_total_capital_auto"] else "explicit",
     )
     return
 
@@ -5446,6 +5761,7 @@ async def run_settlement_only(args: argparse.Namespace) -> int:
     # Initialize the persisted completed-loss circuit breaker before a
     # recovered or newly discovered market can submit an order.
     if not dry_run:
+        refresh_dynamic_base_share_scaling(state, config)
         refresh_entry_loss_skip(state, config)
     checkpoint = StateCheckpointPublisher.create(config_path, state_path, args.report.expanduser(), config, state)
     api_key = os.getenv("KALSHI_API_KEY_ID", "")
@@ -5498,12 +5814,20 @@ async def run_settlement_only(args: argparse.Namespace) -> int:
     last_feed_update_count = feed.update_count
     active_markets: list[Any] = []
     recovery_ready = False
-    rungs = live_rung_quantities(config)
+    rungs = live_rung_quantities(config, state)
+    scaling = dynamic_scaling_snapshot(state, config)
     LOG.warning(
         "LIVE SETTLEMENT POLICY | enabled=%s ladder=%s total_contracts=%.2f max_principal=$%.2f "
         "absolute_selected_side_stop=$%.2f; all other filled contracts hold to settlement.",
         not dry_run, "/".join(f"{rungs[level]:.0f}x${level:.2f}" for level in LADDER_LEVELS),
         sum(rungs.values()), ladder_principal_for_rungs(rungs), config["live_absolute_stop_price"],
+    )
+    LOG.warning(
+        "DYNAMIC BASE SCALING POLICY | enabled=%s base=%.0f start=%.0f increment=%.0f multiplier=$%.4f "
+        "next_threshold=$%.4f; auto_caps=contracts:%s/capital:%s.",
+        scaling["enabled"], scaling["current_base_share_count"], scaling["starting_base_share_count"],
+        scaling["base_share_increment"], scaling["scaling_profit_multiplier"], scaling["required_profit"],
+        scaling["max_contracts_per_market_auto"], scaling["max_total_capital_auto"],
     )
     try:
         while not shutdown_requested.is_set():
@@ -5534,9 +5858,11 @@ async def run_settlement_only(args: argparse.Namespace) -> int:
                 last_order_reconcile_at = monotonic_now
                 last_private_update_count = feed.private_update_count
             # A settlement or completed 5c stop above may have changed the
-            # realized sequence. Refresh before handling any new signal so a
-            # second loss skips the next two signals in this same loop.
+            # realized sequence. Refresh scaling and the loss skip before
+            # handling a new signal; each one therefore applies to this same
+            # loop's next market without changing an already-posted ladder.
             if not dry_run:
+                refresh_dynamic_base_share_scaling(state, config)
                 refresh_entry_loss_skip(state, config)
             for market in active_markets:
                 ticker = str(field(market, "ticker") or "")
@@ -5882,6 +6208,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--submit", action="store_true")
     parser.add_argument("--allow-live", action="store_true")
     parser.add_argument("--initial-position-size", type=float, help="Persistent share multiplier: 3 means 3/6/9/12 contracts.")
+    parser.add_argument(
+        "--enable-dynamic-scaling", choices=("true", "false"),
+        help="Opt in or out of realized-P&L base-share scaling; false keeps the configured starting base fixed.",
+    )
+    parser.add_argument(
+        "--base-share-increment", type=float,
+        help="Positive whole number of base shares added on each dynamic scaling threshold.",
+    )
+    parser.add_argument(
+        "--scaling-profit-multiplier", type=float,
+        help="Realized profit required per current base share before the next dynamic increase.",
+    )
     parser.add_argument("--max-active-markets", type=int)
     parser.add_argument("--max-contracts-per-market", type=float)
     parser.add_argument("--max-total-capital", type=float)
