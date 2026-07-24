@@ -11,6 +11,7 @@ This repository is organized around the systems that are currently operational. 
 - Default share multiplier is **3**, so the four rungs are **3 / 6 / 9 / 12** contracts: 30 contracts and $6 maximum principal before fees.
 - There is no ML model, profit gate, 60¢ activation, or trailing stop in the live path.
 - Every fill holds to settlement unless the selected-side fresh full-depth bid is **≤5¢**. That is the sole emergency reduce-only exit.
+- After **two consecutive completed realized losses** on filled live trades, it keeps generating the normal settlement-contrarian signal but skips the next **two** signaled markets without submitting orders. A completed winner clears the loss count immediately; zero-fill and dry-run records do not count.
 - Configuration, state, and the compact live performance report persist at the repository root so every Actions handoff resumes the same ladder sizing and open-position state.
 
 Use these Actions:
@@ -20,7 +21,7 @@ Use these Actions:
 3. **Kalshi BTC 15m Live Trader Watchdog** — recovery safety net.
 4. **Kalshi BTC 15m Position Audit (Read Only)** — inspect an exact Kalshi position without submitting orders.
 
-The live action verifies [`tests/live/test_kalshi_btc15m_settlement_trader.py`](tests/live/test_kalshi_btc15m_settlement_trader.py) before it starts. The checks cover the 3/6/9/12 ladder, persistent sizing, the flat 5¢ stop, and the absence of the retired trailing/gate exit logic.
+The live action verifies [`tests/live/test_kalshi_btc15m_settlement_trader.py`](tests/live/test_kalshi_btc15m_settlement_trader.py) before it starts. The checks cover the 3/6/9/12 ladder, persistent sizing, the flat 5¢ stop, the two-loss/two-signal skip, and the absence of the retired trailing/gate exit logic.
 
 ## Active Polymarket system
 

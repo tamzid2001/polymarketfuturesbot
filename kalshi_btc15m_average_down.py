@@ -57,8 +57,8 @@ except ImportError:  # pragma: no cover - exercised only in minimal local enviro
 LOG = logging.getLogger("kalshi_btc15m_average_down")
 SERIES_TICKER = "KXBTC15M"
 LADDER_LEVELS = (0.40, 0.30, 0.20, 0.10)
-CONFIG_VERSION = 13
-STATE_VERSION = 7
+CONFIG_VERSION = 14
+STATE_VERSION = 8
 ORDER_NAMESPACE = uuid.UUID("4d85857e-4dc6-43ec-960f-0b342523bdb7")
 KALSHI_WS_URL = os.getenv(
     "KALSHI_WS_URL",
@@ -104,6 +104,12 @@ DEFAULT_CONFIG = {
     "live_quote_max_age_seconds": 3.0,
     "settlement_contrarian_decision_delay_seconds": 45.0,
     "settlement_contrarian_entry_grace_seconds": 90.0,
+    # Realized-trade circuit breaker. These are intentionally fixed by the
+    # live policy rather than exposed as workflow inputs: two completed losses
+    # skip the next two causally generated market signals. A completed winner
+    # clears the loss count immediately.
+    "live_consecutive_loss_limit": 2,
+    "live_markets_to_skip_after_loss_limit": 2,
     "status_log_seconds": 60.0,
 }
 
@@ -559,7 +565,7 @@ class StateCheckpointPublisher:
 
 
 def validate_config(config: dict[str, Any]) -> dict[str, Any]:
-    # A version-12 config contained model, paper-study, and hold-gate keys.
+    # A version-13 config contained model, paper-study, and hold-gate keys.
     # Do not carry those settings forward into a real settlement-only runner.
     legacy = dict(config)
     prior_version = int(as_float(legacy.get("format_version")) or 0)
@@ -570,6 +576,11 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
     # A deployment may not select its source dynamically. This prevents an
     # inherited Action input from restoring a retired model/gate strategy.
     merged["live_execution_strategy"] = LIVE_EXECUTION_STRATEGY
+    # This risk circuit breaker is a fixed live safeguard. Do not let an old
+    # persisted config or an Action input silently change its two-loss /
+    # two-market behavior.
+    merged["live_consecutive_loss_limit"] = 2
+    merged["live_markets_to_skip_after_loss_limit"] = 2
     for name in (
         "initial_position_size", "max_contracts_per_market", "max_total_capital",
         "fee_reserve", "poll_seconds", "market_refresh_seconds", "order_reconcile_seconds",
@@ -1771,7 +1782,256 @@ def market_record(state: dict[str, Any], ticker: str) -> dict[str, Any]:
     return markets[ticker]
 
 
-FINAL_RECORD_STATUSES = {"finalized", "finalized_unfilled", "finalized_no_signal", "exited_early"}
+FINAL_RECORD_STATUSES = {
+    "finalized", "finalized_unfilled", "finalized_no_signal", "exited_early",
+    "entry_skipped_loss_circuit_breaker",
+}
+
+
+def live_completed_trade_records(state: dict[str, Any]) -> list[tuple[tuple[int, str], dict[str, Any]]]:
+    """Return completed, actually-filled live trades in completion order.
+
+    A zero-fill market is operational history, not a trade.  Completed 5c
+    stops and settlement finalizations both count because each has a realized
+    exchange P&L.  Explicit dry-run records are excluded from this live risk
+    control; older live records predate the marker and remain eligible.
+    """
+    completed: list[tuple[tuple[int, str], dict[str, Any]]] = []
+    for ticker, record in state.get("markets", {}).items():
+        if not isinstance(record, dict):
+            continue
+        if record.get("strategy") not in LIVE_SETTLEMENT_RECORD_STRATEGIES:
+            continue
+        if record.get("execution_mode") == "dry_run":
+            continue
+        if record.get("status") not in {"finalized", "exited_early"}:
+            continue
+        if float(record.get("contracts") or 0.0) <= 0.004:
+            continue
+        completed_at = record.get("exited_at") or record.get("settled_at")
+        completed_epoch = timestamp_epoch(completed_at)
+        if completed_epoch is None:
+            # A record without an authoritative completion time cannot safely
+            # be ordered against a later actual trade, so it never drives the
+            # circuit breaker.
+            continue
+        completed.append(((completed_epoch, str(record.get("ticker") or ticker)), record))
+    return sorted(completed, key=lambda item: item[0])
+
+
+def _entry_loss_skip_control(state: dict[str, Any]) -> dict[str, Any]:
+    """Return the durable two-loss/two-signal circuit-breaker state."""
+    control = state.get("entry_loss_skip")
+    if not isinstance(control, dict):
+        control = {}
+        state["entry_loss_skip"] = control
+    control["format_version"] = 1
+    control["consecutive_completed_losses"] = max(
+        0, int(as_float(control.get("consecutive_completed_losses")) or 0)
+    )
+    control["markets_remaining_to_skip"] = max(
+        0, int(as_float(control.get("markets_remaining_to_skip")) or 0)
+    )
+    control.setdefault("initialized", False)
+    return control
+
+
+def _entry_loss_skip_cursor(control: dict[str, Any]) -> tuple[int, str] | None:
+    epoch = as_float(control.get("last_processed_completion_epoch"))
+    ticker = control.get("last_processed_completion_ticker")
+    if epoch is None or ticker is None:
+        return None
+    return int(epoch), str(ticker)
+
+
+def _clear_entry_loss_skip(control: dict[str, Any], reason: str, at_epoch: float) -> None:
+    control.update({
+        "consecutive_completed_losses": 0,
+        "markets_remaining_to_skip": 0,
+        "skip_armed_at": None,
+        "skip_triggering_ticker": None,
+        "last_reset_at": datetime.fromtimestamp(at_epoch, tz=timezone.utc).isoformat(),
+        "last_reset_reason": reason,
+    })
+
+
+def _arm_entry_loss_skip(
+    control: dict[str, Any], config: dict[str, Any], completed_epoch: float, ticker: str,
+) -> None:
+    """Arm the next-two-signals skip after the second realized loss."""
+    control.update({
+        "consecutive_completed_losses": int(config["live_consecutive_loss_limit"]),
+        "markets_remaining_to_skip": int(config["live_markets_to_skip_after_loss_limit"]),
+        "skip_armed_at": datetime.fromtimestamp(completed_epoch, tz=timezone.utc).isoformat(),
+        "skip_triggering_ticker": ticker,
+    })
+
+
+def _initialize_entry_loss_skip_from_live_ledger(
+    state: dict[str, Any], config: dict[str, Any], now_epoch: float,
+) -> dict[str, Any]:
+    """Seed the new safeguard from the tail of the already-live ledger.
+
+    The first rollout honors an existing tail of two completed live losses by
+    skipping the next two normally generated signals. Older completed records
+    are marked as processed so they cannot be counted twice on a handoff.
+    """
+    control = _entry_loss_skip_control(state)
+    if control.get("initialized"):
+        return control
+    completed = live_completed_trade_records(state)
+    if completed:
+        last_key, last_record = completed[-1]
+        control["last_processed_completion_epoch"] = last_key[0]
+        control["last_processed_completion_ticker"] = last_key[1]
+        control["last_completed_trade"] = {
+            "ticker": last_key[1],
+            "completed_at": last_record.get("exited_at") or last_record.get("settled_at"),
+            "net_profit_loss": float(last_record.get("net_profit_loss") or 0.0),
+        }
+        losses = 0
+        for key, record in reversed(completed):
+            profit_loss = float(record.get("net_profit_loss") or 0.0)
+            if profit_loss > 0.0:
+                break
+            if profit_loss < 0.0:
+                losses += 1
+                if losses >= int(config["live_consecutive_loss_limit"]):
+                    break
+        if losses >= int(config["live_consecutive_loss_limit"]):
+            _arm_entry_loss_skip(control, config, last_key[0], last_key[1])
+            LOG.warning(
+                "ENTRY SKIP RESTORED | two most-recent completed live losses; the next %d normal signals will be skipped.",
+                control["markets_remaining_to_skip"],
+            )
+        else:
+            control["consecutive_completed_losses"] = losses
+    control["initialized"] = True
+    control["initialized_at"] = datetime.fromtimestamp(now_epoch, tz=timezone.utc).isoformat()
+    return control
+
+
+def refresh_entry_loss_skip(
+    state: dict[str, Any], config: dict[str, Any], now_epoch: float | None = None,
+) -> dict[str, Any]:
+    """Process newly completed live trades and return the durable skip state.
+
+    Only a finalized/exited record with filled contracts is eligible.  Wins
+    clear both the loss count and a pending skip immediately. Break-even
+    trades leave the current count unchanged.
+    """
+    now_epoch = time.time() if now_epoch is None else float(now_epoch)
+    control = _initialize_entry_loss_skip_from_live_ledger(state, config, now_epoch)
+    limit = int(config["live_consecutive_loss_limit"])
+    cursor = _entry_loss_skip_cursor(control)
+    for key, record in live_completed_trade_records(state):
+        if cursor is not None and key <= cursor:
+            continue
+        completed_epoch, ticker = key
+        profit_loss = float(record.get("net_profit_loss") or 0.0)
+        control["last_processed_completion_epoch"] = completed_epoch
+        control["last_processed_completion_ticker"] = ticker
+        control["last_completed_trade"] = {
+            "ticker": ticker,
+            "completed_at": record.get("exited_at") or record.get("settled_at"),
+            "net_profit_loss": profit_loss,
+        }
+        if profit_loss > 0.0:
+            pending_skips = int(control.get("markets_remaining_to_skip") or 0)
+            _clear_entry_loss_skip(control, "completed_winning_trade", now_epoch)
+            LOG.warning(
+                "ENTRY LOSS COUNT RESET | %s completed a realized win of $%+.4f%s.",
+                ticker, profit_loss, "; pending skips cleared" if pending_skips else "",
+            )
+        elif profit_loss < 0.0:
+            control["last_completed_loss_at"] = record.get("exited_at") or record.get("settled_at")
+            control["last_completed_loss_ticker"] = ticker
+            pending_skips = int(control.get("markets_remaining_to_skip") or 0)
+            if pending_skips:
+                # This can only be a position that was already open before
+                # the breaker armed. It must not extend the fixed two-market
+                # skip beyond the user's requested policy.
+                control["consecutive_completed_losses"] = limit
+                LOG.warning(
+                    "ENTRY SKIP NOTE | %s completed at $%+.4f while %d scheduled skip(s) remain; skip count is unchanged.",
+                    ticker, profit_loss, pending_skips,
+                )
+            else:
+                losses = int(control.get("consecutive_completed_losses") or 0) + 1
+                control["consecutive_completed_losses"] = losses
+                if losses >= limit:
+                    _arm_entry_loss_skip(control, config, completed_epoch, ticker)
+                    LOG.critical(
+                        "ENTRY SKIP ARMED | %s completed the second consecutive realized loss ($%+.4f); next %d normal signals will be skipped.",
+                        ticker, profit_loss, control["markets_remaining_to_skip"],
+                    )
+                else:
+                    LOG.warning(
+                        "ENTRY LOSS COUNT | %s completed a realized loss of $%+.4f; consecutive losses=%d/%d.",
+                        ticker, profit_loss, losses, limit,
+                    )
+        cursor = key
+    return control
+
+
+def consume_entry_loss_skip(
+    state: dict[str, Any], record: dict[str, Any], selected_side: str, config: dict[str, Any],
+) -> bool:
+    """Consume one pending skip after its normal causal signal is frozen."""
+    control = refresh_entry_loss_skip(state, config)
+    remaining = int(control.get("markets_remaining_to_skip") or 0)
+    if remaining <= 0:
+        return False
+    ticker = str(record.get("ticker") or "?")
+    remaining_after = remaining - 1
+    control["markets_remaining_to_skip"] = remaining_after
+    control.setdefault("skipped_markets", []).append({
+        "ticker": ticker,
+        "side": selected_side,
+        "skipped_at": now_iso(),
+        "remaining_after": remaining_after,
+        "reason": "two_consecutive_completed_losses",
+    })
+    # Keep this bounded while retaining the most recent operational audit.
+    control["skipped_markets"] = control["skipped_markets"][-20:]
+    record.update({
+        "candidate_side": selected_side,
+        "locked_side": selected_side,
+        "locked_at": now_iso(),
+        "strategy": LIVE_EXECUTION_STRATEGY,
+        "execution_mode": "not_entered_loss_skip",
+        "status": "entry_skipped_loss_circuit_breaker",
+        "entry_skip": {
+            "reason": "two_consecutive_completed_losses",
+            "triggering_ticker": control.get("skip_triggering_ticker"),
+            "selected_side": selected_side,
+            "skipped_at": now_iso(),
+            "remaining_after": remaining_after,
+        },
+    })
+    if remaining_after == 0:
+        _clear_entry_loss_skip(control, "two_markets_skipped", time.time())
+    LOG.warning(
+        "ENTRY SKIPPED | %s selected_side=%s from the normal settlement-contrarian signal; %d/%d skips remain. No exchange order submitted.",
+        ticker, selected_side.upper(), remaining_after, int(config["live_markets_to_skip_after_loss_limit"]),
+    )
+    return True
+
+
+def entry_loss_skip_snapshot(state: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
+    """Expose the persisted circuit breaker without altering trading state."""
+    control = state.get("entry_loss_skip") if isinstance(state.get("entry_loss_skip"), dict) else {}
+    return {
+        "loss_limit": int(config["live_consecutive_loss_limit"]),
+        "markets_to_skip_after_limit": int(config["live_markets_to_skip_after_loss_limit"]),
+        "consecutive_completed_losses": int(as_float(control.get("consecutive_completed_losses")) or 0),
+        "markets_remaining_to_skip": int(as_float(control.get("markets_remaining_to_skip")) or 0),
+        "skip_armed_at": control.get("skip_armed_at"),
+        "triggering_ticker": control.get("skip_triggering_ticker"),
+        "last_completed_trade": control.get("last_completed_trade"),
+        "last_reset_at": control.get("last_reset_at"),
+        "last_reset_reason": control.get("last_reset_reason"),
+    }
 
 
 def start_market_watcher(state: dict[str, Any], market: Any, config: dict[str, Any]) -> dict[str, Any] | None:
@@ -1797,7 +2057,7 @@ def start_market_watcher(state: dict[str, Any], market: Any, config: dict[str, A
         "watch_started_at": now_iso(),
     })
     LOG.info(
-        "WATCH STARTED | %s awaiting the open+%.0fs causally settled outcome; it will lock the opposite side and post the persistent 1/2/3/4 GTC ladder.",
+        "WATCH STARTED | %s awaiting the open+%.0fs causally settled outcome; it will lock the opposite side and post the persistent 1/2/3/4 GTC ladder unless the two-loss entry skip is pending.",
         ticker, float(config["settlement_contrarian_decision_delay_seconds"]),
     )
     return record
@@ -3302,6 +3562,11 @@ async def consider_initial_entry(
             "GTC LADDER SKIPPED | %s opening grace expired; refusing to pre-post a new ladder mid-market.", ticker,
         )
         return False
+    # The signal was produced through the ordinary settlement-contrarian path
+    # above. Only now—after its causal side is frozen and the market is still
+    # within the normal entry window—consume a pending loss-circuit skip.
+    if not dry_run and consume_entry_loss_skip(state, record, ml_side, config):
+        return False
     # ML paper studies remain attached only to an actual ML signal.  The
     # settlement-contrarian live mode neither invokes nor labels itself as ML.
     if signal_source == "ml":
@@ -3373,6 +3638,7 @@ async def consider_initial_entry(
         "reserved_principal": reserve,
         "rung_quantities": {f"{level:.4f}": rung_quantities[level] for level in LADDER_LEVELS},
         "strategy": LIVE_EXECUTION_STRATEGY,
+        "execution_mode": "dry_run" if dry_run else "live",
         "market_close_time": field(market, "close_time", "expected_expiration_time"),
     })
     record.pop("source_ml_side", None)
@@ -4226,6 +4492,7 @@ def performance_report(state: dict[str, Any], config: dict[str, Any]) -> dict[st
         "watching", "initial_submitted", "ladder_active", "live_exit_pending",
     }]
     unfilled = sum(record.get("status") == "finalized_unfilled" for record in records)
+    skipped_after_losses = sum(record.get("status") == "entry_skipped_loss_circuit_breaker" for record in records)
     pnls = [float(record.get("net_profit_loss") or 0.0) for record in closed]
     costs = [float(record.get("total_cost") or 0.0) for record in closed]
     contracts = [float(record.get("contracts") or 0.0) for record in closed]
@@ -4260,6 +4527,7 @@ def performance_report(state: dict[str, Any], config: dict[str, Any]) -> dict[st
         "active_markets": len(active),
         "settled_trades": len(closed),
         "unfilled_markets": int(unfilled),
+        "markets_skipped_due_to_loss_circuit_breaker": int(skipped_after_losses),
         "winning_trades": wins,
         "losing_trades": losses,
         "win_rate": round(wins / len(closed), 6) if closed else None,
@@ -4276,6 +4544,7 @@ def performance_report(state: dict[str, Any], config: dict[str, Any]) -> dict[st
         "longest_losing_streak": streak(pnls, False),
         "five_cent_stop_exits": five_cent_stops,
         "settlement_exits": settlement_exits,
+        "entry_loss_skip": entry_loss_skip_snapshot(state, config),
         "rung_performance": rung_performance(closed),
         "rung_order_activity": rung_order_activity({"markets": {str(index): record for index, record in enumerate(records)}}),
         "last_closed_trade": None if last_trade is None else {
@@ -4402,9 +4671,10 @@ def log_performance_summary(report: dict[str, Any], context: str) -> None:
     """Emit a compact, periodic summary without model or paper-study noise."""
     streak = "none" if not report["current_streak"] else f"{report['current_streak']} {report['current_streak_kind']}"
     LOG.info(
-        "LIVE SETTLEMENT SUMMARY | %s started=%d active=%d settled=%d unfilled=%d W/L=%d/%d win_rate=%s "
+        "LIVE SETTLEMENT SUMMARY | %s started=%d active=%d settled=%d unfilled=%d skipped=%d W/L=%d/%d win_rate=%s "
         "net=$%+.4f roi=%s costs=$%.4f contracts=%.2f stops=5c:%d/settlement:%d streak=%s longest_W/L=%d/%d max_dd=$%.4f.",
         context, report["markets_started"], report["active_markets"], report["settled_trades"], report["unfilled_markets"],
+        report["markets_skipped_due_to_loss_circuit_breaker"],
         report["winning_trades"], report["losing_trades"],
         "n/a" if report["win_rate"] is None else f"{100 * report['win_rate']:.2f}%",
         report["net_profit"], "n/a" if report["return_on_capital"] is None else f"{100 * report['return_on_capital']:.2f}%",
@@ -4419,6 +4689,15 @@ def log_performance_summary(report: dict[str, Any], context: str) -> None:
             last["exit_method"], last["contracts"], last["total_cost"], last["gross_payout"], last["fees"],
             last["net_profit_loss"], "n/a" if last["return_percentage"] is None else f"{last['return_percentage']:+.2f}%",
         )
+    loss_skip = report["entry_loss_skip"]
+    LOG.info(
+        "LIVE ENTRY LOSS SKIP | %s consecutive_losses=%d/%d pending_market_skips=%d/%d trigger=%s last_reset=%s.",
+        context,
+        loss_skip["consecutive_completed_losses"], loss_skip["loss_limit"],
+        loss_skip["markets_remaining_to_skip"], loss_skip["markets_to_skip_after_limit"],
+        loss_skip["triggering_ticker"] or "none",
+        loss_skip["last_reset_reason"] or "none",
+    )
     return
 
     # Historical verbose report retained below for offline research only.
@@ -5067,6 +5346,10 @@ async def run_settlement_only(args: argparse.Namespace) -> int:
                 "settlement_only_migrated_at": now_iso(),
                 "settlement_only_migration_note": "retired model/gate path; retain position to settlement with 5c stop only",
             })
+    # Initialize the persisted completed-loss circuit breaker before a
+    # recovered or newly discovered market can submit an order.
+    if not dry_run:
+        refresh_entry_loss_skip(state, config)
     checkpoint = StateCheckpointPublisher.create(config_path, state_path, args.report.expanduser(), config, state)
     api_key = os.getenv("KALSHI_API_KEY_ID", "")
     pem_path = Path(os.getenv("KALSHI_PEM_PATH", "kalshi_private_key.pem"))
@@ -5153,6 +5436,11 @@ async def run_settlement_only(args: argparse.Namespace) -> int:
                         await submit_ladder(rest, record, market, config, dry_run)
                 last_order_reconcile_at = monotonic_now
                 last_private_update_count = feed.private_update_count
+            # A settlement or completed 5c stop above may have changed the
+            # realized sequence. Refresh before handling any new signal so a
+            # second loss skips the next two signals in this same loop.
+            if not dry_run:
+                refresh_entry_loss_skip(state, config)
             for market in active_markets:
                 ticker = str(field(market, "ticker") or "")
                 record = state["markets"].get(ticker)

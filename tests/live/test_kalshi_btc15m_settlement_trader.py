@@ -5,12 +5,26 @@ from __future__ import annotations
 import argparse
 import contextlib
 import io
+import time
 import unittest
+from datetime import datetime, timezone
 
 import kalshi_btc15m_average_down as trader
 
 
 class SettlementTraderTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def completed_live_record(ticker: str, completed_epoch: int, profit_loss: float) -> dict:
+        return {
+            "ticker": ticker,
+            "strategy": trader.LIVE_EXECUTION_STRATEGY,
+            "execution_mode": "live",
+            "status": "finalized",
+            "contracts": 3.0,
+            "net_profit_loss": profit_loss,
+            "settled_at": datetime.fromtimestamp(completed_epoch, tz=timezone.utc).isoformat(),
+        }
+
     def test_default_three_share_ladder_and_reserve(self) -> None:
         config = trader.validate_config({})
         self.assertEqual(trader.live_rung_quantities(config), {0.40: 3.0, 0.30: 6.0, 0.20: 9.0, 0.10: 12.0})
@@ -119,6 +133,137 @@ class SettlementTraderTests(unittest.IsolatedAsyncioTestCase):
                 parser.parse_args(["--ml-model-path", "retired.joblib"])
             with self.assertRaises(SystemExit):
                 parser.parse_args(["--live-inverse-ml-hold-gate", "0.60"])
+
+    def test_two_completed_losses_skip_next_two_normal_signals(self) -> None:
+        config = trader.validate_config({})
+        state = {"markets": {}}
+        base = 1_700_000_000
+        trader.refresh_entry_loss_skip(state, config, now_epoch=base)
+        state["markets"]["KXBTC15M-loss-1"] = self.completed_live_record(
+            "KXBTC15M-loss-1", base + 1, -0.40,
+        )
+        trader.refresh_entry_loss_skip(state, config, now_epoch=base + 2)
+        self.assertEqual(state["entry_loss_skip"]["consecutive_completed_losses"], 1)
+        state["markets"]["KXBTC15M-loss-2"] = self.completed_live_record(
+            "KXBTC15M-loss-2", base + 3, -0.30,
+        )
+        trader.refresh_entry_loss_skip(state, config, now_epoch=base + 4)
+        self.assertEqual(state["entry_loss_skip"]["markets_remaining_to_skip"], 2)
+
+        skipped_one = {
+            "ticker": "KXBTC15M-skip-1", "status": "watching", "orders": {},
+            "settlement_contrarian_signal": {"side": "yes", "source_ticker": "KXBTC15M-loss-2"},
+        }
+        self.assertTrue(trader.consume_entry_loss_skip(state, skipped_one, "yes", config))
+        self.assertEqual(skipped_one["status"], "entry_skipped_loss_circuit_breaker")
+        self.assertEqual(skipped_one["candidate_side"], "yes")
+        self.assertEqual(skipped_one["settlement_contrarian_signal"]["side"], "yes")
+        self.assertEqual(skipped_one["orders"], {})
+        self.assertEqual(state["entry_loss_skip"]["markets_remaining_to_skip"], 1)
+
+        skipped_two = {"ticker": "KXBTC15M-skip-2", "status": "watching", "orders": {}}
+        self.assertTrue(trader.consume_entry_loss_skip(state, skipped_two, "no", config))
+        self.assertEqual(skipped_two["status"], "entry_skipped_loss_circuit_breaker")
+        self.assertEqual(state["entry_loss_skip"]["markets_remaining_to_skip"], 0)
+        self.assertEqual(state["entry_loss_skip"]["consecutive_completed_losses"], 0)
+
+    def test_completed_win_immediately_clears_pending_skips(self) -> None:
+        config = trader.validate_config({})
+        base = 1_700_000_100
+        state = {
+            "markets": {
+                "KXBTC15M-loss-2": self.completed_live_record("KXBTC15M-loss-2", base, -0.30),
+                "KXBTC15M-win": self.completed_live_record("KXBTC15M-win", base + 1, 0.40),
+            },
+            "entry_loss_skip": {
+                "initialized": True,
+                "consecutive_completed_losses": 2,
+                "markets_remaining_to_skip": 2,
+                "last_processed_completion_epoch": base,
+                "last_processed_completion_ticker": "KXBTC15M-loss-2",
+            },
+        }
+        trader.refresh_entry_loss_skip(state, config, now_epoch=base + 2)
+        self.assertEqual(state["entry_loss_skip"]["consecutive_completed_losses"], 0)
+        self.assertEqual(state["entry_loss_skip"]["markets_remaining_to_skip"], 0)
+        self.assertEqual(state["entry_loss_skip"]["last_reset_reason"], "completed_winning_trade")
+
+    def test_completed_loss_while_skip_is_pending_does_not_extend_two_market_skip(self) -> None:
+        config = trader.validate_config({})
+        base = 1_700_000_150
+        state = {
+            "markets": {
+                "KXBTC15M-loss-2": self.completed_live_record("KXBTC15M-loss-2", base, -0.30),
+                "KXBTC15M-prior-open-loss": self.completed_live_record("KXBTC15M-prior-open-loss", base + 1, -0.20),
+            },
+            "entry_loss_skip": {
+                "initialized": True,
+                "consecutive_completed_losses": 2,
+                "markets_remaining_to_skip": 1,
+                "last_processed_completion_epoch": base,
+                "last_processed_completion_ticker": "KXBTC15M-loss-2",
+            },
+        }
+        trader.refresh_entry_loss_skip(state, config, now_epoch=base + 2)
+        self.assertEqual(state["entry_loss_skip"]["markets_remaining_to_skip"], 1)
+        self.assertEqual(state["entry_loss_skip"]["consecutive_completed_losses"], 2)
+
+    def test_zero_fill_or_dry_run_records_never_count_as_completed_losses(self) -> None:
+        config = trader.validate_config({})
+        base = 1_700_000_200
+        state = {
+            "markets": {
+                "KXBTC15M-unfilled": {
+                    "ticker": "KXBTC15M-unfilled", "strategy": trader.LIVE_EXECUTION_STRATEGY,
+                    "status": "finalized_unfilled", "contracts": 0.0,
+                    "net_profit_loss": -1.0,
+                    "settled_at": datetime.fromtimestamp(base, tz=timezone.utc).isoformat(),
+                },
+                "KXBTC15M-paper": {
+                    "ticker": "KXBTC15M-paper", "strategy": trader.LIVE_EXECUTION_STRATEGY,
+                    "execution_mode": "dry_run", "status": "finalized", "contracts": 3.0,
+                    "net_profit_loss": -1.0,
+                    "settled_at": datetime.fromtimestamp(base + 1, tz=timezone.utc).isoformat(),
+                },
+            },
+        }
+        trader.refresh_entry_loss_skip(state, config, now_epoch=base + 2)
+        snapshot = trader.entry_loss_skip_snapshot(state, config)
+        self.assertEqual(snapshot["consecutive_completed_losses"], 0)
+        self.assertEqual(snapshot["markets_remaining_to_skip"], 0)
+
+    async def test_loss_skip_blocks_the_actual_order_path_after_normal_signal(self) -> None:
+        class Rest:
+            async def balance_dollars(self):
+                raise AssertionError("a skipped signal must not check balance or submit an order")
+
+        config = trader.validate_config({})
+        ticker = "KXBTC15M-skip-order-path"
+        now = time.time()
+        state = {
+            "markets": {
+                ticker: {
+                    "ticker": ticker,
+                    "status": "watching",
+                    "orders": {},
+                    "settlement_contrarian_signal": {"side": "no", "source_ticker": "KXBTC15M-prior"},
+                },
+            },
+            "entry_loss_skip": {
+                "initialized": True,
+                "consecutive_completed_losses": 2,
+                "markets_remaining_to_skip": 2,
+            },
+        }
+        market = {"ticker": ticker, "status": "active", "open_time": now - 1, "close_time": now + 300}
+        submitted = await trader.consider_initial_entry(
+            Rest(), state, market, config, dry_run=False, ml_side="no", signal_source="settlement_contrarian",
+        )
+        self.assertFalse(submitted)
+        record = state["markets"][ticker]
+        self.assertEqual(record["status"], "entry_skipped_loss_circuit_breaker")
+        self.assertEqual(record["locked_side"], "no")
+        self.assertEqual(record["orders"], {})
 
 
 if __name__ == "__main__":
