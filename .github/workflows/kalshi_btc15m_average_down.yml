@@ -64,7 +64,7 @@ jobs:
       - name: Verify settlement trader
         run: |
           python -m py_compile kalshi_btc15m_average_down.py
-          python -m unittest -v test_kalshi_btc15m_settlement_trader.py
+          PYTHONPATH=. python tests/live/test_kalshi_btc15m_settlement_trader.py
 
       - name: Write Kalshi RSA private key
         env:
