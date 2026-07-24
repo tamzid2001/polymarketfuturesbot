@@ -6,7 +6,7 @@ This repository contains a live Kalshi BTC 15-minute settlement-contrarian trade
 
 [`kalshi_btc15m_average_down.py`](kalshi_btc15m_average_down.py) is the only active Kalshi execution path.
 
-- At a market open, it waits up to **five minutes** for the **immediately preceding** KXBTC15M market to finalize. It locks the opposite YES/NO side and submits the GTC ladder immediately when that result is available—there is no fixed 45-second wait and no fallback to an older result. A source that misses the five-minute causal window is recorded once as a terminal no-order skip.
+- At a market open, it waits through the **penultimate minute** (up to 14 minutes) for the **immediately preceding** KXBTC15M market to finalize. It locks the opposite YES/NO side and submits the GTC ladder immediately when that result is available—there is no fixed 45-second wait and no fallback to an older result. A source that misses this causal window is recorded once as a terminal no-order skip.
 - It posts a single-side GTC ladder at 40¢ / 30¢ / 20¢ / 10¢, expiring at the market close. The default base is **3**, giving **3 / 6 / 9 / 12** contracts (30 total, $6 principal before fees).
 - Filled contracts hold to settlement. The only early exit is a reduce-only stop when the selected-side fresh full-depth bid is **≤5¢**. There is no ML signal, profit gate, or trailing stop in the live path.
 - After two consecutive realized losses on filled live trades, it still computes and records the normal next two signals, but sends no balance check or exchange orders for those two markets. It then resets and resumes. A realized win resets the loss count immediately.

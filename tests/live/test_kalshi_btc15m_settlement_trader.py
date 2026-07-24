@@ -49,7 +49,7 @@ class SettlementTraderTests(unittest.IsolatedAsyncioTestCase):
         config = trader.validate_config({
             "settlement_contrarian_entry_grace_seconds": 999.0,
         })
-        self.assertEqual(config["settlement_contrarian_entry_grace_seconds"], 300.0)
+        self.assertEqual(config["settlement_contrarian_entry_grace_seconds"], 840.0)
         opened_at = 1_700_000_000
         market = {"ticker": "KXBTC15M-current", "open_time": opened_at}
         record = {"ticker": "KXBTC15M-current", "status": "watching"}
@@ -63,7 +63,7 @@ class SettlementTraderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(record["settlement_contrarian_signal"]["source_close_epoch"], opened_at)
         self.assertEqual(record["settlement_contrarian_signal"]["decision_available_epoch"], opened_at + 7)
 
-    async def test_immediate_predecessor_can_arrive_late_within_five_minute_window(self) -> None:
+    async def test_immediate_predecessor_can_arrive_late_within_penultimate_minute_window(self) -> None:
         class Rest:
             async def immediately_preceding_settled_btc15m(self, current_open_epoch, available_by_epoch):
                 self.available_by_epoch = available_by_epoch
@@ -81,10 +81,10 @@ class SettlementTraderTests(unittest.IsolatedAsyncioTestCase):
         rest = Rest()
         side = await trader.settlement_contrarian_side_for_market(
             rest, {"ticker": "KXBTC15M-current", "open_time": opened_at}, record, config,
-            now_epoch=opened_at + 299,
+            now_epoch=opened_at + 839,
         )
         self.assertEqual(side, "yes")
-        self.assertEqual(rest.available_by_epoch, opened_at + 299)
+        self.assertEqual(rest.available_by_epoch, opened_at + 839)
         self.assertEqual(record["status"], "watching")
 
     async def test_source_window_expiry_is_a_single_terminal_no_order_state(self) -> None:
@@ -97,7 +97,7 @@ class SettlementTraderTests(unittest.IsolatedAsyncioTestCase):
         record = {"ticker": "KXBTC15M-current", "status": "watching", "orders": {}}
         side = await trader.settlement_contrarian_side_for_market(
             Rest(), {"ticker": "KXBTC15M-current", "open_time": opened_at}, record, config,
-            now_epoch=opened_at + 300.01,
+            now_epoch=opened_at + 840.01,
         )
         self.assertIsNone(side)
         self.assertEqual(record["status"], "signal_window_missed")

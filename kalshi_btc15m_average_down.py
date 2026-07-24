@@ -57,7 +57,7 @@ except ImportError:  # pragma: no cover - exercised only in minimal local enviro
 LOG = logging.getLogger("kalshi_btc15m_average_down")
 SERIES_TICKER = "KXBTC15M"
 LADDER_LEVELS = (0.40, 0.30, 0.20, 0.10)
-CONFIG_VERSION = 18
+CONFIG_VERSION = 19
 STATE_VERSION = 9
 ORDER_NAMESPACE = uuid.UUID("4d85857e-4dc6-43ec-960f-0b342523bdb7")
 KALSHI_WS_URL = os.getenv(
@@ -72,10 +72,11 @@ EXCHANGE_RECOVERY_RETRY_SECONDS = 60.0
 CHECKPOINT_RETRY_SECONDS = max(1.0, float(os.getenv("KALSHI_CHECKPOINT_RETRY_SECONDS", "60")))
 # There is no fixed signal delay. The first finalized immediately preceding
 # market is used as soon as it is observable. Kalshi can publish that final
-# result later than two minutes after the next market opens, so keep a five-
-# minute causal availability window rather than silently substituting an older
-# result or repeatedly logging an already-expired watcher.
-SETTLEMENT_CONTRARIAN_ENTRY_GRACE_SECONDS = 300.0
+# result more than five minutes after the next market opens, so retain causal
+# availability through the penultimate minute of each fixed 15-minute market.
+# This avoids substituting an older result while still leaving at least one
+# minute before close for the same-side GTC ladder to rest.
+SETTLEMENT_CONTRARIAN_ENTRY_GRACE_SECONDS = 840.0
 # Polling metadata changes every few seconds and must never turn the bot-state
 # branch into a stream of commits. Everything else is material trading state.
 CHECKPOINT_IGNORED_KEYS = {
