@@ -57,7 +57,7 @@ except ImportError:  # pragma: no cover - exercised only in minimal local enviro
 LOG = logging.getLogger("kalshi_btc15m_average_down")
 SERIES_TICKER = "KXBTC15M"
 LADDER_LEVELS = (0.40, 0.30, 0.20, 0.10)
-CONFIG_VERSION = 14
+CONFIG_VERSION = 15
 STATE_VERSION = 8
 ORDER_NAMESPACE = uuid.UUID("4d85857e-4dc6-43ec-960f-0b342523bdb7")
 KALSHI_WS_URL = os.getenv(
@@ -70,6 +70,11 @@ QUOTE_STALE_SECONDS = 20.0
 MAINTENANCE_TIMEZONE = ZoneInfo("America/New_York")
 EXCHANGE_RECOVERY_RETRY_SECONDS = 60.0
 CHECKPOINT_RETRY_SECONDS = max(1.0, float(os.getenv("KALSHI_CHECKPOINT_RETRY_SECONDS", "60")))
+SETTLEMENT_CONTRARIAN_DECISION_DELAY_SECONDS = 45.0
+# The side remains causal at +45s.  The separate two-minute submission window
+# gives an API settlement update or an Actions handoff enough time to surface
+# that already-frozen source without changing the signal.
+SETTLEMENT_CONTRARIAN_ENTRY_GRACE_SECONDS = 120.0
 # Polling metadata changes every few seconds and must never turn the bot-state
 # branch into a stream of commits. Everything else is material trading state.
 CHECKPOINT_IGNORED_KEYS = {
@@ -102,8 +107,8 @@ DEFAULT_CONFIG = {
     "live_execution_strategy": "settlement_contrarian_settlement_v2",
     "live_absolute_stop_price": 0.05,
     "live_quote_max_age_seconds": 3.0,
-    "settlement_contrarian_decision_delay_seconds": 45.0,
-    "settlement_contrarian_entry_grace_seconds": 90.0,
+    "settlement_contrarian_decision_delay_seconds": SETTLEMENT_CONTRARIAN_DECISION_DELAY_SECONDS,
+    "settlement_contrarian_entry_grace_seconds": SETTLEMENT_CONTRARIAN_ENTRY_GRACE_SECONDS,
     # Realized-trade circuit breaker. These are intentionally fixed by the
     # live policy rather than exposed as workflow inputs: two completed losses
     # skip the next two causally generated market signals. A completed winner
@@ -581,6 +586,11 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
     # two-market behavior.
     merged["live_consecutive_loss_limit"] = 2
     merged["live_markets_to_skip_after_loss_limit"] = 2
+    # Preserve the current causal signal semantics while giving its frozen
+    # source a full two minutes after open to become available for submission.
+    # These are deliberate live-policy constants, not Action inputs.
+    merged["settlement_contrarian_decision_delay_seconds"] = SETTLEMENT_CONTRARIAN_DECISION_DELAY_SECONDS
+    merged["settlement_contrarian_entry_grace_seconds"] = SETTLEMENT_CONTRARIAN_ENTRY_GRACE_SECONDS
     for name in (
         "initial_position_size", "max_contracts_per_market", "max_total_capital",
         "fee_reserve", "poll_seconds", "market_refresh_seconds", "order_reconcile_seconds",
