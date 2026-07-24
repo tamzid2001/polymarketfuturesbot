@@ -6,7 +6,7 @@ This repository is organized around the systems that are currently operational. 
 
 [`kalshi_btc15m_average_down.py`](kalshi_btc15m_average_down.py) is the only active Kalshi execution strategy.
 
-- At market open +45 seconds, it freezes the opposite of the newest causally available settled KXBTC15M outcome. The frozen ladder may be submitted through open +120 seconds, so a delayed settlement API update or Actions handoff has two minutes to supply that same causal signal.
+- At market open, it waits only for the **immediately preceding** KXBTC15M market to finalize, then freezes the opposite side and submits the ladder without a fixed delay. It never substitutes an older outcome while that predecessor is still settling; the maximum wait is 120 seconds after open.
 - It posts a single-side GTC ladder at 40¢ / 30¢ / 20¢ / 10¢.
 - Default share multiplier is **3**, so the four rungs are **3 / 6 / 9 / 12** contracts: 30 contracts and $6 maximum principal before fees.
 - There is no ML model, profit gate, 60¢ activation, or trailing stop in the live path.

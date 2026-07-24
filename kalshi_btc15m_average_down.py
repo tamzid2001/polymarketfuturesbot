@@ -57,7 +57,7 @@ except ImportError:  # pragma: no cover - exercised only in minimal local enviro
 LOG = logging.getLogger("kalshi_btc15m_average_down")
 SERIES_TICKER = "KXBTC15M"
 LADDER_LEVELS = (0.40, 0.30, 0.20, 0.10)
-CONFIG_VERSION = 15
+CONFIG_VERSION = 16
 STATE_VERSION = 8
 ORDER_NAMESPACE = uuid.UUID("4d85857e-4dc6-43ec-960f-0b342523bdb7")
 KALSHI_WS_URL = os.getenv(
@@ -70,10 +70,9 @@ QUOTE_STALE_SECONDS = 20.0
 MAINTENANCE_TIMEZONE = ZoneInfo("America/New_York")
 EXCHANGE_RECOVERY_RETRY_SECONDS = 60.0
 CHECKPOINT_RETRY_SECONDS = max(1.0, float(os.getenv("KALSHI_CHECKPOINT_RETRY_SECONDS", "60")))
-SETTLEMENT_CONTRARIAN_DECISION_DELAY_SECONDS = 45.0
-# The side remains causal at +45s.  The separate two-minute submission window
-# gives an API settlement update or an Actions handoff enough time to surface
-# that already-frozen source without changing the signal.
+# There is no fixed signal delay.  The first finalized immediately preceding
+# market is used as soon as it is observable; the two-minute window gives its
+# settlement update and an Actions handoff time to arrive.
 SETTLEMENT_CONTRARIAN_ENTRY_GRACE_SECONDS = 120.0
 # Polling metadata changes every few seconds and must never turn the bot-state
 # branch into a stream of commits. Everything else is material trading state.
@@ -85,6 +84,7 @@ CHECKPOINT_IGNORED_KEYS = {
     "last_heartbeat_at",
     "pause_blocked_at",
     "last_quote_state",
+    "next_predecessor_lookup_epoch",
 }
 
 DEFAULT_CONFIG = {
@@ -107,7 +107,6 @@ DEFAULT_CONFIG = {
     "live_execution_strategy": "settlement_contrarian_settlement_v2",
     "live_absolute_stop_price": 0.05,
     "live_quote_max_age_seconds": 3.0,
-    "settlement_contrarian_decision_delay_seconds": SETTLEMENT_CONTRARIAN_DECISION_DELAY_SECONDS,
     "settlement_contrarian_entry_grace_seconds": SETTLEMENT_CONTRARIAN_ENTRY_GRACE_SECONDS,
     # Realized-trade circuit breaker. These are intentionally fixed by the
     # live policy rather than exposed as workflow inputs: two completed losses
@@ -586,16 +585,15 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
     # two-market behavior.
     merged["live_consecutive_loss_limit"] = 2
     merged["live_markets_to_skip_after_loss_limit"] = 2
-    # Preserve the current causal signal semantics while giving its frozen
-    # source a full two minutes after open to become available for submission.
-    # These are deliberate live-policy constants, not Action inputs.
-    merged["settlement_contrarian_decision_delay_seconds"] = SETTLEMENT_CONTRARIAN_DECISION_DELAY_SECONDS
+    # The source must be the immediately preceding finalized market, but it
+    # may arrive at any time in this post-open submission window.  This fixed
+    # value prevents old state or Action inputs from silently shortening it.
     merged["settlement_contrarian_entry_grace_seconds"] = SETTLEMENT_CONTRARIAN_ENTRY_GRACE_SECONDS
     for name in (
         "initial_position_size", "max_contracts_per_market", "max_total_capital",
         "fee_reserve", "poll_seconds", "market_refresh_seconds", "order_reconcile_seconds",
         "watch_start_grace_seconds", "live_absolute_stop_price", "live_quote_max_age_seconds",
-        "settlement_contrarian_decision_delay_seconds", "settlement_contrarian_entry_grace_seconds",
+        "settlement_contrarian_entry_grace_seconds",
         "status_log_seconds",
     ):
         value = as_float(merged.get(name))
@@ -1517,6 +1515,73 @@ class KalshiREST:
             return None
         return max(eligible, key=lambda item: (int(item["settlement_epoch"]), str(item["ticker"])))
 
+    async def immediately_preceding_settled_btc15m(
+        self, current_open_epoch: float, available_by_epoch: float,
+    ) -> dict[str, Any] | None:
+        """Return only the finalized market that closed at this market's open.
+
+        This is intentionally narrower than ``latest_settled_btc15m_before``:
+        when a previous 15-minute market is still settling, using an older
+        outcome would silently change the strategy.  A source is eligible only
+        after Kalshi finalizes it and only if its close timestamp equals the
+        current market's opening timestamp.
+        """
+        if aiohttp is None:
+            LOG.error("SETTLEMENT CONTRARIAN UNAVAILABLE | aiohttp is not installed.")
+            return None
+        endpoints = (
+            ("https://external-api.kalshi.com/trade-api/v2/markets", {"status": "settled"}),
+            ("https://external-api.kalshi.com/trade-api/v2/historical/markets", {}),
+        )
+        eligible: list[dict[str, Any]] = []
+        try:
+            timeout = aiohttp.ClientTimeout(total=12)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                for url, parameters in endpoints:
+                    params = {"series_ticker": SERIES_TICKER, "limit": "1000", **parameters}
+                    async with session.get(url, params=params, headers={"Accept": "application/json"}) as response:
+                        if response.status >= 400:
+                            LOG.warning(
+                                "PRECEDING SETTLEMENT LOOKUP | %s returned HTTP %s.", url, response.status,
+                            )
+                            continue
+                        payload = await response.json(content_type=None)
+                    markets = payload.get("markets") if isinstance(payload, dict) else None
+                    if not isinstance(markets, list):
+                        continue
+                    for market in markets:
+                        if not isinstance(market, dict):
+                            continue
+                        ticker = str(market.get("ticker") or "")
+                        close_epoch = timestamp_epoch(market.get("close_time"))
+                        settled_at = timestamp_epoch(market.get("settlement_ts"))
+                        result = market_result(market)
+                        if (
+                            ticker.startswith(SERIES_TICKER + "-")
+                            and result in {"yes", "no"}
+                            and close_epoch is not None
+                            and abs(close_epoch - float(current_open_epoch)) <= 1.0
+                            and settled_at is not None
+                            and settled_at <= float(available_by_epoch) + 1e-9
+                        ):
+                            eligible.append({
+                                "ticker": ticker,
+                                "result": result,
+                                "close_time": market.get("close_time"),
+                                "close_epoch": close_epoch,
+                                "settlement_ts": market.get("settlement_ts"),
+                                "settlement_epoch": settled_at,
+                                "source": "kalshi_public_current" if "historical" not in url else "kalshi_public_historical",
+                            })
+                    if eligible:
+                        break
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning("PRECEDING SETTLEMENT LOOKUP FAILED | %s", exc)
+            return None
+        if not eligible:
+            return None
+        return max(eligible, key=lambda item: (int(item["settlement_epoch"]), str(item["ticker"])))
+
     async def create_order(
         self, *, ticker: str, side: str, position_price: float, quantity: float,
         tif: str, expiration_time: int | None, dry_run: bool, order_key: str,
@@ -2067,8 +2132,8 @@ def start_market_watcher(state: dict[str, Any], market: Any, config: dict[str, A
         "watch_started_at": now_iso(),
     })
     LOG.info(
-        "WATCH STARTED | %s awaiting the open+%.0fs causally settled outcome; it will lock the opposite side and post the persistent 1/2/3/4 GTC ladder unless the two-loss entry skip is pending.",
-        ticker, float(config["settlement_contrarian_decision_delay_seconds"]),
+        "WATCH STARTED | %s awaiting the immediately preceding KXBTC15M finalization; it will lock the opposite side and post the persistent 1/2/3/4 GTC ladder as soon as that result is available, up to %.0fs after open, unless the two-loss entry skip is pending.",
+        ticker, entry_start_grace_seconds(config),
     )
     return record
 
@@ -2089,74 +2154,96 @@ def opposite_side(side: str) -> str | None:
 async def settlement_contrarian_side_for_market(
     rest: Any, market: Any, record: dict[str, Any], config: dict[str, Any], now_epoch: float | None = None,
 ) -> str | None:
-    """Freeze the opposite of the latest settlement known at market open + delay.
+    """Lock the opposite of the immediately preceding finalized KXBTC15M result.
 
-    The cutoff is stored before the lookup and the persisted signal is reused
-    on every handoff.  This prevents an API response arriving later from
-    incorporating a later settlement or changing an already selected side.
+    There is deliberately no fixed post-open delay.  The source must have a
+    close timestamp equal to this market's opening timestamp, so an older
+    finalized market can never be substituted while the immediate predecessor
+    is still settling.  Once the source is found, it is persisted and reused
+    across handoffs without recalculating or changing sides.
     """
     ticker = str(field(market, "ticker") or record.get("ticker") or "")
     open_epoch = timestamp_epoch(field(market, "open_time") or record.get("market_open_time"))
     if not ticker or open_epoch is None:
         record["settlement_contrarian_status"] = "missing_market_open_time"
         return None
-    cutoff_epoch = float(open_epoch) + float(config["settlement_contrarian_decision_delay_seconds"])
     current_epoch = time.time() if now_epoch is None else float(now_epoch)
     persisted = record.get("settlement_contrarian_signal")
     if isinstance(persisted, dict):
         side = str(persisted.get("side") or "").lower()
         source_epoch = as_float(persisted.get("source_settlement_epoch"))
-        persisted_cutoff = as_float(persisted.get("decision_cutoff_epoch"))
+        persisted_frozen_epoch = as_float(
+            persisted.get("decision_available_epoch", persisted.get("decision_cutoff_epoch"))
+        )
+        source_close_epoch = as_float(persisted.get("source_close_epoch"))
         if (
             side in {"yes", "no"}
-            and source_epoch is not None and source_epoch <= cutoff_epoch + 1e-9
-            and persisted_cutoff is not None and abs(persisted_cutoff - cutoff_epoch) <= 1e-6
+            and source_epoch is not None and persisted_frozen_epoch is not None
+            and source_epoch <= persisted_frozen_epoch + 1e-9
+            and str(persisted.get("source_ticker") or "") != ticker
+            and (source_close_epoch is None or abs(source_close_epoch - float(open_epoch)) <= 1.0)
         ):
             record["settlement_contrarian_status"] = "resumed_frozen_signal"
             return side
         record["settlement_contrarian_status"] = "invalid_persisted_signal"
         LOG.critical("SETTLEMENT CONTRARIAN BLOCKED | %s has an invalid persisted source signal.", ticker)
         return None
-    if current_epoch + 1e-9 < cutoff_epoch:
-        if record.get("settlement_contrarian_status") != "waiting_for_cutoff":
+    if current_epoch + 1e-9 < float(open_epoch):
+        if record.get("settlement_contrarian_status") != "waiting_for_market_open":
             LOG.info(
-                "SETTLEMENT CONTRARIAN WAIT | %s decision_cutoff=%s; no side or order before the causal cutoff.",
-                ticker, datetime.fromtimestamp(cutoff_epoch, tz=timezone.utc).isoformat(),
+                "SETTLEMENT CONTRARIAN WAIT | %s has not opened; no side or order before open.", ticker,
             )
-        record["settlement_contrarian_status"] = "waiting_for_cutoff"
+        record["settlement_contrarian_status"] = "waiting_for_market_open"
         return None
     entry_deadline = float(open_epoch) + float(config["settlement_contrarian_entry_grace_seconds"])
     if current_epoch > entry_deadline + 1e-9:
         record["settlement_contrarian_status"] = "signal_window_missed"
         LOG.warning(
-            "SETTLEMENT CONTRARIAN SKIPPED | %s source was not available by the %.0fs entry grace; no late ladder.",
+            "SETTLEMENT CONTRARIAN SKIPPED | %s immediately preceding source was not finalized by the %.0fs entry window; no late ladder.",
             ticker, float(config["settlement_contrarian_entry_grace_seconds"]),
         )
         return None
-    lookup = getattr(rest, "latest_settled_btc15m_before", None)
+    lookup = getattr(rest, "immediately_preceding_settled_btc15m", None)
     if not callable(lookup):
-        record["settlement_contrarian_status"] = "settlement_lookup_unsupported"
-        LOG.critical("SETTLEMENT CONTRARIAN BLOCKED | %s REST adapter cannot read settled outcomes.", ticker)
+        record["settlement_contrarian_status"] = "preceding_settlement_lookup_unsupported"
+        LOG.critical("SETTLEMENT CONTRARIAN BLOCKED | %s REST adapter cannot read the immediately preceding settlement.", ticker)
         return None
-    source = await lookup(cutoff_epoch)
+    next_lookup_epoch = as_float(record.get("next_predecessor_lookup_epoch"))
+    if next_lookup_epoch is not None and current_epoch + 1e-9 < next_lookup_epoch:
+        return None
+    # The authenticated stream can wake this loop many times a second.  Probe
+    # the public settlement endpoint at the normal two-second cadence instead
+    # of turning a busy quote stream into duplicate HTTP calls.
+    record["next_predecessor_lookup_epoch"] = current_epoch + max(1.0, min(float(config["poll_seconds"]), 5.0))
+    source = await lookup(float(open_epoch), current_epoch)
     source_side = str(field(source, "result") or "").lower() if source is not None else ""
     source_epoch = as_float(field(source, "settlement_epoch", "settlement_ts")) if source is not None else None
-    if source_side not in {"yes", "no"} or source_epoch is None or source_epoch > cutoff_epoch + 1e-9:
-        if record.get("settlement_contrarian_status") != "awaiting_prior_settlement":
+    source_close_epoch = as_float(field(source, "close_epoch", "close_time")) if source is not None else None
+    if (
+        source_side not in {"yes", "no"}
+        or source_epoch is None
+        or source_epoch > current_epoch + 1e-9
+        or source_close_epoch is None
+        or abs(source_close_epoch - float(open_epoch)) > 1.0
+    ):
+        if record.get("settlement_contrarian_status") != "awaiting_immediate_predecessor":
             LOG.warning(
-                "SETTLEMENT CONTRARIAN WAIT | %s no prior finalized KXBTC15M result was available by the frozen cutoff.", ticker,
+                "SETTLEMENT CONTRARIAN WAIT | %s immediately preceding KXBTC15M market is not finalized yet; refusing to substitute an older settlement.",
+                ticker,
             )
-        record["settlement_contrarian_status"] = "awaiting_prior_settlement"
+        record["settlement_contrarian_status"] = "awaiting_immediate_predecessor"
         return None
     side = opposite_side(source_side)
     assert side is not None
+    record.pop("next_predecessor_lookup_epoch", None)
     record["settlement_contrarian_signal"] = {
-        "source": "latest_settled_outcome_opposite_v1",
-        "decision_cutoff_epoch": cutoff_epoch,
-        "decision_cutoff": datetime.fromtimestamp(cutoff_epoch, tz=timezone.utc).isoformat(),
+        "source": "immediately_preceding_finalized_outcome_opposite_v2",
+        "decision_available_epoch": current_epoch,
+        "decision_available": datetime.fromtimestamp(current_epoch, tz=timezone.utc).isoformat(),
         "source_ticker": str(field(source, "ticker") or ""),
         "source_settlement": field(source, "settlement_ts"),
         "source_settlement_epoch": source_epoch,
+        "source_close_epoch": source_close_epoch,
         "source_result": source_side,
         "side": side,
         "source_lookup": field(source, "source"),
@@ -2164,10 +2251,10 @@ async def settlement_contrarian_side_for_market(
     }
     record["settlement_contrarian_status"] = "frozen"
     LOG.warning(
-        "SETTLEMENT CONTRARIAN SIDE READY | %s source=%s settled=%s result=%s selected=%s cutoff=%s.",
+        "SETTLEMENT CONTRARIAN SIDE READY | %s source=%s settled=%s result=%s selected=%s available_at=%s.",
         ticker, str(field(source, "ticker") or "?"),
         str(field(source, "settlement_ts") or source_epoch), source_side.upper(), side.upper(),
-        datetime.fromtimestamp(cutoff_epoch, tz=timezone.utc).isoformat(),
+        datetime.fromtimestamp(current_epoch, tz=timezone.utc).isoformat(),
     )
     return side
 
@@ -5271,7 +5358,7 @@ async def log_heartbeat(
                 LOG.info(
                     "WATCH | %s active; %s.", record.get("ticker", "?"),
                     (f"settlement-contrarian selected {side} from {str(signal.get('source_ticker') or '?').upper()}; full weighted GTC ladder will post immediately"
-                     if side else "awaiting its open+45s causal settlement cutoff; no order can be placed"),
+                     if side else "awaiting the immediately preceding KXBTC15M finalization; no order can be placed"),
                 )
                 continue
             ml_signal = record.get("ml_inference") if isinstance(record.get("ml_inference"), dict) else {}
@@ -5636,8 +5723,7 @@ async def run(args: argparse.Namespace) -> int:
     if ml_selector is None:
         LOG.warning(
             "SETTLEMENT CONTRARIAN POLICY | no ML model, ledger, probability, or model-transition comparison is loaded. "
-            "At each market open+%.0fs, latest finalized KXBTC15M result is read and the opposite side is frozen.",
-            config["settlement_contrarian_decision_delay_seconds"],
+            "After each market opens, the immediately preceding finalized KXBTC15M result is read and the opposite side is frozen without a fixed delay.",
         )
     else:
         LOG.info(
@@ -5869,7 +5955,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--live-execution-strategy", choices=sorted(LIVE_EXECUTION_STRATEGIES),
         help=("Persisted real-order mode. inverse_ml_weighted_hold_gate is the inverse-ML 1/2/3/4 strategy; "
-              "settlement_contrarian_weighted_hold_gate uses the opposite of the latest settlement at open+45s and never loads ML."),
+              "settlement_contrarian_weighted_hold_gate uses the opposite of the immediately preceding finalized settlement and never loads ML."),
     )
     parser.add_argument(
         "--live-inverse-ml-hold-gate", type=float,

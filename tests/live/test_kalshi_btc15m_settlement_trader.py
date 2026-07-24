@@ -32,34 +32,54 @@ class SettlementTraderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(config["max_total_capital"], 6.0)
         self.assertEqual(trader.ladder_principal_for_rungs(trader.live_rung_quantities(config)), 6.0)
 
-    async def test_two_minute_submission_window_keeps_the_45_second_causal_signal(self) -> None:
+    async def test_immediate_predecessor_signal_has_no_fixed_delay(self) -> None:
         class Rest:
-            async def latest_settled_btc15m_before(self, cutoff_epoch):
-                self.cutoff_epoch = cutoff_epoch
+            async def immediately_preceding_settled_btc15m(self, current_open_epoch, available_by_epoch):
+                self.current_open_epoch = current_open_epoch
+                self.available_by_epoch = available_by_epoch
                 return {
                     "ticker": "KXBTC15M-prior",
                     "result": "yes",
-                    "settlement_epoch": cutoff_epoch,
-                    "settlement_ts": datetime.fromtimestamp(cutoff_epoch, tz=timezone.utc).isoformat(),
+                    "close_epoch": current_open_epoch,
+                    "settlement_epoch": current_open_epoch + 6,
+                    "settlement_ts": datetime.fromtimestamp(current_open_epoch + 6, tz=timezone.utc).isoformat(),
                     "source": "test",
                 }
 
         config = trader.validate_config({
-            "settlement_contrarian_decision_delay_seconds": 999.0,
             "settlement_contrarian_entry_grace_seconds": 999.0,
         })
-        self.assertEqual(config["settlement_contrarian_decision_delay_seconds"], 45.0)
         self.assertEqual(config["settlement_contrarian_entry_grace_seconds"], 120.0)
         opened_at = 1_700_000_000
         market = {"ticker": "KXBTC15M-current", "open_time": opened_at}
         record = {"ticker": "KXBTC15M-current"}
         rest = Rest()
         side = await trader.settlement_contrarian_side_for_market(
-            rest, market, record, config, now_epoch=opened_at + 119,
+            rest, market, record, config, now_epoch=opened_at + 7,
         )
         self.assertEqual(side, "no")
-        self.assertEqual(rest.cutoff_epoch, opened_at + 45)
-        self.assertEqual(record["settlement_contrarian_signal"]["decision_cutoff_epoch"], opened_at + 45)
+        self.assertEqual(rest.current_open_epoch, opened_at)
+        self.assertEqual(rest.available_by_epoch, opened_at + 7)
+        self.assertEqual(record["settlement_contrarian_signal"]["source_close_epoch"], opened_at)
+        self.assertEqual(record["settlement_contrarian_signal"]["decision_available_epoch"], opened_at + 7)
+
+    async def test_signal_waits_for_immediate_predecessor_not_an_older_settlement(self) -> None:
+        class Rest:
+            async def immediately_preceding_settled_btc15m(self, current_open_epoch, available_by_epoch):
+                self.current_open_epoch = current_open_epoch
+                self.available_by_epoch = available_by_epoch
+                return None
+
+        config = trader.validate_config({})
+        opened_at = 1_700_000_000
+        record = {"ticker": "KXBTC15M-current"}
+        rest = Rest()
+        side = await trader.settlement_contrarian_side_for_market(
+            rest, {"ticker": "KXBTC15M-current", "open_time": opened_at}, record, config, now_epoch=opened_at + 7,
+        )
+        self.assertIsNone(side)
+        self.assertEqual(record["settlement_contrarian_status"], "awaiting_immediate_predecessor")
+        self.assertEqual(rest.current_open_epoch, opened_at)
 
     def test_share_override_persists_scaled_caps(self) -> None:
         args = argparse.Namespace(
