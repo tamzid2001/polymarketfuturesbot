@@ -16,7 +16,7 @@ This repository contains a live Kalshi BTC 15-minute settlement-contrarian trade
 Dynamic scaling is disabled by default, so the configured starting base stays fixed. Enable it from the **Kalshi BTC 15m Settlement Contrarian** Action with:
 
 - `enable_dynamic_scaling`: `true` or `false` (default `false`)
-- `base_share_increment`: whole base shares added after a threshold (default `1`)
+- `base_share_increment`: base shares added after a threshold, in 0.01-share increments (default `1`)
 - `scaling_profit_multiplier`: realized net profit required per current base share (default `16.5`)
 
 When enabled, the runner starts a fresh scaling balance at the configured base. It accumulates realized net P&L from subsequently completed, filled live trades. At:
@@ -25,7 +25,7 @@ When enabled, the runner starts a fresh scaling balance at the configured base. 
 profit_since_last_increase >= current_base_share_count × scaling_profit_multiplier
 ```
 
-it increases the base by `base_share_increment`, resets that balance to zero, and uses the new **1/2/3/4** ladder only for later markets. Existing GTC ladders retain their original size. Runner-owned contract and principal caps grow as needed; explicitly supplied caps are never overridden and will safely block an oversized full ladder rather than submit it partially.
+it increases the base by `base_share_increment`, resets that balance to zero, and uses the new **1/2/3/4** ladder only for later markets. Bases and rungs retain 0.01-share precision (for example, base `3.25` creates `3.25 / 6.50 / 9.75 / 13.00`). Existing GTC ladders retain their original size. Runner-owned contract and principal caps grow as needed; explicitly supplied caps are never overridden and will safely block an oversized full ladder rather than submit it partially.
 
 The live report and periodic `LIVE DYNAMIC BASE SCALING` log include the active base, profit balance, next threshold, increase count, and whether capacity is automatic or explicit. Settings are persisted across controlled GitHub Actions handoffs.
 

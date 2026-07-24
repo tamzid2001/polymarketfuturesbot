@@ -174,6 +174,61 @@ class SettlementTraderTests(unittest.IsolatedAsyncioTestCase):
             {0.40: 5.0, 0.30: 10.0, 0.20: 15.0, 0.10: 20.0},
         )
 
+    def test_dynamic_scaling_accepts_fractional_base_increment_at_cent_precision(self) -> None:
+        config = trader.validate_config({
+            "initial_position_size": 3.0,
+            "enable_dynamic_scaling": True,
+            "base_share_increment": 0.25,
+            "scaling_profit_multiplier": 0.75,
+        })
+        base = 1_700_001_250
+        state = {"markets": {}}
+        trader.refresh_dynamic_base_share_scaling(state, config, now_epoch=base)
+        state["markets"]["KXBTC15M-fractional-threshold-win"] = self.completed_live_record(
+            "KXBTC15M-fractional-threshold-win", base + 1, 2.25,
+        )
+        trader.refresh_dynamic_base_share_scaling(state, config, now_epoch=base + 2)
+        snapshot = trader.dynamic_scaling_snapshot(state, config)
+        self.assertEqual(snapshot["required_profit"], 2.4375)
+        self.assertEqual(snapshot["current_base_share_count"], 3.25)
+        self.assertEqual(
+            trader.live_rung_quantities(config, state),
+            {0.40: 3.25, 0.30: 6.5, 0.20: 9.75, 0.10: 13.0},
+        )
+
+    def test_share_sizing_rejects_more_than_cent_precision(self) -> None:
+        minimum = trader.validate_config({"initial_position_size": 0.01})
+        self.assertEqual(
+            trader.live_rung_quantities(minimum),
+            {0.40: 0.01, 0.30: 0.02, 0.20: 0.03, 0.10: 0.04},
+        )
+        with self.assertRaisesRegex(ValueError, "two decimal places"):
+            trader.validate_config({"base_share_increment": 0.001})
+        with self.assertRaisesRegex(ValueError, "two decimal places"):
+            trader.validate_config({"initial_position_size": 3.001})
+
+    async def test_live_order_boundaries_preserve_cent_precision(self) -> None:
+        # ``dry_run`` reaches the exact live request-construction boundary
+        # without requiring credentials or a network call.
+        rest = object.__new__(trader.KalshiREST)
+        entry = await rest.create_order(
+            ticker="KXBTC15M-cent-precision", side="yes", position_price=0.40,
+            quantity=3.25, tif="good_till_canceled", expiration_time=1_700_000_000,
+            dry_run=True, order_key="fractional",
+        )
+        self.assertEqual(entry["quantity"], 3.25)
+        with self.assertRaisesRegex(ValueError, "two decimal places"):
+            await rest.create_order(
+                ticker="KXBTC15M-cent-precision", side="yes", position_price=0.40,
+                quantity=3.251, tif="good_till_canceled", expiration_time=1_700_000_000,
+                dry_run=True, order_key="invalid",
+            )
+        with self.assertRaisesRegex(ValueError, "two decimal places"):
+            await rest.create_reduce_only_exit(
+                ticker="KXBTC15M-cent-precision", held_side="yes", economic_exit_price=0.05,
+                quantity=3.251, dry_run=True, order_key="invalid-exit",
+            )
+
     def test_dynamic_scaling_action_overrides_are_persistable_and_explicit_caps_stay_manual(self) -> None:
         parser = trader.build_parser()
         args = parser.parse_args([
@@ -191,7 +246,7 @@ class SettlementTraderTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(config["max_contracts_per_market_auto"])
         self.assertFalse(config["max_total_capital_auto"])
 
-    async def test_scaled_base_is_snapshotted_on_the_next_full_live_ladder(self) -> None:
+    async def test_fractional_scaled_base_is_snapshotted_on_the_next_full_live_ladder(self) -> None:
         class Rest:
             def __init__(self) -> None:
                 self.orders: list[dict] = []
@@ -210,14 +265,14 @@ class SettlementTraderTests(unittest.IsolatedAsyncioTestCase):
 
         config = trader.validate_config({
             "enable_dynamic_scaling": True,
-            "base_share_increment": 1,
-            "scaling_profit_multiplier": 1.0,
+            "base_share_increment": 0.25,
+            "scaling_profit_multiplier": 0.75,
         })
         now = time.time()
         state = {"markets": {}}
         trader.refresh_dynamic_base_share_scaling(state, config, now_epoch=now)
         state["markets"]["KXBTC15M-scale-win"] = self.completed_live_record(
-            "KXBTC15M-scale-win", int(now) + 1, 3.0,
+            "KXBTC15M-scale-win", int(now) + 1, 2.25,
         )
         trader.refresh_dynamic_base_share_scaling(state, config, now_epoch=now + 2)
         ticker = "KXBTC15M-scaled-entry"
@@ -228,12 +283,12 @@ class SettlementTraderTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(submitted)
         record = state["markets"][ticker]
-        self.assertEqual(record["base_share_count"], 4.0)
+        self.assertEqual(record["base_share_count"], 3.25)
         self.assertEqual(
             record["rung_quantities"],
-            {"0.4000": 4.0, "0.3000": 8.0, "0.2000": 12.0, "0.1000": 16.0},
+            {"0.4000": 3.25, "0.3000": 6.5, "0.2000": 9.75, "0.1000": 13.0},
         )
-        self.assertEqual([order["quantity"] for order in rest.orders], [4.0, 8.0, 12.0, 16.0])
+        self.assertEqual([order["quantity"] for order in rest.orders], [3.25, 6.5, 9.75, 13.0])
 
     async def test_high_price_never_arms_or_closes_a_profit_trail(self) -> None:
         class Feed:
