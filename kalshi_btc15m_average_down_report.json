@@ -3,8 +3,10 @@
   "average_contracts_per_trade": 15.3145,
   "average_entry_price": 0.216409,
   "configuration": {
+    "base_share_increment": 1.0,
+    "enable_dynamic_scaling": false,
     "fee_reserve": 0.05,
-    "format_version": 16,
+    "format_version": 17,
     "initial_position_size": 3.0,
     "live_absolute_stop_price": 0.05,
     "live_consecutive_loss_limit": 2,
@@ -14,15 +16,38 @@
     "market_refresh_seconds": 15.0,
     "max_active_markets": 1,
     "max_contracts_per_market": 30.0,
+    "max_contracts_per_market_auto": true,
     "max_total_capital": 6.0,
+    "max_total_capital_auto": true,
     "order_reconcile_seconds": 5.0,
     "poll_seconds": 2.0,
+    "scaling_profit_multiplier": 16.5,
     "settlement_contrarian_entry_grace_seconds": 120.0,
     "status_log_seconds": 60.0,
     "watch_start_grace_seconds": 45.0
   },
   "current_streak": 2,
   "current_streak_kind": "win",
+  "dynamic_base_share_scaling": {
+    "base_share_increment": 1.0,
+    "current_base_share_count": 3.0,
+    "current_ladder_rungs": {
+      "0.1000": 12.0,
+      "0.2000": 9.0,
+      "0.3000": 6.0,
+      "0.4000": 3.0
+    },
+    "enabled": false,
+    "last_scale": null,
+    "max_contracts_per_market_auto": true,
+    "max_total_capital_auto": true,
+    "profit_remaining_to_increase": 49.5,
+    "profit_since_last_increase": 0.0,
+    "required_profit": 49.5,
+    "scale_count": 0,
+    "scaling_profit_multiplier": 16.5,
+    "starting_base_share_count": 3.0
+  },
   "entry_loss_skip": {
     "consecutive_completed_losses": 0,
     "last_completed_trade": {
@@ -40,7 +65,7 @@
   },
   "exit_policy": "hold every filled contract to settlement; only fresh full-depth selected-side bid <= $0.05 triggers a reduce-only close",
   "five_cent_stop_exits": 66,
-  "generated_at": "2026-07-24T17:15:46.298930+00:00",
+  "generated_at": "2026-07-24T17:23:14.710234+00:00",
   "last_closed_trade": {
     "closed_at": "2026-07-24T17:15:14.515809+00:00",
     "contracts": 3.0,
