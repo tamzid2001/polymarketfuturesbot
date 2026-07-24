@@ -49,10 +49,10 @@ class SettlementTraderTests(unittest.IsolatedAsyncioTestCase):
         config = trader.validate_config({
             "settlement_contrarian_entry_grace_seconds": 999.0,
         })
-        self.assertEqual(config["settlement_contrarian_entry_grace_seconds"], 120.0)
+        self.assertEqual(config["settlement_contrarian_entry_grace_seconds"], 300.0)
         opened_at = 1_700_000_000
         market = {"ticker": "KXBTC15M-current", "open_time": opened_at}
-        record = {"ticker": "KXBTC15M-current"}
+        record = {"ticker": "KXBTC15M-current", "status": "watching"}
         rest = Rest()
         side = await trader.settlement_contrarian_side_for_market(
             rest, market, record, config, now_epoch=opened_at + 7,
@@ -62,6 +62,84 @@ class SettlementTraderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rest.available_by_epoch, opened_at + 7)
         self.assertEqual(record["settlement_contrarian_signal"]["source_close_epoch"], opened_at)
         self.assertEqual(record["settlement_contrarian_signal"]["decision_available_epoch"], opened_at + 7)
+
+    async def test_immediate_predecessor_can_arrive_late_within_five_minute_window(self) -> None:
+        class Rest:
+            async def immediately_preceding_settled_btc15m(self, current_open_epoch, available_by_epoch):
+                self.available_by_epoch = available_by_epoch
+                return {
+                    "ticker": "KXBTC15M-prior", "result": "no",
+                    "close_epoch": current_open_epoch,
+                    "settlement_epoch": available_by_epoch,
+                    "settlement_ts": datetime.fromtimestamp(available_by_epoch, tz=timezone.utc).isoformat(),
+                    "source": "test",
+                }
+
+        config = trader.validate_config({})
+        opened_at = 1_700_000_000
+        record = {"ticker": "KXBTC15M-current", "status": "watching"}
+        rest = Rest()
+        side = await trader.settlement_contrarian_side_for_market(
+            rest, {"ticker": "KXBTC15M-current", "open_time": opened_at}, record, config,
+            now_epoch=opened_at + 299,
+        )
+        self.assertEqual(side, "yes")
+        self.assertEqual(rest.available_by_epoch, opened_at + 299)
+        self.assertEqual(record["status"], "watching")
+
+    async def test_source_window_expiry_is_a_single_terminal_no_order_state(self) -> None:
+        class Rest:
+            async def immediately_preceding_settled_btc15m(self, *args):
+                raise AssertionError("expired source window must not issue another settlement lookup")
+
+        config = trader.validate_config({})
+        opened_at = 1_700_000_000
+        record = {"ticker": "KXBTC15M-current", "status": "watching", "orders": {}}
+        side = await trader.settlement_contrarian_side_for_market(
+            Rest(), {"ticker": "KXBTC15M-current", "open_time": opened_at}, record, config,
+            now_epoch=opened_at + 300.01,
+        )
+        self.assertIsNone(side)
+        self.assertEqual(record["status"], "signal_window_missed")
+        self.assertEqual(record["settlement_contrarian_status"], "signal_window_missed")
+        self.assertIn(record["status"], trader.FINAL_RECORD_STATUSES)
+        self.assertEqual(record["reserved_principal"], 0.0)
+        self.assertIsNone(await trader.settlement_contrarian_side_for_market(
+            Rest(), {"ticker": "KXBTC15M-current", "open_time": opened_at}, record, config,
+            now_epoch=opened_at + 400,
+        ))
+
+    def test_early_exit_later_records_official_outcome_without_repricing_realized_pnl(self) -> None:
+        record = {
+            "ticker": "KXBTC15M-stopped",
+            "strategy": trader.LIVE_EXECUTION_STRATEGY,
+            "status": "exited_early",
+            "locked_side": "yes",
+            "orders": {
+                "0.4000": {
+                    "fill_count": 3.0,
+                    "average_fill_price": 0.40,
+                    "fees_paid": 0.0,
+                },
+            },
+            "live_exit_orders": [{
+                "fill_count": 3.0,
+                "average_fill_price": 0.05,
+                "fees_paid": 0.0,
+            }],
+            "net_profit_loss": -1.05,
+        }
+        self.assertTrue(trader.annotate_early_exit_settlement_outcome(
+            record, {"status": "finalized", "result": "yes"},
+        ))
+        self.assertEqual(record["settlement_outcome"], "yes")
+        self.assertEqual(record["post_exit_directional_result"], "would_have_won")
+        self.assertFalse(trader.annotate_early_exit_settlement_outcome(
+            record, {"status": "finalized", "result": "yes"},
+        ))
+        rung = trader.rung_performance([record])["0.40"]
+        self.assertEqual(rung["net_profit"], -1.05)
+        self.assertEqual(rung["losing_orders"], 1)
 
     async def test_signal_waits_for_immediate_predecessor_not_an_older_settlement(self) -> None:
         class Rest:

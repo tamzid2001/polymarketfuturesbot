@@ -57,7 +57,7 @@ except ImportError:  # pragma: no cover - exercised only in minimal local enviro
 LOG = logging.getLogger("kalshi_btc15m_average_down")
 SERIES_TICKER = "KXBTC15M"
 LADDER_LEVELS = (0.40, 0.30, 0.20, 0.10)
-CONFIG_VERSION = 17
+CONFIG_VERSION = 18
 STATE_VERSION = 9
 ORDER_NAMESPACE = uuid.UUID("4d85857e-4dc6-43ec-960f-0b342523bdb7")
 KALSHI_WS_URL = os.getenv(
@@ -70,10 +70,12 @@ QUOTE_STALE_SECONDS = 20.0
 MAINTENANCE_TIMEZONE = ZoneInfo("America/New_York")
 EXCHANGE_RECOVERY_RETRY_SECONDS = 60.0
 CHECKPOINT_RETRY_SECONDS = max(1.0, float(os.getenv("KALSHI_CHECKPOINT_RETRY_SECONDS", "60")))
-# There is no fixed signal delay.  The first finalized immediately preceding
-# market is used as soon as it is observable; the two-minute window gives its
-# settlement update and an Actions handoff time to arrive.
-SETTLEMENT_CONTRARIAN_ENTRY_GRACE_SECONDS = 120.0
+# There is no fixed signal delay. The first finalized immediately preceding
+# market is used as soon as it is observable. Kalshi can publish that final
+# result later than two minutes after the next market opens, so keep a five-
+# minute causal availability window rather than silently substituting an older
+# result or repeatedly logging an already-expired watcher.
+SETTLEMENT_CONTRARIAN_ENTRY_GRACE_SECONDS = 300.0
 # Polling metadata changes every few seconds and must never turn the bot-state
 # branch into a stream of commits. Everything else is material trading state.
 CHECKPOINT_IGNORED_KEYS = {
@@ -1936,7 +1938,7 @@ def market_record(state: dict[str, Any], ticker: str) -> dict[str, Any]:
 
 FINAL_RECORD_STATUSES = {
     "finalized", "finalized_unfilled", "finalized_no_signal", "exited_early",
-    "entry_skipped_loss_circuit_breaker",
+    "entry_skipped_loss_circuit_breaker", "signal_window_missed",
 }
 
 
@@ -2484,6 +2486,10 @@ async def settlement_contrarian_side_for_market(
         record["settlement_contrarian_status"] = "invalid_persisted_signal"
         LOG.critical("SETTLEMENT CONTRARIAN BLOCKED | %s has an invalid persisted source signal.", ticker)
         return None
+    # This is terminal for a zero-order watcher. Keeping it terminal prevents
+    # both a late ladder and a warning on every subsequent quote-loop wakeup.
+    if record.get("status") == "signal_window_missed":
+        return None
     if current_epoch + 1e-9 < float(open_epoch):
         if record.get("settlement_contrarian_status") != "waiting_for_market_open":
             LOG.info(
@@ -2493,10 +2499,19 @@ async def settlement_contrarian_side_for_market(
         return None
     entry_deadline = float(open_epoch) + float(config["settlement_contrarian_entry_grace_seconds"])
     if current_epoch > entry_deadline + 1e-9:
-        record["settlement_contrarian_status"] = "signal_window_missed"
+        window = float(config["settlement_contrarian_entry_grace_seconds"])
+        record.update({
+            "status": "signal_window_missed",
+            "settlement_contrarian_status": "signal_window_missed",
+            "signal_window_deadline_epoch": entry_deadline,
+            "signal_window_missed_at": now_iso(),
+            "signal_window_missed_reason": "immediate_predecessor_not_finalized_before_deadline",
+            "reserved_principal": 0.0,
+        })
         LOG.warning(
-            "SETTLEMENT CONTRARIAN SKIPPED | %s immediately preceding source was not finalized by the %.0fs entry window; no late ladder.",
-            ticker, float(config["settlement_contrarian_entry_grace_seconds"]),
+            "SETTLEMENT CONTRARIAN SKIPPED | %s immediate predecessor was not finalized by the %.0fs causal window; "
+            "watcher is terminal and no late ladder will be posted.",
+            ticker, window,
         )
         return None
     lookup = getattr(rest, "immediately_preceding_settled_btc15m", None)
@@ -3682,6 +3697,38 @@ def mark_live_exit_if_flat(record: dict[str, Any]) -> bool:
     return True
 
 
+def annotate_early_exit_settlement_outcome(record: dict[str, Any], market: Any) -> bool:
+    """Attach an official result to an already-closed 5c-stop record.
+
+    This is informational only. The reduce-only exit already fixed realized
+    P&L, so no order, position, average cost, or profit field is modified.
+    It prevents a finalized stopped market from permanently showing
+    ``outcome=?`` in the compact live report.
+    """
+    if record.get("status") != "exited_early":
+        return False
+    existing = str(record.get("settlement_outcome") or "").lower()
+    if existing in {"yes", "no"}:
+        return False
+    result = market_result(market)
+    market_status = str(field(market, "status") or "").lower()
+    if result not in {"yes", "no"} or market_status != "finalized":
+        return False
+    side = str(record.get("locked_side") or record.get("candidate_side") or "").lower()
+    directional_result = "would_have_won" if side == result else "would_have_lost"
+    record.update({
+        "settlement_outcome": result,
+        "settlement_outcome_observed_at": now_iso(),
+        "post_exit_directional_result": directional_result,
+    })
+    LOG.info(
+        "LIVE POST-EXIT SETTLEMENT | %s side=%s official_outcome=%s %s; "
+        "the earlier reduce-only exit and realized P&L are unchanged.",
+        record.get("ticker", "?"), side.upper() or "?", result.upper(), directional_result,
+    )
+    return True
+
+
 async def monitor_live_absolute_stop(
     rest: KalshiREST, record: dict[str, Any], feed: KalshiLiveFeed | None,
     config: dict[str, Any], dry_run: bool,
@@ -4192,8 +4239,20 @@ def rung_performance(settled: list[dict[str, Any]]) -> dict[str, dict[str, Any]]
                 continue
             result = stats[f"{level:.2f}"]
             average_price = float(order.get("average_fill_price") or order.get("position_price") or 0.0)
-            fee = float(order.get("fees_paid") or 0.0)
-            order_net = (fill if position_side == resolved_side else 0.0) - fill * average_price - fee
+            entry_fee = float(order.get("fees_paid") or 0.0)
+            if record.get("status") == "exited_early":
+                # A completed 5c stop has no settlement payout. Allocate its
+                # actual exit proceeds and fees by filled entry size so a
+                # later informational settlement outcome cannot make the
+                # rung report treat already-sold contracts as a $1 payout.
+                entry_total = filled_contracts(record)
+                share = fill / entry_total if entry_total > 0.004 else 0.0
+                order_net = (
+                    share * (live_exit_proceeds(record) - live_exit_fees(record))
+                    - fill * average_price - entry_fee
+                )
+            else:
+                order_net = (fill if position_side == resolved_side else 0.0) - fill * average_price - entry_fee
             result["filled_orders"] += 1
             result["filled_contracts"] += fill
             result["net_profit"] += order_net
@@ -4910,6 +4969,7 @@ def performance_report(state: dict[str, Any], config: dict[str, Any]) -> dict[st
     }]
     unfilled = sum(record.get("status") == "finalized_unfilled" for record in records)
     skipped_after_losses = sum(record.get("status") == "entry_skipped_loss_circuit_breaker" for record in records)
+    source_window_misses = sum(record.get("status") == "signal_window_missed" for record in records)
     pnls = [float(record.get("net_profit_loss") or 0.0) for record in closed]
     costs = [float(record.get("total_cost") or 0.0) for record in closed]
     contracts = [float(record.get("contracts") or 0.0) for record in closed]
@@ -4945,6 +5005,7 @@ def performance_report(state: dict[str, Any], config: dict[str, Any]) -> dict[st
         "settled_trades": len(closed),
         "unfilled_markets": int(unfilled),
         "markets_skipped_due_to_loss_circuit_breaker": int(skipped_after_losses),
+        "markets_skipped_due_to_source_finalization_window": int(source_window_misses),
         "winning_trades": wins,
         "losing_trades": losses,
         "win_rate": round(wins / len(closed), 6) if closed else None,
@@ -4977,6 +5038,7 @@ def performance_report(state: dict[str, Any], config: dict[str, Any]) -> dict[st
             "net_profit_loss": float(last_trade.get("net_profit_loss") or 0.0),
             "return_percentage": last_trade.get("return_percentage"),
             "closed_at": last_trade.get("exited_at") or last_trade.get("settled_at"),
+            "post_exit_directional_result": last_trade.get("post_exit_directional_result"),
         },
         "exit_policy": "hold every filled contract to settlement; only fresh full-depth selected-side bid <= $0.05 triggers a reduce-only close",
     }
@@ -5089,10 +5151,11 @@ def log_performance_summary(report: dict[str, Any], context: str) -> None:
     """Emit a compact, periodic summary without model or paper-study noise."""
     streak = "none" if not report["current_streak"] else f"{report['current_streak']} {report['current_streak_kind']}"
     LOG.info(
-        "LIVE SETTLEMENT SUMMARY | %s started=%d active=%d settled=%d unfilled=%d skipped=%d W/L=%d/%d win_rate=%s "
+        "LIVE SETTLEMENT SUMMARY | %s started=%d active=%d settled=%d unfilled=%d loss_skips=%d source_window_misses=%d W/L=%d/%d win_rate=%s "
         "net=$%+.4f roi=%s costs=$%.4f contracts=%.2f stops=5c:%d/settlement:%d streak=%s longest_W/L=%d/%d max_dd=$%.4f.",
         context, report["markets_started"], report["active_markets"], report["settled_trades"], report["unfilled_markets"],
         report["markets_skipped_due_to_loss_circuit_breaker"],
+        report["markets_skipped_due_to_source_finalization_window"],
         report["winning_trades"], report["losing_trades"],
         "n/a" if report["win_rate"] is None else f"{100 * report['win_rate']:.2f}%",
         report["net_profit"], "n/a" if report["return_on_capital"] is None else f"{100 * report['return_on_capital']:.2f}%",
@@ -5102,10 +5165,11 @@ def log_performance_summary(report: dict[str, Any], context: str) -> None:
     last = report["last_closed_trade"]
     if isinstance(last, dict):
         LOG.info(
-            "LIVE LAST SETTLEMENT | %s side=%s outcome=%s exit=%s contracts=%.2f cost=$%.4f payout=$%.4f fees=$%.4f net=$%+.4f roi=%s.",
-            last["ticker"] or "?", str(last["selected_side"] or "?").upper(), str(last["settlement_outcome"] or "?").upper(),
+            "LIVE LAST CLOSED TRADE | %s side=%s outcome=%s exit=%s contracts=%.2f cost=$%.4f payout=$%.4f fees=$%.4f net=$%+.4f roi=%s%s.",
+            last["ticker"] or "?", str(last["selected_side"] or "?").upper(), str(last["settlement_outcome"] or "pending").upper(),
             last["exit_method"], last["contracts"], last["total_cost"], last["gross_payout"], last["fees"],
             last["net_profit_loss"], "n/a" if last["return_percentage"] is None else f"{last['return_percentage']:+.2f}%",
+            "" if not last.get("post_exit_directional_result") else f" later_{last['post_exit_directional_result']}",
         )
     loss_skip = report["entry_loss_skip"]
     LOG.info(
@@ -5862,7 +5926,19 @@ async def run_settlement_only(args: argparse.Namespace) -> int:
             private_update = feed.private_update_count != last_private_update_count
             if private_update or monotonic_now - last_order_reconcile_at >= config["order_reconcile_seconds"]:
                 for ticker, record in list(state["markets"].items()):
-                    if not isinstance(record, dict) or record.get("status") in FINAL_RECORD_STATUSES:
+                    if not isinstance(record, dict):
+                        continue
+                    if record.get("status") in FINAL_RECORD_STATUSES:
+                        # A 5c stop is economically complete, but its later
+                        # official YES/NO settlement result is useful report
+                        # metadata. Fetch it once without changing the close.
+                        if (
+                            record.get("status") == "exited_early"
+                            and str(record.get("settlement_outcome") or "").lower() not in {"yes", "no"}
+                        ):
+                            market = await rest.get_market(ticker)
+                            if market is not None:
+                                annotate_early_exit_settlement_outcome(record, market)
                         continue
                     market = await rest.get_market(ticker)
                     if market is None:
