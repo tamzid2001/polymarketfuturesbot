@@ -1942,6 +1942,99 @@ FINAL_RECORD_STATUSES = {
     "entry_skipped_loss_circuit_breaker", "signal_window_missed",
 }
 
+# A stopped or deliberately skipped market is already terminal for execution,
+# but its frozen signal is not scoreable until the target market itself is
+# officially finalized.  Avoid repeatedly polling that closed record before
+# its settlement is even possible, and then use a modest retry cadence while
+# Kalshi publishes the official result.
+DIRECTIONAL_SIGNAL_SETTLEMENT_RECHECK_SECONDS = 30.0
+
+
+def settlement_contrarian_signal_side(record: dict[str, Any]) -> str | None:
+    """Return only the already-frozen causal prediction for a record."""
+    signal = record.get("settlement_contrarian_signal")
+    if not isinstance(signal, dict):
+        return None
+    side = str(signal.get("side") or "").lower()
+    return side if side in {"yes", "no"} else None
+
+
+def directional_signal_is_scored(record: dict[str, Any]) -> bool:
+    """Whether the frozen settlement-only signal has an official outcome."""
+    scored = record.get("directional_signal")
+    return (
+        isinstance(scored, dict)
+        and str(scored.get("prediction") or "").lower() in {"yes", "no"}
+        and str(scored.get("outcome") or "").lower() in {"yes", "no"}
+        and isinstance(scored.get("correct"), bool)
+    )
+
+
+def directional_signal_settlement_check_due(record: dict[str, Any], now_epoch: float | None = None) -> bool:
+    """Return whether an execution-terminal signal needs a settlement lookup.
+
+    A target market cannot have an official outcome before its close.  This
+    guard keeps a stopped/zero-order record from creating one REST request per
+    reconciliation cycle for the remainder of the 15-minute market.
+    """
+    if directional_signal_is_scored(record):
+        return False
+    if str(record.get("settlement_outcome") or "").lower() in {"yes", "no"}:
+        return True
+    now_value = time.time() if now_epoch is None else float(now_epoch)
+    close_epoch = timestamp_epoch(record.get("market_close_time"))
+    if close_epoch is not None and now_value + 1e-9 < close_epoch:
+        return False
+    next_check = as_float(record.get("directional_signal_next_check_epoch"))
+    return next_check is None or now_value + 1e-9 >= next_check
+
+
+def defer_directional_signal_settlement_check(record: dict[str, Any], now_epoch: float | None = None) -> None:
+    """Persist the next official-result retry without changing signal state."""
+    now_value = time.time() if now_epoch is None else float(now_epoch)
+    record["directional_signal_next_check_epoch"] = round(
+        now_value + DIRECTIONAL_SIGNAL_SETTLEMENT_RECHECK_SECONDS, 3,
+    )
+
+
+def record_directional_signal_outcome(record: dict[str, Any], outcome: str) -> bool:
+    """Score a frozen signal from settlement, independent of any ladder fill.
+
+    This is intentionally separate from realized trade P&L. A zero-fill
+    ladder and an intentional two-loss skip still have a valid model-free
+    directional prediction; their win/loss is solely the selected side versus
+    the target market's final YES/NO result.
+    """
+    prediction = settlement_contrarian_signal_side(record)
+    resolved = str(outcome or "").lower()
+    if prediction not in {"yes", "no"} or resolved not in {"yes", "no"}:
+        return False
+    existing = record.get("directional_signal")
+    if (
+        isinstance(existing, dict)
+        and str(existing.get("prediction") or "").lower() == prediction
+        and str(existing.get("outcome") or "").lower() == resolved
+        and isinstance(existing.get("correct"), bool)
+    ):
+        record.setdefault("settlement_outcome", resolved)
+        return False
+    signal = record.get("settlement_contrarian_signal")
+    signal = signal if isinstance(signal, dict) else {}
+    record["settlement_outcome"] = resolved
+    record["directional_signal"] = {
+        "prediction": prediction,
+        "outcome": resolved,
+        "correct": prediction == resolved,
+        "source_ticker": signal.get("source_ticker"),
+        "source_result": signal.get("source_result"),
+        "frozen_at": signal.get("frozen_at"),
+        "scored_at": now_iso(),
+        "entry_status": record.get("status"),
+        "entry_filled_contracts": filled_contracts(record),
+    }
+    record.pop("directional_signal_next_check_epoch", None)
+    return True
+
 
 def live_completed_trade_records(state: dict[str, Any]) -> list[tuple[tuple[int, str], dict[str, Any]]]:
     """Return completed, actually-filled live trades in completion order.
@@ -3708,15 +3801,15 @@ def annotate_early_exit_settlement_outcome(record: dict[str, Any], market: Any) 
     """
     if record.get("status") != "exited_early":
         return False
-    existing = str(record.get("settlement_outcome") or "").lower()
-    if existing in {"yes", "no"}:
-        return False
     result = market_result(market)
     market_status = str(field(market, "status") or "").lower()
     if result not in {"yes", "no"} or market_status != "finalized":
         return False
     side = str(record.get("locked_side") or record.get("candidate_side") or "").lower()
     directional_result = "would_have_won" if side == result else "would_have_lost"
+    changed = record_directional_signal_outcome(record, result)
+    if not changed and str(record.get("settlement_outcome") or "").lower() in {"yes", "no"}:
+        return False
     record.update({
         "settlement_outcome": result,
         "settlement_outcome_observed_at": now_iso(),
@@ -3728,6 +3821,20 @@ def annotate_early_exit_settlement_outcome(record: dict[str, Any], market: Any) 
         record.get("ticker", "?"), side.upper() or "?", result.upper(), directional_result,
     )
     return True
+
+
+def annotate_skipped_signal_settlement_outcome(record: dict[str, Any], market: Any) -> bool:
+    """Score a deliberately unentered two-loss-skip signal at settlement."""
+    if record.get("status") != "entry_skipped_loss_circuit_breaker":
+        return False
+    result = market_result(market)
+    market_status = str(field(market, "status") or "").lower()
+    if result not in {"yes", "no"} or market_status != "finalized":
+        return False
+    changed = record_directional_signal_outcome(record, result)
+    if changed:
+        record["settlement_outcome_observed_at"] = now_iso()
+    return changed
 
 
 async def monitor_live_absolute_stop(
@@ -3938,8 +4045,13 @@ async def settle_or_cancel(rest: KalshiREST, record: dict[str, Any], market: Any
             "gross_payout": 0.0, "gross_profit_loss": 0.0, "kalshi_fees": 0.0,
             "net_profit_loss": 0.0, "return_percentage": None,
         })
-        LOG.info("FINALIZED UNFILLED | %s %s: zero contracts held; excluded from performance.",
-                 record["ticker"], result.upper())
+        record_directional_signal_outcome(record, result)
+        direction = (record.get("directional_signal") or {}).get("correct")
+        LOG.info(
+            "FINALIZED UNFILLED | %s %s: zero contracts held; no financial trade, directional_signal=%s.",
+            record["ticker"], result.upper(),
+            "WIN" if direction is True else ("LOSS" if direction is False else "not_eligible"),
+        )
         return
     cost = live_entry_cost(record)
     entry_fees = live_entry_fees(record)
@@ -3961,6 +4073,7 @@ async def settle_or_cancel(rest: KalshiREST, record: dict[str, Any], market: Any
         "early_exit_contracts": round(exit_count, 2),
         "settlement_contracts": round(remaining_contracts, 2),
     })
+    record_directional_signal_outcome(record, result)
     LOG.info("SETTLED | %s %s contracts=%.2f net=$%.4f", record["ticker"], result.upper(), quantity, net)
 
 
@@ -4950,6 +5063,62 @@ def live_settlement_contrarian_hold_gate_performance(state: dict[str, Any], conf
     return live_weighted_hold_gate_performance(state, config, "settlement_contrarian_weighted_hold_gate_live_v1")
 
 
+def directional_signal_performance(records: list[dict[str, Any]]) -> dict[str, Any]:
+    """Score causal settlement signals without reference to ladder execution."""
+    scored: list[tuple[tuple[int, str], dict[str, Any], bool]] = []
+    for record in records:
+        prediction = settlement_contrarian_signal_side(record)
+        outcome = str(record.get("settlement_outcome") or "").lower()
+        if prediction not in {"yes", "no"} or outcome not in {"yes", "no"}:
+            continue
+        directional = record.get("directional_signal")
+        score_time = (
+            directional.get("scored_at") if isinstance(directional, dict) else None
+        ) or record.get("settlement_outcome_observed_at") or record.get("settled_at") or record.get("exited_at")
+        epoch = timestamp_epoch(score_time) or 0
+        scored.append(((epoch, str(record.get("ticker") or "")), record, prediction == outcome))
+    scored.sort(key=lambda item: item[0])
+
+    def counts(items: list[tuple[tuple[int, str], dict[str, Any], bool]]) -> tuple[int, int]:
+        return sum(item[2] for item in items), sum(not item[2] for item in items)
+
+    wins, losses = counts(scored)
+    unfilled = [item for item in scored if item[1].get("status") == "finalized_unfilled"]
+    loss_skips = [item for item in scored if item[1].get("status") == "entry_skipped_loss_circuit_breaker"]
+    executed = [item for item in scored if float(item[1].get("contracts") or 0.0) > 0.004]
+    outcomes = [1.0 if item[2] else -1.0 for item in scored]
+    current_streak = 0
+    current_kind = "none"
+    if outcomes:
+        current_kind = "win" if outcomes[-1] > 0.0 else "loss"
+        for outcome in reversed(outcomes):
+            if (outcome > 0.0) != (outcomes[-1] > 0.0):
+                break
+            current_streak += 1
+    unfilled_wins, unfilled_losses = counts(unfilled)
+    skipped_wins, skipped_losses = counts(loss_skips)
+    executed_wins, executed_losses = counts(executed)
+    return {
+        "eligible_signals": len(scored),
+        "wins": wins,
+        "losses": losses,
+        "win_rate": round(wins / len(scored), 6) if scored else None,
+        "current_streak": current_streak,
+        "current_streak_kind": current_kind,
+        "longest_winning_streak": streak(outcomes, True),
+        "longest_losing_streak": streak(outcomes, False),
+        "executed_signals": len(executed),
+        "executed_wins": executed_wins,
+        "executed_losses": executed_losses,
+        "unfilled_ladder_signals": len(unfilled),
+        "unfilled_ladder_wins": unfilled_wins,
+        "unfilled_ladder_losses": unfilled_losses,
+        "loss_skipped_signals": len(loss_skips),
+        "loss_skipped_wins": skipped_wins,
+        "loss_skipped_losses": skipped_losses,
+    }
+
+
 def performance_report(state: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
     """Return only the current settlement-contrarian live ledger.
 
@@ -5023,6 +5192,7 @@ def performance_report(state: dict[str, Any], config: dict[str, Any]) -> dict[st
         "longest_losing_streak": streak(pnls, False),
         "five_cent_stop_exits": five_cent_stops,
         "settlement_exits": settlement_exits,
+        "directional_signal_performance": directional_signal_performance(records),
         "entry_loss_skip": entry_loss_skip_snapshot(state, config),
         "dynamic_base_share_scaling": dynamic_scaling_snapshot(state, config),
         "rung_performance": rung_performance(closed),
@@ -5152,7 +5322,7 @@ def log_performance_summary(report: dict[str, Any], context: str) -> None:
     """Emit a compact, periodic summary without model or paper-study noise."""
     streak = "none" if not report["current_streak"] else f"{report['current_streak']} {report['current_streak_kind']}"
     LOG.info(
-        "LIVE SETTLEMENT SUMMARY | %s started=%d active=%d settled=%d unfilled=%d loss_skips=%d source_window_misses=%d W/L=%d/%d win_rate=%s "
+        "LIVE SETTLEMENT SUMMARY | %s started=%d active=%d executed=%d unfilled=%d loss_skips=%d source_window_misses=%d executed_W/L=%d/%d executed_win_rate=%s "
         "net=$%+.4f roi=%s costs=$%.4f contracts=%.2f stops=5c:%d/settlement:%d streak=%s longest_W/L=%d/%d max_dd=$%.4f.",
         context, report["markets_started"], report["active_markets"], report["settled_trades"], report["unfilled_markets"],
         report["markets_skipped_due_to_loss_circuit_breaker"],
@@ -5162,6 +5332,18 @@ def log_performance_summary(report: dict[str, Any], context: str) -> None:
         report["net_profit"], "n/a" if report["return_on_capital"] is None else f"{100 * report['return_on_capital']:.2f}%",
         report["total_cost"], report["total_contracts"], report["five_cent_stop_exits"], report["settlement_exits"],
         streak, report["longest_winning_streak"], report["longest_losing_streak"], report["maximum_drawdown"],
+    )
+    directional = report["directional_signal_performance"]
+    LOG.info(
+        "LIVE DIRECTIONAL SIGNAL SUMMARY | %s eligible=%d W/L=%d/%d win_rate=%s streak=%s longest_W/L=%d/%d "
+        "executed=%d(%d/%d) zero_fill=%d(%d/%d) loss_skipped=%d(%d/%d); settlement outcome only, no ladder-fill dependency.",
+        context, directional["eligible_signals"], directional["wins"], directional["losses"],
+        "n/a" if directional["win_rate"] is None else f"{100 * directional['win_rate']:.2f}%",
+        "none" if not directional["current_streak"] else f"{directional['current_streak']} {directional['current_streak_kind']}",
+        directional["longest_winning_streak"], directional["longest_losing_streak"],
+        directional["executed_signals"], directional["executed_wins"], directional["executed_losses"],
+        directional["unfilled_ladder_signals"], directional["unfilled_ladder_wins"], directional["unfilled_ladder_losses"],
+        directional["loss_skipped_signals"], directional["loss_skipped_wins"], directional["loss_skipped_losses"],
     )
     last = report["last_closed_trade"]
     if isinstance(last, dict):
@@ -5930,16 +6112,29 @@ async def run_settlement_only(args: argparse.Namespace) -> int:
                     if not isinstance(record, dict):
                         continue
                     if record.get("status") in FINAL_RECORD_STATUSES:
-                        # A 5c stop is economically complete, but its later
-                        # official YES/NO settlement result is useful report
-                        # metadata. Fetch it once without changing the close.
-                        if (
-                            record.get("status") == "exited_early"
-                            and str(record.get("settlement_outcome") or "").lower() not in {"yes", "no"}
-                        ):
-                            market = await rest.get_market(ticker)
-                            if market is not None:
-                                annotate_early_exit_settlement_outcome(record, market)
+                        # An early stop or intentional loss-skip has no
+                        # settlement result in its order ledger yet. Its
+                        # frozen causal signal is still scored from the target
+                        # outcome, without changing realized P&L or entries.
+                        if record.get("status") in {
+                            "exited_early", "entry_skipped_loss_circuit_breaker",
+                        } and directional_signal_settlement_check_due(record):
+                            known_outcome = str(record.get("settlement_outcome") or "").lower()
+                            if known_outcome in {"yes", "no"}:
+                                record_directional_signal_outcome(record, known_outcome)
+                            else:
+                                market = await rest.get_market(ticker)
+                                if market is not None:
+                                    market_result_value = market_result(market)
+                                    market_status = str(field(market, "status") or "").lower()
+                                    if market_result_value not in {"yes", "no"} or market_status != "finalized":
+                                        defer_directional_signal_settlement_check(record)
+                                    elif record.get("status") == "exited_early":
+                                        annotate_early_exit_settlement_outcome(record, market)
+                                    else:
+                                        annotate_skipped_signal_settlement_outcome(record, market)
+                                else:
+                                    defer_directional_signal_settlement_check(record)
                         continue
                     market = await rest.get_market(ticker)
                     if market is None:

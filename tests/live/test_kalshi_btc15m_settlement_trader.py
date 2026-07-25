@@ -553,6 +553,84 @@ class SettlementTraderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot["consecutive_completed_losses"], 0)
         self.assertEqual(snapshot["markets_remaining_to_skip"], 0)
 
+    def test_settlement_signal_score_includes_zero_fill_and_loss_skip_but_not_trade_pnl(self) -> None:
+        base = 1_700_000_250
+        filled = self.completed_live_record("KXBTC15M-filled", base, -0.40)
+        filled.update({
+            "settlement_contrarian_signal": {"side": "yes", "source_ticker": "KXBTC15M-prior-1"},
+            "settlement_outcome": "no",
+        })
+        zero_fill = {
+            "ticker": "KXBTC15M-zero-fill", "strategy": trader.LIVE_EXECUTION_STRATEGY,
+            "status": "finalized_unfilled", "contracts": 0.0, "net_profit_loss": 0.0,
+            "settled_at": datetime.fromtimestamp(base + 1, tz=timezone.utc).isoformat(),
+            "settlement_contrarian_signal": {"side": "no", "source_ticker": "KXBTC15M-prior-2"},
+        }
+        skipped = {
+            "ticker": "KXBTC15M-loss-skip", "strategy": trader.LIVE_EXECUTION_STRATEGY,
+            "status": "entry_skipped_loss_circuit_breaker", "contracts": 0.0,
+            "settlement_contrarian_signal": {"side": "yes", "source_ticker": "KXBTC15M-prior-3"},
+            "market_close_time": base + 2,
+        }
+        self.assertTrue(trader.record_directional_signal_outcome(zero_fill, "no"))
+        self.assertTrue(trader.annotate_skipped_signal_settlement_outcome(
+            skipped, {"status": "finalized", "result": "yes"},
+        ))
+        self.assertTrue(zero_fill["directional_signal"]["correct"])
+        self.assertTrue(skipped["directional_signal"]["correct"])
+        self.assertEqual(zero_fill["net_profit_loss"], 0.0)
+        self.assertNotIn("net_profit_loss", skipped)
+
+        directional = trader.directional_signal_performance([filled, zero_fill, skipped])
+        self.assertEqual(directional["eligible_signals"], 3)
+        self.assertEqual((directional["wins"], directional["losses"]), (2, 1))
+        self.assertEqual((directional["executed_wins"], directional["executed_losses"]), (0, 1))
+        self.assertEqual((directional["unfilled_ladder_wins"], directional["unfilled_ladder_losses"]), (1, 0))
+        self.assertEqual((directional["loss_skipped_wins"], directional["loss_skipped_losses"]), (1, 0))
+
+        report = trader.performance_report({"markets": {
+            filled["ticker"]: filled,
+            zero_fill["ticker"]: zero_fill,
+            skipped["ticker"]: skipped,
+        }}, trader.validate_config({}))
+        self.assertEqual(report["settled_trades"], 1)
+        self.assertEqual((report["winning_trades"], report["losing_trades"]), (0, 1))
+
+    def test_directional_settlement_lookup_waits_until_close_then_throttles(self) -> None:
+        record = {
+            "status": "entry_skipped_loss_circuit_breaker",
+            "market_close_time": 1_700_000_500,
+            "settlement_contrarian_signal": {"side": "yes"},
+        }
+        self.assertFalse(trader.directional_signal_settlement_check_due(record, 1_700_000_499))
+        self.assertTrue(trader.directional_signal_settlement_check_due(record, 1_700_000_500))
+        trader.defer_directional_signal_settlement_check(record, 1_700_000_500)
+        self.assertFalse(trader.directional_signal_settlement_check_due(record, 1_700_000_529))
+        self.assertTrue(trader.directional_signal_settlement_check_due(record, 1_700_000_530))
+
+    async def test_zero_fill_finalization_records_directional_result_without_financial_trade(self) -> None:
+        class Rest:
+            async def cancel_order(self, _order, _dry_run):
+                return None
+
+            async def refresh_order(self, _order):
+                return None
+
+        record = {
+            "ticker": "KXBTC15M-unfilled-directional", "status": "ladder_active",
+            "candidate_side": "yes", "locked_side": "yes",
+            "settlement_contrarian_signal": {"side": "yes", "source_ticker": "KXBTC15M-prior"},
+            "orders": {"0.4000": {"quantity": 3.0, "fill_count": 0.0}},
+        }
+        await trader.settle_or_cancel(
+            Rest(), record, {"status": "finalized", "result": "yes"}, dry_run=False,
+        )
+        self.assertEqual(record["status"], "finalized_unfilled")
+        self.assertEqual(record["contracts"], 0.0)
+        self.assertEqual(record["net_profit_loss"], 0.0)
+        self.assertEqual(record["directional_signal"]["prediction"], "yes")
+        self.assertTrue(record["directional_signal"]["correct"])
+
     async def test_loss_skip_blocks_the_actual_order_path_after_normal_signal(self) -> None:
         class Rest:
             async def balance_dollars(self):
