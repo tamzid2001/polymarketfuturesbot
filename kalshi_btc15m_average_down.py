@@ -142,12 +142,13 @@ DEFAULT_CONFIG = {
     "live_consecutive_loss_limit": 2,
     "live_markets_to_skip_after_loss_limit": 2,
     "status_log_seconds": 60.0,
-    # The owner explicitly enabled the guarded P10/P90 live regime.  A
-    # startup API reconciliation or unavailable post-stop shadow tape fails
-    # closed before it can permit a new live entry.
+    # The P10/P90 controller remains observation-only until its absolute
+    # balance history is reconciled. The underlying settlement strategy can
+    # still trade; this flag only prevents the regime from changing that
+    # decision.
     "equity_regime_enabled": True,
-    "equity_regime_dry_run": False,
-    "allow_live_state_transitions": True,
+    "equity_regime_dry_run": True,
+    "allow_live_state_transitions": False,
     "subaccount": 0,
     "starting_balance": "100.00",
     "history_start_ts": None,
