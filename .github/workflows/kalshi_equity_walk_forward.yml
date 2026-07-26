@@ -59,16 +59,28 @@ jobs:
         env:
           PYTHONUNBUFFERED: "1"
         run: |
+          input_csv="${{ inputs.input_csv }}"
+          input_format="${{ inputs.input_format }}"
+          starting_balance="${{ inputs.starting_balance }}"
+          min_training_trades="${{ inputs.min_training_trades }}"
+          run_sensitivity="${{ inputs.run_sensitivity }}"
+          # workflow_dispatch supplies inputs; a dedicated branch push is the
+          # authenticated automatic trigger used for this reproducible run.
+          input_csv="${input_csv:-backtest/data/closed-positions-2026-07-26.csv}"
+          input_format="${input_format:-kalshi}"
+          starting_balance="${starting_balance:-100}"
+          min_training_trades="${min_training_trades:-100}"
+          run_sensitivity="${run_sensitivity:-true}"
           args=(
-            --input "${{ inputs.input_csv }}"
-            --input-format "${{ inputs.input_format }}"
-            --starting-balance "${{ inputs.starting_balance }}"
-            --min-training-trades "${{ inputs.min_training_trades }}"
+            --input "$input_csv"
+            --input-format "$input_format"
+            --starting-balance "$starting_balance"
+            --min-training-trades "$min_training_trades"
             --refit-every 1
             --signal-mode level
             --output-dir outputs
           )
-          if [ "${{ inputs.run_sensitivity }}" != "true" ]; then
+          if [ "$run_sensitivity" != "true" ]; then
             args+=(--no-run-sensitivity)
           fi
           python -m backtest.run_backtest "${args[@]}"
