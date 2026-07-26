@@ -12,7 +12,7 @@ from scipy import stats
 
 from .charts import create_charts
 from .config import BacktestConfig, output_paths
-from .data_loader import load_input
+from .data_loader import load_input, most_recent_trades
 from .equity import performance_summary
 from .regimes import regime_windows
 from .report import write_report
@@ -108,6 +108,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--input-format", choices=("kalshi", "equity"), required=True)
     parser.add_argument("--output-dir", default="outputs")
     parser.add_argument("--starting-balance", type=float, default=100.0)
+    parser.add_argument("--max-trades", type=int, default=200, help="Use only the most recent completed trades (default: 200).")
     parser.add_argument("--min-training-trades", type=int, default=100)
     parser.add_argument("--training-window", type=int, default=None)
     parser.add_argument("--refit-every", type=int, default=1)
@@ -128,7 +129,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     config = BacktestConfig(
-        starting_balance=args.starting_balance, min_training_trades=args.min_training_trades,
+        starting_balance=args.starting_balance, max_trades=args.max_trades, min_training_trades=args.min_training_trades,
         training_window=args.training_window, refit_every_n_trades=args.refit_every,
         forecast_frequency=args.forecast_frequency, uncertainty_samples=args.uncertainty_samples,
         changepoint_prior_scale=args.changepoint_prior_scale, seasonality_prior_scale=args.seasonality_prior_scale,
@@ -140,8 +141,9 @@ def main(argv: list[str] | None = None) -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
     paths = output_paths(output_dir)
     print("Loading input and constructing shadow equity...", flush=True)
-    trades = load_input(args.input, args.input_format, config.starting_balance)
-    print(f"Loaded {len(trades)} chronological opportunities from {trades['ds'].iloc[0]} to {trades['ds'].iloc[-1]}", flush=True)
+    all_trades = load_input(args.input, args.input_format, config.starting_balance)
+    trades = most_recent_trades(all_trades, config.max_trades, config.starting_balance)
+    print(f"Loaded {len(trades)} most-recent opportunities (from {len(all_trades)} source rows) from {trades['ds'].iloc[0]} to {trades['ds'].iloc[-1]}", flush=True)
     print("Running primary strict walk-forward Prophet forecast...", flush=True)
     primary_result = run_walk_forward(trades, config, output_dir=output_dir, persist_partial=True)
     primary_log = primary_result.log

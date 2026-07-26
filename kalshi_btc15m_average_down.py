@@ -21,10 +21,12 @@ import json
 import logging
 import math
 import os
+import random
 import subprocess
 import time
 import uuid
 from dataclasses import dataclass
+from decimal import Decimal
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -40,6 +42,16 @@ from kalshi_ladder_scalp_shadow import (
     simulate_ladder_average_entry_scalp,
 )
 from kalshi_ml_features import FEATURE_SCHEMA, ML_ONLY_FEATURE_COLUMNS
+from bot.equity_regime import (
+    DEFAULT_CLIENT_ORDER_PREFIX,
+    EquityRegimeController,
+    KalshiRawHistoryAPI,
+    LadderOrder,
+    RegimeConfig,
+    StrategyDecision,
+    synchronize_history,
+    utc_timestamp,
+)
 
 try:  # Installed by the dedicated live-runner requirements file.
     import aiohttp
@@ -69,6 +81,7 @@ LADDER_LEVELS = (0.40, 0.30, 0.20, 0.10)
 CONFIG_VERSION = 12
 STATE_VERSION = 7
 ORDER_NAMESPACE = uuid.UUID("4d85857e-4dc6-43ec-960f-0b342523bdb7")
+BOT_CLIENT_ORDER_PREFIX = DEFAULT_CLIENT_ORDER_PREFIX
 KALSHI_WS_URL = os.getenv(
     "KALSHI_WS_URL",
     "wss://external-api-ws.demo.kalshi.co/trade-api/ws/v2"
@@ -178,6 +191,39 @@ DEFAULT_CONFIG = {
     "settlement_contrarian_decision_delay_seconds": 45.0,
     "settlement_contrarian_entry_grace_seconds": 90.0,
     "status_log_seconds": 30.0,
+    # The operator explicitly enabled this guarded production regime. Its
+    # startup reconciliation fails closed; while stopped, an unavailable
+    # public trade tape can never trigger an unverified restart.
+    "equity_regime_enabled": True,
+    "equity_regime_dry_run": False,
+    "allow_live_state_transitions": True,
+    "subaccount": 0,
+    "starting_balance": "100.00",
+    "history_start_ts": None,
+    "history_end_ts": None,
+    "history_max_markets": 200,
+    "accounting_tolerance": "0.01",
+    "bot_client_order_prefix": BOT_CLIENT_ORDER_PREFIX,
+    "bot_order_group_id": None,
+    "prophet_enabled": True,
+    "prophet_min_history": 100,
+    "prophet_training_window": 75,
+    "prophet_refit_every_markets": 1,
+    "prophet_use_log_transform": True,
+    "prophet_uncertainty_samples": 2000,
+    "prophet_changepoint_prior_scale": 0.05,
+    "prophet_seasonality_prior_scale": 10.0,
+    "prophet_daily_seasonality": True,
+    "prophet_weekly_seasonality": False,
+    "prophet_yearly_seasonality": False,
+    "prophet_random_seed": 42,
+    "shadow_fill_model": "conservative_trade_through",
+    "shadow_latency_ms": 0,
+    "shadow_slippage_cents": "0",
+    "shadow_partial_fills": True,
+    "shadow_require_trade_through": True,
+    "scaling_equity_source": "actual",
+    "cooldown_state_source": "separate",
 }
 
 # Paper-only asymmetric averaging schedule requested for the extended scalp
@@ -459,6 +505,22 @@ def load_json(path: Path, default: dict[str, Any]) -> dict[str, Any]:
         LOG.warning("Cannot read %s; using defaults.", path)
         return dict(default)
     return payload if isinstance(payload, dict) else dict(default)
+
+
+def equity_regime_environment_overrides() -> dict[str, str]:
+    """Accept documented all-caps regime controls without touching secrets."""
+    names = (
+        "EQUITY_REGIME_ENABLED", "EQUITY_REGIME_DRY_RUN", "ALLOW_LIVE_STATE_TRANSITIONS",
+        "SUBACCOUNT", "SERIES_TICKER", "STARTING_BALANCE", "HISTORY_START_TS", "HISTORY_END_TS",
+        "HISTORY_MAX_MARKETS", "BOT_CLIENT_ORDER_PREFIX", "BOT_ORDER_GROUP_ID", "ACCOUNTING_TOLERANCE",
+        "PROPHET_ENABLED", "PROPHET_MIN_HISTORY", "PROPHET_TRAINING_WINDOW", "PROPHET_REFIT_EVERY_MARKETS",
+        "PROPHET_USE_LOG_TRANSFORM", "PROPHET_UNCERTAINTY_SAMPLES", "PROPHET_CHANGEPOINT_PRIOR_SCALE",
+        "PROPHET_SEASONALITY_PRIOR_SCALE", "PROPHET_DAILY_SEASONALITY", "PROPHET_WEEKLY_SEASONALITY",
+        "PROPHET_YEARLY_SEASONALITY", "PROPHET_RANDOM_SEED", "SHADOW_FILL_MODEL", "SHADOW_LATENCY_MS",
+        "SHADOW_SLIPPAGE_CENTS", "SHADOW_PARTIAL_FILLS", "SHADOW_REQUIRE_TRADE_THROUGH",
+        "SCALING_EQUITY_SOURCE", "COOLDOWN_STATE_SOURCE",
+    )
+    return {name.lower(): os.environ[name] for name in names if os.environ.get(name) is not None}
 
 
 def save_json(path: Path, payload: dict[str, Any]) -> None:
@@ -769,6 +831,39 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("initial_position_size * four ladder levels exceeds max_contracts_per_market")
     if ladder_principal(quantity) > merged["max_total_capital"] + 1e-9:
         raise ValueError("max_total_capital cannot fund the complete four-level ladder")
+    for name, default in (
+        ("equity_regime_enabled", False),
+        ("equity_regime_dry_run", True),
+        ("allow_live_state_transitions", False),
+        ("prophet_enabled", True),
+        ("prophet_use_log_transform", True),
+        ("prophet_daily_seasonality", True),
+        ("prophet_weekly_seasonality", False),
+        ("prophet_yearly_seasonality", False),
+        ("shadow_partial_fills", True),
+        ("shadow_require_trade_through", True),
+    ):
+        raw = merged.get(name, default)
+        merged[name] = raw if isinstance(raw, bool) else str(raw).strip().lower() in {"1", "true", "yes", "on"}
+    for name in ("subaccount", "history_max_markets", "prophet_min_history", "prophet_training_window", "prophet_refit_every_markets", "prophet_uncertainty_samples", "prophet_random_seed", "shadow_latency_ms"):
+        if merged.get(name) is None and name == "prophet_training_window":
+            continue
+        try:
+            merged[name] = int(merged[name])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{name} must be an integer") from exc
+    if merged["history_max_markets"] < merged["prophet_min_history"]:
+        raise ValueError("history_max_markets must be at least prophet_min_history")
+    if merged["prophet_training_window"] is not None and merged["prophet_training_window"] < 2:
+        raise ValueError("prophet_training_window must be None or at least two")
+    if merged["prophet_refit_every_markets"] < 1:
+        raise ValueError("prophet_refit_every_markets must be positive")
+    if str(merged.get("shadow_fill_model")) not in {"conservative_trade_through", "touch", "live_equivalent"}:
+        raise ValueError("shadow_fill_model must be conservative_trade_through, touch, or live_equivalent")
+    if str(merged.get("scaling_equity_source")) not in {"actual", "shadow", "disabled_while_off"}:
+        raise ValueError("invalid scaling_equity_source")
+    if str(merged.get("cooldown_state_source")) not in {"actual", "shadow", "separate"}:
+        raise ValueError("invalid cooldown_state_source")
     return merged
 
 
@@ -778,6 +873,10 @@ def apply_config_overrides(config: dict[str, Any], args: argparse.Namespace) -> 
         "max_total_capital", "fee_reserve", "poll_seconds", "market_refresh_seconds",
         "order_reconcile_seconds", "watch_start_grace_seconds", "ml_preopen_lead_seconds",
         "ml_min_confidence", "status_log_seconds", "live_inverse_ml_hold_gate",
+        "equity_regime_enabled", "equity_regime_dry_run", "allow_live_state_transitions",
+        "subaccount", "starting_balance", "history_max_markets", "prophet_min_history",
+        "prophet_training_window", "prophet_refit_every_markets", "shadow_fill_model",
+        "history_start_ts", "history_end_ts", "accounting_tolerance",
     )
     changed = False
     updated = dict(config)
@@ -855,6 +954,13 @@ def client_order_id(ticker: str, side: str, order_key: str) -> str:
     An initial protected IOC can itself be observed at 30c/20c/10c. It must
     not collide with the separately requested averaging rung at that price.
     """
+    # The prefix makes future bot-owned fills auditable without relying on a
+    # local state file. UUID5 keeps the ID stable across retries/restarts.
+    return f"{BOT_CLIENT_ORDER_PREFIX}{uuid.uuid5(ORDER_NAMESPACE, f'average-down-v1:{ticker}:{side}:{order_key}').hex}"
+
+
+def legacy_client_order_id(ticker: str, side: str, order_key: str) -> str:
+    """Pre-prefix deterministic ID accepted only for safe historical recovery."""
     return str(uuid.uuid5(ORDER_NAMESPACE, f"average-down-v1:{ticker}:{side}:{order_key}"))
 
 
@@ -866,7 +972,7 @@ def managed_mechanical_order_role(order: Any) -> tuple[str, str] | None:
         return None
     for side in ("yes", "no"):
         for order_key in ("initial", "0.3000", "0.2000", "0.1000"):
-            if client_id == client_order_id(ticker, side, order_key):
+            if client_id in {client_order_id(ticker, side, order_key), legacy_client_order_id(ticker, side, order_key)}:
                 return side, order_key
     return None
 
@@ -900,6 +1006,11 @@ class KalshiLiveFeed:
         self.desired_tickers: set[str] = set()
         self.subscribed_tickers: set[str] = set()
         self.quotes: dict[str, dict[str, Any]] = {}
+        # Public ``trade`` events are kept separately from BBO snapshots.  A
+        # resting shadow order may only use an event that occurred after its
+        # decision timestamp; a ticker's last-price field is not a substitute
+        # for this ordered evidence.
+        self.public_trades: dict[str, list[dict[str, Any]]] = {}
         self.connected = False
         self.message_count = 0
         self.update_count = 0
@@ -914,6 +1025,7 @@ class KalshiLiveFeed:
             # executable for a newly watched ticker.
             for ticker in desired - self.desired_tickers:
                 self.quotes.pop(ticker, None)
+                self.public_trades.pop(ticker, None)
             self.desired_tickers = desired
             self._wake.set()
 
@@ -1038,6 +1150,26 @@ class KalshiLiveFeed:
             "quote_age_seconds": round(max(0.0, age), 6),
         }, "executable_top_of_book"
 
+    def public_trades_after(self, ticker: str, created_at: datetime) -> list[dict[str, Any]]:
+        """Return timestamped public trades strictly after a shadow order.
+
+        The server timestamp and the post-subscription receipt timestamp must
+        both be later than the immutable strategy decision.  This is
+        intentionally conservative around clock skew and reconnects: omitted
+        trade data causes an ``unavailable`` shadow outcome, never a made-up
+        fill.
+        """
+        created = created_at.astimezone(timezone.utc)
+        events: list[dict[str, Any]] = []
+        for event in self.public_trades.get(ticker, []):
+            server_time = utc_timestamp(event.get("source_server_timestamp"))
+            received_time = utc_timestamp(event.get("received_at"))
+            if server_time is None or received_time is None:
+                continue
+            if server_time > created and received_time >= created:
+                events.append(dict(event))
+        return events
+
     async def wait_for_update(self, timeout: float, observed_update_count: int) -> int:
         """Return the latest update sequence without losing a just-arrived event."""
         if self.update_count != observed_update_count:
@@ -1068,7 +1200,10 @@ class KalshiLiveFeed:
         await ws.send_json({
             "id": self._command_id,
             "cmd": "subscribe",
-            "params": {"channels": ["ticker"], "market_tickers": sorted(tickers)},
+            # Kalshi's public ``trade`` channel supplies the timestamped
+            # post-order price/size evidence used by the conservative shadow
+            # fill model. Ticker remains the BBO source for live mechanics.
+            "params": {"channels": ["ticker", "trade"], "market_tickers": sorted(tickers)},
         })
         self.subscribed_tickers.update(tickers)
         LOG.info("WS SUBSCRIBE | tickers=%s", ",".join(sorted(tickers)))
@@ -1091,6 +1226,42 @@ class KalshiLiveFeed:
         if message_type in {"fill", "user_orders"}:
             self.update_count += 1
             self.private_update_count += 1
+            self._wake.set()
+            return
+        if message_type == "trade":
+            message = payload.get("msg") or {}
+            ticker = str(message.get("market_ticker") or message.get("ticker") or "")
+            trade_id = str(message.get("trade_id") or "")
+            server_time = field(message, "ts_ms", "created_time", "time", "ts")
+            count = as_float(field(message, "count_fp", "count"))
+            yes_price = as_float(field(message, "yes_price_dollars", "yes_price"))
+            no_price = as_float(field(message, "no_price_dollars", "no_price"))
+            if not ticker or not trade_id or server_time is None or count is None or count <= 0:
+                return
+            if yes_price is None and no_price is None:
+                return
+            if yes_price is not None and not 0.0 < yes_price < 1.0:
+                return
+            if no_price is not None and not 0.0 < no_price < 1.0:
+                return
+            entries = self.public_trades.setdefault(ticker, [])
+            if any(str(item.get("trade_id")) == trade_id for item in entries):
+                return
+            entries.append({
+                "trade_id": trade_id,
+                "ticker": ticker,
+                "count": round(count, 6),
+                "yes_price": yes_price,
+                "no_price": no_price,
+                "source_server_timestamp": server_time,
+                "received_at": now_iso(),
+            })
+            # A 15-minute market should never generate this many relevant
+            # events. The cap protects Actions state without discarding recent
+            # causal evidence for active shadow orders.
+            if len(entries) > 5_000:
+                del entries[:-5_000]
+            self.update_count += 1
             self._wake.set()
             return
         if message_type != "ticker":
@@ -1160,6 +1331,7 @@ class KalshiLiveFeed:
                         # New socket, new market-data sequence: do not reuse a
                         # quote that was received before this subscription.
                         self.quotes.clear()
+                        self.public_trades.clear()
                         LOG.info("WS CONNECTED | %s", self.url)
                         await self._session_loop(ws)
             except asyncio.CancelledError:
@@ -1493,8 +1665,8 @@ class KalshiREST:
         if KalshiClient is None or KalshiAuth is None:
             raise RuntimeError("Install requirements_kalshi_average_down.txt before running")
         pem = self.pem_path.read_text(encoding="utf-8")
-        base_url = "https://demo-api.kalshi.co/trade-api/v2" if self.demo else "https://api.elections.kalshi.com/trade-api/v2"
-        configuration = Configuration(host=base_url)
+        self.base_url = "https://demo-api.kalshi.co/trade-api/v2" if self.demo else "https://api.elections.kalshi.com/trade-api/v2"
+        configuration = Configuration(host=self.base_url)
         configuration.api_key_id = self.api_key_id
         configuration.private_key_pem = pem
         self.client = KalshiClient(configuration)
@@ -1505,6 +1677,43 @@ class KalshiREST:
         self.orders = OrdersApi(self.client)
         self.pause_until = 0.0
         self.pause_reason: str | None = None
+
+    async def get_raw_json(self, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Signed read-only escape hatch for API endpoints absent from the SDK.
+
+        Historical fills/cutoff are intentionally read through the same
+        authenticated client key used by the live runner.  It retries only
+        idempotent GETs, honours bounded exponential backoff, and never logs
+        credentials or response secrets.
+        """
+        if aiohttp is None:
+            raise RuntimeError("aiohttp is required for Kalshi historical API synchronization")
+        normalized_path = "/" + path.lstrip("/")
+        url = self.base_url + normalized_path
+        last_error: Exception | None = None
+        for attempt in range(4):
+            headers = {"Accept": "application/json", **self.auth.create_auth_headers("GET", normalized_path)}
+            try:
+                timeout = aiohttp.ClientTimeout(total=20)
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.get(url, params=params or {}, headers=headers) as response:
+                        if response.status in {429, 500, 502, 503, 504}:
+                            body = await response.text()
+                            raise RuntimeError(f"Kalshi GET {normalized_path} temporary HTTP {response.status}: {body[:200]}")
+                        if response.status >= 400:
+                            body = await response.text()
+                            raise RuntimeError(f"Kalshi GET {normalized_path} HTTP {response.status}: {body[:300]}")
+                        payload = await response.json(content_type=None)
+                        if not isinstance(payload, dict):
+                            raise RuntimeError(f"Kalshi GET {normalized_path} returned non-object JSON")
+                        return payload
+            except Exception as exc:  # noqa: BLE001 - GET retry is intentionally narrow and bounded
+                last_error = exc
+                if attempt == 3:
+                    break
+                await asyncio.sleep(min(8.0, (2 ** attempt) + random.uniform(0, 0.5)))
+        assert last_error is not None
+        raise last_error
 
     async def close(self) -> None:
         await self.client.close()
@@ -2006,6 +2215,47 @@ def filled_contracts(record: dict[str, Any]) -> float:
 def opposite_side(side: str) -> str | None:
     normalized = str(side).lower()
     return "no" if normalized == "yes" else ("yes" if normalized == "no" else None)
+
+
+def build_equity_regime_decision(
+    record: dict[str, Any], market: Any, config: dict[str, Any], signal_side: str,
+) -> StrategyDecision | None:
+    """Package the existing frozen ladder as an immutable shared decision.
+
+    This function does not choose a side, size, stop, or timing.  It merely
+    exposes the exact decisions already made by the mechanical live strategy
+    to both its live order path and the equity-regime shadow executor.
+    """
+    selected_side = opposite_side(signal_side) if live_weighted_inverse_enabled(config) else signal_side
+    if selected_side not in {"yes", "no"}:
+        return None
+    close_epoch = expiration_epoch(market)
+    if close_epoch is None:
+        return None
+    source = record.get("settlement_contrarian_signal") or {}
+    source_ticker = str(source.get("source_ticker") or "") or None
+    rungs = live_rung_quantities(config)
+    now = datetime.now(tz=timezone.utc)
+    close = datetime.fromtimestamp(close_epoch, tz=timezone.utc)
+    if close <= now:
+        return None
+    return StrategyDecision(
+        target_ticker=str(field(market, "ticker") or ""),
+        source_ticker=source_ticker,
+        selected_side=selected_side,
+        eligible=True,
+        skip_reason=None,
+        ladder_orders=tuple(
+            LadderOrder(Decimal(str(level)), Decimal(str(rungs[level])), "initial" if level == LADDER_LEVELS[0] else f"{level:.4f}")
+            for level in LADDER_LEVELS
+        ),
+        stop_price=Decimal(str(config["live_inverse_ml_absolute_stop_price"])),
+        trailing_activation_gain=Decimal(str(config["live_inverse_ml_hold_gate"])),
+        trailing_retracement=Decimal(str(config["live_inverse_ml_trailing_stop"])),
+        generated_at=now,
+        target_close_time=close,
+        strategy_name=str(record.get("strategy") or config.get("live_execution_strategy") or "mechanical_ladder"),
+    )
 
 
 async def settlement_contrarian_side_for_market(
@@ -3492,7 +3742,7 @@ async def settle_or_cancel(rest: KalshiREST, record: dict[str, Any], market: Any
 async def consider_initial_entry(
     rest: KalshiREST, state: dict[str, Any], market: Any, config: dict[str, Any], dry_run: bool,
     live_asks: dict[str, float | None] | None = None, ml_side: str | None = None,
-    paper_monitor_only: bool = False, signal_source: str = "ml",
+    paper_monitor_only: bool = False, signal_source: str = "ml", strategy_decision: StrategyDecision | None = None,
 ) -> bool:
     """Post the complete fixed GTC ladder for one frozen causal signal.
 
@@ -3584,6 +3834,13 @@ async def consider_initial_entry(
     if side not in {"yes", "no"}:
         return False
     rung_quantities = live_rung_quantities(config)
+    if strategy_decision is not None:
+        if strategy_decision.target_ticker != ticker or strategy_decision.selected_side != side:
+            raise RuntimeError("equity-regime decision does not match the live strategy decision")
+        decision_rungs = {float(order.price): float(order.quantity) for order in strategy_decision.ladder_orders}
+        if set(decision_rungs) != set(LADDER_LEVELS):
+            raise RuntimeError("equity-regime decision does not contain the complete existing four-rung ladder")
+        rung_quantities = decision_rungs
     quantity = max(rung_quantities.values())
     reserve = ladder_principal_for_rungs(rung_quantities)
     # A retried, partially submitted ladder is already included in the active
@@ -5154,7 +5411,7 @@ async def cancel_open_mechanical_orders(rest: KalshiREST, state: dict[str, Any],
 
 async def run(args: argparse.Namespace) -> int:
     config_path = args.config.expanduser()
-    config = validate_config(load_json(config_path, DEFAULT_CONFIG))
+    config = validate_config({**load_json(config_path, DEFAULT_CONFIG), **equity_regime_environment_overrides()})
     config, config_changed = apply_config_overrides(config, args)
     if args.persist_config or config_changed:
         save_json(config_path, config)
@@ -5190,6 +5447,28 @@ async def run(args: argparse.Namespace) -> int:
     if not api_key or not pem_path.exists():
         raise SystemExit("KALSHI_API_KEY_ID and KALSHI_PEM_PATH are required")
     rest = KalshiREST(api_key, pem_path, os.getenv("KALSHI_DEMO", "false").lower() in {"1", "true", "yes"})
+    regime: EquityRegimeController | None = None
+    if config.get("equity_regime_enabled", False):
+        regime_config = RegimeConfig.from_mapping(config)
+        regime = EquityRegimeController(regime_config, args.equity_regime_state.expanduser(), args.equity_regime_output_dir.expanduser())
+        try:
+            replayed = regime.bootstrap_from_live_ledger(state)
+            await synchronize_history(regime, KalshiRawHistoryAPI(rest), state)
+            regime.save()
+            LOG.warning(
+                "EQUITY REGIME STARTUP | recent_markets=%d replayed=%d training_window=%s min_history=%d dry_run=%s live_control=%s",
+                regime_config.history_max_markets, replayed, regime_config.prophet_training_window,
+                regime_config.prophet_min_history, regime_config.dry_run, regime_config.controls_live_execution,
+            )
+        except Exception as exc:  # noqa: BLE001
+            # A failed reconciliation can never be used to make an execution
+            # decision. In dry-run it is logged for remediation; with live
+            # control explicitly enabled it fails closed before any new order.
+            LOG.exception("EQUITY REGIME STARTUP FAILED | %s", exc)
+            if regime_config.controls_live_execution:
+                await rest.close()
+                raise
+            regime = None
     if control_only:
         try:
             canceled = (
@@ -5324,10 +5603,43 @@ async def run(args: argparse.Namespace) -> int:
                     market = await rest.get_market(ticker)
                     if market is None:
                         continue
-                    await reconcile_orders(rest, record, dry_run)
-                    await settle_or_cancel(rest, record, market, dry_run)
+                    record_dry_run = dry_run or bool(record.get("regime_live_entry_suppressed"))
+                    await reconcile_orders(rest, record, record_dry_run)
+                    await settle_or_cancel(rest, record, market, record_dry_run)
+                    if regime is not None and record.get("status") in FINAL_RECORD_STATUSES:
+                        outcome = market_result(market)
+                        closed_at = utc_timestamp(
+                            field(market, "close_time", "expected_expiration_time") or record.get("settled_at") or record.get("closed_at"),
+                        )
+                        if outcome in {"yes", "no"} and closed_at is not None:
+                            selected_side = record.get("locked_side") or record.get("candidate_side")
+                            settlement_payout = (
+                                Decimal(str(record.get("settlement_contracts") or "0"))
+                                if selected_side == outcome else Decimal("0")
+                            )
+                            gross_payout = Decimal(str(record.get("gross_payout") or "0"))
+                            regime.close_market(
+                                ticker=ticker,
+                                outcome=outcome,
+                                market_close_time=closed_at,
+                                actual_realized_pnl=Decimal(str(record.get("net_profit_loss") or "0")),
+                                actual_metadata={
+                                    "selected_side": selected_side,
+                                    "contracts_bought": record.get("contracts", 0),
+                                    "contracts_sold": record.get("early_exit_contracts", 0),
+                                    "average_entry": record.get("average_entry"),
+                                    "entry_cost": record.get("total_cost", 0),
+                                    "exit_proceeds": format(gross_payout - settlement_payout, "f"),
+                                    "settlement_payout": format(settlement_payout, "f"),
+                                    "fees": record.get("kalshi_fees", 0),
+                                    "exit_method": record.get("exit_method") or "settlement",
+                                    "source": "live_bot_ledger",
+                                    "reconciliation_status": "pending_api_reconciliation",
+                                },
+                                actual_was_live=not record_dry_run,
+                            )
                     if market_is_tradeable(market) and not record.get("paper_monitor_only"):
-                        await submit_ladder(rest, record, market, config, dry_run)
+                        await submit_ladder(rest, record, market, config, record_dry_run)
                 last_order_reconcile_at = monotonic_now
                 last_private_update_count = feed.private_update_count
 
@@ -5344,10 +5656,19 @@ async def run(args: argparse.Namespace) -> int:
                 else:
                     ml_side = await ml_selector.side_for_market(market, record)
                     signal_source = "ml"
+                strategy_decision = build_equity_regime_decision(record, market, config, ml_side) if ml_side in {"yes", "no"} else None
+                entry_dry_run = dry_run
+                if regime is not None and strategy_decision is not None:
+                    regime.start_market(strategy_decision)
+                    if regime.should_suppress_new_live_orders():
+                        entry_dry_run = True
+                        record["regime_live_entry_suppressed"] = True
+                        record["regime_suppression_reason"] = regime.state.get("state_reason")
+                        LOG.warning("EQUITY REGIME ENTRY SUPPRESSED | %s state=%s", ticker, regime.state.get("state_reason"))
                 await consider_initial_entry(
-                    rest, state, market, config, dry_run,
+                    rest, state, market, config, entry_dry_run,
                     live_asks=feed.executable_asks(ticker), ml_side=ml_side,
-                    paper_monitor_only=args.paper_monitor_only, signal_source=signal_source,
+                    paper_monitor_only=args.paper_monitor_only, signal_source=signal_source, strategy_decision=strategy_decision,
                 )
             # The counterfactual is intentionally driven only by the
             # authenticated ticker stream. It is evaluated separately from
@@ -5368,9 +5689,18 @@ async def run(args: argparse.Namespace) -> int:
                     simulate_ml_weighted_activation_comparison(record, feed, inverse=False)
                     simulate_ml_weighted_activation_comparison(record, feed, inverse=True)
                     simulate_model_transition_shadow(record, feed, config)
+                    if regime is not None:
+                        regime.observe_shadow_market(
+                            str(record.get("ticker") or ""),
+                            feed.executable_shadow_quote,
+                            feed.executable_shadow_exit_quote,
+                            feed.public_trades_after,
+                        )
             monotonic_now = asyncio.get_running_loop().time()
             if monotonic_now - last_heartbeat_at >= config["status_log_seconds"]:
                 await log_heartbeat(rest, state, active_markets, config, dry_run, monotonic_now - started_at, feed)
+                if regime is not None:
+                    regime.heartbeat()
                 last_heartbeat_at = monotonic_now
             save_json(state_path, state)
             save_json(args.report.expanduser(), performance_report(state, config))
@@ -5486,6 +5816,36 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--persist-config", action="store_true")
     parser.add_argument("--submit", action="store_true")
     parser.add_argument("--allow-live", action="store_true")
+    parser.add_argument(
+        "--equity-regime-enabled", action=argparse.BooleanOptionalAction, default=None,
+        help="Enable persisted shadow-equity/Prophet regime monitoring and, with the other opt-ins, live entry gating.",
+    )
+    parser.add_argument(
+        "--equity-regime-dry-run", action=argparse.BooleanOptionalAction, default=None,
+        help="Record would-be P10/P90 transitions but never suppress a real order.",
+    )
+    parser.add_argument(
+        "--allow-live-state-transitions", action=argparse.BooleanOptionalAction, default=None,
+        help="Explicit final opt-in allowing a saved regime state to suppress new live entries.",
+    )
+    parser.add_argument("--subaccount", type=int, help="Kalshi subaccount used only for historical reconciliation scope.")
+    parser.add_argument("--starting-balance", help="Configured accounting starting balance; never inferred from current API balance.")
+    parser.add_argument("--history-max-markets", type=int, help="Most recent bot-owned completed markets retained (default: 200).")
+    parser.add_argument("--history-start-ts", help="Optional UTC ISO timestamp bounding historical API reconstruction.")
+    parser.add_argument("--history-end-ts", help="Optional UTC ISO timestamp bounding historical API reconstruction.")
+    parser.add_argument("--accounting-tolerance", help="Dollar discrepancy tolerance for API versus local-ledger reconciliation.")
+    parser.add_argument("--prophet-min-history", type=int, help="Minimum completed shadow markets before Prophet forecasts (default: 100).")
+    parser.add_argument("--prophet-training-window", type=int, help="Rolling Prophet window; default 75 is exploratory only.")
+    parser.add_argument(
+        "--prophet-refit-every-markets", type=int,
+        help="Refit Prophet after this many completed markets (default: 1).",
+    )
+    parser.add_argument(
+        "--shadow-fill-model", choices=("conservative_trade_through", "touch", "live_equivalent"),
+        help="Shadow fill model. touch is optimistic relative to a queue-aware resting fill.",
+    )
+    parser.add_argument("--equity-regime-state", type=Path, default=Path("data/kalshi_equity_regime_state.json"))
+    parser.add_argument("--equity-regime-output-dir", type=Path, default=Path("outputs"))
     parser.add_argument(
         "--live-execution-strategy", choices=sorted(LIVE_EXECUTION_STRATEGIES),
         help=("Persisted real-order mode. inverse_ml_weighted_hold_gate is the inverse-ML 1/2/3/4 strategy; "

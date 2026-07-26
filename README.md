@@ -678,6 +678,48 @@ same `python -m backtest.run_backtest ...` command after installing
 `from backtest.colab_entry import run_uploaded_csv; run_uploaded_csv()` to use
 the Colab upload picker and invoke the identical primary and sensitivity run.
 
+### Equity-regime live shadow layer
+
+The average-down runner now has an integrated, persisted equity-regime layer.
+The committed production configuration enables it: `EQUITY_REGIME_ENABLED=true`,
+`EQUITY_REGIME_DRY_RUN=false`, and `ALLOW_LIVE_STATE_TRANSITIONS=true`.
+Those three controls remain independent of `DRY_RUN`; all three must be true
+before the regime can suppress a real order. Startup API reconciliation fails
+closed. During a disabled period, the runner consumes Kalshi's timestamped
+public `trade` feed for post-order trade-through shadow fills; missing trade
+evidence is written as `unavailable` and cannot trigger a P10 live restart.
+
+The layer keeps the most recent 200 bot-owned completed markets, reconstructs
+actual P/L from the local bot ledger plus authenticated Kalshi fills and
+settlements, and separately advances a continuously simulated shadow curve.
+Prophet uses only shadow observations completed before the target market. The
+exploratory operational window is 75 completed markets with a 100-market
+warm-up; it is not a claim of statistical significance.
+
+The fixed-origin reference CSV with 129 populated `actual` rows is retained
+only as an in-sample diagnostic. Its P10/P90 bands were fitted once before its
+future rows, whereas the live gate and the strict backtest forecast each next
+market without using its outcome. The backtest defaults to `--max-trades 200`
+and rebases that selected recent-trade slice to the configured starting balance.
+
+To perform a read-only reconciliation (no strategy orders):
+
+```bash
+python -m bot.equity_regime reconcile \
+  --trader-state kalshi_btc15m_average_down_state.json \
+  --regime-state data/kalshi_equity_regime_state.json \
+  --output-dir outputs \
+  --starting-balance 100.00
+```
+
+This reads `/historical/cutoff`, `/historical/fills`, `/portfolio/fills`,
+`/portfolio/settlements`, and `/portfolio/balance` through the existing
+authenticated client. It writes the actual/shadow histories, forecasts,
+transitions, reconciliation CSV, report, and charts. The default
+`conservative_trade_through` model records an unavailable shadow fill rather
+than inventing one when only BBO data is available; `touch` is explicitly an
+approximation, not a queue-aware fill replay.
+
 ### Prophet normal/inverse selector replay
 
 **“Kalshi Prophet Selector Historical Backtest”** is a separate manual Action

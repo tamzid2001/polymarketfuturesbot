@@ -53,7 +53,10 @@ jobs:
           python -m pip install -r requirements_equity_backtest.txt
 
       - name: Run automated integrity and unit tests
-        run: python -m unittest discover -s backtest/tests -v
+        run: |
+          python -m py_compile kalshi_btc15m_average_down.py bot/equity_regime.py
+          python -m unittest discover -s backtest/tests -v
+          python -m unittest -v test_equity_regime.py
 
       - name: Run full strict walk-forward analysis
         env:
@@ -75,6 +78,7 @@ jobs:
             --input "$input_csv"
             --input-format "$input_format"
             --starting-balance "$starting_balance"
+            --max-trades 200
             --min-training-trades "$min_training_trades"
             --refit-every 1
             --signal-mode level

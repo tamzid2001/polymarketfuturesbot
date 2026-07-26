@@ -15,6 +15,44 @@ on:
         required: true
         type: boolean
         default: true
+      equity_regime_enabled:
+        description: "Enable the persisted shadow-equity Prophet P10/P90 execution regime."
+        required: true
+        type: boolean
+        default: true
+      equity_regime_dry_run:
+        description: "Record only when true; false permits the enabled regime to suppress next-market entries."
+        required: true
+        type: boolean
+        default: false
+      allow_live_state_transitions:
+        description: "Second explicit opt-in required before P90/P10 transitions suppress or restore live entries."
+        required: true
+        type: boolean
+        default: true
+      prophet_min_history:
+        description: "Completed shadow markets required before Prophet forecasts."
+        required: true
+        type: number
+        default: 100
+      prophet_refit_every_markets:
+        description: "Refit cadence in completed markets; primary operational setting is 1."
+        required: true
+        type: number
+        default: 1
+      shadow_fill_model:
+        description: "Conservative trade-through requires a trade tape; touch is explicitly approximate."
+        required: true
+        type: choice
+        options:
+          - conservative_trade_through
+          - touch
+        default: conservative_trade_through
+      starting_balance:
+        description: "Accounting starting balance for the bounded 200-market regime history."
+        required: true
+        type: string
+        default: "100.00"
       initial_position_size:
         description: "Contracts per 40c/30c/20c/10c rung. If changed alone, the four-rung contract and capital caps auto-scale; blank keeps persisted values."
         required: false
@@ -158,8 +196,8 @@ jobs:
 
       - name: Verify mechanical strategy
         run: |
-          python -m py_compile kalshi_ladder_scalp_shadow.py kalshi_btc15m_average_down.py
-          python -m unittest -v test_kalshi_btc15m_average_down.py test_kalshi_ladder_scalp_shadow.py
+          python -m py_compile kalshi_ladder_scalp_shadow.py kalshi_btc15m_average_down.py bot/equity_regime.py
+          python -m unittest -v test_kalshi_btc15m_average_down.py test_kalshi_ladder_scalp_shadow.py test_equity_regime.py
 
       - name: Download stored ML model and frozen feature ledger
         if: env.USE_ML_INFERENCE == 'true'
@@ -213,6 +251,13 @@ jobs:
           MAX_ACTIVE_MARKETS: ${{ inputs.max_active_markets }}
           MAX_CONTRACTS_PER_MARKET: ${{ inputs.max_contracts_per_market }}
           MAX_TOTAL_CAPITAL: ${{ inputs.max_total_capital }}
+          EQUITY_REGIME_ENABLED: ${{ inputs.equity_regime_enabled }}
+          EQUITY_REGIME_DRY_RUN: ${{ inputs.equity_regime_dry_run }}
+          ALLOW_LIVE_STATE_TRANSITIONS: ${{ inputs.allow_live_state_transitions }}
+          PROPHET_MIN_HISTORY: ${{ inputs.prophet_min_history }}
+          PROPHET_REFIT_EVERY_MARKETS: ${{ inputs.prophet_refit_every_markets }}
+          SHADOW_FILL_MODEL: ${{ inputs.shadow_fill_model }}
+          EQUITY_REGIME_STARTING_BALANCE: ${{ inputs.starting_balance }}
         run: |
           set -euo pipefail
           args=(--config kalshi_btc15m_average_down_config.json
@@ -235,6 +280,19 @@ jobs:
           [ -z "$MAX_ACTIVE_MARKETS" ] || args+=(--max-active-markets "$MAX_ACTIVE_MARKETS")
           [ -z "$MAX_CONTRACTS_PER_MARKET" ] || args+=(--max-contracts-per-market "$MAX_CONTRACTS_PER_MARKET")
           [ -z "$MAX_TOTAL_CAPITAL" ] || args+=(--max-total-capital "$MAX_TOTAL_CAPITAL")
+          if [ -n "$EQUITY_REGIME_ENABLED" ]; then
+            if [ "$EQUITY_REGIME_ENABLED" = "true" ]; then args+=(--equity-regime-enabled); else args+=(--no-equity-regime-enabled); fi
+          fi
+          if [ -n "$EQUITY_REGIME_DRY_RUN" ]; then
+            if [ "$EQUITY_REGIME_DRY_RUN" = "true" ]; then args+=(--equity-regime-dry-run); else args+=(--no-equity-regime-dry-run); fi
+          fi
+          if [ -n "$ALLOW_LIVE_STATE_TRANSITIONS" ]; then
+            if [ "$ALLOW_LIVE_STATE_TRANSITIONS" = "true" ]; then args+=(--allow-live-state-transitions); else args+=(--no-allow-live-state-transitions); fi
+          fi
+          [ -z "$PROPHET_MIN_HISTORY" ] || args+=(--prophet-min-history "$PROPHET_MIN_HISTORY")
+          [ -z "$PROPHET_REFIT_EVERY_MARKETS" ] || args+=(--prophet-refit-every-markets "$PROPHET_REFIT_EVERY_MARKETS")
+          [ -z "$SHADOW_FILL_MODEL" ] || args+=(--shadow-fill-model "$SHADOW_FILL_MODEL")
+          [ -z "$EQUITY_REGIME_STARTING_BALANCE" ] || args+=(--starting-balance "$EQUITY_REGIME_STARTING_BALANCE")
           if [ "$USE_ML_INFERENCE" = "true" ] && [ -s previous_model/kxbtc15m_ml_model.joblib ]; then
             args+=(--previous-ml-model-path previous_model/kxbtc15m_ml_model.joblib
                    --previous-ml-model-metadata previous_model/kxbtc15m_ml_model_metadata.json
@@ -259,6 +317,7 @@ jobs:
             kalshi_btc15m_weighted_trailing_inverse_ledger.json kalshi_btc15m_weighted_trailing_inverse_report.json
             kalshi_btc15m_actual_price_bracket_normal_ledger.json kalshi_btc15m_actual_price_bracket_normal_report.json
             kalshi_btc15m_actual_price_bracket_inverse_ledger.json kalshi_btc15m_actual_price_bracket_inverse_report.json
+            data/kalshi_equity_regime_state.json data/kalshi_actual_equity_history.csv data/kalshi_shadow_equity_history.csv
           )
           for file in "${files[@]}"; do
             test ! -f "$file" || git add "$file"
@@ -338,5 +397,17 @@ jobs:
             kalshi_btc15m_actual_price_bracket_normal_report.json
             kalshi_btc15m_actual_price_bracket_inverse_ledger.json
             kalshi_btc15m_actual_price_bracket_inverse_report.json
+            data/kalshi_equity_regime_state.json
+            data/kalshi_actual_equity_history.csv
+            data/kalshi_shadow_equity_history.csv
+            outputs/actual_equity_curve.csv
+            outputs/shadow_equity_curve.csv
+            outputs/prophet_forecasts.csv
+            outputs/regime_transitions.csv
+            outputs/live_vs_shadow_trades.csv
+            outputs/accounting_reconciliation.csv
+            outputs/equity_regime_report.md
+            outputs/equity_curves.png
+            outputs/shadow_equity_with_p10_p90.png
           if-no-files-found: warn
           retention-days: 90

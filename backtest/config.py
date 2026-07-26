@@ -21,6 +21,7 @@ class BacktestConfig:
     """
 
     starting_balance: float = 100.0
+    max_trades: int = 200
     min_training_trades: int = 100
     training_window: int | None = None
     refit_every_n_trades: int = 1
@@ -43,6 +44,8 @@ class BacktestConfig:
             raise ValueError("starting_balance must be positive")
         if self.min_training_trades < 2:
             raise ValueError("min_training_trades must be at least 2")
+        if self.max_trades <= self.min_training_trades:
+            raise ValueError("max_trades must exceed min_training_trades")
         if self.training_window is not None and self.training_window <= 1:
             raise ValueError("training_window must be None or an integer above 1")
         if self.refit_every_n_trades < 1:

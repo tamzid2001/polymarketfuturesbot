@@ -86,7 +86,7 @@ Primary preregistered configuration: `MIN_TRAINING_TRADES={config.min_training_t
 
 ## Methodology
 
-The input is parsed as UTC and timezone information is removed only after conversion, preserving UTC clock time for Prophet.  For original Kalshi positions, ticker timestamps are parsed with the documented `KXBTC15M` regex and realized `Total return ($)` forms the P/L series. Confirmed duplicate economic records only are removed; unresolved duplicate timestamps stop the run.
+The input is parsed as UTC and timezone information is removed only after conversion, preserving UTC clock time for Prophet. The analysis is explicitly limited to the most recent `{config.max_trades}` completed trades; if the source contains older rows, the selected slice is rebased to the configured starting balance before any forecast. For original Kalshi positions, ticker timestamps are parsed with the documented `KXBTC15M` regex and realized `Total return ($)` forms the P/L series. Confirmed duplicate economic records only are removed; unresolved duplicate timestamps stop the run.
 
 The always-on **shadow equity** is starting balance plus every realized opportunity P/L, including results during inactive periods. The filtered curve includes only opportunities whose state was already on before that opportunity. At trade index *t*, the model is trained on shadow-equity rows ending at *t-1*, forecasts the exact timestamp of *t*, then the outcome is revealed. The P10/P90 comparison changes state only for *t+1*. This sequencing prevents the trade generating a signal from being counted in the new regime.
 

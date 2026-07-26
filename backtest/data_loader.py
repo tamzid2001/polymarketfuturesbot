@@ -146,6 +146,25 @@ def load_input(path: str | Path, input_format: str, starting_balance: float) -> 
     return result
 
 
+def most_recent_trades(trades: pd.DataFrame, max_trades: int, starting_balance: float) -> pd.DataFrame:
+    """Keep the newest bounded trade universe and rebuild its shadow equity.
+
+    The reference files contain a starting-balance row plus 200 trades.  When
+    a later export has older history too, retaining rows alone would leave
+    ``shadow_equity_after`` anchored to omitted P/L.  Rebuilding from the
+    configured balance preserves the defined 200-trade experiment.
+    """
+
+    if max_trades < 1:
+        raise ValueError("max_trades must be positive")
+    result = trades.tail(max_trades).copy().reset_index(drop=True)
+    result["trade_index"] = np.arange(len(result), dtype=int)
+    result["shadow_equity_after"] = starting_balance + result["trade_pnl"].cumsum()
+    if (result["shadow_equity_after"] <= 0).any():
+        raise ValueError("The selected recent-trade shadow equity is non-positive")
+    return result
+
+
 def data_signature(trades: pd.DataFrame) -> str:
     """Stable input identity used to keep cached sensitivity forecasts honest."""
 
