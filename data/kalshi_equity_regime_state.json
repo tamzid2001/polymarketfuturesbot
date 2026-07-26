@@ -1,5 +1,5 @@
 {
-  "actual_balance": "78.9868",
+  "actual_balance": "84.9868",
   "actual_history": [
     {
       "actual_balance_after": "78.9868",
@@ -27,6 +27,33 @@
       "state_after_market": "on",
       "state_before_market": "on",
       "timestamp": "2026-07-26T23:15:13.201980+00:00"
+    },
+    {
+      "actual_balance_after": "84.9868",
+      "actual_balance_before": "78.9868",
+      "actual_realized_pnl": "6.0",
+      "average_entry": 0.333333,
+      "balance_source": "authenticated_kalshi_api",
+      "completed_at": "2026-07-26T23:30:12.736202+00:00",
+      "contracts_bought": 9.0,
+      "contracts_sold": 0,
+      "entry_cost": 3.0,
+      "entry_signal_after_market": false,
+      "execution_enabled_for_market": true,
+      "exit_method": "settlement",
+      "exit_proceeds": "0.0",
+      "exit_signal_after_market": false,
+      "fees": 0.0,
+      "market_close_time": "2026-07-26T23:30:12.694519+00:00",
+      "market_ticker": "KXBTC15M-26JUL261930-30",
+      "reconciled": true,
+      "reconciliation_status": "pending_api_reconciliation",
+      "selected_side": "no",
+      "settlement_payout": "9.0",
+      "source": "live_bot_ledger",
+      "state_after_market": "on",
+      "state_before_market": "on",
+      "timestamp": "2026-07-26T23:30:12.736186+00:00"
     }
   ],
   "ambiguous_fills": [
@@ -421,7 +448,7 @@
   "last_p90": null,
   "last_p99": null,
   "last_processed_fill_id": "873790c1-bc45-6c52-f9f2-201b497fcf83",
-  "last_processed_market_ticker": "KXBTC15M-26JUL261915-15",
+  "last_processed_market_ticker": "KXBTC15M-26JUL261930-30",
   "last_processed_settlement_ticker": "KXBTC15M-26JUL261900-00",
   "legacy_migration": {
     "archive": "data/kalshi_equity_regime_state.legacy-rebased-20260726T230426Z.json",
@@ -443,11 +470,21 @@
       "market_ticker": "KXBTC15M-26JUL261915-15",
       "shadow_realized_pnl": "1.8",
       "shadow_simulation_quality": "exact_replay"
+    },
+    {
+      "actual_realized_pnl": "6.0",
+      "difference": "0.0",
+      "live_execution_enabled": true,
+      "market_close_time": "2026-07-26T23:30:12.694519+00:00",
+      "market_ticker": "KXBTC15M-26JUL261930-30",
+      "shadow_realized_pnl": "6.0",
+      "shadow_simulation_quality": "exact_replay"
     }
   ],
   "processed_fill_ids": [],
   "processed_market_tickers": [
-    "KXBTC15M-26JUL261915-15"
+    "KXBTC15M-26JUL261915-15",
+    "KXBTC15M-26JUL261930-30"
   ],
   "processed_settlement_tickers": [],
   "prophet_training_end": null,
@@ -5503,10 +5540,10 @@
       "shadow_balance": "75.9868"
     }
   ],
-  "shadow_balance": "77.7868",
+  "shadow_balance": "83.7868",
   "shadow_cooldown_state": {
-    "consecutive_completed_losses": 2,
-    "last_resolution": "completed_losing_shadow_trade",
+    "consecutive_completed_losses": 0,
+    "last_resolution": "completed_winning_shadow_trade",
     "markets_remaining_to_skip": 0,
     "skipped_markets": [
       {
@@ -5546,100 +5583,32 @@
       "shadow_simulation_quality": "exact_replay",
       "shadow_skip_reason": "missing_strategy_decision",
       "timestamp": "2026-07-26T23:15:13.201996+00:00"
+    },
+    {
+      "completed_at": "2026-07-26T23:30:12.736217+00:00",
+      "live_execution_enabled": true,
+      "market_close_time": "2026-07-26T23:30:12.694519+00:00",
+      "market_ticker": "KXBTC15M-26JUL261930-30",
+      "shadow_average_entry": "0.3333333333333333333333333333",
+      "shadow_balance_after": "83.7868",
+      "shadow_balance_before": "77.7868",
+      "shadow_contracts": "9.0",
+      "shadow_cost": "3.0",
+      "shadow_eligible": true,
+      "shadow_exit_method": "settlement",
+      "shadow_fees": "0.0",
+      "shadow_fill_model": "live_equivalent",
+      "shadow_market_pnl": "6.0",
+      "shadow_payout": "9.0",
+      "shadow_proceeds": "0.0",
+      "shadow_realized_pnl": "6.0",
+      "shadow_selected_side": "no",
+      "shadow_simulation_quality": "exact_replay",
+      "shadow_skip_reason": null,
+      "timestamp": "2026-07-26T23:30:12.736211+00:00"
     }
   ],
-  "shadow_open": {
-    "KXBTC15M-26JUL261930-30": {
-      "consumed_public_trade_count": {
-        "764e9e79-95a1-5321-fc32-9e1d85927f32": "1.0",
-        "c8ca3f41-f54c-5c74-efa1-8717cfebacdc": "5.00",
-        "d36dac9c-8d93-7489-f898-eabbdfb6334c": "3.0"
-      },
-      "eligible": true,
-      "entry_cost": "3.00",
-      "exit_method": null,
-      "fees": "0",
-      "fill_notes": [
-        {
-          "events_seen": 32,
-          "reason": "post_order_public_tape_checked"
-        },
-        {
-          "fill": "3.0",
-          "modeled_price": "0.4",
-          "order_key": "0.4000",
-          "public_trade_id": "d36dac9c-8d93-7489-f898-eabbdfb6334c",
-          "public_trade_price": "0.4",
-          "public_trade_timestamp": 1785107742802,
-          "reason": "post_order_public_trade_through"
-        },
-        {
-          "fill": "1.0",
-          "modeled_price": "0.3",
-          "order_key": "0.3000",
-          "public_trade_id": "764e9e79-95a1-5321-fc32-9e1d85927f32",
-          "public_trade_price": "0.3",
-          "public_trade_timestamp": 1785107762997,
-          "reason": "post_order_public_trade_through"
-        },
-        {
-          "fill": "5.0",
-          "modeled_price": "0.3",
-          "order_key": "0.3000",
-          "public_trade_id": "c8ca3f41-f54c-5c74-efa1-8717cfebacdc",
-          "public_trade_price": "0.3",
-          "public_trade_timestamp": 1785107762997,
-          "reason": "post_order_public_trade_through"
-        }
-      ],
-      "generated_at": "2026-07-26T23:15:34.478243+00:00",
-      "highest_bid": "0.41",
-      "live_execution_enabled": true,
-      "market_close_time": "2026-07-26T23:30:00+00:00",
-      "orders": [
-        {
-          "created_at": "2026-07-26T23:15:34.478243+00:00",
-          "filled": "3.0",
-          "order_key": "0.4000",
-          "price": "0.4",
-          "quantity": "3.0"
-        },
-        {
-          "created_at": "2026-07-26T23:15:34.478243+00:00",
-          "filled": "6.0",
-          "order_key": "0.3000",
-          "price": "0.3",
-          "quantity": "6.0"
-        },
-        {
-          "created_at": "2026-07-26T23:15:34.478243+00:00",
-          "filled": "0",
-          "order_key": "0.2000",
-          "price": "0.2",
-          "quantity": "9.0"
-        },
-        {
-          "created_at": "2026-07-26T23:15:34.478243+00:00",
-          "filled": "0",
-          "order_key": "0.1000",
-          "price": "0.1",
-          "quantity": "12.0"
-        }
-      ],
-      "payout": "0",
-      "proceeds": "0",
-      "selected_side": "no",
-      "shadow_fill_model": "conservative_trade_through",
-      "shadow_simulation_quality": "conservative_approximation",
-      "skip_reason": null,
-      "source_ticker": "KXBTC15M-26JUL261915-15",
-      "status": "active",
-      "stop_price": "0.05",
-      "target_ticker": "KXBTC15M-26JUL261930-30",
-      "trailing_activation_gain": "2",
-      "trailing_retracement": "2"
-    }
-  },
+  "shadow_open": {},
   "shadow_pnl_while_disabled": "1.8",
   "starting_balance": "100.00",
   "state_changed_at": "2026-07-26T22:45:07.220092+00:00",
