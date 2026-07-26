@@ -1,0 +1,74 @@
+name: Kalshi Streak ML Backtest
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: "Backtest run ID whose artifact contains prophet_ml_backtest_rows.csv."
+        required: true
+        default: "29698207476"
+      signal:
+        description: "Signal outcomes to evaluate."
+        required: true
+        default: "all"
+      min_train_trades:
+        description: "Minimum chronological training rows before out-of-sample scoring."
+        required: true
+        default: "2000"
+      test_blocks:
+        description: "Number of expanding chronological out-of-sample blocks."
+        required: true
+        default: "5"
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  streak-ml-backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+
+      - name: Setup Python 3.13
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements_kalshi_ledger_analysis.txt
+
+      - name: Run Offline Tests
+        run: python test_kalshi_streak_ml_backtest.py
+
+      - name: Download Backtest Artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+        run: |
+          gh run download "$SOURCE_RUN_ID" -R "${{ github.repository }}" \
+            -n "kalshi-btc15m-backtest-$SOURCE_RUN_ID" -D streak_ml_input
+
+      - name: Run Streak ML Backtest
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: |
+          python kalshi_streak_ml_backtest.py \
+            --input streak_ml_input \
+            --output-dir streak_ml_backtest_output \
+            --signal "${{ inputs.signal }}" \
+            --min-train-trades "${{ inputs.min_train_trades }}" \
+            --test-blocks "${{ inputs.test_blocks }}"
+
+      - name: Upload Backtest
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kalshi-streak-ml-backtest-${{ github.run_id }}
+          path: streak_ml_backtest_output/
+          if-no-files-found: warn
+          retention-days: 30

@@ -1,0 +1,109 @@
+{
+  "active_paper_markets": 0,
+  "average_entry_profiles": {},
+  "current_streak": 0,
+  "current_streak_kind": "none",
+  "excursion_observer": {
+    "completed_position_states": 0,
+    "depth_observed_position_states": 0,
+    "enabled": false,
+    "maximum_gross_per_contract": {
+      "average": null,
+      "maximum": null,
+      "median": null,
+      "minimum": null,
+      "p25": null,
+      "p75": null,
+      "p90": null
+    },
+    "method": "records the maximum later fresh executable bid with displayed depth for each unchanged filled-average/size; range shadows do not select an exit, trailing shadows may close on their configured retracement, and fixed-stop shadows may close at their configured loss threshold",
+    "target_opportunities": {
+      "0.01": {
+        "completed_position_states": 0,
+        "depth_observed_position_states": 0,
+        "hit_position_states": 0,
+        "hit_rate_given_depth_observation": null,
+        "target_per_contract": 0.01
+      },
+      "0.02": {
+        "completed_position_states": 0,
+        "depth_observed_position_states": 0,
+        "hit_position_states": 0,
+        "hit_rate_given_depth_observation": null,
+        "target_per_contract": 0.02
+      },
+      "0.03": {
+        "completed_position_states": 0,
+        "depth_observed_position_states": 0,
+        "hit_position_states": 0,
+        "hit_rate_given_depth_observation": null,
+        "target_per_contract": 0.03
+      },
+      "0.05": {
+        "completed_position_states": 0,
+        "depth_observed_position_states": 0,
+        "hit_position_states": 0,
+        "hit_rate_given_depth_observation": null,
+        "target_per_contract": 0.05
+      },
+      "0.10": {
+        "completed_position_states": 0,
+        "depth_observed_position_states": 0,
+        "hit_position_states": 0,
+        "hit_rate_given_depth_observation": null,
+        "target_per_contract": 0.1
+      }
+    },
+    "unit": "gross dollars per contract; fees, queue position, latency, and price impact excluded"
+  },
+  "fee_treatment": "excluded_no_exchange_fill",
+  "fill_rule": "buy at a fresh actual executable ask <= rung with displayed ask depth; maintains the latest fresh YES and NO top-of-book snapshot, requires displayed bid depth for the whole filled position on every exit, closes an absolute stop only at its configured selected-side price, and closes a trailing stop only after its average-filled-entry gain activation and later configured retracement",
+  "filled_market_trades": 0,
+  "fixed_stop_loss": {
+    "configured_absolute_prices": [],
+    "configured_gaps_per_contract": [],
+    "enabled": false,
+    "execution_rule": "a fresh full-depth selected-side bid at or below the configured absolute price exits the whole paper position at that observed bid; legacy average-entry-gap records remain distinguishable in configured_gaps_per_contract",
+    "fixed_stop_loss_exits": 0
+  },
+  "fixed_stop_loss_exits": 0,
+  "limitations": [
+    "A quote hit or exit is a paper event, not a Kalshi exchange fill.",
+    "Queue priority, quote cancellation, latency, hidden liquidity, partial fills, and fees are not modeled.",
+    "The full simulated position is closed at the observed bid; no favorable price improvement is assumed."
+  ],
+  "locked_side_policy": "side is fixed before open and never changes on later quotes",
+  "longest_losing_streak": 0,
+  "longest_winning_streak": 0,
+  "losing_trades": 0,
+  "maximum_drawdown": 0.0,
+  "mode": "paper_only_no_exchange_orders",
+  "net_profit": 0,
+  "paper_markets_started": 0,
+  "pnl_time_series": [],
+  "return_on_simulated_capital": null,
+  "scalp_exits": 0,
+  "settlement_exits_without_take_profit": 0,
+  "source": "same_frozen_ml_side_as_primary_ladder",
+  "strategy": "normal_ml_weighted_1234_trailing_scalp_shadow_v1",
+  "total_entry_cost": 0,
+  "total_exit_proceeds": 0,
+  "total_simulated_contracts": 0,
+  "trailing_stop": {
+    "configured_activation_gains_per_contract": [],
+    "configured_gaps_per_contract": [],
+    "enabled": false,
+    "execution_rule": "after a fresh full-depth bid first reaches average filled entry plus the configured activation gain, a later fresh full-depth bid at or below the maximum minus the configured gap exits the whole paper position at that observed bid",
+    "trailing_stop_exits": 0
+  },
+  "trailing_stop_exits": 0,
+  "unfilled_markets": 0,
+  "weighted_rungs": {
+    "0.10": 4.0,
+    "0.20": 3.0,
+    "0.30": 2.0,
+    "0.40": 1.0
+  },
+  "win_rate": null,
+  "winning_trades": 0
+}

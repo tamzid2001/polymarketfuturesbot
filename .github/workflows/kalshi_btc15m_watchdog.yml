@@ -1,7 +1,7 @@
 name: Kalshi BTC 15m Live Trader Watchdog
 
-# A recovery safety net for the live ML-side trader. The trader's normal
-# 5h45m self-handoff remains primary. This runs every five minutes only to
+# A recovery safety net for the settlement-only trader. The trader's normal
+# 5h25m self-handoff remains primary. This runs every five minutes only to
 # dispatch a replacement when no trader is active/queued and the last success
 # has had time to enqueue its successor.
 on:
@@ -50,5 +50,13 @@ jobs:
           fi
 
           gh workflow run kalshi_btc15m_average_down.yml \
-            --repo "$REPOSITORY" --ref main -f live_trading=true
+            --repo "$REPOSITORY" --ref main \
+            -f live_trading=true \
+            -f enable_dynamic_scaling=true \
+            -f equity_regime_enabled=true \
+            -f equity_regime_dry_run=false \
+            -f prophet_min_history=100 \
+            -f prophet_refit_every_markets=1 \
+            -f shadow_fill_model=conservative_trade_through \
+            -f starting_balance=100.00
           echo "WATCHDOG DISPATCHED | no active/queued live runner; replacement queued."

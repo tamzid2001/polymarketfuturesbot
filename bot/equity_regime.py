@@ -23,7 +23,7 @@ import random
 import tempfile
 import time
 from collections import defaultdict
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
@@ -395,10 +395,10 @@ def normalize_price(record: Mapping[str, Any], side: str) -> Decimal:
 
 
 def normalize_fill(record: Mapping[str, Any], source: str) -> NormalizedFill:
-    side = str(value_from(record, "side", "market_side", "outcome") or "").lower()
+    side = str(value_from(record, "side", "market_side", "outcome", "outcome_side", "taker_outcome_side") or "").lower()
     if side not in {"yes", "no"}:
         raise ValueError(f"fill has unsupported side: {side!r}")
-    action = str(value_from(record, "action", "trade_action", "type") or "buy").lower()
+    action = str(value_from(record, "action", "trade_action", "taker_action", "type") or "buy").lower()
     if action in {"purchase", "bought"}:
         action = "buy"
     if action in {"sale", "sold"}:
@@ -424,7 +424,11 @@ def normalize_fill(record: Mapping[str, Any], source: str) -> NormalizedFill:
         price=normalize_price(record, side),
         count=count,
         fee=decimal_value(value_from(record, "fee_cost", "fee_cost_dollars", "fees_paid_dollars", "fee")),
-        subaccount=(int(value_from(record, "subaccount", "subaccount_id")) if value_from(record, "subaccount", "subaccount_id") is not None else None),
+        subaccount=(
+            int(value_from(record, "subaccount", "subaccount_id", "subaccount_number"))
+            if value_from(record, "subaccount", "subaccount_id", "subaccount_number") is not None
+            else None
+        ),
         source=source,
         raw=record,
     )
@@ -483,7 +487,17 @@ async def paginated_records(
 
 
 def cutoff_timestamp(payload: Mapping[str, Any]) -> datetime | None:
-    return utc_timestamp(value_from(payload, "historical_cutoff_ts", "cutoff_ts", "cutoff_time", "timestamp"))
+    # Kalshi publishes separate cutoffs.  Fills must use ``trades_created_ts``;
+    # settlement and order cutoffs are not a safe substitute for the fill
+    # boundary.  Older names remain for backward-compatible test fixtures.
+    return utc_timestamp(value_from(
+        payload,
+        "trades_created_ts",
+        "historical_cutoff_ts",
+        "cutoff_ts",
+        "cutoff_time",
+        "timestamp",
+    ))
 
 
 def known_bot_identifiers(local_state: Mapping[str, Any]) -> tuple[set[str], set[str]]:
@@ -541,11 +555,19 @@ class HistoricalSynchronizer:
     async def sync(self, api: JsonAPI) -> HistorySyncResult:
         cutoff_payload = await api.get_json("/historical/cutoff")
         cutoff = cutoff_timestamp(cutoff_payload)
-        request: dict[str, Any] = {"subaccount": self.config.subaccount}
+        live_request: dict[str, Any] = {"subaccount": self.config.subaccount}
         if self.config.history_start_ts:
-            request["min_ts"] = int(self.config.history_start_ts.timestamp())
+            live_request["min_ts"] = int(self.config.history_start_ts.timestamp())
         if self.config.history_end_ts:
-            request["max_ts"] = int(self.config.history_end_ts.timestamp())
+            live_request["max_ts"] = int(self.config.history_end_ts.timestamp())
+        # The historical-fill endpoint documents only its archival cursor and
+        # upper-bound parameters; unlike the live endpoint, do not send a
+        # speculative ``min_ts`` or ``subaccount`` that can turn a startup
+        # reconstruction into a 400.  We apply the configured time and
+        # subaccount scope after normalized decoding below.
+        historical_request: dict[str, Any] = {}
+        if self.config.history_end_ts:
+            historical_request["max_ts"] = int(self.config.history_end_ts.timestamp())
         start = self.config.history_start_ts
         end = self.config.history_end_ts
         fetch_historical = cutoff is None or start is None or start <= cutoff
@@ -553,16 +575,16 @@ class HistoricalSynchronizer:
         raw_fills: list[tuple[str, Mapping[str, Any]]] = []
         if fetch_historical:
             raw_fills.extend(("historical", row) for row in await paginated_records(
-                api, "/historical/fills", params=request, list_keys=("fills", "historical_fills"),
+                api, "/historical/fills", params=historical_request, list_keys=("fills", "historical_fills"),
             ))
         if fetch_live:
             raw_fills.extend(("portfolio", row) for row in await paginated_records(
-                api, "/portfolio/fills", params=request, list_keys=("fills", "portfolio_fills"),
+                api, "/portfolio/fills", params=live_request, list_keys=("fills", "portfolio_fills"),
             ))
         raw_settlements = await paginated_records(
-            api, "/portfolio/settlements", params=request, list_keys=("settlements", "market_settlements"),
+            api, "/portfolio/settlements", params=live_request, list_keys=("settlements", "market_settlements"),
         )
-        balance_payload = await api.get_json("/portfolio/balance", request)
+        balance_payload = await api.get_json("/portfolio/balance", {"subaccount": self.config.subaccount})
         deduplicated: dict[tuple[str, ...], NormalizedFill] = {}
         duplicate_count = 0
         ambiguous: list[dict[str, Any]] = []
@@ -571,6 +593,11 @@ class HistoricalSynchronizer:
                 fill = normalize_fill(row, source)
             except ValueError as exc:
                 ambiguous.append({"reason": str(exc), "raw": dict(row)})
+                continue
+            if (
+                (self.config.history_start_ts and fill.created_at and fill.created_at < self.config.history_start_ts)
+                or (self.config.history_end_ts and fill.created_at and fill.created_at > self.config.history_end_ts)
+            ):
                 continue
             if fill.dedupe_key in deduplicated:
                 duplicate_count += 1
@@ -589,7 +616,13 @@ class HistoricalSynchronizer:
                 settlement = normalize_settlement(row, "portfolio")
             except ValueError:
                 continue
-            if settlement.ticker.startswith(self.config.series_ticker + "-"):
+            if (
+                settlement.ticker.startswith(self.config.series_ticker + "-")
+                and not (
+                    (self.config.history_start_ts and settlement.settled_at and settlement.settled_at < self.config.history_start_ts)
+                    or (self.config.history_end_ts and settlement.settled_at and settlement.settled_at > self.config.history_end_ts)
+                )
+            ):
                 settlements.append(settlement)
         fills = sorted(deduplicated.values(), key=lambda item: (item.created_at or datetime.min.replace(tzinfo=UTC), item.fill_id))
         settlements.sort(key=lambda item: (item.settled_at or datetime.min.replace(tzinfo=UTC), item.ticker))
@@ -836,6 +869,18 @@ class ShadowExecutor:
         except Exception as exc:  # noqa: BLE001 - data absence remains unavailable, never a fill
             trade.setdefault("fill_notes", []).append({"reason": "public_trade_getter_error", "error": str(exc)})
             return False
+        # A successfully queried, post-decision public tape is still useful
+        # evidence when no trade crossed an order. It remains conservative
+        # because queue position is unavailable, but it is not the same as a
+        # missing stream/reconnect gap.  This lets a genuine zero-fill market
+        # contribute a zero shadow P/L instead of permanently blocking a P10
+        # restart merely because no public executions occurred.
+        if trade.get("shadow_simulation_quality") == "unavailable":
+            trade["shadow_simulation_quality"] = "conservative_approximation"
+            trade.setdefault("fill_notes", []).append({
+                "reason": "post_order_public_tape_checked",
+                "events_seen": len(events),
+            })
         consumed = trade.setdefault("consumed_public_trade_count", {})
         changed = False
         # Highest-priced buy has the strongest fill priority.  A single public
@@ -1085,11 +1130,69 @@ class EquityRegimeController:
         execution_before = self.execution_enabled_for_market()
         existing = self.state.get("shadow_open", {}).get(decision.target_ticker)
         if existing is None:
-            shadow = self.shadow_executor.start(decision, execution_before)
+            shadow = self.shadow_executor.start(self._shadow_cooldown_decision(decision), execution_before)
             self.state.setdefault("shadow_open", {})[decision.target_ticker] = shadow
             self.save()
             LOG.info("SHADOW MARKET STARTED | %s side=%s model=%s", decision.target_ticker, decision.selected_side.upper(), self.config.shadow_fill_model)
         return forecast or {}, execution_before
+
+    def _shadow_cooldown_decision(self, decision: StrategyDecision) -> StrategyDecision:
+        """Apply the independent hypothetical loss breaker before a shadow market.
+
+        The live runner owns its actual-filled breaker.  With the recommended
+        ``separate`` setting, this controller owns an equivalent shadow-only
+        breaker so an off-state shadow path does not inherit a frozen live
+        streak.  A skipped hypothetical market remains a durable zero-P/L
+        observation and is explicitly labelled rather than being omitted.
+        """
+        if self.config.cooldown_state_source not in {"shadow", "separate"} or not decision.eligible:
+            return decision
+        control = self.state.setdefault("shadow_cooldown_state", {})
+        remaining = int(control.get("markets_remaining_to_skip") or 0)
+        if remaining <= 0:
+            return decision
+        control["markets_remaining_to_skip"] = remaining - 1
+        control.setdefault("skipped_markets", []).append({
+            "ticker": decision.target_ticker,
+            "at": timestamp_text(decision.generated_at),
+            "remaining_after": remaining - 1,
+        })
+        control["skipped_markets"] = control["skipped_markets"][-200:]
+        LOG.warning(
+            "SHADOW COOLDOWN SKIP | %s remaining_after=%d; no shadow order can be filled for this market",
+            decision.target_ticker,
+            remaining - 1,
+        )
+        return replace(
+            decision,
+            eligible=False,
+            skip_reason="shadow_two_consecutive_completed_losses",
+        )
+
+    def _update_shadow_cooldown_after_close(self, trade: Mapping[str, Any], shadow_pnl: Decimal) -> None:
+        if self.config.cooldown_state_source not in {"shadow", "separate"}:
+            return
+        if not bool(trade.get("eligible")) or decimal_value(trade.get("contracts")) <= ZERO:
+            return
+        control = self.state.setdefault("shadow_cooldown_state", {})
+        losses = int(control.get("consecutive_completed_losses") or 0)
+        if shadow_pnl > ZERO:
+            control.update({
+                "consecutive_completed_losses": 0,
+                "markets_remaining_to_skip": 0,
+                "last_resolution": "completed_winning_shadow_trade",
+            })
+        elif shadow_pnl < ZERO:
+            losses += 1
+            control["consecutive_completed_losses"] = losses
+            control["last_resolution"] = "completed_losing_shadow_trade"
+            if losses >= 2:
+                control["markets_remaining_to_skip"] = 2
+                control["consecutive_completed_losses"] = 2
+                LOG.warning(
+                    "SHADOW COOLDOWN ARMED | %s has two consecutive hypothetical losses; next two shadow signals will be skipped",
+                    trade.get("target_ticker"),
+                )
 
     def observe_shadow_market(
         self,
@@ -1097,19 +1200,30 @@ class EquityRegimeController:
         quote_getter: Callable[[str, str, float, float], tuple[dict[str, Any] | None, str]],
         exit_quote_getter: Callable[[str, str, float, float], tuple[dict[str, Any] | None, str]],
         public_trade_getter: Callable[[str, datetime], list[dict[str, Any]]] | None = None,
-    ) -> None:
+    ) -> bool:
         trade = self.state.get("shadow_open", {}).get(ticker)
         if not isinstance(trade, dict):
-            return
-        if public_trade_getter is not None and self.shadow_executor.observe_trade_through(trade, public_trade_getter):
-            LOG.info("SHADOW RUNG FILLED | %s model=conservative_trade_through", ticker)
+            return False
+        changed = False
+        previous_quality = trade.get("shadow_simulation_quality")
+        trade_through_changed = (
+            public_trade_getter is not None
+            and self.shadow_executor.observe_trade_through(trade, public_trade_getter)
+        )
+        if trade_through_changed or trade.get("shadow_simulation_quality") != previous_quality:
+            if trade_through_changed:
+                LOG.info("SHADOW RUNG FILLED | %s model=conservative_trade_through", ticker)
             self.save()
+            changed = True
         if self.shadow_executor.observe_touch_quote(trade, quote_getter):
             LOG.info("SHADOW RUNG FILLED | %s", ticker)
             self.save()
+            changed = True
         if self.shadow_executor.observe_exit_quote(trade, exit_quote_getter):
             LOG.info("SHADOW STOP TRIGGERED | %s method=%s", ticker, trade.get("exit_method"))
             self.save()
+            changed = True
+        return changed
 
     def close_market(
         self, *, ticker: str, outcome: str | None, market_close_time: datetime,
@@ -1178,6 +1292,7 @@ class EquityRegimeController:
         self.state["shadow_history"].append(shadow_row)
         self.state["actual_equity"] = format(actual_after, "f")
         self.state["shadow_equity"] = format(shadow_after, "f")
+        self._update_shadow_cooldown_after_close(trade, shadow_pnl)
         self.state["last_processed_market_ticker"] = ticker
         self.state["processed_market_tickers"].append(ticker)
         if not state_before:

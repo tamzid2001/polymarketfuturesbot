@@ -19,6 +19,7 @@ from bot.equity_regime import (
     normalize_settlement,
     reconstruct_realized_pnl,
 )
+import kalshi_btc15m_average_down as trader
 
 
 class FakeHistoryAPI:
@@ -90,6 +91,22 @@ class EquityRegimeTests(unittest.TestCase):
         self.assertIn("/portfolio/fills", [path for path, _ in api.calls])
         historical_calls = [params for path, params in api.calls if path == "/historical/fills"]
         self.assertEqual(historical_calls[1]["cursor"], "page-2")
+
+    def test_current_kalshi_cutoff_and_subaccount_number_are_normalized(self) -> None:
+        class CurrentCutoffAPI(FakeHistoryAPI):
+            async def get_json(self, path: str, params: Mapping[str, Any] | None = None) -> Mapping[str, Any]:
+                if path == "/historical/cutoff":
+                    return {"trades_created_ts": "2026-07-25T00:00:00Z"}
+                return await super().get_json(path, params)
+
+        config = RegimeConfig(enabled=True, dry_run=True, prophet_min_history=2)
+        result = asyncio.run(HistoricalSynchronizer(config, {"markets": {}}).sync(CurrentCutoffAPI()))
+        self.assertEqual(result.cutoff, datetime(2026, 7, 25, tzinfo=UTC))
+        fill = normalize_fill({
+            "fill_id": "subaccount-fill", "ticker": "KXBTC15M-X", "outcome_side": "yes",
+            "action": "buy", "yes_price_dollars": "0.40", "count_fp": "1", "subaccount_number": 0,
+        }, "portfolio")
+        self.assertEqual(fill.subaccount, 0)
 
     def test_decimal_accounting_handles_partial_exit_and_settlement_without_double_counting(self) -> None:
         fills = [
@@ -224,6 +241,66 @@ class EquityRegimeTests(unittest.TestCase):
             shadow = controller.state["shadow_history"][-1]
             self.assertEqual(Decimal(shadow["shadow_realized_pnl"]), Decimal("0.60"))
             self.assertEqual(shadow["shadow_simulation_quality"], "exact_replay")
+
+    def test_live_control_suppresses_only_the_next_market_after_p90(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = RegimeConfig(
+                enabled=True,
+                dry_run=False,
+                allow_live_state_transitions=True,
+                prophet_min_history=2,
+                prophet_training_window=None,
+            )
+            controller = EquityRegimeController(config, root / "state.json", root / "outputs")
+            now = datetime.now(tz=UTC)
+            controller.state["shadow_history"] = [
+                {"market_ticker": "old1", "market_close_time": (now - timedelta(hours=2)).isoformat(), "completed_at": (now - timedelta(hours=2)).isoformat(), "shadow_equity": "100"},
+                {"market_ticker": "old2", "market_close_time": (now - timedelta(hours=1)).isoformat(), "completed_at": (now - timedelta(hours=1)).isoformat(), "shadow_equity": "100"},
+            ]
+            controller.forecaster = FakeForecaster("95", "100.50")
+            current = decision("KXBTC15M-CURRENT", now)
+            controller.start_market(current)
+            controller.state["shadow_open"][current.target_ticker].update({"status": "finalized", "shadow_realized_pnl": "1", "contracts": "0"})
+            controller.close_market(
+                ticker=current.target_ticker,
+                outcome="yes",
+                market_close_time=current.target_close_time,
+                actual_realized_pnl=Decimal("1"),
+                actual_was_live=True,
+            )
+            self.assertFalse(controller.execution_enabled_for_market())
+            self.assertTrue(controller.should_suppress_new_live_orders())
+            self.assertTrue(controller.state["live_vs_shadow"][-1]["live_execution_enabled"])
+
+    def test_live_finalization_updates_actual_and_shadow_once(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = RegimeConfig(enabled=True, dry_run=False, allow_live_state_transitions=True, prophet_min_history=2)
+            controller = EquityRegimeController(config, root / "state.json", root / "outputs")
+            generated = datetime.now(tz=UTC)
+            target = decision("KXBTC15M-LIVE-FINAL", generated)
+            controller.start_market(target)
+            record = {
+                "ticker": target.target_ticker,
+                "settlement_outcome": "yes",
+                "settled_at": target.target_close_time.isoformat(),
+                "market_close_time": target.target_close_time.isoformat(),
+                "locked_side": "yes",
+                "execution_mode": "live",
+                "contracts": "1",
+                "total_cost": "0.40",
+                "gross_payout": "1.00",
+                "settlement_contracts": "1",
+                "kalshi_fees": "0",
+                "net_profit_loss": "0.60",
+            }
+            trader.account_equity_regime_finalization(controller, record, None, dry_run=False)
+            self.assertTrue(record["regime_accounted"])
+            self.assertEqual(Decimal(controller.state["actual_equity"]), Decimal("100.60"))
+            self.assertEqual(Decimal(controller.state["shadow_equity"]), Decimal("100.60"))
+            trader.account_equity_regime_finalization(controller, record, None, dry_run=False)
+            self.assertEqual(len(controller.state["actual_history"]), 1)
 
 
 if __name__ == "__main__":
