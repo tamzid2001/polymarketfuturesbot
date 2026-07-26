@@ -8,6 +8,8 @@ import io
 import time
 import unittest
 from datetime import datetime, timezone
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import kalshi_btc15m_average_down as trader
 
@@ -63,6 +65,57 @@ class SettlementTraderTests(unittest.IsolatedAsyncioTestCase):
             [order.quantity for order in scaled.ladder_orders],
             [trader.Decimal("3.25"), trader.Decimal("6.5"), trader.Decimal("9.75"), trader.Decimal("13.0")],
         )
+
+    async def test_regime_history_requests_sign_the_full_kalshi_api_path(self) -> None:
+        """The URL is relative to base_url, but Kalshi signs from host root."""
+        signed_paths: list[str] = []
+
+        class Auth:
+            def create_auth_headers(self, method, path):
+                if method != "GET":
+                    raise AssertionError(method)
+                signed_paths.append(path)
+                return {"X-Test-Signature": "ok"}
+
+        class Response:
+            status = 200
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def json(self, **kwargs):
+                return {"fills": []}
+
+        class Session:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            def get(self, url, *, params, headers):
+                if url != "https://api.elections.kalshi.com/trade-api/v2/portfolio/fills":
+                    raise AssertionError(url)
+                if params != {"limit": 1000}:
+                    raise AssertionError(params)
+                if headers["X-Test-Signature"] != "ok":
+                    raise AssertionError(headers)
+                return Response()
+
+        fake_aiohttp = SimpleNamespace(
+            ClientTimeout=lambda **kwargs: kwargs,
+            ClientSession=lambda **kwargs: Session(),
+        )
+        rest = object.__new__(trader.KalshiREST)
+        rest.auth = Auth()
+        rest.base_url = "https://api.elections.kalshi.com/trade-api/v2"
+        with patch.object(trader, "aiohttp", fake_aiohttp):
+            payload = await rest.get_raw_json("portfolio/fills", {"limit": 1000})
+        self.assertEqual(payload, {"fills": []})
+        self.assertEqual(signed_paths, ["/trade-api/v2/portfolio/fills"])
 
     async def test_immediate_predecessor_signal_has_no_fixed_delay(self) -> None:
         class Rest:
