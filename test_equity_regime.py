@@ -376,6 +376,41 @@ class EquityRegimeTests(unittest.TestCase):
             self.assertTrue(controller.state["future_forecast_snapshot"][0]["used_for_live_filter"])
             self.assertFalse(controller.state["future_forecast_snapshot"][1]["used_for_live_filter"])
 
+    def test_finalization_bootstraps_immediately_after_inherited_position_closes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = RegimeConfig(
+                enabled=True, dry_run=False, allow_live_state_transitions=True,
+                prophet_min_history=2, history_max_markets=2, prophet_training_window=2,
+                allow_endpoint_anchored_ledger_bootstrap=True,
+            )
+            controller = EquityRegimeController(config, root / "state.json", root / "outputs")
+            controller.initialize_absolute_balances(Decimal("100"), reason="test")
+            now = datetime.now(tz=UTC)
+            previous = {
+                "ticker": "KXBTC15M-OLD", "status": "finalized", "market_close_time": (now - timedelta(minutes=30)).isoformat(),
+                "net_profit_loss": "1", "locked_side": "yes", "contracts": "1", "total_cost": "0.4", "gross_payout": "1",
+            }
+            current = {
+                "ticker": "KXBTC15M-CURRENT-BOOT", "status": "finalized", "settlement_outcome": "yes",
+                "settled_at": (now - timedelta(minutes=15)).isoformat(), "market_close_time": (now - timedelta(minutes=15)).isoformat(),
+                "net_profit_loss": "-0.5", "locked_side": "no", "execution_mode": "live", "contracts": "1",
+                "total_cost": "0.5", "gross_payout": "0", "settlement_contracts": "0", "kalshi_fees": "0",
+            }
+            trader_state = {"markets": {previous["ticker"]: previous, current["ticker"]: current}}
+
+            class FakeRest:
+                async def balance_decimal(self) -> Decimal:
+                    return Decimal("100.50")
+
+            asyncio.run(trader.account_equity_regime_finalization(
+                FakeRest(), controller, trader_state, current, None, dry_run=False,
+            ))
+            self.assertTrue(current["regime_accounted"])
+            self.assertEqual(len(controller.state["shadow_history"]), 2)
+            self.assertEqual(Decimal(controller.state["shadow_balance"]), Decimal("100.50"))
+            self.assertEqual(controller.state["state_reason"], "absolute_200_market_ledger_bootstrap")
+
     def test_live_control_suppresses_only_the_next_market_after_p90(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -435,11 +470,11 @@ class EquityRegimeTests(unittest.TestCase):
             class FakeRest:
                 async def balance_decimal(self) -> Decimal:
                     return Decimal("100.60")
-            asyncio.run(trader.account_equity_regime_finalization(FakeRest(), controller, record, None, dry_run=False))
+            asyncio.run(trader.account_equity_regime_finalization(FakeRest(), controller, {"markets": {}}, record, None, dry_run=False))
             self.assertTrue(record["regime_accounted"])
             self.assertEqual(Decimal(controller.state["actual_balance"]), Decimal("100.60"))
             self.assertEqual(Decimal(controller.state["shadow_balance"]), Decimal("100.60"))
-            asyncio.run(trader.account_equity_regime_finalization(FakeRest(), controller, record, None, dry_run=False))
+            asyncio.run(trader.account_equity_regime_finalization(FakeRest(), controller, {"markets": {}}, record, None, dry_run=False))
             self.assertEqual(len(controller.state["actual_history"]), 1)
 
 

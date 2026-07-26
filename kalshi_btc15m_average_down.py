@@ -2734,7 +2734,13 @@ def build_equity_regime_decision(
 
 
 async def account_equity_regime_finalization(
-    rest: KalshiREST, regime: EquityRegimeController, record: dict[str, Any], market: Any | None, *, dry_run: bool,
+    rest: KalshiREST,
+    regime: EquityRegimeController,
+    trader_state: dict[str, Any],
+    record: dict[str, Any],
+    market: Any | None,
+    *,
+    dry_run: bool,
 ) -> None:
     """Append one finalized active-strategy market exactly once to both curves."""
     if record.get("regime_accounted"):
@@ -2785,6 +2791,21 @@ async def account_equity_regime_finalization(
         actual_balance_after=actual_balance_after,
     )
     record["regime_accounted"] = True
+    # Startup may correctly defer the endpoint-anchored 200-market balance
+    # rebuild while an inherited position is filled.  Immediately after that
+    # position is closed there is a causal, no-open-exposure window before the
+    # next market is considered, so perform the rebuild here rather than
+    # waiting for another five-hour Actions handoff.
+    rebuilt = regime.bootstrap_from_live_ledger(
+        trader_state,
+        api_current_balance=actual_balance_after,
+    )
+    if rebuilt:
+        regime.save()
+        LOG.warning(
+            "ABSOLUTE 200-MARKET REGIME BOOTSTRAP | rows=%d after terminal market=%s",
+            rebuilt, record.get("ticker"),
+        )
 
 
 def orders_for_market(record: dict[str, Any]) -> list[dict[str, Any]]:
@@ -6445,7 +6466,7 @@ async def run_settlement_only(args: argparse.Namespace) -> int:
                             if outcome not in {"yes", "no"}:
                                 market_for_regime = await rest.get_market(ticker)
                             await account_equity_regime_finalization(
-                                rest, regime, record, market_for_regime, dry_run=dry_run,
+                                rest, regime, state, record, market_for_regime, dry_run=dry_run,
                             )
                         continue
                     market = await rest.get_market(ticker)
@@ -6465,7 +6486,7 @@ async def run_settlement_only(args: argparse.Namespace) -> int:
                     ):
                         await submit_ladder(rest, record, market, config, record_dry_run)
                     if regime is not None and record.get("status") in FINAL_RECORD_STATUSES:
-                        await account_equity_regime_finalization(rest, regime, record, market, dry_run=dry_run)
+                        await account_equity_regime_finalization(rest, regime, state, record, market, dry_run=dry_run)
                 last_order_reconcile_at = monotonic_now
                 last_private_update_count = feed.private_update_count
             # A settlement or completed 5c stop above may have changed the
