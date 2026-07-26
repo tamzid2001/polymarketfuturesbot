@@ -308,6 +308,17 @@ def default_regime_state(config: RegimeConfig) -> dict[str, Any]:
         "last_processed_fill_id": None,
         "last_processed_settlement_ticker": None,
         "last_processed_market_ticker": None,
+        "last_p01": None,
+        "last_p10": None,
+        "last_p25": None,
+        "last_p50": None,
+        "last_p75": None,
+        "last_p90": None,
+        "last_p99": None,
+        "forecast_generated_at": None,
+        "forecast_target_ticker": None,
+        "prophet_training_end": None,
+        "prophet_training_rows": 0,
         "actual_history": [],
         "shadow_history": [],
         "forecasts": [],
@@ -953,9 +964,24 @@ class EquityRegimeController:
         self.state["execution_enabled"] = bool_value(self.state.get("execution_enabled"), True)
 
     def save(self) -> None:
+        self._bound_persisted_history()
         self._assert_state_integrity()
         self.store.save(self.state)
         self.write_outputs()
+
+    def _bound_persisted_history(self) -> None:
+        """Retain the requested recent market scope without changing equity.
+
+        Equity is a cumulative Decimal balance, so trimming old audit rows
+        never rebases it or changes a future Prophet input.  The corresponding
+        processed IDs are retained over exactly the same 200-market horizon so
+        a restart cannot replay a record that remains in API scope.
+        """
+        limit = self.config.history_max_markets
+        for key in ("actual_history", "shadow_history", "forecasts", "live_vs_shadow", "processed_market_tickers"):
+            values = self.state.get(key)
+            if isinstance(values, list) and len(values) > limit:
+                self.state[key] = values[-limit:]
 
     def _assert_state_integrity(self) -> None:
         shadow = decimal_value(self.state["shadow_equity"])
@@ -1038,6 +1064,13 @@ class EquityRegimeController:
             "refit_number": self.forecaster.fit_number,
         }
         self.state["forecasts"].append(forecast)
+        self.state.update({
+            "last_p01": forecast["p01"], "last_p10": forecast["p10"], "last_p25": forecast["p25"],
+            "last_p50": forecast["p50"], "last_p75": forecast["p75"], "last_p90": forecast["p90"],
+            "last_p99": forecast["p99"], "forecast_generated_at": forecast["forecast_generated_at"],
+            "forecast_target_ticker": decision.target_ticker, "prophet_training_end": forecast["training_end"],
+            "prophet_training_rows": forecast["training_rows"],
+        })
         LOG.info(
             "PROPHET FORECAST GENERATED | target=%s training_rows=%d P10=%s P50=%s P90=%s",
             decision.target_ticker, len(training), forecast["p10"], forecast["p50"], forecast["p90"],
@@ -1428,7 +1461,7 @@ class EquityRegimeController:
 
 {chr(10).join(f'- `{name}`: {count}' for name, count in sorted(quality.items())) or '- No completed shadow markets.'}
 
-`conservative_trade_through` requires timestamped post-order market trades. The current runner's BBO feed does not provide that tape, so it records `unavailable` rather than inventing a resting fill. `touch` uses post-decision BBO and is labelled an approximation. Existing real bot ledger rows are labelled `exact_replay`; they are not hypothetical fills.
+`conservative_trade_through` consumes Kalshi's timestamped public `trade` stream only after the immutable order-decision time. It consumes no more than each public trade's reported volume, but cannot observe queue position, so it remains a `conservative_approximation`, not an exact replay. If that tape is missing across a reconnect, the outcome is `unavailable` rather than an invented resting fill, and it cannot trigger a P10 restart. `touch` uses post-decision BBO and is explicitly more optimistic. Existing real bot ledger rows are labelled `exact_replay`; they are not hypothetical fills.
 
 ## Limitations and reconciliation
 
@@ -1537,7 +1570,11 @@ async def synchronize_history(controller: EquityRegimeController, api: JsonAPI, 
                 "ledger_realized_pnl": format(ledger_value, "f"), "difference": None,
                 "reconciliation_status": "missing_from_api_history",
             })
-    balance = decimal_value(value_from(result.balance_payload or {}, "balance_dollars", "balance"))
+    balance_payload = result.balance_payload or {}
+    balance_dollars = value_from(balance_payload, "balance_dollars")
+    # Legacy portfolio responses expose integer cents in ``balance``. This is
+    # informational only, but it must still never be reported as 100x larger.
+    balance = decimal_value(balance_dollars) if balance_dollars is not None else decimal_value(value_from(balance_payload, "balance")) / Decimal("100")
     reconciliation.append({
         "market_ticker": "__account_balance_reconciliation__", "market_close_time": None,
         "api_balance": format(balance, "f"), "strategy_actual_equity": controller.state["actual_equity"],
@@ -1549,6 +1586,10 @@ async def synchronize_history(controller: EquityRegimeController, api: JsonAPI, 
         "settlements": len(result.settlements), "duplicate_fills_removed": result.duplicate_fills_removed,
         "ambiguous_fills": len(result.ambiguous_fills),
     }
+    if result.fills:
+        controller.state["last_processed_fill_id"] = result.fills[-1].fill_id or None
+    if result.settlements:
+        controller.state["last_processed_settlement_ticker"] = result.settlements[-1].ticker
     controller.save()
     LOG.info("API HISTORY SYNC | fills=%d settlements=%d duplicates=%d ambiguous=%d cutoff=%s", len(result.fills), len(result.settlements), result.duplicate_fills_removed, len(result.ambiguous_fills), timestamp_text(result.cutoff))
     return result

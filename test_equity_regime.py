@@ -159,6 +159,9 @@ class EquityRegimeTests(unittest.TestCase):
             controller.forecaster = FakeForecaster("95", "100.50")
             first = decision("KXBTC15M-T1", now)
             controller.start_market(first)
+            self.assertEqual(controller.state["last_p10"], "95")
+            self.assertEqual(controller.state["forecast_target_ticker"], first.target_ticker)
+            self.assertEqual(controller.state["prophet_training_rows"], 2)
             controller.state["shadow_open"][first.target_ticker].update({"status": "finalized", "shadow_realized_pnl": "1", "contracts": "0"})
             controller.close_market(ticker=first.target_ticker, outcome="yes", market_close_time=first.target_close_time, actual_realized_pnl=Decimal("0"))
             # T1 was processed under the on state; P90 becomes off only for T2.
@@ -186,6 +189,21 @@ class EquityRegimeTests(unittest.TestCase):
             self.assertEqual(len(restored.state["shadow_history"]), rows_before)
             for forecast in restored.state["forecasts"]:
                 self.assertLess(forecast["training_end"], forecast["forecast_target_time"])
+
+    def test_state_retains_only_configured_recent_market_history(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = RegimeConfig(enabled=True, dry_run=True, prophet_min_history=2, history_max_markets=2)
+            controller = EquityRegimeController(config, root / "state.json", root / "outputs")
+            close = datetime.now(tz=UTC).isoformat()
+            controller.state["actual_history"] = [{"market_ticker": str(index), "market_close_time": close, "actual_equity": "100"} for index in range(3)]
+            controller.state["shadow_history"] = [{"market_ticker": str(index), "market_close_time": close, "shadow_equity": "100"} for index in range(3)]
+            controller.state["forecasts"] = []
+            controller.state["live_vs_shadow"] = [{"market_ticker": str(index)} for index in range(3)]
+            controller.state["processed_market_tickers"] = [str(index) for index in range(3)]
+            controller.save()
+            self.assertEqual([row["market_ticker"] for row in controller.state["actual_history"]], ["1", "2"])
+            self.assertEqual(controller.state["processed_market_tickers"], ["1", "2"])
 
     def test_live_market_is_exact_shadow_even_with_conservative_off_state_model(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
