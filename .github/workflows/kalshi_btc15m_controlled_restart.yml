@@ -28,7 +28,7 @@ jobs:
     timeout-minutes: 12
     steps:
       - name: Checkout current settlement-trader code
-        uses: actions/checkout@v7
+        uses: actions/checkout@v6
 
       - name: Stop the specified older runner
         env:
@@ -49,7 +49,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
-          python-version: "3.13"
+          python-version: "3.12"
 
       - name: Install controlled-handoff dependencies
         run: |
@@ -69,5 +69,13 @@ jobs:
         run: |
           set -euo pipefail
           gh workflow run kalshi_btc15m_average_down.yml \
-            --repo "$GITHUB_REPOSITORY" --ref main -f live_trading=true
+            --repo "$GITHUB_REPOSITORY" --ref main \
+            -f live_trading=true \
+            -f enable_dynamic_scaling=true \
+            -f equity_regime_enabled=true \
+            -f equity_regime_dry_run=false \
+            -f prophet_min_history=100 \
+            -f prophet_refit_every_markets=1 \
+            -f shadow_fill_model=conservative_trade_through \
+            -f starting_balance=100.00
           echo "SETTLEMENT RUNNER QUEUED | existing deterministic orders will be recovered; no overlap remains."

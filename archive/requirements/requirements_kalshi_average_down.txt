@@ -1,5 +1,5 @@
-# KXBTC15M ML-side + mechanical average-down runner. These dependencies exclude
-# Prophet and yfinance; the live ML path uses raw Coinbase candles only.
+# KXBTC15M mechanical runner plus the separately fail-closed shadow-equity
+# Prophet regime layer. The regime remains disabled/dry-run by default.
 kalshi-python-async>=3.22,<4
 aiohttp>=3.9
 cryptography>=42.0
@@ -9,5 +9,7 @@ numpy>=1.26
 scikit-learn>=1.5,<2
 scipy>=1.10
 joblib>=1.3
+prophet>=1.1.6
+matplotlib>=3.8
 # The SDK's current wheel imports urllib3 but does not declare it transitively.
 urllib3>=2,<3

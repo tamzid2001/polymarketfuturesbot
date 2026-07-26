@@ -1,0 +1,101 @@
+name: Kalshi Equity Prophet Walk-Forward Backtest
+
+on:
+  push:
+    branches:
+      - agent/kalshi-equity-walk-forward
+  workflow_dispatch:
+    inputs:
+      input_csv:
+        description: "Repository-relative closed-position or ds/y equity CSV"
+        required: true
+        default: "backtest/data/closed-positions-2026-07-26.csv"
+      input_format:
+        description: "kalshi for original closed positions; equity for ds,y input"
+        required: true
+        type: choice
+        options: [kalshi, equity]
+        default: kalshi
+      starting_balance:
+        description: "Starting balance in dollars"
+        required: true
+        default: "100"
+      min_training_trades:
+        description: "Primary minimum completed shadow-equity observations"
+        required: true
+        default: "100"
+      run_sensitivity:
+        description: "Run declared one-factor-at-a-time sensitivity matrix"
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  walk-forward-equity-backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          # Prophet's CmdStan-backed wheel is exercised in CI; 3.12 has the
+          # broadest supported wheel coverage for the complete research stack.
+          python-version: "3.12"
+
+      - name: Install isolated backtest dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements_equity_backtest.txt
+
+      - name: Run automated integrity and unit tests
+        run: |
+          python -m py_compile kalshi_btc15m_average_down.py bot/equity_regime.py
+          python -m unittest discover -s backtest/tests -v
+          python -m unittest -v test_equity_regime.py
+
+      - name: Run full strict walk-forward analysis
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: |
+          input_csv="${{ inputs.input_csv }}"
+          input_format="${{ inputs.input_format }}"
+          starting_balance="${{ inputs.starting_balance }}"
+          min_training_trades="${{ inputs.min_training_trades }}"
+          run_sensitivity="${{ inputs.run_sensitivity }}"
+          # workflow_dispatch supplies inputs; a dedicated branch push is the
+          # authenticated automatic trigger used for this reproducible run.
+          input_csv="${input_csv:-backtest/data/closed-positions-2026-07-26.csv}"
+          input_format="${input_format:-kalshi}"
+          starting_balance="${starting_balance:-100}"
+          min_training_trades="${min_training_trades:-100}"
+          run_sensitivity="${run_sensitivity:-true}"
+          args=(
+            --input "$input_csv"
+            --input-format "$input_format"
+            --starting-balance "$starting_balance"
+            --max-trades 200
+            --min-training-trades "$min_training_trades"
+            --refit-every 1
+            --signal-mode level
+            --output-dir outputs
+          )
+          if [ "$run_sensitivity" != "true" ]; then
+            args+=(--no-run-sensitivity)
+          fi
+          python -m backtest.run_backtest "${args[@]}"
+
+      - name: Upload complete analysis artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kalshi-equity-walk-forward-${{ github.run_id }}
+          path: outputs/
+          if-no-files-found: warn
+          retention-days: 30

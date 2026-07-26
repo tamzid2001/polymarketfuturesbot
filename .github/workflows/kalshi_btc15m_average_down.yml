@@ -34,10 +34,10 @@ on:
         type: string
         default: ""
       enable_dynamic_scaling:
-        description: "Enable dynamic base share scaling. False keeps the configured starting base fixed."
+        description: "Enable dynamic base share scaling from realized actual P/L."
         required: false
         type: string
-        default: "false"
+        default: "true"
       base_share_increment:
         description: "Base shares to add after a scaling threshold (minimum precision 0.01)."
         required: false
@@ -48,6 +48,39 @@ on:
         required: false
         type: string
         default: "16.5"
+      equity_regime_enabled:
+        description: "Enable the persistent Prophet P10/P90 equity-regime controller."
+        required: false
+        type: boolean
+        default: true
+      equity_regime_dry_run:
+        description: "Observe the equity regime without suppressing real orders. False makes a recorded P90/P10 transition control the next market."
+        required: false
+        type: boolean
+        default: false
+      prophet_min_history:
+        description: "Completed shadow markets required before one-step Prophet forecasts."
+        required: false
+        type: number
+        default: 100
+      prophet_refit_every_markets:
+        description: "Refit frequency in completed markets; primary live configuration is one."
+        required: false
+        type: number
+        default: 1
+      shadow_fill_model:
+        description: "Off-state shadow fill assumption. Trade-through is conservative but remains an approximation."
+        required: false
+        type: choice
+        options:
+          - conservative_trade_through
+          - touch
+        default: conservative_trade_through
+      starting_balance:
+        description: "Configured starting trading balance; never replaced by current account balance."
+        required: false
+        type: string
+        default: "100.00"
 
 concurrency:
   group: kalshi-btc15m-average-down-singleton
@@ -69,7 +102,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
-          python-version: "3.13"
+          python-version: "3.12"
 
       - name: Install settlement trader dependencies
         run: |
@@ -78,8 +111,9 @@ jobs:
 
       - name: Verify settlement trader
         run: |
-          python -m py_compile kalshi_btc15m_average_down.py
+          python -m py_compile kalshi_btc15m_average_down.py bot/equity_regime.py
           PYTHONPATH=. python tests/live/test_kalshi_btc15m_settlement_trader.py
+          PYTHONPATH=. python test_equity_regime.py
 
       - name: Write Kalshi RSA private key
         env:
@@ -108,6 +142,12 @@ jobs:
           ENABLE_DYNAMIC_SCALING: ${{ inputs.enable_dynamic_scaling }}
           BASE_SHARE_INCREMENT: ${{ inputs.base_share_increment }}
           SCALING_PROFIT_MULTIPLIER: ${{ inputs.scaling_profit_multiplier }}
+          EQUITY_REGIME_ENABLED: ${{ inputs.equity_regime_enabled }}
+          EQUITY_REGIME_DRY_RUN: ${{ inputs.equity_regime_dry_run }}
+          PROPHET_MIN_HISTORY: ${{ inputs.prophet_min_history }}
+          PROPHET_REFIT_EVERY_MARKETS: ${{ inputs.prophet_refit_every_markets }}
+          SHADOW_FILL_MODEL: ${{ inputs.shadow_fill_model }}
+          STARTING_BALANCE: ${{ inputs.starting_balance }}
         run: |
           set -euo pipefail
           args=(--config kalshi_btc15m_average_down_config.json
@@ -121,6 +161,16 @@ jobs:
           [ -z "$ENABLE_DYNAMIC_SCALING" ] || args+=(--enable-dynamic-scaling "$ENABLE_DYNAMIC_SCALING")
           [ -z "$BASE_SHARE_INCREMENT" ] || args+=(--base-share-increment "$BASE_SHARE_INCREMENT")
           [ -z "$SCALING_PROFIT_MULTIPLIER" ] || args+=(--scaling-profit-multiplier "$SCALING_PROFIT_MULTIPLIER")
+          if [ -n "$EQUITY_REGIME_ENABLED" ]; then
+            [ "$EQUITY_REGIME_ENABLED" = "true" ] && args+=(--equity-regime-enabled) || args+=(--no-equity-regime-enabled)
+          fi
+          if [ -n "$EQUITY_REGIME_DRY_RUN" ]; then
+            [ "$EQUITY_REGIME_DRY_RUN" = "true" ] && args+=(--equity-regime-dry-run) || args+=(--no-equity-regime-dry-run)
+          fi
+          [ -z "$PROPHET_MIN_HISTORY" ] || args+=(--prophet-min-history "$PROPHET_MIN_HISTORY")
+          [ -z "$PROPHET_REFIT_EVERY_MARKETS" ] || args+=(--prophet-refit-every-markets "$PROPHET_REFIT_EVERY_MARKETS")
+          [ -z "$SHADOW_FILL_MODEL" ] || args+=(--shadow-fill-model "$SHADOW_FILL_MODEL")
+          [ -z "$STARTING_BALANCE" ] || args+=(--starting-balance "$STARTING_BALANCE")
           if [ "$LIVE_TRADING" = "true" ]; then
             DRY_RUN=false python kalshi_btc15m_average_down.py "${args[@]}" --submit --allow-live
           else
@@ -135,6 +185,9 @@ jobs:
             kalshi_btc15m_average_down_config.json
             kalshi_btc15m_average_down_state.json
             kalshi_btc15m_average_down_report.json
+            data/kalshi_equity_regime_state.json
+            data/kalshi_actual_equity_history.csv
+            data/kalshi_shadow_equity_history.csv
           )
           for file in "${files[@]}"; do
             test ! -f "$file" || git add "$file"
@@ -162,11 +215,23 @@ jobs:
           scaling_enabled="$(python -c 'import json; c=json.load(open("kalshi_btc15m_average_down_config.json")); print(str(bool(c.get("enable_dynamic_scaling", False))).lower())')"
           scaling_increment="$(python -c 'import json; c=json.load(open("kalshi_btc15m_average_down_config.json")); print(c.get("base_share_increment", 1))')"
           scaling_multiplier="$(python -c 'import json; c=json.load(open("kalshi_btc15m_average_down_config.json")); print(c.get("scaling_profit_multiplier", 16.5))')"
+          regime_enabled="$(python -c 'import json; c=json.load(open("kalshi_btc15m_average_down_config.json")); print(str(bool(c.get("equity_regime_enabled", True))).lower())')"
+          regime_dry_run="$(python -c 'import json; c=json.load(open("kalshi_btc15m_average_down_config.json")); print(str(bool(c.get("equity_regime_dry_run", False))).lower())')"
+          prophet_min_history="$(python -c 'import json; c=json.load(open("kalshi_btc15m_average_down_config.json")); print(c.get("prophet_min_history", 100))')"
+          prophet_refit_every_markets="$(python -c 'import json; c=json.load(open("kalshi_btc15m_average_down_config.json")); print(c.get("prophet_refit_every_markets", 1))')"
+          shadow_fill_model="$(python -c 'import json; c=json.load(open("kalshi_btc15m_average_down_config.json")); print(c.get("shadow_fill_model", "conservative_trade_through"))')"
+          starting_balance="$(python -c 'import json; c=json.load(open("kalshi_btc15m_average_down_config.json")); print(c.get("starting_balance", "100.00"))')"
           gh workflow run kalshi_btc15m_average_down.yml --repo "$GITHUB_REPOSITORY" --ref main \
             -f live_trading=true \
             -f enable_dynamic_scaling="$scaling_enabled" \
             -f base_share_increment="$scaling_increment" \
-            -f scaling_profit_multiplier="$scaling_multiplier"
+            -f scaling_profit_multiplier="$scaling_multiplier" \
+            -f equity_regime_enabled="$regime_enabled" \
+            -f equity_regime_dry_run="$regime_dry_run" \
+            -f prophet_min_history="$prophet_min_history" \
+            -f prophet_refit_every_markets="$prophet_refit_every_markets" \
+            -f shadow_fill_model="$shadow_fill_model" \
+            -f starting_balance="$starting_balance"
           echo "HANDOFF QUEUED | next run keeps the persisted base size, dynamic-scaling settings, and settlement-only exit policy."
 
       - name: Upload execution audit artifact
@@ -178,5 +243,9 @@ jobs:
             kalshi_btc15m_average_down_config.json
             kalshi_btc15m_average_down_state.json
             kalshi_btc15m_average_down_report.json
+            data/kalshi_equity_regime_state.json
+            data/kalshi_actual_equity_history.csv
+            data/kalshi_shadow_equity_history.csv
+            outputs/
           if-no-files-found: warn
           retention-days: 90

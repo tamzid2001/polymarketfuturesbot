@@ -1,6 +1,6 @@
 # Trading Automation
 
-This repository contains a live Kalshi BTC 15-minute settlement-contrarian trader and a separate Polymarket portfolio system. Retired ML, Prophet, paper-trading, and backtest material is preserved under [`archive/`](archive/README.md) and is not deployed.
+This repository contains a live Kalshi BTC 15-minute settlement-contrarian trader and a separate Polymarket portfolio system. Retired ML and paper-study material is preserved under [`archive/`](archive/README.md) and is not deployed.
 
 ## Kalshi BTC 15-minute trader
 
@@ -12,11 +12,11 @@ This repository contains a live Kalshi BTC 15-minute settlement-contrarian trade
 - After two consecutive realized losses on filled live trades, it still computes and records the normal next two signals, but sends no balance check or exchange orders for those two markets. It then resets and resumes. A realized win resets the loss count immediately.
 - Signal accuracy is reported separately from execution: every frozen settlement-contrarian side is scored against the target market's final YES/NO outcome, including zero-fill ladders and intentional loss-skip markets. Financial P&L, the realized-trade W/L, and the two-loss entry guard remain based only on contracts that actually filled.
 
-### Optional dynamic base-share scaling
+### Dynamic base-share scaling
 
-Dynamic scaling is disabled by default, so the configured starting base stays fixed. Enable it from the **Kalshi BTC 15m Settlement Contrarian** Action with:
+Dynamic scaling is enabled by default. Configure it from the **Kalshi BTC 15m Settlement Contrarian** Action with:
 
-- `enable_dynamic_scaling`: `true` or `false` (default `false`)
+- `enable_dynamic_scaling`: `true` or `false` (default `true`)
 - `base_share_increment`: base shares added after a threshold, in 0.01-share increments (default `1`)
 - `scaling_profit_multiplier`: realized net profit required per current base share (default `16.5`)
 
@@ -29,6 +29,17 @@ profit_since_last_increase >= current_base_share_count × scaling_profit_multipl
 it increases the base by `base_share_increment`, resets that balance to zero, and uses the new **1/2/3/4** ladder only for later markets. Bases and rungs retain 0.01-share precision (for example, base `3.25` creates `3.25 / 6.50 / 9.75 / 13.00`). Existing GTC ladders retain their original size. Runner-owned contract and principal caps grow as needed; explicitly supplied caps are never overridden and will safely block an oversized full ladder rather than submit it partially.
 
 The live report and periodic `LIVE DYNAMIC BASE SCALING` log include the active base, profit balance, next threshold, increase count, and whether capacity is automatic or explicit. Settings are persisted across controlled GitHub Actions handoffs.
+
+### Live Prophet equity regime
+
+The live controller is enabled with live state transitions (`equity_regime_enabled=true`, `equity_regime_dry_run=false`). It retains the most recent 200 completed markets, fits the exploratory 75-market rolling Prophet configuration after 100 completed shadow observations, and applies a P90/P10 signal only to the next eligible market.
+
+- It stops new real entries after a saved shadow-equity P90 observation and leaves already-filled positions to the existing 5¢ stop or settlement logic.
+- While stopped, it still creates the same immutable settlement-contrarian shadow decision. A base share of **3** therefore produces shadow limits of **3/6/9/12** at **40¢/30¢/20¢/10¢**, exactly matching the live ladder. The shadow fill model uses only post-decision public trades and is explicitly a conservative approximation, not a queue-aware replay.
+- Dynamic base-share scaling remains sourced from **actual realized P/L** (`scaling_equity_source=actual`). Hypothetical shadow gains while the bot is stopped cannot increase real or shadow ladder size. The current actual base is persisted with the live state and is used for both live and shadow decisions.
+- A P10 observation restarts real entry placement for the following eligible market. The controller persists its state, forecasts, shadow curve, and actual curve under `data/`; the workflow includes them in checkpoints and audit artifacts.
+
+The 75-market setting is exploratory sensitivity evidence, not an unbiased live-performance claim. Its P10–P90 interval coverage was poor in the strict 200-trade review, so the saved forecast and shadow-simulation records should be monitored rather than treated as a deployment guarantee.
 
 ## Operations
 
