@@ -142,25 +142,26 @@ DEFAULT_CONFIG = {
     "live_consecutive_loss_limit": 2,
     "live_markets_to_skip_after_loss_limit": 2,
     "status_log_seconds": 60.0,
-    # The P10/P90 controller remains observation-only until its absolute
-    # balance history is reconciled. The underlying settlement strategy can
-    # still trade; this flag only prevents the regime from changing that
-    # decision.
+    # The P10/P90 controller acts only after its absolute balance history is
+    # reconciled.  Its 200-row lookback preserves balance values unchanged.
     "equity_regime_enabled": True,
-    "equity_regime_dry_run": True,
-    "allow_live_state_transitions": False,
+    "equity_regime_dry_run": False,
+    "allow_live_state_transitions": True,
     "subaccount": 0,
     "starting_balance": "100.00",
     "history_start_ts": None,
     "history_end_ts": None,
     "history_max_markets": 200,
+    "allow_endpoint_anchored_ledger_bootstrap": True,
     "accounting_tolerance": "0.01",
     "bot_client_order_prefix": BOT_CLIENT_ORDER_PREFIX,
     "bot_order_group_id": None,
     "prophet_enabled": True,
-    "prophet_min_history": 100,
-    "prophet_training_window": 75,
+    "prophet_min_history": 200,
+    "prophet_training_window": 200,
     "prophet_refit_every_markets": 1,
+    "prophet_future_horizon_markets": 100,
+    "prophet_forecast_frequency_minutes": 15,
     "prophet_use_log_transform": True,
     "prophet_uncertainty_samples": 2000,
     "prophet_changepoint_prior_scale": 0.05,

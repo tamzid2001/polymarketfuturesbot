@@ -272,6 +272,110 @@ class EquityRegimeTests(unittest.TestCase):
             self.assertEqual(Decimal(shadow["shadow_realized_pnl"]), Decimal("0.60"))
             self.assertEqual(shadow["shadow_simulation_quality"], "exact_replay")
 
+    def test_live_cash_timing_uses_authenticated_balance_change_without_rebasing_shadow(self) -> None:
+        """A position opened before recovery debits cash before its P/L closes."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = RegimeConfig(enabled=True, dry_run=False, allow_live_state_transitions=True, prophet_min_history=2)
+            controller = EquityRegimeController(config, root / "state.json", root / "outputs")
+            controller.initialize_absolute_balances(Decimal("75.9868"), reason="test")
+            target = decision("KXBTC15M-CARRY", datetime.now(tz=UTC))
+            controller.start_market(target)
+            controller.close_market(
+                ticker=target.target_ticker,
+                outcome="yes",
+                market_close_time=target.target_close_time,
+                actual_realized_pnl=Decimal("1.8"),
+                actual_metadata={"contracts_bought": "3", "entry_cost": "1.2", "settlement_payout": "3"},
+                actual_was_live=True,
+                actual_balance_after=Decimal("78.9868"),
+            )
+            self.assertEqual(Decimal(controller.state["actual_balance"]), Decimal("78.9868"))
+            self.assertEqual(Decimal(controller.state["shadow_balance"]), Decimal("78.9868"))
+            shadow = controller.state["shadow_history"][-1]
+            self.assertEqual(Decimal(shadow["shadow_market_pnl"]), Decimal("1.8"))
+            self.assertEqual(Decimal(shadow["shadow_balance_change"]), Decimal("3"))
+            self.assertEqual(controller.state["balance_adjustments"][-1]["adjustment_type"], "entry_or_open_position_cash_timing")
+            self.assertTrue(controller.balance_reconciled)
+
+    def test_endpoint_anchored_ledger_bootstrap_preserves_absolute_balances(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = RegimeConfig(
+                enabled=True,
+                dry_run=False,
+                allow_live_state_transitions=True,
+                prophet_min_history=2,
+                history_max_markets=2,
+                prophet_training_window=2,
+                allow_endpoint_anchored_ledger_bootstrap=True,
+            )
+            controller = EquityRegimeController(config, root / "state.json", root / "outputs")
+            controller.initialize_absolute_balances(Decimal("100"), reason="test")
+            now = datetime.now(tz=UTC)
+            trader_state = {
+                "markets": {
+                    "KXBTC15M-A": {
+                        "ticker": "KXBTC15M-A", "status": "finalized", "market_close_time": (now - timedelta(minutes=30)).isoformat(),
+                        "net_profit_loss": "1.50", "locked_side": "yes", "contracts": "3", "total_cost": "1.50", "gross_payout": "3",
+                    },
+                    "KXBTC15M-B": {
+                        "ticker": "KXBTC15M-B", "status": "exited_early", "market_close_time": (now - timedelta(minutes=15)).isoformat(),
+                        "net_profit_loss": "-0.50", "locked_side": "no", "contracts": "2", "total_cost": "1", "gross_payout": "0.50",
+                    },
+                },
+            }
+            self.assertEqual(
+                controller.bootstrap_from_live_ledger(trader_state, api_current_balance=Decimal("100")),
+                2,
+            )
+            balances = [Decimal(row["shadow_balance_after"]) for row in controller.state["shadow_history"]]
+            self.assertEqual(balances, [Decimal("100.50"), Decimal("100.00")])
+            self.assertEqual(Decimal(controller.state["actual_balance"]), Decimal("100"))
+            self.assertEqual(Decimal(controller.state["shadow_balance"]), Decimal("100"))
+            self.assertEqual(Decimal(controller.state["historical_starting_balance"]), Decimal("99.00"))
+            self.assertTrue(controller.balance_reconciled)
+            self.assertEqual(controller.state["balance_source"], "authenticated_endpoint_anchored_durable_live_bot_ledger")
+
+    def test_hundred_row_diagnostic_forecast_uses_only_first_row_for_live_filter(self) -> None:
+        class HorizonForecaster:
+            fit_number = 0
+
+            def forecast_horizon(self, observations, _target, horizon):
+                self.fit_number += 1
+                self.observed_balances = [row["shadow_balance_after"] for row in observations]
+                return [
+                    {
+                        "p01": Decimal("90"), "p10": Decimal("95"), "p25": Decimal("97"),
+                        "p50": Decimal("100"), "p75": Decimal("103"), "p90": Decimal("105"), "p99": Decimal("110"),
+                    }
+                    for _ in range(horizon)
+                ]
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = RegimeConfig(
+                enabled=True, dry_run=False, allow_live_state_transitions=True,
+                prophet_min_history=2, prophet_training_window=2, history_max_markets=2,
+                prophet_future_horizon_markets=100,
+            )
+            controller = EquityRegimeController(config, root / "state.json", root / "outputs")
+            controller.initialize_absolute_balances(Decimal("100"), reason="test")
+            now = datetime.now(tz=UTC)
+            controller.state["shadow_history"] = [
+                {"market_ticker": "old1", "market_close_time": (now - timedelta(minutes=30)).isoformat(), "completed_at": (now - timedelta(minutes=30)).isoformat(), "shadow_balance_after": "98.50"},
+                {"market_ticker": "old2", "market_close_time": (now - timedelta(minutes=15)).isoformat(), "completed_at": (now - timedelta(minutes=15)).isoformat(), "shadow_balance_after": "100.00"},
+            ]
+            forecaster = HorizonForecaster()
+            controller.forecaster = forecaster
+            forecast = controller.prepare_forecast(decision("KXBTC15M-HORIZON", now))
+            self.assertEqual(forecaster.observed_balances, ["98.50", "100.00"])
+            self.assertEqual(forecast["p10"], "95")
+            self.assertEqual(len(controller.state["future_forecast_snapshot"]), 100)
+            self.assertTrue(controller.state["future_forecast_snapshot"][0]["used_for_live_filter"])
+            self.assertFalse(controller.state["future_forecast_snapshot"][1]["used_for_live_filter"])
+
     def test_live_control_suppresses_only_the_next_market_after_p90(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
