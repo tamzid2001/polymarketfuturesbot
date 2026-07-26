@@ -17,7 +17,7 @@ on:
         options: [kalshi, equity]
         default: kalshi
       starting_balance:
-        description: "Starting balance in dollars"
+        description: "Verified balance immediately before the first input trade; required to reconstruct an absolute balance curve"
         required: true
         default: "100"
       min_training_trades:
@@ -73,7 +73,13 @@ jobs:
           # authenticated automatic trigger used for this reproducible run.
           input_csv="${input_csv:-backtest/data/closed-positions-2026-07-26.csv}"
           input_format="${input_format:-kalshi}"
-          starting_balance="${starting_balance:-100}"
+          # No code path silently invents $100. The workflow input is an
+          # explicit provenance assertion for the checked-in reference data.
+          starting_balance="${starting_balance:-}"
+          if [ -z "$starting_balance" ]; then
+            echo "starting_balance must be an explicitly verified opening balance" >&2
+            exit 2
+          fi
           min_training_trades="${min_training_trades:-100}"
           run_sensitivity="${run_sensitivity:-true}"
           args=(

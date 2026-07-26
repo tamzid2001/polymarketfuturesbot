@@ -55,10 +55,9 @@ def performance_summary(
 ) -> dict[str, object]:
     """Calculate the requested opportunity-level statistics on ``frame``.
 
-    The caller passes only the true walk-forward evaluation rows.  Equity is
-    rebased to the supplied starting balance for an apples-to-apples OOS
-    ending balance, while source-equity accounting remains available in the
-    trade log.
+    The caller passes only true walk-forward evaluation rows.  The evaluation
+    path is anchored at the *actual absolute balance immediately before the
+    first evaluation trade*; it is not normalized or rebased to $100.
     """
 
     pnl_all = frame[pnl_column].astype(float)
@@ -77,6 +76,7 @@ def performance_summary(
     return {
         "strategy": strategy,
         "evaluation_scope": "true_walk_forward_after_initial_training",
+        "evaluation_opening_balance": float(starting_balance),
         "exploratory": exploratory,
         "total_opportunities": int(len(frame)),
         "trades_taken": int(active.sum()),

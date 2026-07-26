@@ -31,11 +31,18 @@ def _quick_one_sided(values: pd.Series) -> float:
     return float(stats.t.sf(np.mean(x) / (std / np.sqrt(len(x))), len(x) - 1))
 
 
+def _backtest_opening_balance(log: pd.DataFrame) -> float:
+    evaluation = log[log["is_walk_forward_evaluation"]]
+    if evaluation.empty:
+        raise ValueError("No walk-forward evaluation trade is available")
+    return float(evaluation.iloc[0]["shadow_equity_before"])
+
+
 def _summary_for_rule(log: pd.DataFrame, rule: SignalRule, config: BacktestConfig) -> tuple[dict[str, object], pd.DataFrame]:
     windows = regime_windows(log)
     evaluation = log[log["is_walk_forward_evaluation"]].copy()
     summary = performance_summary(
-        evaluation, rule.name, "selected_trade_pnl", "bot_active_for_trade", config.starting_balance,
+        evaluation, rule.name, "selected_trade_pnl", "bot_active_for_trade", _backtest_opening_balance(log),
         "entry_signal_after_trade", "exit_signal_after_trade",
         int((windows["status"] == "closed").sum()) if not windows.empty else 0,
         bool(not windows.empty and windows["status"].iloc[-1] == "open_at_end"), rule.exploratory,
@@ -48,7 +55,7 @@ def _baseline_summary(log: pd.DataFrame, config: BacktestConfig, name: str, acti
     evaluation = log[log["is_walk_forward_evaluation"]].copy()
     evaluation["baseline_active"] = active
     evaluation["baseline_pnl"] = evaluation["trade_pnl"] if active else 0.0
-    return performance_summary(evaluation, name, "baseline_pnl", "baseline_active", config.starting_balance)
+    return performance_summary(evaluation, name, "baseline_pnl", "baseline_active", _backtest_opening_balance(log))
 
 
 def sensitivity_configs(primary: BacktestConfig) -> list[tuple[str, str, BacktestConfig]]:
@@ -59,7 +66,10 @@ def sensitivity_configs(primary: BacktestConfig) -> list[tuple[str, str, Backtes
         specs.append(("min_training_trades", str(value), replace(primary, min_training_trades=value)))
     for value in (75, 100, 150, 200):
         specs.append(("training_window", str(value), replace(primary, training_window=value)))
-    for value in (4, 5, 8, 10, 16):
+    # Exploratory cadence checks.  The primary is still refit every market;
+    # 25/50/75 are explicitly included because they were previously discussed
+    # as potentially promising and must not be silently selected post hoc.
+    for value in (4, 5, 8, 10, 16, 25, 50, 75):
         specs.append(("refit_every_n_trades", str(value), replace(primary, refit_every_n_trades=value)))
     for value in (0.01, 0.10, 0.25):
         specs.append(("changepoint_prior_scale", str(value), replace(primary, changepoint_prior_scale=value)))
@@ -107,7 +117,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--input", required=True, help="Original Kalshi closed-position CSV or ds/y equity CSV")
     parser.add_argument("--input-format", choices=("kalshi", "equity"), required=True)
     parser.add_argument("--output-dir", default="outputs")
-    parser.add_argument("--starting-balance", type=float, default=100.0)
+    parser.add_argument("--starting-balance", type=float, default=None,
+                        help="Verified account balance immediately before the first source trade; required for both input formats.")
     parser.add_argument("--max-trades", type=int, default=200, help="Use only the most recent completed trades (default: 200).")
     parser.add_argument("--min-training-trades", type=int, default=100)
     parser.add_argument("--training-window", type=int, default=None)

@@ -159,7 +159,13 @@ class RegimeConfig:
     allow_live_state_transitions: bool = False
     subaccount: int = 0
     series_ticker: str = "KXBTC15M"
+    # Kept only for historical P/L reconstruction.  It must never be used to
+    # rebase a rolling live lookback; live balances come from /portfolio/balance.
     starting_balance: Decimal = Decimal("100.00")
+    # Required for a historical P/L reconstruction.  It is deliberately
+    # separate from the legacy strategy-size setting above so a default $100
+    # can never be mistaken for an authenticated account snapshot.
+    historical_starting_balance: Decimal | None = None
     history_start_ts: datetime | None = None
     history_end_ts: datetime | None = None
     history_max_markets: int = 200
@@ -189,6 +195,8 @@ class RegimeConfig:
     def __post_init__(self) -> None:
         if self.starting_balance <= ZERO:
             raise ValueError("starting_balance must be positive")
+        if self.historical_starting_balance is not None and self.historical_starting_balance <= ZERO:
+            raise ValueError("historical_starting_balance must be positive when supplied")
         if self.accounting_tolerance < ZERO:
             raise ValueError("accounting_tolerance cannot be negative")
         if self.prophet_min_history < 2:
@@ -219,6 +227,10 @@ class RegimeConfig:
             subaccount=int(pick("subaccount", 0)),
             series_ticker=str(pick("series_ticker", "KXBTC15M")),
             starting_balance=decimal_value(pick("starting_balance", "100.00")),
+            historical_starting_balance=(
+                None if pick("historical_starting_balance", None) in {None, "", "None", "none"}
+                else decimal_value(pick("historical_starting_balance", None))
+            ),
             history_start_ts=utc_timestamp(pick("history_start_ts", None)),
             history_end_ts=utc_timestamp(pick("history_end_ts", None)),
             history_max_markets=int(pick("history_max_markets", 200)),
@@ -295,10 +307,15 @@ class AtomicJsonStore:
 
 def default_regime_state(config: RegimeConfig) -> dict[str, Any]:
     return {
-        "format_version": 1,
-        "starting_balance": format(config.starting_balance, "f"),
-        "actual_equity": format(config.starting_balance, "f"),
-        "shadow_equity": format(config.starting_balance, "f"),
+        "format_version": 2,
+        "historical_starting_balance": None,
+        "actual_balance": None,
+        "shadow_balance": None,
+        "balance_source": "uninitialized_requires_authenticated_balance",
+        "balance_reconciled": False,
+        "balance_reconciliation_error": "not_initialized",
+        "legacy_migration": None,
+        "balance_adjustments": [],
         "execution_enabled": True,
         "shadow_enabled": True,
         "state_reason": "initial_state",
@@ -721,13 +738,13 @@ class ProphetForecaster:
 
     def forecast(self, observations: list[Mapping[str, Any]], target_time: datetime) -> dict[str, Decimal]:
         if len(observations) < self.config.prophet_min_history:
-            raise ValueError("insufficient shadow-equity history")
+            raise ValueError("insufficient shadow-balance history")
         if self.config.prophet_training_window is not None:
             observations = observations[-self.config.prophet_training_window :]
         training_times = [utc_timestamp(row.get("market_close_time")) for row in observations]
         if not all(training_times) or max(training_times) >= target_time:
             raise ValueError("forecast training contains target or future shadow observation")
-        balances = [decimal_value(row.get("shadow_equity")) for row in observations]
+        balances = [decimal_value(row.get("shadow_balance_after")) for row in observations]
         if self.config.prophet_use_log_transform and any(value <= ZERO for value in balances):
             raise ValueError("log-transform Prophet requires positive shadow balances")
         try:
@@ -997,16 +1014,195 @@ class EquityRegimeController:
         self.shadow_executor = ShadowExecutor(config)
         self._normalize_state()
         LOG.info(
-            "STATE RESTORED | actual_equity=%s shadow_equity=%s execution_enabled=%s dry_run=%s",
-            self.state["actual_equity"], self.state["shadow_equity"], self.state["execution_enabled"], config.dry_run,
+            "STATE RESTORED | actual_balance=%s shadow_balance=%s execution_enabled=%s dry_run=%s reconciled=%s",
+            self.state["actual_balance"], self.state["shadow_balance"], self.state["execution_enabled"], config.dry_run,
+            self.state["balance_reconciled"],
         )
 
     def _normalize_state(self) -> None:
+        # Version 1 stored a rebased ``100 + recent P/L`` index in these
+        # fields.  Never translate those numbers into balances; preserve them
+        # only long enough to write an audit archive during initialization.
+        if "actual_equity" in self.state or "shadow_equity" in self.state:
+            self.state.setdefault("legacy_rebased_actual_equity", self.state.get("actual_equity"))
+            self.state.setdefault("legacy_rebased_shadow_equity", self.state.get("shadow_equity"))
         defaults = default_regime_state(self.config)
         for key, value in defaults.items():
             self.state.setdefault(key, value)
+        self.state["format_version"] = max(int(self.state.get("format_version") or 0), 2)
         self.state["shadow_enabled"] = True  # invariant; regime never disables the shadow strategy
         self.state["execution_enabled"] = bool_value(self.state.get("execution_enabled"), True)
+
+    @property
+    def balance_reconciled(self) -> bool:
+        return bool_value(self.state.get("balance_reconciled"), False)
+
+    def migrate_legacy_rebased_state(self, api_current_balance: Decimal) -> bool:
+        """Archive a version-1 rebased index and invalidate every derived band.
+
+        The legacy controller initialized the last 200-market P/L replay at
+        $100.  That value is not recoverable account balance data and cannot
+        be made valid by relabeling it.  The safe migration starts both curves
+        at the authenticated current balance and requires fresh observations.
+        """
+
+        legacy_shadow = self.state.get("legacy_rebased_shadow_equity")
+        legacy_actual = self.state.get("legacy_rebased_actual_equity")
+        if legacy_shadow is None and legacy_actual is None:
+            return False
+        stamp = datetime.now(tz=UTC).strftime("%Y%m%dT%H%M%SZ")
+        archive = self.store.path.with_name(f"{self.store.path.stem}.legacy-rebased-{stamp}.json")
+        AtomicJsonStore(archive, lambda: {}).save(dict(self.state))
+        self.state.update({
+            "actual_balance": format(api_current_balance, "f"),
+            "shadow_balance": format(api_current_balance, "f"),
+            "historical_starting_balance": format(api_current_balance, "f"),
+            "balance_source": "authenticated_api_balance_after_legacy_rebased_migration",
+            "balance_reconciled": True,
+            "balance_reconciliation_error": None,
+            "actual_history": [], "shadow_history": [], "forecasts": [], "transitions": [],
+            "live_vs_shadow": [], "processed_market_tickers": [], "shadow_open": {},
+            "last_p01": None, "last_p10": None, "last_p25": None, "last_p50": None,
+            "last_p75": None, "last_p90": None, "last_p99": None,
+            "forecast_generated_at": None, "forecast_target_ticker": None,
+            "prophet_training_end": None, "prophet_training_rows": 0,
+            "execution_enabled": True, "state_reason": "legacy_rebased_state_migrated_dry_run",
+            "legacy_migration": {
+                "legacy_shadow_value": legacy_shadow,
+                "legacy_actual_value": legacy_actual,
+                "corrected_actual_balance": format(api_current_balance, "f"),
+                "corrected_shadow_balance": format(api_current_balance, "f"),
+                "migration_timestamp": timestamp_text(datetime.now(tz=UTC)),
+                "migration_reason": "legacy_rolling_pnl_index_is_not_absolute_balance",
+                "archive": str(archive),
+            },
+        })
+        self.state.pop("actual_equity", None)
+        self.state.pop("shadow_equity", None)
+        self.state.pop("legacy_rebased_actual_equity", None)
+        self.state.pop("legacy_rebased_shadow_equity", None)
+        LOG.error(
+            "LEGACY REBASED STATE MIGRATED | archived=%s actual_balance=%s shadow_balance=%s",
+            archive, api_current_balance, api_current_balance,
+        )
+        return True
+
+    def initialize_absolute_balances(self, api_current_balance: Decimal, *, reason: str) -> None:
+        """Initialize or reconcile both curves against authenticated Kalshi cash."""
+
+        if api_current_balance <= ZERO:
+            raise RuntimeError("authenticated Kalshi balance is non-positive; regime controller fails closed")
+        if self.migrate_legacy_rebased_state(api_current_balance):
+            self.save()
+            return
+        actual = self.state.get("actual_balance")
+        shadow = self.state.get("shadow_balance")
+        if actual is None or shadow is None:
+            self.state.update({
+                "actual_balance": format(api_current_balance, "f"),
+                "shadow_balance": format(api_current_balance, "f"),
+                "historical_starting_balance": format(api_current_balance, "f"),
+                "balance_source": "authenticated_api_balance_initialization",
+                "balance_reconciled": True,
+                "balance_reconciliation_error": None,
+                "state_reason": reason,
+            })
+            self.state["forecasts"] = []
+            LOG.info("ABSOLUTE BALANCES INITIALIZED | actual=%s shadow=%s", api_current_balance, api_current_balance)
+            self.save()
+            return
+        reconstructed = decimal_value(actual)
+        difference = reconstructed - api_current_balance
+        self.state["balance_reconciled"] = abs(difference) <= self.config.accounting_tolerance
+        self.state["balance_reconciliation_error"] = None if self.balance_reconciled else format(difference, "f")
+        if not self.balance_reconciled:
+            self.state["forecasts"] = []
+            self.state["execution_enabled"] = True
+            self.state["state_reason"] = "actual_balance_api_reconciliation_failed"
+            LOG.error(
+                "EQUITY RECONCILIATION FAILED | api_balance=%s reconstructed_balance=%s difference=%s; regime control disabled",
+                api_current_balance, reconstructed, difference,
+            )
+        self.save()
+
+    def rebuild_absolute_history(
+        self,
+        rows: Iterable[ReconstructedMarket],
+        *,
+        historical_starting_balance: Decimal,
+        api_current_balance: Decimal,
+    ) -> bool:
+        """Rebuild an absolute curve only from an explicitly verified anchor.
+
+        Fills and settlements tell us P/L, not the balance before the first
+        fill.  This method refuses to publish that P/L series as a balance
+        unless its supplied historical anchor reconciles to the authenticated
+        current balance within a cent.
+        """
+
+        ordered = [row for row in rows if row.market_close_time is not None]
+        expected = historical_starting_balance + sum((row.realized_pnl for row in ordered), ZERO)
+        difference = expected - api_current_balance
+        if abs(difference) > self.config.accounting_tolerance:
+            self.state.update({
+                "actual_balance": format(api_current_balance, "f"),
+                "shadow_balance": format(api_current_balance, "f"),
+                "historical_starting_balance": format(historical_starting_balance, "f"),
+                "balance_source": "authenticated_api_balance_historical_reconstruction_unreconciled",
+                "balance_reconciled": False,
+                "balance_reconciliation_error": format(difference, "f"),
+                "state_reason": "historical_absolute_balance_reconstruction_failed",
+                "forecasts": [], "execution_enabled": True,
+            })
+            LOG.error(
+                "EQUITY RECONCILIATION FAILED | historical_start=%s included_pnl=%s reconstructed=%s api=%s difference=%s",
+                historical_starting_balance, expected - historical_starting_balance, expected, api_current_balance, difference,
+            )
+            return False
+        actual = shadow = historical_starting_balance
+        actual_history: list[dict[str, Any]] = []
+        shadow_history: list[dict[str, Any]] = []
+        for row in ordered:
+            actual_before = actual
+            shadow_before = shadow
+            actual += row.realized_pnl
+            shadow += row.realized_pnl
+            timestamp = timestamp_text(row.market_close_time)
+            actual_history.append({
+                "timestamp": timestamp, "market_ticker": row.market_ticker, "market_close_time": timestamp,
+                "actual_balance_before": format(actual_before, "f"), "actual_realized_pnl": format(row.realized_pnl, "f"),
+                "actual_balance_after": format(actual, "f"), "execution_enabled_for_market": True,
+                "state_before_market": "on", "state_after_market": "on", "balance_source": "reconstructed_from_verified_historical_starting_balance",
+                "reconciled": True, "selected_side": row.selected_side, "contracts_bought": format(row.contracts_bought, "f"),
+                "contracts_sold": format(row.contracts_sold, "f"), "average_entry": None if row.average_entry is None else format(row.average_entry, "f"),
+                "entry_cost": format(row.entry_cost, "f"), "exit_proceeds": format(row.exit_proceeds, "f"),
+                "settlement_payout": format(row.settlement_payout, "f"), "fees": format(row.fees, "f"),
+                "exit_method": row.exit_method, "source": row.source, "reconciliation_status": row.reconciliation_status,
+            })
+            shadow_history.append({
+                "timestamp": timestamp, "market_ticker": row.market_ticker, "market_close_time": timestamp,
+                "shadow_balance_before": format(shadow_before, "f"), "shadow_market_pnl": format(row.realized_pnl, "f"),
+                "shadow_realized_pnl": format(row.realized_pnl, "f"), "shadow_balance_after": format(shadow, "f"),
+                "shadow_selected_side": row.selected_side, "shadow_eligible": row.contracts_bought > ZERO,
+                "shadow_skip_reason": None, "shadow_contracts": format(row.contracts_bought, "f"),
+                "shadow_average_entry": None if row.average_entry is None else format(row.average_entry, "f"),
+                "shadow_cost": format(row.entry_cost, "f"), "shadow_proceeds": format(row.exit_proceeds, "f"),
+                "shadow_payout": format(row.settlement_payout, "f"), "shadow_fees": format(row.fees, "f"),
+                "shadow_exit_method": row.exit_method, "shadow_fill_model": "live_equivalent",
+                "shadow_simulation_quality": "exact_replay", "live_execution_enabled": True,
+                "completed_at": timestamp,
+            })
+        self.state.update({
+            "historical_starting_balance": format(historical_starting_balance, "f"),
+            "actual_balance": format(actual, "f"), "shadow_balance": format(shadow, "f"),
+            "actual_history": actual_history, "shadow_history": shadow_history,
+            "processed_market_tickers": [row.market_ticker for row in ordered],
+            "forecasts": [], "transitions": [], "live_vs_shadow": [],
+            "balance_source": "reconstructed_from_verified_historical_starting_balance",
+            "balance_reconciled": True, "balance_reconciliation_error": None,
+        })
+        LOG.info("ABSOLUTE BALANCE HISTORY REBUILT | rows=%d start=%s end=%s", len(ordered), historical_starting_balance, actual)
+        return True
 
     def save(self) -> None:
         self._bound_persisted_history()
@@ -1029,8 +1225,10 @@ class EquityRegimeController:
                 self.state[key] = values[-limit:]
 
     def _assert_state_integrity(self) -> None:
-        shadow = decimal_value(self.state["shadow_equity"])
-        actual = decimal_value(self.state["actual_equity"])
+        if self.state.get("actual_balance") is None or self.state.get("shadow_balance") is None:
+            return
+        shadow = decimal_value(self.state["shadow_balance"])
+        actual = decimal_value(self.state["actual_balance"])
         if shadow <= ZERO or actual <= ZERO:
             # The live deployment's default log transform has a hard positive
             # balance invariant. A breached account must fail closed.
@@ -1048,7 +1246,7 @@ class EquityRegimeController:
         return bool(self.state["execution_enabled"])
 
     def should_suppress_new_live_orders(self) -> bool:
-        return self.config.controls_live_execution and not self.execution_enabled_for_market()
+        return self.config.controls_live_execution and self.balance_reconciled and not self.execution_enabled_for_market()
 
     def _shadow_rows_before(self, decision_time: datetime) -> list[dict[str, Any]]:
         rows = [
@@ -1066,6 +1264,9 @@ class EquityRegimeController:
         for item in self.state["forecasts"]:
             if item.get("forecast_target_ticker") == decision.target_ticker:
                 return item
+        if not self.balance_reconciled:
+            LOG.error("PROPHET FORECAST SKIPPED | target=%s balance curve is unreconciled", decision.target_ticker)
+            return None
         training = self._shadow_rows_before(decision.generated_at)
         if not self.config.prophet_enabled or len(training) < self.config.prophet_min_history:
             return None
@@ -1100,7 +1301,7 @@ class EquityRegimeController:
             "training_end": timestamp_text(training_end),
             "training_rows": len(training),
             **copied,
-            "observed_shadow_equity": None,
+            "observed_shadow_balance": None,
             "entry_signal": False,
             "exit_signal": False,
             "state_before": "on" if self.execution_enabled_for_market() else "off",
@@ -1228,7 +1429,7 @@ class EquityRegimeController:
     def close_market(
         self, *, ticker: str, outcome: str | None, market_close_time: datetime,
         actual_realized_pnl: Decimal, actual_metadata: Mapping[str, Any] | None = None,
-        actual_was_live: bool = False,
+        actual_was_live: bool = False, actual_balance_after: Decimal,
     ) -> None:
         """Atomically append P/L, evaluate prior forecast, then transition next state."""
 
@@ -1261,20 +1462,28 @@ class EquityRegimeController:
         self.shadow_executor.finalize(trade, outcome)
         shadow_pnl = decimal_value(trade.get("shadow_realized_pnl"))
         state_before = self.execution_enabled_for_market()
-        actual_before = decimal_value(self.state["actual_equity"])
-        shadow_before = decimal_value(self.state["shadow_equity"])
-        actual_after = actual_before + actual_realized_pnl
+        if self.state.get("actual_balance") is None or self.state.get("shadow_balance") is None:
+            raise RuntimeError("absolute balances must be initialized from the authenticated API before market accounting")
+        actual_before = decimal_value(self.state["actual_balance"])
+        shadow_before = decimal_value(self.state["shadow_balance"])
+        actual_after = actual_balance_after
         shadow_after = shadow_before + shadow_pnl
         if actual_after <= ZERO or shadow_after <= ZERO:
             raise RuntimeError("equity update would make balance non-positive; manual intervention is required")
         actual_row = {
-            "market_ticker": ticker, "market_close_time": timestamp_text(market_close_time),
+            "timestamp": timestamp_text(datetime.now(tz=UTC)), "market_ticker": ticker, "market_close_time": timestamp_text(market_close_time),
             "completed_at": timestamp_text(datetime.now(tz=UTC)),
-            "realized_pnl": format(actual_realized_pnl, "f"), "actual_equity": format(actual_after, "f"),
+            "actual_balance_before": format(actual_before, "f"),
+            "actual_realized_pnl": format(actual_realized_pnl, "f"),
+            "actual_balance_after": format(actual_after, "f"),
+            "execution_enabled_for_market": state_before,
+            "state_before_market": "on" if state_before else "off",
+            "balance_source": "authenticated_kalshi_api",
+            "reconciled": True,
             **dict(actual_metadata or {}),
         }
         shadow_row = {
-            "market_ticker": ticker, "market_close_time": timestamp_text(market_close_time),
+            "timestamp": timestamp_text(datetime.now(tz=UTC)), "market_ticker": ticker, "market_close_time": timestamp_text(market_close_time),
             "completed_at": timestamp_text(datetime.now(tz=UTC)),
             "shadow_selected_side": trade.get("selected_side"), "shadow_eligible": trade.get("eligible"),
             "shadow_skip_reason": trade.get("skip_reason"), "shadow_contracts": trade.get("contracts", "0"),
@@ -1284,14 +1493,31 @@ class EquityRegimeController:
             ),
             "shadow_cost": trade.get("entry_cost", "0"), "shadow_proceeds": trade.get("proceeds", "0"),
             "shadow_payout": trade.get("payout", "0"), "shadow_fees": trade.get("fees", "0"),
-            "shadow_realized_pnl": format(shadow_pnl, "f"), "shadow_equity": format(shadow_after, "f"),
+            "shadow_balance_before": format(shadow_before, "f"),
+            "shadow_market_pnl": format(shadow_pnl, "f"), "shadow_realized_pnl": format(shadow_pnl, "f"),
+            "shadow_balance_after": format(shadow_after, "f"),
             "shadow_exit_method": trade.get("exit_method"), "shadow_fill_model": trade.get("shadow_fill_model"),
             "shadow_simulation_quality": trade.get("shadow_simulation_quality"), "live_execution_enabled": state_before,
         }
         self.state["actual_history"].append(actual_row)
         self.state["shadow_history"].append(shadow_row)
-        self.state["actual_equity"] = format(actual_after, "f")
-        self.state["shadow_equity"] = format(shadow_after, "f")
+        self.state["actual_balance"] = format(actual_after, "f")
+        self.state["shadow_balance"] = format(shadow_after, "f")
+        actual_delta = actual_after - actual_before
+        difference = actual_delta - actual_realized_pnl
+        if abs(difference) > self.config.accounting_tolerance:
+            adjustment = {
+                "timestamp": timestamp_text(datetime.now(tz=UTC)),
+                "adjustment_type": "unreconciled_balance_adjustment",
+                "amount": format(difference, "f"), "source": "portfolio_balance_after_market",
+                "balance_before": format(actual_before, "f"), "balance_after": format(actual_after, "f"),
+            }
+            self.state["balance_adjustments"].append(adjustment)
+            self.state["balance_reconciled"] = False
+            self.state["balance_reconciliation_error"] = format(difference, "f")
+            actual_row["reconciled"] = False
+            actual_row["reconciliation_status"] = "market_balance_delta_differs_from_realized_pnl"
+            LOG.error("EQUITY RECONCILIATION | %s balance_delta=%s realized_pnl=%s difference=%s", ticker, actual_delta, actual_realized_pnl, difference)
         self._update_shadow_cooldown_after_close(trade, shadow_pnl)
         self.state["last_processed_market_ticker"] = ticker
         self.state["processed_market_tickers"].append(ticker)
@@ -1299,7 +1525,7 @@ class EquityRegimeController:
             self.state["shadow_pnl_while_disabled"] = format(decimal_value(self.state["shadow_pnl_while_disabled"]) + shadow_pnl, "f")
         forecast = next((row for row in self.state["forecasts"] if row.get("forecast_target_ticker") == ticker), None)
         if forecast:
-            forecast["observed_shadow_equity"] = format(shadow_after, "f")
+            forecast["observed_shadow_balance"] = format(shadow_after, "f")
             p10, p90 = decimal_value(forecast["p10"]), decimal_value(forecast["p90"])
             unavailable_disabled_shadow = (
                 not state_before
@@ -1324,11 +1550,11 @@ class EquityRegimeController:
             # Persist the *model's* state even in dry-run.  Dry-run therefore
             # tests a realistic sequence of stop/restart decisions; only the
             # separate controls_live_execution predicate may suppress orders.
-            transition_recorded = transition_requested and self.config.enabled
-            live_execution_effective = transition_requested and self.config.controls_live_execution
+            transition_recorded = transition_requested and self.config.enabled and self.balance_reconciled
+            live_execution_effective = transition_requested and self.config.controls_live_execution and self.balance_reconciled
             if transition_recorded:
                 self.state["execution_enabled"] = desired_state
-                self.state["state_reason"] = "shadow_equity_at_or_below_p10" if entry else "shadow_equity_at_or_above_p90"
+                self.state["state_reason"] = "shadow_balance_at_or_below_p10" if entry else "shadow_balance_at_or_above_p90"
                 self.state["state_changed_at"] = timestamp_text(datetime.now(tz=UTC))
                 if desired_state:
                     disabled_since = utc_timestamp(self.state.get("disabled_since"))
@@ -1343,13 +1569,24 @@ class EquityRegimeController:
                     "transition_time": timestamp_text(datetime.now(tz=UTC)), "effective_market": "next_eligible_market",
                     "signal_market": ticker, "old_state": "on" if state_before else "off",
                     "new_state": "on" if desired_state else "off",
-                    "reason": "shadow_equity_at_or_below_p10" if entry else "shadow_equity_at_or_above_p90",
-                    "applied": transition_recorded, "live_order_suppression_effective": live_execution_effective, "actual_equity": format(actual_after, "f"),
-                    "shadow_equity": format(shadow_after, "f"), "p10": forecast["p10"], "p50": forecast["p50"], "p90": forecast["p90"],
+                    "reason": "shadow_balance_at_or_below_p10" if entry else "shadow_balance_at_or_above_p90",
+                    "applied": transition_recorded, "live_order_suppression_effective": live_execution_effective, "actual_balance": format(actual_after, "f"),
+                    "shadow_balance": format(shadow_after, "f"), "p10": forecast["p10"], "p50": forecast["p50"], "p90": forecast["p90"],
                     "markets_disabled": sum(not bool(row.get("live_execution_enabled")) for row in self.state["shadow_history"]),
                     "shadow_pnl_during_disabled_period": self.state["shadow_pnl_while_disabled"],
                 })
             forecast["state_after"] = "on" if self.execution_enabled_for_market() else "off"
+            actual_row.update({
+                "entry_signal_after_market": forecast["entry_signal"],
+                "exit_signal_after_market": forecast["exit_signal"],
+                "state_after_market": forecast["state_after"],
+                "p10": forecast["p10"], "p50": forecast["p50"], "p90": forecast["p90"],
+            })
+        else:
+            actual_row.update({
+                "entry_signal_after_market": False, "exit_signal_after_market": False,
+                "state_after_market": "on" if self.execution_enabled_for_market() else "off",
+            })
         self.state["live_vs_shadow"].append({
             "market_ticker": ticker, "market_close_time": timestamp_text(market_close_time),
             "actual_realized_pnl": format(actual_realized_pnl, "f"), "shadow_realized_pnl": format(shadow_pnl, "f"),
@@ -1358,102 +1595,31 @@ class EquityRegimeController:
         })
         open_trades.pop(ticker, None)
         self.save()
-        LOG.info("ACTUAL EQUITY UPDATE | %s pnl=%s equity=%s", ticker, actual_realized_pnl, actual_after)
-        LOG.info("SHADOW EQUITY UPDATE | %s pnl=%s equity=%s", ticker, shadow_pnl, shadow_after)
+        LOG.info("ACTUAL BALANCE UPDATE | %s pnl=%s balance=%s", ticker, actual_realized_pnl, actual_after)
+        LOG.info("SHADOW BALANCE UPDATE | %s pnl=%s balance=%s", ticker, shadow_pnl, shadow_after)
 
     def bootstrap_from_live_ledger(self, trader_state: Mapping[str, Any]) -> int:
-        """Use recorded bot fills/settlements as exact replay only for real history.
-
-        This does not invent historical shadow fills.  A finalized ledger row
-        contains the strategy's actual fills, stop exits, and settlement; when
-        live orders were sent, it is the highest-quality replay available.
-        """
-
-        appended = 0
-        records = [record for record in (trader_state.get("markets") or {}).values() if isinstance(record, Mapping)]
-        records.sort(key=lambda record: timestamp_text(record.get("settled_at") or record.get("closed_at")))
-        # The deployment is deliberately bounded to the current 200-market
-        # evaluation universe.  Older ledger records remain intact in the
-        # trader ledger; they are not silently deleted or used by Prophet.
-        records = records[-self.config.history_max_markets :]
-        for record in records:
-            ticker = str(record.get("ticker") or "")
-            if not ticker or ticker in set(self.state["processed_market_tickers"]):
-                continue
-            if str(record.get("status")) not in {"finalized", "exited_early", "finalized_unfilled", "finalized_no_signal"}:
-                continue
-            close_time = utc_timestamp(record.get("settled_at") or record.get("closed_at") or record.get("market_close_time"))
-            if close_time is None:
-                continue
-            pnl = decimal_value(record.get("net_profit_loss"))
-            # The historical ledger is an exact replay of actual real fills;
-            # make a completed shadow record with the same outcome, not a
-            # fabricated BBO assumption.
-            shadow_trade = {
-                "target_ticker": ticker, "selected_side": record.get("selected_side") or record.get("locked_side") or record.get("candidate_side"),
-                "eligible": bool(record.get("candidate_side")), "skip_reason": None,
-                "contracts": format(decimal_value(record.get("contracts")), "f"), "entry_cost": format(decimal_value(record.get("total_cost")), "f"),
-                "proceeds": format(decimal_value(record.get("gross_payout")) - decimal_value(record.get("settlement_contracts")), "f"),
-                "payout": format(decimal_value(record.get("settlement_contracts")) if str(record.get("settlement_outcome")) == str(record.get("locked_side") or record.get("candidate_side")) else ZERO, "f"),
-                "fees": format(decimal_value(record.get("kalshi_fees")), "f"), "shadow_realized_pnl": format(pnl, "f"),
-                "shadow_fill_model": "live_equivalent", "shadow_simulation_quality": "exact_replay",
-                "exit_method": record.get("exit_method") or "settlement", "status": "finalized",
-                "live_execution_enabled": True,
-            }
-            self.state.setdefault("shadow_open", {})[ticker] = shadow_trade
-            self.close_market(
-                ticker=ticker, outcome=str(record.get("settlement_outcome") or "").lower() or None,
-                market_close_time=close_time, actual_realized_pnl=pnl,
-                actual_metadata={"source": "existing_bot_ledger", "reconciliation_status": "exact_ledger_replay"},
-            )
-            appended += 1
-        return appended
+        raise RuntimeError(
+            "Historical ledger replay is disabled: a bounded P/L replay cannot "
+            "establish an absolute balance without a verified opening balance. "
+            "Use authenticated balance reconciliation or an explicit verified "
+            "historical balance snapshot."
+        )
 
     def bootstrap_from_api_reconstruction(self, rows: Iterable[ReconstructedMarket]) -> int:
-        """Seed both curves from bot-owned real fills only when no ledger exists.
-
-        These closed real bot trades occurred before this regime was active, so
-        actual and shadow are equal on this historical prefix.  The quality is
-        explicitly ``exact_replay`` of actual fills, not a hypothetical fill
-        assumption.  A local ledger, when present, remains the stronger
-        attribution source and takes precedence.
-        """
-        if self.state["actual_history"] or self.state["shadow_history"]:
-            return 0
-        appended = 0
-        for row in list(rows)[-self.config.history_max_markets :]:
-            if row.market_close_time is None:
-                continue
-            self.state.setdefault("shadow_open", {})[row.market_ticker] = {
-                "target_ticker": row.market_ticker, "selected_side": row.selected_side,
-                "eligible": row.contracts_bought > ZERO, "skip_reason": None,
-                "contracts": format(row.contracts_bought, "f"), "entry_cost": format(row.entry_cost, "f"),
-                "proceeds": format(row.exit_proceeds, "f"), "payout": format(row.settlement_payout, "f"),
-                "fees": format(row.fees, "f"), "shadow_realized_pnl": format(row.realized_pnl, "f"),
-                "shadow_fill_model": "live_equivalent", "shadow_simulation_quality": "exact_replay",
-                "exit_method": row.exit_method, "status": "finalized", "live_execution_enabled": True,
-            }
-            self.close_market(
-                ticker=row.market_ticker, outcome=None, market_close_time=row.market_close_time,
-                actual_realized_pnl=row.realized_pnl,
-                actual_metadata={
-                    "selected_side": row.selected_side, "contracts_bought": format(row.contracts_bought, "f"),
-                    "contracts_sold": format(row.contracts_sold, "f"), "average_entry": None if row.average_entry is None else format(row.average_entry, "f"),
-                    "entry_cost": format(row.entry_cost, "f"), "exit_proceeds": format(row.exit_proceeds, "f"),
-                    "settlement_payout": format(row.settlement_payout, "f"), "fees": format(row.fees, "f"),
-                    "exit_method": row.exit_method, "source": row.source, "reconciliation_status": row.reconciliation_status,
-                },
-            )
-            appended += 1
-        return appended
+        raise RuntimeError(
+            "API P/L reconstruction is not an absolute balance curve without "
+            "a verified historical opening balance; refusing to rebase it."
+        )
 
     def heartbeat(self) -> dict[str, Any]:
         last_forecast = self.state["forecasts"][-1] if self.state["forecasts"] else {}
-        shadow = decimal_value(self.state["shadow_equity"])
+        shadow = decimal_value(self.state["shadow_balance"]) if self.state.get("shadow_balance") else ZERO
         p10, p90 = decimal_value(last_forecast.get("p10")), decimal_value(last_forecast.get("p90"))
         result = {
-            "actual_equity": self.state["actual_equity"], "shadow_equity": self.state["shadow_equity"],
+            "actual_balance": self.state["actual_balance"], "shadow_balance": self.state["shadow_balance"],
             "execution_enabled": self.execution_enabled_for_market(), "shadow_enabled": True,
+            "balance_reconciled": self.balance_reconciled,
             "p10": last_forecast.get("p10"), "p50": last_forecast.get("p50"), "p90": last_forecast.get("p90"),
             "distance_to_p10": format(shadow - p10, "f") if p10 else None,
             "distance_to_p90": format(p90 - shadow, "f") if p90 else None,
@@ -1467,10 +1633,10 @@ class EquityRegimeController:
 
     def write_outputs(self) -> None:
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        actual_columns = ("market_ticker", "market_close_time", "selected_side", "contracts_bought", "contracts_sold", "average_entry", "entry_cost", "exit_proceeds", "settlement_payout", "fees", "realized_pnl", "actual_equity", "exit_method", "source", "reconciliation_status")
-        shadow_columns = ("market_ticker", "market_close_time", "shadow_selected_side", "shadow_eligible", "shadow_skip_reason", "shadow_contracts", "shadow_average_entry", "shadow_cost", "shadow_proceeds", "shadow_payout", "shadow_fees", "shadow_realized_pnl", "shadow_equity", "shadow_exit_method", "shadow_fill_model", "shadow_simulation_quality", "live_execution_enabled")
-        forecast_columns = ("forecast_generated_at", "forecast_target_ticker", "training_start", "training_end", "training_rows", *QUANTILES, "observed_shadow_equity", "entry_signal", "exit_signal", "state_before", "state_after")
-        transition_columns = ("transition_time", "effective_market", "old_state", "new_state", "reason", "actual_equity", "shadow_equity", "p10", "p50", "p90", "markets_disabled", "shadow_pnl_during_disabled_period")
+        actual_columns = ("timestamp", "market_ticker", "market_close_time", "actual_balance_before", "actual_realized_pnl", "actual_balance_after", "execution_enabled_for_market", "state_before_market", "entry_signal_after_market", "exit_signal_after_market", "state_after_market", "p10", "p50", "p90", "balance_source", "reconciled", "selected_side", "contracts_bought", "contracts_sold", "average_entry", "entry_cost", "exit_proceeds", "settlement_payout", "fees", "exit_method", "source", "reconciliation_status")
+        shadow_columns = ("timestamp", "market_ticker", "market_close_time", "shadow_balance_before", "shadow_market_pnl", "shadow_realized_pnl", "shadow_balance_after", "shadow_selected_side", "shadow_eligible", "shadow_skip_reason", "shadow_contracts", "shadow_average_entry", "shadow_cost", "shadow_proceeds", "shadow_payout", "shadow_fees", "shadow_exit_method", "shadow_fill_model", "shadow_simulation_quality", "live_execution_enabled")
+        forecast_columns = ("forecast_generated_at", "forecast_target_ticker", "training_start", "training_end", "training_rows", *QUANTILES, "observed_shadow_balance", "entry_signal", "exit_signal", "state_before", "state_after")
+        transition_columns = ("transition_time", "effective_market", "old_state", "new_state", "reason", "actual_balance", "shadow_balance", "p10", "p50", "p90", "markets_disabled", "shadow_pnl_during_disabled_period")
         self._write_csv(self.output_dir / "actual_equity_curve.csv", self.state["actual_history"], actual_columns)
         self._write_csv(self.output_dir / "shadow_equity_curve.csv", self.state["shadow_history"], shadow_columns)
         self._write_csv(self.output_dir / "prophet_forecasts.csv", self.state["forecasts"], forecast_columns)
@@ -1500,8 +1666,8 @@ class EquityRegimeController:
         os.replace(temporary, path)
 
     def _write_report(self, path: Path) -> None:
-        actual = decimal_value(self.state["actual_equity"]) - self.config.starting_balance
-        shadow = decimal_value(self.state["shadow_equity"]) - self.config.starting_balance
+        actual_balance = decimal_value(self.state["actual_balance"]) if self.state.get("actual_balance") else ZERO
+        shadow_balance = decimal_value(self.state["shadow_balance"]) if self.state.get("shadow_balance") else ZERO
         transitions = self.state["transitions"]
         stops = sum(item.get("new_state") == "off" and item.get("applied") for item in transitions)
         restarts = sum(item.get("new_state") == "on" and item.get("applied") for item in transitions)
@@ -1513,11 +1679,11 @@ class EquityRegimeController:
         sync = self.state.get("history_sync", {})
         reconciliation = self.state.get("reconciliation", [])
         discrepancies = sum(row.get("reconciliation_status") == "discrepancy_exceeds_tolerance" for row in reconciliation if isinstance(row, Mapping))
-        forecast_rows = [row for row in self.state["forecasts"] if row.get("observed_shadow_equity") is not None]
+        forecast_rows = [row for row in self.state["forecasts"] if row.get("observed_shadow_balance") is not None]
         def coverage(lower: str, upper: str) -> str:
             if not forecast_rows:
                 return "n/a"
-            observed = [decimal_value(row["observed_shadow_equity"]) for row in forecast_rows]
+            observed = [decimal_value(row["observed_shadow_balance"]) for row in forecast_rows]
             inside = [decimal_value(row[lower]) <= value <= decimal_value(row[upper]) for row, value in zip(forecast_rows, observed, strict=True)]
             return f"{sum(inside) / len(inside):.1%} ({sum(inside)}/{len(inside)})"
         transition_table = "\n".join(
@@ -1538,10 +1704,10 @@ class EquityRegimeController:
 
 ## Accounting and history
 
-- Actual realized P/L: `${money_text(actual)}`
-- Shadow realized P/L: `${money_text(shadow)}`
-- Actual ending equity: `${money_text(decimal_value(self.state['actual_equity']))}`
-- Shadow ending equity: `${money_text(decimal_value(self.state['shadow_equity']))}`
+- Actual balance: `${money_text(actual_balance)}`
+- Shadow balance: `${money_text(shadow_balance)}`
+- Balance source: `{self.state.get('balance_source')}`
+- Balance reconciled to authenticated API: `{self.balance_reconciled}`
 - Actual history rows: `{len(self.state['actual_history'])}`
 - Shadow history rows: `{len(self.state['shadow_history'])}`
 - Ambiguous fills excluded: `{len(self.state['ambiguous_fills'])}`
@@ -1580,7 +1746,7 @@ class EquityRegimeController:
 
 ## Limitations and reconciliation
 
-Current account balance is an informational reconciliation value only; deposits, withdrawals, transfers, unrelated trades, and open exposure are never used to change the configured starting balance or historical strategy P/L. The `accounting_reconciliation.csv` file compares reconstructed closed-market API P/L with the local ledger and flags differences above the configured tolerance. P/L and fills are retained as `Decimal` values internally. Shadow results obtained without a timestamped order-book/trade replay are not exact and must not be used as proof of live profitability.
+The authenticated Kalshi account balance is the actual-balance source. Deposits, withdrawals, transfers, unrelated trades, and open exposure are recorded separately in the adjustment ledger and never relabelled as strategy P/L. A discrepancy beyond the configured tolerance invalidates forecasts and prevents live regime control. P/L and fills are retained as `Decimal` values internally. Shadow results obtained without a timestamped order-book/trade replay are not exact and must not be used as proof of live profitability.
 
 ## State machine
 
@@ -1604,30 +1770,29 @@ For market *t*, the state saved before it controls real order placement. After t
         with plt.style.context("seaborn-v0_8-whitegrid"):
             figure, axis = plt.subplots(figsize=(14, 7), dpi=180)
             if actual_rows:
-                axis.plot([utc_timestamp(row.get("market_close_time")) for row in actual_rows], [float(decimal_value(row.get("actual_equity"))) for row in actual_rows], label="Actual equity", linewidth=2)
+                axis.plot([utc_timestamp(row.get("market_close_time")) for row in actual_rows], [float(decimal_value(row.get("actual_balance_after"))) for row in actual_rows], label="Actual balance", linewidth=2)
             if shadow_rows:
-                axis.plot(dates, [float(decimal_value(row.get("shadow_equity"))) for row in shadow_rows], label="Shadow equity", linewidth=2)
-            axis.axhline(float(self.config.starting_balance), color="black", linestyle=":", label="Starting balance")
-            axis.set(title="Actual versus shadow equity", xlabel="UTC market close", ylabel="Equity ($)")
+                axis.plot(dates, [float(decimal_value(row.get("shadow_balance_after"))) for row in shadow_rows], label="Shadow balance", linewidth=2)
+            axis.set(title="Actual versus shadow balance", xlabel="UTC market close", ylabel="Balance ($)")
             axis.legend()
             figure.autofmt_xdate()
             figure.tight_layout()
             figure.savefig(self.output_dir / "equity_curves.png")
             plt.close(figure)
-            forecasts = [row for row in self.state["forecasts"] if row.get("observed_shadow_equity") is not None]
+            forecasts = [row for row in self.state["forecasts"] if row.get("observed_shadow_balance") is not None]
             if forecasts:
                 figure, axis = plt.subplots(figsize=(14, 7), dpi=180)
                 x = [utc_timestamp(row.get("forecast_target_time")) for row in forecasts]
                 p10 = [float(decimal_value(row.get("p10"))) for row in forecasts]
                 p50 = [float(decimal_value(row.get("p50"))) for row in forecasts]
                 p90 = [float(decimal_value(row.get("p90"))) for row in forecasts]
-                observed = [float(decimal_value(row.get("observed_shadow_equity"))) for row in forecasts]
+                observed = [float(decimal_value(row.get("observed_shadow_balance"))) for row in forecasts]
                 axis.fill_between(x, p10, p90, alpha=0.2, label="P10–P90")
                 axis.plot(x, p10, linestyle="--", label="P10")
                 axis.plot(x, p50, label="P50")
                 axis.plot(x, p90, linestyle="--", label="P90")
-                axis.plot(x, observed, color="black", linewidth=2, label="Shadow equity")
-                axis.set(title="Shadow equity with one-step-ahead Prophet bands", xlabel="UTC target close", ylabel="Equity ($)")
+                axis.plot(x, observed, color="black", linewidth=2, label="Shadow balance")
+                axis.set(title="Shadow balance with one-step-ahead Prophet bands", xlabel="UTC target close", ylabel="Balance ($)")
                 axis.legend()
                 figure.autofmt_xdate()
                 figure.tight_layout()
@@ -1652,7 +1817,6 @@ async def synchronize_history(controller: EquityRegimeController, api: JsonAPI, 
     result = await HistoricalSynchronizer(controller.config, trader_state).sync(api)
     controller.state["ambiguous_fills"] = result.ambiguous_fills
     reconstructed = reconstruct_realized_pnl(result.fills, result.settlements)[-controller.config.history_max_markets :]
-    controller.bootstrap_from_api_reconstruction(reconstructed)
     ledger_pnl = {
         str(record.get("ticker")): decimal_value(record.get("net_profit_loss"))
         for record in (trader_state.get("markets") or {}).values()
@@ -1687,13 +1851,32 @@ async def synchronize_history(controller: EquityRegimeController, api: JsonAPI, 
             })
     balance_payload = result.balance_payload or {}
     balance_dollars = value_from(balance_payload, "balance_dollars")
-    # Legacy portfolio responses expose integer cents in ``balance``. This is
-    # informational only, but it must still never be reported as 100x larger.
-    balance = decimal_value(balance_dollars) if balance_dollars is not None else decimal_value(value_from(balance_payload, "balance")) / Decimal("100")
+    # Legacy portfolio responses expose integer cents in ``balance``.
+    raw_balance = balance_dollars if balance_dollars is not None else value_from(balance_payload, "balance")
+    if raw_balance is None:
+        raise RuntimeError("/portfolio/balance returned no usable balance; refusing regime initialization")
+    balance = decimal_value(balance_dollars) if balance_dollars is not None else decimal_value(raw_balance) / Decimal("100")
+    prior_actual = decimal_value(controller.state["actual_balance"]) if controller.state.get("actual_balance") else None
+    if controller.config.historical_starting_balance is not None:
+        controller.migrate_legacy_rebased_state(balance)
+        controller.rebuild_absolute_history(
+            reconstructed,
+            historical_starting_balance=controller.config.historical_starting_balance,
+            api_current_balance=balance,
+        )
+    else:
+        LOG.warning(
+            "HISTORICAL ABSOLUTE CURVE UNAVAILABLE | no verified historical_starting_balance; "
+            "initializing both balances from authenticated API and withholding Prophet control until new history accrues",
+        )
+        controller.initialize_absolute_balances(balance, reason="authenticated_api_history_sync")
+    current_difference = None if prior_actual is None else prior_actual - balance
     reconciliation.append({
         "market_ticker": "__account_balance_reconciliation__", "market_close_time": None,
-        "api_balance": format(balance, "f"), "strategy_actual_equity": controller.state["actual_equity"],
-        "reconciliation_status": "informational_only_current_balance_not_used_as_history_start",
+        "api_balance": format(balance, "f"), "actual_balance": controller.state["actual_balance"],
+        "shadow_balance": controller.state["shadow_balance"],
+        "difference": None if current_difference is None else format(current_difference, "f"),
+        "reconciliation_status": "within_tolerance" if controller.balance_reconciled else "discrepancy_exceeds_tolerance",
     })
     controller.state["reconciliation"] = reconciliation
     controller.state["history_sync"] = {
@@ -1725,7 +1908,6 @@ async def _reconcile_command(args: argparse.Namespace) -> int:
     rest = KalshiREST(api_key, pem_path, bool_value(os.getenv("KALSHI_DEMO", "false")))
     try:
         await synchronize_history(controller, KalshiRawHistoryAPI(rest), trader_state)
-        controller.bootstrap_from_live_ledger(trader_state)
         controller.save()
     finally:
         await rest.close()

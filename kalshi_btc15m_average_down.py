@@ -1561,6 +1561,20 @@ class KalshiREST:
             LOG.warning("Balance lookup failed: %s", exc)
             return None
 
+    async def balance_decimal(self) -> Decimal | None:
+        """Read the authenticated cash balance without binary-float accounting."""
+
+        try:
+            response = await self.portfolio.get_balance()
+            dollars = field(response, "balance_dollars")
+            if dollars is not None:
+                return Decimal(str(dollars))
+            cents = field(response, "balance")
+            return Decimal(str(cents)) / Decimal("100") if cents is not None else None
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning("Decimal balance lookup failed: %s", exc)
+            return None
+
     async def position_for_ticker(self, ticker: str) -> float | None:
         """Return the signed live Kalshi position for one market.
 
@@ -2718,8 +2732,8 @@ def build_equity_regime_decision(
     )
 
 
-def account_equity_regime_finalization(
-    regime: EquityRegimeController, record: dict[str, Any], market: Any | None, *, dry_run: bool,
+async def account_equity_regime_finalization(
+    rest: KalshiREST, regime: EquityRegimeController, record: dict[str, Any], market: Any | None, *, dry_run: bool,
 ) -> None:
     """Append one finalized active-strategy market exactly once to both curves."""
     if record.get("regime_accounted"):
@@ -2734,6 +2748,9 @@ def account_equity_regime_finalization(
     )
     if close_time is None:
         return
+    actual_balance_after = await rest.balance_decimal()
+    if actual_balance_after is None:
+        raise RuntimeError("Cannot account an equity-regime market without authenticated current Kalshi balance")
     selected_side = record.get("locked_side") or record.get("candidate_side")
     suppressed = bool(record.get("regime_live_entry_suppressed"))
     # ``execution_mode`` is the source of truth for this historical market.
@@ -2764,6 +2781,7 @@ def account_equity_regime_finalization(
             "reconciliation_status": "pending_api_reconciliation",
         },
         actual_was_live=actual_was_live,
+        actual_balance_after=actual_balance_after,
     )
     record["regime_accounted"] = True
 
@@ -6290,7 +6308,6 @@ async def run_settlement_only(args: argparse.Namespace) -> int:
             regime_config, regime_state_path, args.equity_regime_output_dir.expanduser(),
         )
         try:
-            replayed = regime.bootstrap_from_live_ledger(state)
             await synchronize_history(regime, KalshiRawHistoryAPI(rest), state)
             # Every finalized record present before this process started is
             # historical scope.  The controller bootstrapped/reconciled its
@@ -6307,9 +6324,10 @@ async def run_settlement_only(args: argparse.Namespace) -> int:
                     record["regime_accounted"] = True
             regime.save()
             LOG.warning(
-                "EQUITY REGIME STARTUP | history=%d replayed=%d window=%s min_history=%d dry_run=%s live_control=%s",
-                regime_config.history_max_markets, replayed, regime_config.prophet_training_window,
+                "EQUITY REGIME STARTUP | history=%d window=%s min_history=%d dry_run=%s live_control=%s actual_balance=%s shadow_balance=%s reconciled=%s",
+                regime_config.history_max_markets, regime_config.prophet_training_window,
                 regime_config.prophet_min_history, regime_config.dry_run, regime_config.controls_live_execution,
+                regime.state.get("actual_balance"), regime.state.get("shadow_balance"), regime.balance_reconciled,
             )
         except Exception as exc:  # noqa: BLE001 - accounting failure must never control a live entry
             LOG.exception("EQUITY REGIME STARTUP FAILED | %s", exc)
@@ -6425,8 +6443,8 @@ async def run_settlement_only(args: argparse.Namespace) -> int:
                             market_for_regime = None
                             if outcome not in {"yes", "no"}:
                                 market_for_regime = await rest.get_market(ticker)
-                            account_equity_regime_finalization(
-                                regime, record, market_for_regime, dry_run=dry_run,
+                            await account_equity_regime_finalization(
+                                rest, regime, record, market_for_regime, dry_run=dry_run,
                             )
                         continue
                     market = await rest.get_market(ticker)
@@ -6446,7 +6464,7 @@ async def run_settlement_only(args: argparse.Namespace) -> int:
                     ):
                         await submit_ladder(rest, record, market, config, record_dry_run)
                     if regime is not None and record.get("status") in FINAL_RECORD_STATUSES:
-                        account_equity_regime_finalization(regime, record, market, dry_run=dry_run)
+                        await account_equity_regime_finalization(rest, regime, record, market, dry_run=dry_run)
                 last_order_reconcile_at = monotonic_now
                 last_private_update_count = feed.private_update_count
             # A settlement or completed 5c stop above may have changed the
@@ -6489,7 +6507,7 @@ async def run_settlement_only(args: argparse.Namespace) -> int:
                         LOG.warning(
                             "LIVE ENTRY SUPPRESSED BY EQUITY REGIME | %s side=%s shadow=%s P10=%s P90=%s; "
                             "shadow decision continues and no real order was created.",
-                            ticker, side.upper(), regime.state["shadow_equity"],
+                            ticker, side.upper(), regime.state["shadow_balance"],
                             regime.state.get("last_p10"), regime.state.get("last_p90"),
                         )
                         continue
