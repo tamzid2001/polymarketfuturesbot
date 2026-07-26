@@ -1520,9 +1520,14 @@ class KalshiREST:
         if aiohttp is None:
             raise RuntimeError("aiohttp is required for Kalshi history synchronization")
         normalized_path = "/" + path.lstrip("/")
+        # Kalshi signs the complete path from the host root.  ``base_url``
+        # already contains /trade-api/v2, but API helpers receive endpoint
+        # paths relative to it; signing just /portfolio/fills would therefore
+        # fail authentication even though the request URL is correct.
+        signature_path = "/trade-api/v2" + normalized_path
         last_error: Exception | None = None
         for attempt in range(4):
-            headers = {"Accept": "application/json", **self.auth.create_auth_headers("GET", normalized_path)}
+            headers = {"Accept": "application/json", **self.auth.create_auth_headers("GET", signature_path)}
             try:
                 async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as session:
                     async with session.get(self.base_url + normalized_path, params=params or {}, headers=headers) as response:
