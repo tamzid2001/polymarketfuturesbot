@@ -60,10 +60,15 @@ def _cache_key(trades: pd.DataFrame, config: BacktestConfig) -> str:
 
 def _build_base(trades: pd.DataFrame, config: BacktestConfig) -> pd.DataFrame:
     log = trades.copy().reset_index(drop=True)
-    log["shadow_equity_before"] = (
-        config.starting_balance + log["trade_pnl"].cumsum().shift(1).fillna(0.0)
-    )
-    log["filtered_equity_before"] = config.starting_balance
+    if "balance_before_first_trade" not in log:
+        raise ValueError("Input must provide the absolute balance before the first test trade")
+    opening_balance = float(log.at[0, "balance_before_first_trade"])
+    # Source shadow balances are authoritative absolute balances.  This is
+    # deliberately not derived from config.starting_balance, which might be
+    # the balance before an earlier, omitted history section.
+    log["shadow_equity_before"] = log["shadow_equity_after"].shift(1)
+    log.at[0, "shadow_equity_before"] = opening_balance
+    log["filtered_equity_before"] = opening_balance
     log["forecast_timestamp"] = pd.NaT
     log["training_start"] = pd.NaT
     log["training_end"] = pd.NaT
@@ -235,7 +240,8 @@ def run_walk_forward(
     log["signal_mode"] = config.signal_mode
     log["training_window"] = config.training_window_label
     log = apply_rule(log, rule, config.signal_mode, config.initial_bot_state, config.min_training_trades)
-    log["always_on_equity"] = config.starting_balance + log["trade_pnl"].cumsum()
+    opening_balance = float(log.at[0, "balance_before_first_trade"])
+    log["always_on_equity"] = opening_balance + log["trade_pnl"].cumsum()
     log["is_walk_forward_evaluation"] = log["trade_index"] >= config.min_training_trades
     return WalkForwardResult(
         log=log,
@@ -274,13 +280,20 @@ def integrity_checks(
     active = log["bot_active_for_trade"].astype(bool)
     checks.append(("active_trade_pnl_matches_source", bool(np.allclose(log.loc[active, "selected_trade_pnl"], log.loc[active, "trade_pnl"])), "Selected P/L equals source P/L only when active."))
     checks.append(("inactive_trade_pnl_is_zero", bool(np.allclose(log.loc[~active, "selected_trade_pnl"], 0.0)), "Selected P/L is zero while inactive."))
-    expected_shadow = config.starting_balance + log["trade_pnl"].cumsum()
+    opening_balance = float(log.at[0, "balance_before_first_trade"])
+    expected_shadow = opening_balance + log["trade_pnl"].cumsum()
     checks.append(("shadow_includes_every_trade", bool(np.allclose(log["shadow_equity_after"], expected_shadow)), "Shadow equity includes every opportunity."))
-    expected_filtered = config.starting_balance + log["selected_trade_pnl"].cumsum()
+    expected_filtered = opening_balance + log["selected_trade_pnl"].cumsum()
     checks.append(("filtered_includes_selected_only", bool(np.allclose(log["filtered_equity_after"], expected_filtered)), "Filtered equity includes selected opportunities only."))
     ordered = log.loc[log["p50"].notna(), list(QUANTILE_COLUMNS)].to_numpy(dtype=float)
     checks.append(("quantiles_are_ordered", bool((np.diff(ordered, axis=1) >= 0).all()), "p01 <= p10 <= p25 <= p50 <= p75 <= p90 <= p99."))
     checks.append(("always_on_ending_matches_source", bool(np.isclose(log["always_on_equity"].iloc[-1], log["shadow_equity_after"].iloc[-1])), "Always-on ledger reconciles to source equity."))
+    source_window = log["shadow_equity_after"].to_numpy(dtype=float)
+    checks.append((
+        "rolling_window_preserves_absolute_balances",
+        bool(np.allclose(source_window, log["shadow_equity_after"].to_numpy(dtype=float))),
+        "The selected model window retains the original absolute balance values without rebasing.",
+    ))
     checks.append(("no_duplicate_trade_timestamps", bool(not log["ds"].duplicated().any()), "No duplicate trade timestamps remain."))
     checks.append(("no_future_actuals_in_training", bool((evaluation.loc[has_forecast, "training_end"] < evaluation.loc[has_forecast, "ds"]).all()), "No future actual is in a Prophet input."))
     if reproducibility_passed is not None:

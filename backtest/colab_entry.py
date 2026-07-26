@@ -17,7 +17,7 @@ from .run_backtest import main
 def run_uploaded_csv(
     input_format: str = "kalshi",
     output_dir: str = "outputs",
-    starting_balance: float = 100.0,
+    starting_balance: float | None = None,
     min_training_trades: int = 100,
 ) -> int:
     """Open Colab's upload picker and run the same CLI implementation."""
@@ -26,6 +26,8 @@ def run_uploaded_csv(
         from google.colab import files
     except ImportError as exc:  # keeps normal Python imports honest.
         raise RuntimeError("run_uploaded_csv is intended for Google Colab") from exc
+    if starting_balance is None:
+        raise ValueError("starting_balance must be the verified balance before the first source trade")
     uploaded = files.upload()
     if not uploaded:
         raise RuntimeError("No CSV was uploaded")

@@ -20,7 +20,10 @@ class BacktestConfig:
     into an earlier forecast.
     """
 
-    starting_balance: float = 100.0
+    # This is provenance for P/L-only inputs and must be explicitly supplied
+    # by the CLI.  Runtime accounting uses the absolute balance carried by the
+    # input rows, never this value to rebase a selected lookback window.
+    starting_balance: float | None = None
     max_trades: int = 200
     min_training_trades: int = 100
     training_window: int | None = None
@@ -40,7 +43,7 @@ class BacktestConfig:
     save_every: int = 25
 
     def __post_init__(self) -> None:
-        if self.starting_balance <= 0:
+        if self.starting_balance is not None and self.starting_balance <= 0:
             raise ValueError("starting_balance must be positive")
         if self.min_training_trades < 2:
             raise ValueError("min_training_trades must be at least 2")
@@ -63,7 +66,7 @@ class BacktestConfig:
         return asdict(self)
 
 
-PRIMARY_CONFIGURATION = BacktestConfig()
+PRIMARY_CONFIGURATION = BacktestConfig(starting_balance=100.0)
 
 
 def output_paths(output_dir: str | Path) -> dict[str, Path]:

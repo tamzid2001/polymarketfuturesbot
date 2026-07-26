@@ -41,7 +41,7 @@ def create_charts(log: pd.DataFrame, calibration: pd.DataFrame, output_dir: str 
     plt.figure(figsize=(14, 7))
     plt.plot(x, log["always_on_equity"], label="Always-on equity", linewidth=1.8)
     plt.plot(x, log["filtered_equity_after"], label="P10/P90 filtered equity", linewidth=2.2, linestyle="--")
-    plt.axhline(config.starting_balance, color="black", linestyle=":", label="Starting balance")
+    plt.axhline(float(log.iloc[0]["balance_before_first_trade"]), color="black", linestyle=":", label="Opening balance")
     plt.scatter(entry["ds"], entry["filtered_equity_after"], marker="^", s=60, color="green", label="Entry signal")
     plt.scatter(exit_["ds"], exit_["filtered_equity_after"], marker="v", s=60, color="red", label="Exit signal")
     _finish(root / "equity_comparison.png", "Walk-forward equity comparison")

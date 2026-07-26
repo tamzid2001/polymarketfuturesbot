@@ -19,11 +19,12 @@ class NoLookAheadTest(unittest.TestCase):
             "state_before_trade": ["off", "off"], "state_after_trade": ["off", "off"],
             "bot_active_for_trade": [False, False], "selected_trade_pnl": [0.0, 0.0],
             "trade_pnl": [0.0, 0.0], "shadow_equity_after": [100.0, 100.0],
+            "balance_before_first_trade": [100.0, 100.0],
             "filtered_equity_after": [100.0, 100.0], "always_on_equity": [100.0, 100.0],
             "is_walk_forward_evaluation": [False, True],
         })
         with self.assertRaises(AssertionError):
-            integrity_checks(log, BacktestConfig())
+            integrity_checks(log, BacktestConfig(starting_balance=100.0))
 
 
 if __name__ == "__main__":

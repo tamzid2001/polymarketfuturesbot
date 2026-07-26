@@ -54,7 +54,27 @@ def _ensure_unique_timestamps(frame: pd.DataFrame, source: str) -> None:
         )
 
 
-def load_kalshi_positions(path: str | Path, starting_balance: float) -> pd.DataFrame:
+def _require_verified_starting_balance(starting_balance: float | None, source: str) -> float:
+    """Return an explicitly supplied opening balance.
+
+    A realized-P/L export has no account-balance snapshots.  Reconstructing an
+    *absolute* balance curve therefore requires a verified balance immediately
+    before its first included trade; silently substituting $100 creates a P/L
+    index, not equity.
+    """
+
+    if starting_balance is None:
+        raise ValueError(
+            "Cannot construct an absolute balance curve because the account "
+            f"balance before the first {source} trade is unknown. Supply "
+            "--starting-balance with a verified historical balance."
+        )
+    if not np.isfinite(starting_balance) or starting_balance <= 0:
+        raise ValueError("starting_balance must be a positive verified dollar balance")
+    return float(starting_balance)
+
+
+def load_kalshi_positions(path: str | Path, starting_balance: float | None) -> pd.DataFrame:
     """Read original Kalshi closed positions and return chronological trade P/L.
 
     Only byte-for-byte-equivalent economic records are removed.  Two rows that
@@ -62,6 +82,7 @@ def load_kalshi_positions(path: str | Path, starting_balance: float) -> pd.DataF
     retained and subsequently rejected as ambiguous duplicate timestamps.
     """
 
+    opening_balance = _require_verified_starting_balance(starting_balance, "Kalshi")
     raw = pd.read_csv(path)
     raw.columns = raw.columns.str.strip()
     if "Ticker" not in raw:
@@ -91,11 +112,13 @@ def load_kalshi_positions(path: str | Path, starting_balance: float) -> pd.DataF
         }
     ).sort_values("ds", kind="stable").reset_index(drop=True)
     _ensure_unique_timestamps(result, "Kalshi input")
-    result["shadow_equity_after"] = starting_balance + result["trade_pnl"].cumsum()
+    result["shadow_equity_after"] = opening_balance + result["trade_pnl"].cumsum()
+    result["balance_before_first_trade"] = opening_balance
+    result["balance_source"] = "reconstructed_from_verified_starting_balance"
     return result
 
 
-def load_equity_curve(path: str | Path, starting_balance: float) -> pd.DataFrame:
+def load_equity_curve(path: str | Path, starting_balance: float | None) -> pd.DataFrame:
     """Read a ``ds,y`` equity curve and recover realized per-trade P/L."""
 
     raw = pd.read_csv(path)
@@ -112,28 +135,34 @@ def load_equity_curve(path: str | Path, starting_balance: float) -> pd.DataFrame
     if clean["ds"].duplicated().any():
         raise ValueError("Equity CSV has conflicting duplicate timestamps and cannot be safely replayed")
 
-    # A common exported format begins with an explicit $100 starting row.  It
-    # is an observation, not a trade, so do not turn it into a zero-P/L trade.
-    if np.isclose(float(clean.iloc[0]["y"]), starting_balance):
+    opening_balance = _require_verified_starting_balance(starting_balance, "equity-curve")
+    # Preserve the absolute values exactly as supplied.  A rolling lookback
+    # may later select a subset of these rows, but it must never turn them
+    # into a $100 + cumulative-P/L index.  If the first point is an explicit
+    # opening-balance snapshot it is not an opportunity and is removed only
+    # when the user supplied that exact verified balance.
+    if np.isclose(float(clean.iloc[0]["y"]), opening_balance):
         clean = clean.iloc[1:].copy()
     if clean.empty:
-        raise ValueError("Equity CSV contains only the starting-balance row")
+        raise ValueError("Equity CSV contains only the opening-balance snapshot")
 
     pnl = clean["y"].diff()
-    pnl.iloc[0] = clean.iloc[0]["y"] - starting_balance
+    pnl.iloc[0] = clean.iloc[0]["y"] - opening_balance
     result = pd.DataFrame(
         {
             "ds": clean["ds"].to_numpy(),
             "ticker": clean.get("ticker", pd.Series([pd.NA] * len(clean))).to_numpy(),
             "trade_pnl": pnl.astype(float).to_numpy(),
             "shadow_equity_after": clean["y"].astype(float).to_numpy(),
+            "balance_before_first_trade": opening_balance,
+            "balance_source": "absolute_equity_csv",
         }
     )
     _ensure_unique_timestamps(result, "equity input")
     return result.reset_index(drop=True)
 
 
-def load_input(path: str | Path, input_format: str, starting_balance: float) -> pd.DataFrame:
+def load_input(path: str | Path, input_format: str, starting_balance: float | None) -> pd.DataFrame:
     if input_format == "kalshi":
         result = load_kalshi_positions(path, starting_balance)
     elif input_format == "equity":
@@ -146,20 +175,20 @@ def load_input(path: str | Path, input_format: str, starting_balance: float) -> 
     return result
 
 
-def most_recent_trades(trades: pd.DataFrame, max_trades: int, starting_balance: float) -> pd.DataFrame:
-    """Keep the newest bounded trade universe and rebuild its shadow equity.
+def most_recent_trades(trades: pd.DataFrame, max_trades: int, starting_balance: float | None = None) -> pd.DataFrame:
+    """Keep the newest bounded trade universe without rebasing balances.
 
-    The reference files contain a starting-balance row plus 200 trades.  When
-    a later export has older history too, retaining rows alone would leave
-    ``shadow_equity_after`` anchored to omitted P/L.  Rebuilding from the
-    configured balance preserves the defined 200-trade experiment.
+    ``max_trades`` controls only which complete observations Prophet sees. It
+    never changes the supplied absolute balance values.  The retained window's
+    opening balance is the actual balance immediately before its first trade.
     """
 
     if max_trades < 1:
         raise ValueError("max_trades must be positive")
     result = trades.tail(max_trades).copy().reset_index(drop=True)
     result["trade_index"] = np.arange(len(result), dtype=int)
-    result["shadow_equity_after"] = starting_balance + result["trade_pnl"].cumsum()
+    opening_balance = float(result.iloc[0]["shadow_equity_after"] - result.iloc[0]["trade_pnl"])
+    result["balance_before_first_trade"] = opening_balance
     if (result["shadow_equity_after"] <= 0).any():
         raise ValueError("The selected recent-trade shadow equity is non-positive")
     return result

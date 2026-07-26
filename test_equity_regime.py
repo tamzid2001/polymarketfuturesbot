@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import tempfile
 import unittest
 from datetime import UTC, datetime, timedelta
@@ -79,6 +80,31 @@ def decision(ticker: str, generated: datetime) -> StrategyDecision:
 
 
 class EquityRegimeTests(unittest.TestCase):
+    def test_legacy_rebased_state_is_archived_and_reinitialized_at_api_balance(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state_path = root / "state.json"
+            state_path.write_text(json.dumps({
+                "format_version": 1,
+                "actual_equity": "662.8476",
+                "shadow_equity": "662.8476",
+                "forecasts": [{"p01": "600", "p10": "620", "p25": "640", "p50": "660", "p75": "680", "p90": "700", "p99": "720"}],
+                "actual_history": [{"market_ticker": "legacy"}],
+                "shadow_history": [{"market_ticker": "legacy"}],
+            }), encoding="utf-8")
+            controller = EquityRegimeController(
+                RegimeConfig(enabled=True, dry_run=True, prophet_min_history=2), state_path, root / "outputs",
+            )
+            controller.initialize_absolute_balances(Decimal("80.13"), reason="test_legacy_migration")
+            self.assertEqual(Decimal(controller.state["actual_balance"]), Decimal("80.13"))
+            self.assertEqual(Decimal(controller.state["shadow_balance"]), Decimal("80.13"))
+            self.assertEqual(controller.state["forecasts"], [])
+            self.assertEqual(controller.state["actual_history"], [])
+            self.assertEqual(controller.state["shadow_history"], [])
+            self.assertTrue(controller.state["balance_reconciled"])
+            self.assertEqual(controller.state["legacy_migration"]["legacy_shadow_value"], "662.8476")
+            self.assertTrue(list(root.glob("state.legacy-rebased-*.json")))
+
     def test_history_merge_paginates_routes_and_deduplicates_fill_ids(self) -> None:
         config = RegimeConfig(enabled=True, dry_run=True, prophet_min_history=2, history_max_markets=200)
         state = {"markets": {"KXBTC15M-A": {"orders": {"x": {"order_id": "owned"}}}}}
@@ -168,10 +194,11 @@ class EquityRegimeTests(unittest.TestCase):
             root = Path(temporary)
             config = RegimeConfig(enabled=True, dry_run=True, prophet_min_history=2, prophet_training_window=None)
             controller = EquityRegimeController(config, root / "state.json", root / "outputs")
+            controller.initialize_absolute_balances(Decimal("100"), reason="test")
             now = datetime.now(tz=UTC)
             controller.state["shadow_history"] = [
-                {"market_ticker": "old1", "market_close_time": (now - timedelta(hours=2)).isoformat(), "completed_at": (now - timedelta(hours=2)).isoformat(), "shadow_equity": "100"},
-                {"market_ticker": "old2", "market_close_time": (now - timedelta(hours=1)).isoformat(), "completed_at": (now - timedelta(hours=1)).isoformat(), "shadow_equity": "100"},
+                {"market_ticker": "old1", "market_close_time": (now - timedelta(hours=2)).isoformat(), "completed_at": (now - timedelta(hours=2)).isoformat(), "shadow_balance_after": "100"},
+                {"market_ticker": "old2", "market_close_time": (now - timedelta(hours=1)).isoformat(), "completed_at": (now - timedelta(hours=1)).isoformat(), "shadow_balance_after": "100"},
             ]
             controller.forecaster = FakeForecaster("95", "100.50")
             first = decision("KXBTC15M-T1", now)
@@ -180,7 +207,7 @@ class EquityRegimeTests(unittest.TestCase):
             self.assertEqual(controller.state["forecast_target_ticker"], first.target_ticker)
             self.assertEqual(controller.state["prophet_training_rows"], 2)
             controller.state["shadow_open"][first.target_ticker].update({"status": "finalized", "shadow_realized_pnl": "1", "contracts": "0"})
-            controller.close_market(ticker=first.target_ticker, outcome="yes", market_close_time=first.target_close_time, actual_realized_pnl=Decimal("0"))
+            controller.close_market(ticker=first.target_ticker, outcome="yes", market_close_time=first.target_close_time, actual_realized_pnl=Decimal("0"), actual_balance_after=Decimal("100"))
             # T1 was processed under the on state; P90 becomes off only for T2.
             self.assertEqual(controller.state["live_vs_shadow"][-1]["live_execution_enabled"], True)
             self.assertFalse(controller.execution_enabled_for_market())
@@ -192,17 +219,17 @@ class EquityRegimeTests(unittest.TestCase):
                 "status": "finalized", "shadow_realized_pnl": "-2", "contracts": "0",
                 "shadow_simulation_quality": "conservative_approximation",
             })
-            controller.close_market(ticker=second.target_ticker, outcome="no", market_close_time=second.target_close_time, actual_realized_pnl=Decimal("0"))
+            controller.close_market(ticker=second.target_ticker, outcome="no", market_close_time=second.target_close_time, actual_realized_pnl=Decimal("0"), actual_balance_after=Decimal("100"))
             # T2 was skipped live in the simulated regime; P10 restarts T3.
             self.assertEqual(controller.state["live_vs_shadow"][-1]["live_execution_enabled"], False)
-            self.assertEqual(Decimal(controller.state["actual_equity"]), Decimal("100"))
-            self.assertEqual(Decimal(controller.state["shadow_equity"]), Decimal("99"))
+            self.assertEqual(Decimal(controller.state["actual_balance"]), Decimal("100"))
+            self.assertEqual(Decimal(controller.state["shadow_balance"]), Decimal("99"))
             self.assertTrue(controller.execution_enabled_for_market())
             self.assertFalse(controller.should_suppress_new_live_orders())  # dry-run is never an execution switch
             restored = EquityRegimeController(config, root / "state.json", root / "outputs")
             self.assertTrue(restored.execution_enabled_for_market())
             rows_before = len(restored.state["shadow_history"])
-            restored.close_market(ticker=second.target_ticker, outcome="no", market_close_time=second.target_close_time, actual_realized_pnl=Decimal("0"))
+            restored.close_market(ticker=second.target_ticker, outcome="no", market_close_time=second.target_close_time, actual_realized_pnl=Decimal("0"), actual_balance_after=Decimal("100"))
             self.assertEqual(len(restored.state["shadow_history"]), rows_before)
             for forecast in restored.state["forecasts"]:
                 self.assertLess(forecast["training_end"], forecast["forecast_target_time"])
@@ -212,9 +239,10 @@ class EquityRegimeTests(unittest.TestCase):
             root = Path(temporary)
             config = RegimeConfig(enabled=True, dry_run=True, prophet_min_history=2, history_max_markets=2)
             controller = EquityRegimeController(config, root / "state.json", root / "outputs")
+            controller.initialize_absolute_balances(Decimal("100"), reason="test")
             close = datetime.now(tz=UTC).isoformat()
-            controller.state["actual_history"] = [{"market_ticker": str(index), "market_close_time": close, "actual_equity": "100"} for index in range(3)]
-            controller.state["shadow_history"] = [{"market_ticker": str(index), "market_close_time": close, "shadow_equity": "100"} for index in range(3)]
+            controller.state["actual_history"] = [{"market_ticker": str(index), "market_close_time": close, "actual_balance_after": "100"} for index in range(3)]
+            controller.state["shadow_history"] = [{"market_ticker": str(index), "market_close_time": close, "shadow_balance_after": "100"} for index in range(3)]
             controller.state["forecasts"] = []
             controller.state["live_vs_shadow"] = [{"market_ticker": str(index)} for index in range(3)]
             controller.state["processed_market_tickers"] = [str(index) for index in range(3)]
@@ -227,6 +255,7 @@ class EquityRegimeTests(unittest.TestCase):
             root = Path(temporary)
             config = RegimeConfig(enabled=True, dry_run=True, prophet_min_history=2, shadow_fill_model="conservative_trade_through")
             controller = EquityRegimeController(config, root / "state.json", root / "outputs")
+            controller.initialize_absolute_balances(Decimal("100"), reason="test")
             now = datetime.now(tz=UTC)
             target = decision("KXBTC15M-LIVE", now)
             controller.start_market(target)
@@ -237,6 +266,7 @@ class EquityRegimeTests(unittest.TestCase):
                 actual_realized_pnl=Decimal("0.60"),
                 actual_metadata={"contracts_bought": "1", "entry_cost": "0.40", "settlement_payout": "1", "fees": "0"},
                 actual_was_live=True,
+                actual_balance_after=Decimal("100.60"),
             )
             shadow = controller.state["shadow_history"][-1]
             self.assertEqual(Decimal(shadow["shadow_realized_pnl"]), Decimal("0.60"))
@@ -253,10 +283,11 @@ class EquityRegimeTests(unittest.TestCase):
                 prophet_training_window=None,
             )
             controller = EquityRegimeController(config, root / "state.json", root / "outputs")
+            controller.initialize_absolute_balances(Decimal("100"), reason="test")
             now = datetime.now(tz=UTC)
             controller.state["shadow_history"] = [
-                {"market_ticker": "old1", "market_close_time": (now - timedelta(hours=2)).isoformat(), "completed_at": (now - timedelta(hours=2)).isoformat(), "shadow_equity": "100"},
-                {"market_ticker": "old2", "market_close_time": (now - timedelta(hours=1)).isoformat(), "completed_at": (now - timedelta(hours=1)).isoformat(), "shadow_equity": "100"},
+                {"market_ticker": "old1", "market_close_time": (now - timedelta(hours=2)).isoformat(), "completed_at": (now - timedelta(hours=2)).isoformat(), "shadow_balance_after": "100"},
+                {"market_ticker": "old2", "market_close_time": (now - timedelta(hours=1)).isoformat(), "completed_at": (now - timedelta(hours=1)).isoformat(), "shadow_balance_after": "100"},
             ]
             controller.forecaster = FakeForecaster("95", "100.50")
             current = decision("KXBTC15M-CURRENT", now)
@@ -268,6 +299,7 @@ class EquityRegimeTests(unittest.TestCase):
                 market_close_time=current.target_close_time,
                 actual_realized_pnl=Decimal("1"),
                 actual_was_live=True,
+                actual_balance_after=Decimal("101"),
             )
             self.assertFalse(controller.execution_enabled_for_market())
             self.assertTrue(controller.should_suppress_new_live_orders())
@@ -278,6 +310,7 @@ class EquityRegimeTests(unittest.TestCase):
             root = Path(temporary)
             config = RegimeConfig(enabled=True, dry_run=False, allow_live_state_transitions=True, prophet_min_history=2)
             controller = EquityRegimeController(config, root / "state.json", root / "outputs")
+            controller.initialize_absolute_balances(Decimal("100"), reason="test")
             generated = datetime.now(tz=UTC)
             target = decision("KXBTC15M-LIVE-FINAL", generated)
             controller.start_market(target)
@@ -295,11 +328,14 @@ class EquityRegimeTests(unittest.TestCase):
                 "kalshi_fees": "0",
                 "net_profit_loss": "0.60",
             }
-            trader.account_equity_regime_finalization(controller, record, None, dry_run=False)
+            class FakeRest:
+                async def balance_decimal(self) -> Decimal:
+                    return Decimal("100.60")
+            asyncio.run(trader.account_equity_regime_finalization(FakeRest(), controller, record, None, dry_run=False))
             self.assertTrue(record["regime_accounted"])
-            self.assertEqual(Decimal(controller.state["actual_equity"]), Decimal("100.60"))
-            self.assertEqual(Decimal(controller.state["shadow_equity"]), Decimal("100.60"))
-            trader.account_equity_regime_finalization(controller, record, None, dry_run=False)
+            self.assertEqual(Decimal(controller.state["actual_balance"]), Decimal("100.60"))
+            self.assertEqual(Decimal(controller.state["shadow_balance"]), Decimal("100.60"))
+            asyncio.run(trader.account_equity_regime_finalization(FakeRest(), controller, record, None, dry_run=False))
             self.assertEqual(len(controller.state["actual_history"]), 1)
 
 

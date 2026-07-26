@@ -49,12 +49,14 @@ jobs:
             fi
           fi
 
+          # Absolute-balance migration/reconciliation must complete before the
+          # regime can alter real-order state. This watchdog cannot bypass it.
           gh workflow run kalshi_btc15m_average_down.yml \
             --repo "$REPOSITORY" --ref main \
             -f live_trading=true \
             -f enable_dynamic_scaling=true \
             -f equity_regime_enabled=true \
-            -f equity_regime_dry_run=false \
+            -f equity_regime_dry_run=true \
             -f prophet_min_history=100 \
             -f prophet_refit_every_markets=1 \
             -f shadow_fill_model=conservative_trade_through \
