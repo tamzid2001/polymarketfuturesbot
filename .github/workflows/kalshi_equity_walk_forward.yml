@@ -1,0 +1,83 @@
+name: Kalshi Equity Prophet Walk-Forward Backtest
+
+on:
+  push:
+    branches:
+      - agent/kalshi-equity-walk-forward
+  workflow_dispatch:
+    inputs:
+      input_csv:
+        description: "Repository-relative closed-position or ds/y equity CSV"
+        required: true
+        default: "backtest/data/closed-positions-2026-07-26.csv"
+      input_format:
+        description: "kalshi for original closed positions; equity for ds,y input"
+        required: true
+        type: choice
+        options: [kalshi, equity]
+        default: kalshi
+      starting_balance:
+        description: "Starting balance in dollars"
+        required: true
+        default: "100"
+      min_training_trades:
+        description: "Primary minimum completed shadow-equity observations"
+        required: true
+        default: "100"
+      run_sensitivity:
+        description: "Run declared one-factor-at-a-time sensitivity matrix"
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  walk-forward-equity-backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install isolated backtest dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements_equity_backtest.txt
+
+      - name: Run automated integrity and unit tests
+        run: python -m unittest discover -s backtest/tests -v
+
+      - name: Run full strict walk-forward analysis
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: |
+          args=(
+            --input "${{ inputs.input_csv }}"
+            --input-format "${{ inputs.input_format }}"
+            --starting-balance "${{ inputs.starting_balance }}"
+            --min-training-trades "${{ inputs.min_training_trades }}"
+            --refit-every 1
+            --signal-mode level
+            --output-dir outputs
+          )
+          if [ "${{ inputs.run_sensitivity }}" != "true" ]; then
+            args+=(--no-run-sensitivity)
+          fi
+          python -m backtest.run_backtest "${args[@]}"
+
+      - name: Upload complete analysis artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kalshi-equity-walk-forward-${{ github.run_id }}
+          path: outputs/
+          if-no-files-found: warn
+          retention-days: 30

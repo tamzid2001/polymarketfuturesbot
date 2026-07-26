@@ -646,6 +646,38 @@ every 100 predictions by default, including the current win/loss streak and
 the longest win/loss streak. Set the workflow's `metrics_every` input to
 change that cadence.
 
+### Equity-curve Prophet walk-forward backtest
+
+`backtest.run_backtest` is a separate, read-only equity-regime study. It uses
+the always-on shadow equity—including every original opportunity while the
+filtered bot is off—to make one-step-ahead Prophet forecasts. The P10-entry /
+P90-exit state is changed only after a trade closes and is applied only to the
+next trade. It does not change any live-bot setting, order, state file, or
+workflow.
+
+```bash
+python -m pip install -r requirements_equity_backtest.txt
+python -m backtest.run_backtest \
+  --input "closed-positions.csv" \
+  --input-format kalshi \
+  --starting-balance 100 \
+  --min-training-trades 100 \
+  --refit-every 1 \
+  --signal-mode level \
+  --output-dir outputs
+```
+
+The manual **Kalshi Equity Prophet Walk-Forward Backtest** Action runs this
+same primary configuration and the declared one-factor-at-a-time sensitivity
+matrix, then uploads CSV audit logs, integrity results, charts, and the
+Markdown report as an artifact. Its default input is the checked-in current
+closed-position snapshot at `backtest/data/closed-positions-2026-07-26.csv`.
+For a Colab-compatible entry point, clone/upload the repository and run the
+same `python -m backtest.run_backtest ...` command after installing
+`requirements_equity_backtest.txt`. Or, in a notebook, call
+`from backtest.colab_entry import run_uploaded_csv; run_uploaded_csv()` to use
+the Colab upload picker and invoke the identical primary and sensitivity run.
+
 ### Prophet normal/inverse selector replay
 
 **“Kalshi Prophet Selector Historical Backtest”** is a separate manual Action
