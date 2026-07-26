@@ -59,7 +59,7 @@ def sensitivity_configs(primary: BacktestConfig) -> list[tuple[str, str, Backtes
         specs.append(("min_training_trades", str(value), replace(primary, min_training_trades=value)))
     for value in (75, 100, 150, 200):
         specs.append(("training_window", str(value), replace(primary, training_window=value)))
-    for value in (4, 5, 8, 10, 16):
+    for value in (4, 5, 8, 10, 16, 25, 50, 75):
         specs.append(("refit_every_n_trades", str(value), replace(primary, refit_every_n_trades=value)))
     for value in (0.01, 0.10, 0.25):
         specs.append(("changepoint_prior_scale", str(value), replace(primary, changepoint_prior_scale=value)))
