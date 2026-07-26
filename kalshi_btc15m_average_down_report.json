@@ -1,16 +1,17 @@
 {
-  "active_markets": 1,
+  "active_markets": 0,
   "average_contracts_per_trade": 18.8988,
   "average_entry_price": 0.214516,
   "configuration": {
     "accounting_tolerance": "0.01",
-    "allow_live_state_transitions": false,
+    "allow_endpoint_anchored_ledger_bootstrap": true,
+    "allow_live_state_transitions": true,
     "base_share_increment": 1.0,
     "bot_client_order_prefix": "settlement-contrarian-",
     "bot_order_group_id": null,
     "cooldown_state_source": "separate",
     "enable_dynamic_scaling": true,
-    "equity_regime_dry_run": true,
+    "equity_regime_dry_run": false,
     "equity_regime_enabled": true,
     "fee_reserve": 0.05,
     "format_version": 19,
@@ -34,11 +35,13 @@
     "prophet_changepoint_prior_scale": 0.05,
     "prophet_daily_seasonality": true,
     "prophet_enabled": true,
-    "prophet_min_history": 100,
+    "prophet_forecast_frequency_minutes": 15,
+    "prophet_future_horizon_markets": 100,
+    "prophet_min_history": 200,
     "prophet_random_seed": 42,
     "prophet_refit_every_markets": 1,
     "prophet_seasonality_prior_scale": 10.0,
-    "prophet_training_window": 75,
+    "prophet_training_window": 200,
     "prophet_uncertainty_samples": 2000,
     "prophet_use_log_transform": true,
     "prophet_weekly_seasonality": false,
@@ -114,7 +117,7 @@
   },
   "exit_policy": "hold every filled contract to settlement; only fresh full-depth selected-side bid <= $0.05 triggers a reduce-only close",
   "five_cent_stop_exits": 141,
-  "generated_at": "2026-07-26T23:33:19.736425+00:00",
+  "generated_at": "2026-07-26T23:34:52.318682+00:00",
   "last_closed_trade": {
     "closed_at": "2026-07-26T23:30:12.694519+00:00",
     "contracts": 9.0,
@@ -159,21 +162,21 @@
     },
     "0.30": {
       "canceled_unfilled_orders": 84,
-      "filled_contracts": 1066.0,
-      "filled_order_submissions": 209,
+      "filled_contracts": 1060.0,
+      "filled_order_submissions": 208,
       "resting_orders": 2,
       "rung_price": 0.3,
-      "submitted_contracts": 1494.0,
-      "submitted_orders": 295
+      "submitted_contracts": 1488.0,
+      "submitted_orders": 294
     },
     "0.40": {
       "canceled_unfilled_orders": 49,
-      "filled_contracts": 623.0,
-      "filled_order_submissions": 245,
+      "filled_contracts": 620.0,
+      "filled_order_submissions": 244,
       "resting_orders": 0,
       "rung_price": 0.4,
-      "submitted_contracts": 744.0,
-      "submitted_orders": 294
+      "submitted_contracts": 741.0,
+      "submitted_orders": 293
     }
   },
   "rung_performance": {
