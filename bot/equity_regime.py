@@ -218,6 +218,10 @@ class RegimeConfig:
     # same KXBTC15M market manually.  It is disabled by default and exists
     # only for a deliberately documented legacy import.
     allow_series_ticker_ownership_fallback: bool = False
+    # ``account_series`` matches the supplied Colab workflow: use every
+    # closed account market in the configured series, including manual
+    # activity, solely to construct Prophet's balance input.
+    prophet_history_source: str = "bot_owned"
     prophet_enabled: bool = True
     prophet_min_history: int = 200
     # A lookback is a row selector, never a P/L rebase.  The production
@@ -270,6 +274,8 @@ class RegimeConfig:
             raise ValueError("prophet_forecast_frequency_minutes must be positive")
         if self.history_max_markets < self.prophet_min_history:
             raise ValueError("history_max_markets must be at least prophet_min_history")
+        if self.prophet_history_source not in {"bot_owned", "account_series"}:
+            raise ValueError("prophet_history_source must be bot_owned or account_series")
         if self.shadow_fill_model not in {"conservative_trade_through", "touch", "live_equivalent"}:
             raise ValueError("unsupported shadow_fill_model")
         if self.scaling_equity_source not in {"actual", "shadow", "disabled_while_off"}:
@@ -302,6 +308,7 @@ class RegimeConfig:
             allow_series_ticker_ownership_fallback=bool_value(
                 pick("allow_series_ticker_ownership_fallback", False),
             ),
+            prophet_history_source=str(pick("prophet_history_source", "bot_owned")),
             prophet_enabled=bool_value(pick("prophet_enabled", True), True),
             prophet_min_history=int(pick("prophet_min_history", 200)),
             prophet_training_window=None if window in {None, "", "None", "none"} else int(window),
@@ -385,6 +392,7 @@ def default_regime_state(config: RegimeConfig) -> dict[str, Any]:
         "balance_source": "uninitialized_requires_authenticated_balance",
         "balance_reconciled": False,
         "balance_reconciliation_error": "not_initialized",
+        "prophet_history_ready": False,
         "legacy_migration": None,
         "balance_adjustments": [],
         "execution_enabled": True,
@@ -709,6 +717,8 @@ class HistorySyncResult:
     cutoff: datetime | None
     fills: list[NormalizedFill]
     settlements: list[NormalizedSettlement]
+    series_fills: list[NormalizedFill]
+    series_settlements: list[NormalizedSettlement]
     duplicate_fills_removed: int
     ambiguous_fills: list[dict[str, Any]]
     owned_fill_audit: list[dict[str, Any]]
@@ -758,6 +768,11 @@ class HistoricalSynchronizer:
             api, "/portfolio/settlements", params=live_request, list_keys=("settlements", "market_settlements"),
         )
         balance_payload = await api.get_json("/portfolio/balance", {"subaccount": self.config.subaccount})
+        # Keep the complete normalized account-series set separately from the
+        # bot-owned subset.  The latter remains the accounting source for the
+        # strategy; the former is used only when the operator explicitly
+        # selects the Colab-compatible account-series Prophet input.
+        all_deduplicated: dict[tuple[str, ...], NormalizedFill] = {}
         deduplicated: dict[tuple[str, ...], NormalizedFill] = {}
         duplicate_count = 0
         ambiguous: list[dict[str, Any]] = []
@@ -773,9 +788,10 @@ class HistoricalSynchronizer:
                 or (self.config.history_end_ts and fill.created_at and fill.created_at > self.config.history_end_ts)
             ):
                 continue
-            if fill.dedupe_key in deduplicated:
+            if fill.dedupe_key in all_deduplicated:
                 duplicate_count += 1
                 continue
+            all_deduplicated[fill.dedupe_key] = fill
             evidence = ownership_evidence(fill, self.config, self.local_order_ids, self.local_tickers)
             if evidence is None:
                 ambiguous.append({
@@ -801,6 +817,9 @@ class HistoricalSynchronizer:
                     economic_price=price_for_economic_side(fill.raw, economic_side),
                     order_role=order_metadata["order_role"],
                 )
+                # The account-series curve must account bot reduce-only exits
+                # with the same economic side/action as bot accounting.
+                all_deduplicated[fill.dedupe_key] = fill
             deduplicated[fill.dedupe_key] = fill
             owned_fill_audit.append({
                 "ownership_evidence": evidence,
@@ -827,6 +846,7 @@ class HistoricalSynchronizer:
         owned_tickers = {fill.ticker for fill in deduplicated.values()}
         ambiguous_tickers = {str(row.get("ticker")) for row in ambiguous if row.get("ticker")}
         settlements: list[NormalizedSettlement] = []
+        series_settlement_by_ticker: dict[str, NormalizedSettlement] = {}
         owned_settlement_audit: list[dict[str, Any]] = []
         ambiguous_settlement_audit: list[dict[str, Any]] = []
         for row in raw_settlements:
@@ -845,6 +865,16 @@ class HistoricalSynchronizer:
                 "raw_api_record": raw_record_text(settlement.raw),
             }
             if (
+                settlement.ticker.startswith(self.config.series_ticker + "-")
+                and not (
+                    (self.config.history_start_ts and settlement.settled_at and settlement.settled_at < self.config.history_start_ts)
+                    or (self.config.history_end_ts and settlement.settled_at and settlement.settled_at > self.config.history_end_ts)
+                )
+            ):
+                existing = series_settlement_by_ticker.get(settlement.ticker)
+                if existing is None or (settlement.settled_at or datetime.min.replace(tzinfo=UTC)) > (existing.settled_at or datetime.min.replace(tzinfo=UTC)):
+                    series_settlement_by_ticker[settlement.ticker] = settlement
+            if (
                 settlement.ticker in owned_tickers
                 and not (
                     (self.config.history_start_ts and settlement.settled_at and settlement.settled_at < self.config.history_start_ts)
@@ -861,11 +891,19 @@ class HistoricalSynchronizer:
                 ambiguous_settlement_audit.append(settlement_audit)
         fills = sorted(deduplicated.values(), key=lambda item: (item.created_at or datetime.min.replace(tzinfo=UTC), item.fill_id))
         settlements.sort(key=lambda item: (item.settled_at or datetime.min.replace(tzinfo=UTC), item.ticker))
+        series_fills = sorted(
+            (fill for fill in all_deduplicated.values() if fill.ticker.startswith(self.config.series_ticker + "-")),
+            key=lambda item: (item.created_at or datetime.min.replace(tzinfo=UTC), item.fill_id),
+        )
+        series_settlements = sorted(
+            series_settlement_by_ticker.values(),
+            key=lambda item: (item.settled_at or datetime.min.replace(tzinfo=UTC), item.ticker),
+        )
         owned_fill_audit.sort(key=lambda item: (item["created_at"], item["fill_id"]))
         owned_settlement_audit.sort(key=lambda item: (item["settled_at"], item["ticker"]))
         ambiguous_settlement_audit.sort(key=lambda item: (item["settled_at"], item["ticker"]))
         return HistorySyncResult(
-            cutoff, fills, settlements, duplicate_count, ambiguous,
+            cutoff, fills, settlements, series_fills, series_settlements, duplicate_count, ambiguous,
             owned_fill_audit, owned_settlement_audit, ambiguous_settlement_audit, balance_payload,
         )
 
@@ -1413,6 +1451,10 @@ class EquityRegimeController:
                 "balance_source": "authenticated_api_balance_initialization",
                 "balance_reconciled": True,
                 "balance_reconciliation_error": None,
+                # The empty curve is safe but cannot forecast until it meets
+                # prophet_min_history.  This flag distinguishes it from a
+                # missing/invalid history source.
+                "prophet_history_ready": True,
                 "state_reason": reason,
             })
             self.state["forecasts"] = []
@@ -1425,6 +1467,7 @@ class EquityRegimeController:
         self.state["balance_reconciliation_error"] = None if self.balance_reconciled else format(difference, "f")
         if not self.balance_reconciled:
             self.state["forecasts"] = []
+            self.state["prophet_history_ready"] = False
             self.state["execution_enabled"] = True
             self.state["state_reason"] = "actual_balance_api_reconciliation_failed"
             LOG.error(
@@ -1520,8 +1563,120 @@ class EquityRegimeController:
             "forecasts": [], "future_forecast_snapshot": [], "transitions": [], "live_vs_shadow": [],
             "balance_source": "reconstructed_from_verified_historical_starting_balance",
             "balance_reconciled": True, "balance_reconciliation_error": None,
+            "prophet_history_ready": True,
         })
         LOG.info("ABSOLUTE BALANCE HISTORY REBUILT | rows=%d start=%s end=%s", len(ordered), historical_starting_balance, actual)
+        return True
+
+    def rebuild_colab_reference_account_series_history(
+        self,
+        rows: Iterable[ReconstructedMarket],
+        *,
+        api_current_balance: Decimal,
+    ) -> bool:
+        """Build the exact $100-plus-cumulative-P/L Colab-style input.
+
+        This deliberately does not attribute P/L to the bot and does not use
+        the current API cash balance as an anchor.  It mirrors the reference
+        notebook's construction: sort closed KXBTC15M markets by ticker clock,
+        retain the last ``history_max_markets`` rows, place one configured
+        starting-balance observation immediately before them, then accumulate
+        their realized P/L.  API cash is retained separately as ``actual``
+        operational balance and is not a prerequisite for Prophet bands.
+        """
+
+        candidates: list[tuple[datetime, ReconstructedMarket]] = []
+        for row in rows:
+            observed = ticker_clock_timestamp(row.market_ticker, row.market_close_time)
+            if observed is None or not row.market_ticker.startswith(self.config.series_ticker + "-"):
+                continue
+            candidates.append((observed, row))
+        candidates.sort(key=lambda item: (item[0], item[1].market_ticker))
+        selected = candidates[-self.config.history_max_markets :]
+        if len(selected) < self.config.prophet_min_history:
+            LOG.error(
+                "COLAB ACCOUNT-SERIES HISTORY UNAVAILABLE | closed_rows=%d requires=%d",
+                len(selected), self.config.prophet_min_history,
+            )
+            self.state["prophet_history_ready"] = False
+            return False
+
+        balance = self.config.starting_balance
+        actual_history: list[dict[str, Any]] = []
+        shadow_history: list[dict[str, Any]] = []
+        for observed, row in selected:
+            before = balance
+            balance += row.realized_pnl
+            observed_text = timestamp_text(observed)
+            completed = timestamp_text(row.market_close_time or observed)
+            common = {
+                "timestamp": observed_text,
+                "market_ticker": row.market_ticker,
+                "market_close_time": observed_text,
+                "completed_at": completed,
+            }
+            actual_history.append({
+                **common,
+                "actual_balance_before": format(before, "f"),
+                "actual_realized_pnl": format(row.realized_pnl, "f"),
+                "actual_balance_after": format(balance, "f"),
+                "execution_enabled_for_market": True,
+                "state_before_market": "on", "state_after_market": "on",
+                "balance_source": "colab_reference_account_series", "reconciled": False,
+                "selected_side": row.selected_side,
+                "contracts_bought": format(row.contracts_bought, "f"),
+                "contracts_sold": format(row.contracts_sold, "f"),
+                "average_entry": None if row.average_entry is None else format(row.average_entry, "f"),
+                "entry_cost": format(row.entry_cost, "f"),
+                "exit_proceeds": format(row.exit_proceeds, "f"),
+                "settlement_payout": format(row.settlement_payout, "f"),
+                "fees": format(row.fees, "f"), "exit_method": row.exit_method,
+                "source": row.source,
+                "reconciliation_status": "not_requested_colab_reference_history",
+            })
+            shadow_history.append({
+                **common,
+                "shadow_balance_before": format(before, "f"),
+                "shadow_market_pnl": format(row.realized_pnl, "f"),
+                "shadow_realized_pnl": format(row.realized_pnl, "f"),
+                "shadow_balance_after": format(balance, "f"),
+                "shadow_selected_side": row.selected_side,
+                "shadow_eligible": row.contracts_bought > ZERO,
+                "shadow_skip_reason": None, "shadow_contracts": format(row.contracts_bought, "f"),
+                "shadow_average_entry": None if row.average_entry is None else format(row.average_entry, "f"),
+                "shadow_cost": format(row.entry_cost, "f"), "shadow_proceeds": format(row.exit_proceeds, "f"),
+                "shadow_payout": format(row.settlement_payout, "f"), "shadow_fees": format(row.fees, "f"),
+                "shadow_exit_method": row.exit_method, "shadow_fill_model": "account_series_replay",
+                "shadow_simulation_quality": "exact_replay", "live_execution_enabled": True,
+            })
+
+        first_observed = selected[0][0]
+        anchor_time = first_observed - timedelta(minutes=15)
+        self.state.update({
+            "historical_starting_balance": format(self.config.starting_balance, "f"),
+            # Keep operational cash distinct from the notebook-model balance.
+            "actual_balance": format(api_current_balance, "f"),
+            "shadow_balance": format(balance, "f"),
+            "actual_balance_anchor": {
+                "market_ticker": "__STARTING_BALANCE__", "market_close_time": timestamp_text(anchor_time),
+                "completed_at": timestamp_text(anchor_time), "actual_balance_after": format(self.config.starting_balance, "f"),
+            },
+            "shadow_balance_anchor": {
+                "market_ticker": "__STARTING_BALANCE__", "market_close_time": timestamp_text(anchor_time),
+                "completed_at": timestamp_text(anchor_time), "shadow_balance_after": format(self.config.starting_balance, "f"),
+            },
+            "actual_history": actual_history, "shadow_history": shadow_history,
+            "processed_market_tickers": [row.market_ticker for _, row in selected],
+            "forecasts": [], "future_forecast_snapshot": [], "transitions": [], "live_vs_shadow": [], "shadow_open": {},
+            "balance_source": "colab_reference_account_series_starting_balance",
+            "balance_reconciled": False, "balance_reconciliation_error": "not_requested_for_colab_reference_history",
+            "prophet_history_ready": True,
+            "state_reason": "colab_reference_account_series_history_rebuilt",
+        })
+        LOG.warning(
+            "COLAB ACCOUNT-SERIES HISTORY BUILT | rows=%d anchor=%s ending_shadow=%s api_cash=%s",
+            len(selected), self.config.starting_balance, balance, api_current_balance,
+        )
         return True
 
     def save(self) -> None:
@@ -1581,8 +1736,12 @@ class EquityRegimeController:
     def execution_enabled_for_market(self) -> bool:
         return bool(self.state["execution_enabled"])
 
+    @property
+    def prophet_history_ready(self) -> bool:
+        return bool_value(self.state.get("prophet_history_ready"), False)
+
     def should_suppress_new_live_orders(self) -> bool:
-        return self.config.controls_live_execution and self.balance_reconciled and not self.execution_enabled_for_market()
+        return self.config.controls_live_execution and self.prophet_history_ready and not self.execution_enabled_for_market()
 
     def _shadow_rows_before(self, decision_time: datetime) -> list[dict[str, Any]]:
         rows = [
@@ -1608,8 +1767,8 @@ class EquityRegimeController:
         for item in self.state["forecasts"]:
             if item.get("forecast_target_ticker") == decision.target_ticker:
                 return item
-        if not self.balance_reconciled:
-            LOG.error("PROPHET FORECAST SKIPPED | target=%s balance curve is unreconciled", decision.target_ticker)
+        if not self.prophet_history_ready:
+            LOG.error("PROPHET FORECAST SKIPPED | target=%s balance history is not ready", decision.target_ticker)
             return None
         training = self._shadow_rows_before(decision.generated_at)
         if not self.config.prophet_enabled or len(training) < self.config.prophet_min_history:
@@ -1889,7 +2048,15 @@ class EquityRegimeController:
         # actual and shadow on the same absolute balance scale; the separate
         # realized-P/L columns retain the market P/L for performance analysis.
         actual_balance_change = actual_after - actual_before
-        shadow_balance_change = actual_balance_change if actual_was_live else shadow_pnl
+        # Colab-reference history is a $starting_balance + cumulative realized
+        # P/L curve.  Continue that curve with market P/L even while orders
+        # are live; never replace a synthetic model observation with the
+        # portfolio cash delta (which includes entry reservation timing).
+        shadow_balance_change = (
+            shadow_pnl
+            if self.config.prophet_history_source == "account_series"
+            else (actual_balance_change if actual_was_live else shadow_pnl)
+        )
         shadow_after = shadow_before + shadow_balance_change
         if actual_after <= ZERO or shadow_after <= ZERO:
             raise RuntimeError("equity update would make balance non-positive; manual intervention is required")
@@ -1974,8 +2141,8 @@ class EquityRegimeController:
             # Persist the *model's* state even in dry-run.  Dry-run therefore
             # tests a realistic sequence of stop/restart decisions; only the
             # separate controls_live_execution predicate may suppress orders.
-            transition_recorded = transition_requested and self.config.enabled and self.balance_reconciled
-            live_execution_effective = transition_requested and self.config.controls_live_execution and self.balance_reconciled
+            transition_recorded = transition_requested and self.config.enabled and self.prophet_history_ready
+            live_execution_effective = transition_requested and self.config.controls_live_execution and self.prophet_history_ready
             if transition_recorded:
                 self.state["execution_enabled"] = desired_state
                 self.state["state_reason"] = "shadow_balance_at_or_below_p10" if entry else "shadow_balance_at_or_above_p90"
@@ -2188,6 +2355,7 @@ class EquityRegimeController:
             "forecasts": [], "future_forecast_snapshot": [], "transitions": [], "live_vs_shadow": [], "shadow_open": {},
             "balance_source": "authenticated_endpoint_anchored_durable_live_bot_ledger",
             "balance_reconciled": True, "balance_reconciliation_error": None,
+            "prophet_history_ready": True,
             "state_reason": "absolute_200_market_ledger_bootstrap",
             "ledger_endpoint_bootstrap": {
                 "authenticated_ending_balance": format(api_current_balance, "f"),
@@ -2430,6 +2598,14 @@ async def synchronize_history(controller: EquityRegimeController, api: JsonAPI, 
         result.ambiguous_settlement_audit,
     )
     reconstructed = reconstruct_realized_pnl(result.fills, result.settlements)[-controller.config.history_max_markets :]
+    # The Colab reference CSV contains only closed positions.  A fill in an
+    # active market must never become a premature balance observation merely
+    # because it already appears in /portfolio/fills.
+    settled_series_tickers = {item.ticker for item in result.series_settlements}
+    series_reconstructed = [
+        row for row in reconstruct_realized_pnl(result.series_fills, result.series_settlements)
+        if row.market_ticker in settled_series_tickers
+    ]
     ledger_pnl = {
         str(record.get("ticker")): decimal_value(record.get("net_profit_loss"))
         for record in (trader_state.get("markets") or {}).values()
@@ -2469,7 +2645,13 @@ async def synchronize_history(controller: EquityRegimeController, api: JsonAPI, 
     if raw_balance is None:
         raise RuntimeError("/portfolio/balance returned no usable balance; refusing regime initialization")
     balance = decimal_value(balance_dollars) if balance_dollars is not None else decimal_value(raw_balance) / Decimal("100")
-    if controller.config.historical_starting_balance is not None:
+    if controller.config.prophet_history_source == "account_series":
+        controller.migrate_legacy_rebased_state(balance)
+        controller.rebuild_colab_reference_account_series_history(
+            series_reconstructed,
+            api_current_balance=balance,
+        )
+    elif controller.config.historical_starting_balance is not None:
         controller.migrate_legacy_rebased_state(balance)
         controller.rebuild_absolute_history(
             reconstructed,
@@ -2500,6 +2682,8 @@ async def synchronize_history(controller: EquityRegimeController, api: JsonAPI, 
         "historical_live_cutoff": timestamp_text(result.cutoff), "fills": len(result.fills),
         "settlements": len(result.settlements), "duplicate_fills_removed": result.duplicate_fills_removed,
         "ambiguous_fills": len(result.ambiguous_fills),
+        "series_fills": len(result.series_fills), "series_settlements": len(result.series_settlements),
+        "prophet_history_source": controller.config.prophet_history_source,
     }
     if result.fills:
         controller.state["last_processed_fill_id"] = result.fills[-1].fill_id or None

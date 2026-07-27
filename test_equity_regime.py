@@ -13,6 +13,7 @@ from bot.equity_regime import (
     EquityRegimeController,
     HistoricalSynchronizer,
     LadderOrder,
+    ReconstructedMarket,
     RegimeConfig,
     ShadowExecutor,
     StrategyDecision,
@@ -368,6 +369,39 @@ class EquityRegimeTests(unittest.TestCase):
             self.assertEqual(Decimal(controller.state["historical_starting_balance"]), Decimal("99.00"))
             self.assertTrue(controller.balance_reconciled)
             self.assertEqual(controller.state["balance_source"], "authenticated_endpoint_anchored_durable_live_bot_ledger")
+
+    def test_colab_account_series_history_uses_starting_balance_without_api_reconciliation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = RegimeConfig(
+                enabled=True, dry_run=False, allow_live_state_transitions=True,
+                starting_balance=Decimal("100"), prophet_min_history=2,
+                history_max_markets=2, prophet_training_window=3,
+                prophet_history_source="account_series",
+            )
+            controller = EquityRegimeController(config, root / "state.json", root / "outputs")
+
+            def row(ticker: str, pnl: str) -> ReconstructedMarket:
+                return ReconstructedMarket(
+                    market_ticker=ticker, market_close_time=datetime(2026, 7, 26, tzinfo=UTC), selected_side="yes",
+                    contracts_bought=Decimal("1"), contracts_sold=Decimal("0"), average_entry=Decimal("0.4"),
+                    entry_cost=Decimal("0.4"), exit_proceeds=Decimal("0"), settlement_payout=Decimal("1"),
+                    fees=Decimal("0"), realized_pnl=Decimal(pnl), exit_method="settlement",
+                    source="portfolio", reconciliation_status="reconstructed",
+                )
+
+            self.assertTrue(controller.rebuild_colab_reference_account_series_history(
+                [row("KXBTC15M-26JUL260000-00", "1.50"), row("KXBTC15M-26JUL260015-15", "-0.50")],
+                api_current_balance=Decimal("80.13"),
+            ))
+            self.assertEqual(
+                [Decimal(item["shadow_balance_after"]) for item in controller.state["shadow_history"]],
+                [Decimal("101.50"), Decimal("101.00")],
+            )
+            self.assertEqual(Decimal(controller.state["shadow_balance"]), Decimal("101.00"))
+            self.assertEqual(Decimal(controller.state["actual_balance"]), Decimal("80.13"))
+            self.assertTrue(controller.prophet_history_ready)
+            self.assertFalse(controller.balance_reconciled)
 
     def test_hundred_row_diagnostic_forecast_uses_only_first_row_for_live_filter(self) -> None:
         class HorizonForecaster:
