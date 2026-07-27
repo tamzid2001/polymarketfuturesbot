@@ -346,6 +346,10 @@ class EquityRegimeTests(unittest.TestCase):
                     "KXBTC15M-A": {
                         "ticker": "KXBTC15M-A", "status": "finalized", "market_close_time": (now - timedelta(minutes=30)).isoformat(),
                         "net_profit_loss": "1.50", "locked_side": "yes", "contracts": "3", "total_cost": "1.50", "gross_payout": "3",
+                        # Historical terminal records can retain a stale
+                        # position snapshot and must not block the new
+                        # endpoint-anchored 200-market bootstrap.
+                        "exchange_position_contracts": "-3",
                     },
                     "KXBTC15M-B": {
                         "ticker": "KXBTC15M-B", "status": "exited_early", "market_close_time": (now - timedelta(minutes=15)).isoformat(),
