@@ -2,12 +2,73 @@
 
 from __future__ import annotations
 
+from decimal import Decimal
+from pathlib import Path
+import tempfile
 import unittest
 
-from bot.equity_regime import HistoricalSynchronizer, RegimeConfig, reconstruct_realized_pnl
+from bot.equity_regime import (
+    EquityRegimeController,
+    HistoricalSynchronizer,
+    RegimeConfig,
+    reconstruct_realized_pnl,
+    synchronize_history,
+)
 
 
 class HistorySyncAuditTests(unittest.IsolatedAsyncioTestCase):
+    async def test_colab_closed_positions_source_survives_startup_sync(self) -> None:
+        """Startup must publish CSV-based—not endpoint-ledger—Prophet bands."""
+
+        class HorizonForecaster:
+            fit_number = 0
+            last_future_timestamps = []
+
+            def forecast_horizon(self, observations, target_time, horizon_markets):
+                self.fit_number += 1
+                self.last_future_timestamps = [target_time]
+                return [{
+                    "p01": Decimal("90"), "p10": Decimal("95"), "p25": Decimal("97"),
+                    "p50": Decimal("100"), "p75": Decimal("103"), "p90": Decimal("105"),
+                    "p99": Decimal("110"),
+                }]
+
+        class API:
+            async def get_json(self, path, params=None):
+                if path == "/historical/cutoff":
+                    return {"trades_created_ts": "2026-05-27T00:00:00Z"}
+                if path in {"/historical/fills", "/portfolio/fills"}:
+                    return {"fills": []}
+                if path == "/portfolio/settlements":
+                    return {"settlements": []}
+                if path == "/portfolio/balance":
+                    return {"balance_dollars": "80.13"}
+                raise AssertionError(path)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            export = root / "closed-positions.csv"
+            export.write_text(
+                "Ticker,Total return ($)\n"
+                "KXBTC15M-26JUL260000-00,$1.00\n"
+                "KXBTC15M-26JUL260015-15,-$1.50\n",
+                encoding="utf-8",
+            )
+            config = RegimeConfig(
+                enabled=True, dry_run=True, prophet_history_source="account_series",
+                prophet_reference_closed_positions_path=export, starting_balance=Decimal("100"),
+                prophet_min_history=2, history_max_markets=2, prophet_training_window=3,
+            )
+            controller = EquityRegimeController(config, root / "state.json", root / "outputs")
+            controller.forecaster = HorizonForecaster()
+            await synchronize_history(controller, API(), {"markets": {}})
+
+            self.assertEqual(controller.state["balance_source"], "colab_reference_closed_positions_csv")
+            self.assertEqual(Decimal(controller.state["shadow_balance"]), Decimal("99.50"))
+            self.assertEqual(controller.state["last_p10"], "95")
+            self.assertEqual(controller.state["last_p50"], "100")
+            self.assertEqual(controller.state["last_p90"], "105")
+
     async def test_exports_ownership_evidence_and_manual_settlement_without_counting_it(self) -> None:
         manual_ticker = "KXBTC15M-26JUL262100-00"
         bot_ticker = "KXBTC15M-26JUL262115-15"
