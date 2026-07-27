@@ -34,13 +34,10 @@ class HistorySyncAuditTests(unittest.IsolatedAsyncioTestCase):
                 }]
 
         class API:
+            calls: list[str] = []
+
             async def get_json(self, path, params=None):
-                if path == "/historical/cutoff":
-                    return {"trades_created_ts": "2026-05-27T00:00:00Z"}
-                if path in {"/historical/fills", "/portfolio/fills"}:
-                    return {"fills": []}
-                if path == "/portfolio/settlements":
-                    return {"settlements": []}
+                self.calls.append(path)
                 if path == "/portfolio/balance":
                     return {"balance_dollars": "80.13"}
                 raise AssertionError(path)
@@ -68,6 +65,8 @@ class HistorySyncAuditTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(controller.state["last_p10"], "95")
             self.assertEqual(controller.state["last_p50"], "100")
             self.assertEqual(controller.state["last_p90"], "105")
+            self.assertEqual(API.calls, ["/portfolio/balance"])
+            self.assertTrue(controller.state["history_sync"]["historical_api_sync_skipped"])
 
     async def test_exports_ownership_evidence_and_manual_settlement_without_counting_it(self) -> None:
         manual_ticker = "KXBTC15M-26JUL262100-00"
