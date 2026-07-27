@@ -30,10 +30,15 @@ class SettlementTraderTests(unittest.IsolatedAsyncioTestCase):
     def test_default_three_share_ladder_and_reserve(self) -> None:
         config = trader.validate_config({})
         self.assertTrue(config["enable_dynamic_scaling"])
+        self.assertEqual(config["prophet_refit_every_markets"], 1)
         self.assertEqual(trader.live_rung_quantities(config), {0.40: 3.0, 0.30: 6.0, 0.20: 9.0, 0.10: 12.0})
         self.assertEqual(config["max_contracts_per_market"], 30.0)
         self.assertEqual(config["max_total_capital"], 6.0)
         self.assertEqual(trader.ladder_principal_for_rungs(trader.live_rung_quantities(config)), 6.0)
+
+    def test_live_config_cannot_restore_a_multi_market_prophet_refit_cadence(self) -> None:
+        config = trader.validate_config({"prophet_refit_every_markets": 75})
+        self.assertEqual(config["prophet_refit_every_markets"], 1)
 
     def test_equity_regime_shadow_decision_uses_the_same_dynamic_1_2_3_4_ladder(self) -> None:
         config = trader.validate_config({"enable_dynamic_scaling": True})

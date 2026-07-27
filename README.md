@@ -32,14 +32,14 @@ The live report and periodic `LIVE DYNAMIC BASE SCALING` log include the active 
 
 ### Live Prophet equity regime
 
-The live controller is enabled with live state transitions (`equity_regime_enabled=true`, `equity_regime_dry_run=false`). It retains the most recent 200 completed markets, fits the exploratory 75-market rolling Prophet configuration after 100 completed shadow observations, and applies a P90/P10 signal only to the next eligible market.
+The live controller is enabled with live state transitions (`equity_regime_enabled=true`, `equity_regime_dry_run=false`). It retains the most recent 200 completed markets, refits Prophet for the next eligible market after every finalized balance observation, and applies a P90/P10 signal only to that next market.
 
 - It stops new real entries after a saved shadow-equity P90 observation and leaves already-filled positions to the existing 5¢ stop or settlement logic.
 - While stopped, it still creates the same immutable settlement-contrarian shadow decision. A base share of **3** therefore produces shadow limits of **3/6/9/12** at **40¢/30¢/20¢/10¢**, exactly matching the live ladder. The shadow fill model uses only post-decision public trades and is explicitly a conservative approximation, not a queue-aware replay.
 - Dynamic base-share scaling remains sourced from **actual realized P/L** (`scaling_equity_source=actual`). Hypothetical shadow gains while the bot is stopped cannot increase real or shadow ladder size. The current actual base is persisted with the live state and is used for both live and shadow decisions.
 - A P10 observation restarts real entry placement for the following eligible market. The controller persists its state, forecasts, shadow curve, and actual curve under `data/`; the workflow includes them in checkpoints and audit artifacts.
 
-The 75-market setting is exploratory sensitivity evidence, not an unbiased live-performance claim. Its P10–P90 interval coverage was poor in the strict 200-trade review, so the saved forecast and shadow-simulation records should be monitored rather than treated as a deployment guarantee.
+The retained diagnostic horizon is exploratory sensitivity evidence, not an unbiased live-performance claim. Its P10–P90 interval coverage was poor in the strict 200-trade review, so the saved forecast and shadow-simulation records should be monitored rather than treated as a deployment guarantee.
 
 ## Operations
 

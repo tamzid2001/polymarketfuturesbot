@@ -63,11 +63,6 @@ on:
         required: false
         type: string
         default: ""
-      prophet_refit_every_markets:
-        description: "Refit frequency in completed closed-position observations."
-        required: false
-        type: string
-        default: ""
       shadow_fill_model:
         description: "Off-state shadow fill assumption. Trade-through is conservative but remains an approximation."
         required: false
@@ -150,7 +145,6 @@ jobs:
           EQUITY_REGIME_ENABLED: ${{ inputs.equity_regime_enabled }}
           EQUITY_REGIME_DRY_RUN: ${{ inputs.equity_regime_dry_run }}
           PROPHET_MIN_HISTORY: ${{ inputs.prophet_min_history }}
-          PROPHET_REFIT_EVERY_MARKETS: ${{ inputs.prophet_refit_every_markets }}
           SHADOW_FILL_MODEL: ${{ inputs.shadow_fill_model }}
           STARTING_BALANCE: ${{ inputs.starting_balance }}
           RUN_SECONDS: ${{ inputs.run_seconds || 19500 }}
@@ -174,7 +168,6 @@ jobs:
             [ "$EQUITY_REGIME_DRY_RUN" = "true" ] && args+=(--equity-regime-dry-run) || args+=(--no-equity-regime-dry-run)
           fi
           [ -z "$PROPHET_MIN_HISTORY" ] || args+=(--prophet-min-history "$PROPHET_MIN_HISTORY")
-          [ -z "$PROPHET_REFIT_EVERY_MARKETS" ] || args+=(--prophet-refit-every-markets "$PROPHET_REFIT_EVERY_MARKETS")
           [ -z "$SHADOW_FILL_MODEL" ] || args+=(--shadow-fill-model "$SHADOW_FILL_MODEL")
           [ -z "$STARTING_BALANCE" ] || args+=(--starting-balance "$STARTING_BALANCE")
           if [ "$LIVE_TRADING" = "true" ]; then
@@ -224,7 +217,6 @@ jobs:
           regime_enabled="$(python -c 'import json; c=json.load(open("kalshi_btc15m_average_down_config.json")); print(str(bool(c.get("equity_regime_enabled", True))).lower())')"
           regime_dry_run="$(python -c 'import json; c=json.load(open("kalshi_btc15m_average_down_config.json")); print(str(bool(c.get("equity_regime_dry_run", False))).lower())')"
           prophet_min_history="$(python -c 'import json; c=json.load(open("kalshi_btc15m_average_down_config.json")); print(c.get("prophet_min_history", 100))')"
-          prophet_refit_every_markets="$(python -c 'import json; c=json.load(open("kalshi_btc15m_average_down_config.json")); print(c.get("prophet_refit_every_markets", 1))')"
           shadow_fill_model="$(python -c 'import json; c=json.load(open("kalshi_btc15m_average_down_config.json")); print(c.get("shadow_fill_model", "conservative_trade_through"))')"
           starting_balance="$(python -c 'import json; c=json.load(open("kalshi_btc15m_average_down_config.json")); print(c.get("starting_balance", "100.00"))')"
           gh workflow run kalshi_btc15m_average_down.yml --repo "$GITHUB_REPOSITORY" --ref main \
@@ -235,7 +227,6 @@ jobs:
             -f equity_regime_enabled="$regime_enabled" \
             -f equity_regime_dry_run="$regime_dry_run" \
             -f prophet_min_history="$prophet_min_history" \
-            -f prophet_refit_every_markets="$prophet_refit_every_markets" \
             -f shadow_fill_model="$shadow_fill_model" \
             -f starting_balance="$starting_balance"
           echo "HANDOFF QUEUED | next run keeps the persisted base size, dynamic-scaling settings, and settlement-only exit policy."

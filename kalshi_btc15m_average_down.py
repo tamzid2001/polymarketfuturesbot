@@ -164,7 +164,10 @@ DEFAULT_CONFIG = {
     "prophet_enabled": True,
     "prophet_min_history": 200,
     "prophet_training_window": 201,
-    "prophet_refit_every_markets": 75,
+    # The live P10/P90 gate must use a fit that includes the most recently
+    # finalized balance observation.  A multi-market horizon is still written
+    # for diagnostics, but it is never reused after a balance update.
+    "prophet_refit_every_markets": 1,
     "prophet_future_horizon_markets": 100,
     "prophet_forecast_frequency_minutes": 15,
     "prophet_use_log_transform": True,
@@ -513,11 +516,31 @@ def checkpoint_projection(value: Any) -> Any:
     return value
 
 
-def checkpoint_fingerprint(state: dict[str, Any], config: dict[str, Any]) -> str:
-    """Hash material strategy state without writing secrets or quote noise."""
+def checkpoint_fingerprint(
+    state: dict[str, Any], config: dict[str, Any], extra_paths: tuple[Path, ...] = (),
+) -> str:
+    """Hash material state, including durable equity-regime ledgers.
+
+    The settlement ledger changes whenever a closed market is accounted, but
+    an equity-regime-only change need not modify the main trader state.  Hash
+    the explicitly checkpointed companion files too, so the in-run publisher
+    cannot skip a shadow-balance update that the next Actions handoff needs.
+    """
+
+    extra_files: list[dict[str, str | None]] = []
+    for path in extra_paths:
+        resolved = path.expanduser().resolve()
+        try:
+            content_hash = hashlib.sha256(resolved.read_bytes()).hexdigest() if resolved.is_file() else None
+        except OSError:
+            # The normal end-of-run checkpoint can still create a file that
+            # did not exist at initialization; include its path deterministically.
+            content_hash = None
+        extra_files.append({"path": str(resolved), "sha256": content_hash})
     payload = {
         "state": checkpoint_projection(state),
         "config": checkpoint_projection(config),
+        "extra_files": extra_files,
     }
     encoded = json.dumps(payload, sort_keys=True, default=str, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
@@ -632,13 +655,13 @@ class StateCheckpointPublisher:
             report_path=report_path,
             extra_paths=extra_paths,
             config=config,
-            last_fingerprint=checkpoint_fingerprint(state, config),
+            last_fingerprint=checkpoint_fingerprint(state, config, extra_paths),
             enabled=enabled,
             target_branch=target_branch,
         )
 
     def publish_if_changed(self, state: dict[str, Any], reason: str) -> bool:
-        current = checkpoint_fingerprint(state, self.config)
+        current = checkpoint_fingerprint(state, self.config, self.extra_paths)
         if current == self.last_fingerprint:
             return False
         if not self.enabled:
@@ -713,6 +736,11 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
     # may arrive at any time in this post-open submission window.  This fixed
     # value prevents old state or Action inputs from silently shortening it.
     merged["settlement_contrarian_entry_grace_seconds"] = SETTLEMENT_CONTRARIAN_ENTRY_GRACE_SECONDS
+    # A prediction can only control the next live entry after it incorporates
+    # the prior finalized balance observation.  Keep the old config key for
+    # state-file compatibility, but do not allow a workflow or saved config to
+    # restore the former multi-market refit cadence.
+    merged["prophet_refit_every_markets"] = 1
     for name in ("enable_dynamic_scaling", "max_contracts_per_market_auto", "max_total_capital_auto"):
         value = as_bool(merged.get(name))
         if value is None:

@@ -82,6 +82,21 @@ def decision(ticker: str, generated: datetime) -> StrategyDecision:
 
 
 class EquityRegimeTests(unittest.TestCase):
+    def test_checkpoint_fingerprint_tracks_shadow_balance_ledger(self) -> None:
+        """A regime-only balance update must trigger the in-run checkpoint."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            ledger = root / "kalshi_shadow_equity_history.csv"
+            ledger.write_text("market_ticker,shadow_balance_after\nA,100\n", encoding="utf-8")
+            state = {"format_version": 1, "markets": {}}
+            config = {"prophet_refit_every_markets": 1}
+            before = trader.checkpoint_fingerprint(state, config, (ledger,))
+            ledger.write_text("market_ticker,shadow_balance_after\nA,101\n", encoding="utf-8")
+            after = trader.checkpoint_fingerprint(state, config, (ledger,))
+
+            self.assertNotEqual(before, after)
+
     def test_legacy_rebased_state_is_archived_and_reinitialized_at_api_balance(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -534,6 +549,45 @@ class EquityRegimeTests(unittest.TestCase):
             self.assertEqual(forecaster.fit_number, 1)
             self.assertTrue(controller.state["future_forecast_snapshot"][1]["used_for_live_filter"])
             self.assertEqual(controller.state["future_forecast_snapshot"][1]["consumed_target_ticker"], "KXBTC15M-CADENCE-2")
+
+    def test_completed_balance_change_forces_the_next_live_forecast_to_refit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = RegimeConfig(
+                enabled=True,
+                dry_run=True,
+                prophet_min_history=2,
+                prophet_training_window=None,
+                prophet_refit_every_markets=1,
+            )
+            controller = EquityRegimeController(config, root / "state.json", root / "outputs")
+            controller.initialize_absolute_balances(Decimal("100"), reason="test")
+            now = datetime.now(tz=UTC)
+            controller.state["shadow_history"] = [
+                {"market_ticker": "old1", "market_close_time": (now - timedelta(hours=2)).isoformat(), "completed_at": (now - timedelta(hours=2)).isoformat(), "shadow_balance_after": "100"},
+                {"market_ticker": "old2", "market_close_time": (now - timedelta(hours=1)).isoformat(), "completed_at": (now - timedelta(hours=1)).isoformat(), "shadow_balance_after": "100"},
+            ]
+            forecaster = FakeForecaster("95", "105")
+            controller.forecaster = forecaster
+            first = decision("KXBTC15M-REFIT-1", now)
+            controller.start_market(first)
+            self.assertEqual(forecaster.fit_number, 1)
+
+            controller.state["shadow_open"][first.target_ticker].update({
+                "status": "finalized", "shadow_realized_pnl": "1", "contracts": "0",
+            })
+            controller.close_market(
+                ticker=first.target_ticker,
+                outcome="yes",
+                market_close_time=first.target_close_time,
+                actual_realized_pnl=Decimal("0"),
+                actual_balance_after=Decimal("100"),
+            )
+            self.assertEqual(controller.state["markets_since_refit"], 1)
+
+            controller.start_market(decision("KXBTC15M-REFIT-2", now + timedelta(minutes=16)))
+            self.assertEqual(forecaster.fit_number, 2)
+            self.assertEqual(controller.state["markets_since_refit"], 0)
 
     def test_finalization_bootstraps_immediately_after_inherited_position_closes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

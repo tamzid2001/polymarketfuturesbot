@@ -231,7 +231,9 @@ class RegimeConfig:
     # controller uses the latest 200 closed-trade balances plus their opening
     # balance anchor, matching the 201-row Colab Prophet input.
     prophet_training_window: int | None = 201
-    prophet_refit_every_markets: int = 75
+    # Live forecasts are refit after each finalized balance observation.  The
+    # diagnostic multi-market path is retained for reporting only.
+    prophet_refit_every_markets: int = 1
     # This is a diagnostic horizon only.  The live P10/P90 state machine
     # always consumes the first, actual next-market forecast.
     prophet_future_horizon_markets: int = 100
@@ -320,7 +322,7 @@ class RegimeConfig:
             prophet_enabled=bool_value(pick("prophet_enabled", True), True),
             prophet_min_history=int(pick("prophet_min_history", 200)),
             prophet_training_window=None if window in {None, "", "None", "none"} else int(window),
-            prophet_refit_every_markets=int(pick("prophet_refit_every_markets", 75)),
+            prophet_refit_every_markets=int(pick("prophet_refit_every_markets", 1)),
             prophet_future_horizon_markets=int(pick("prophet_future_horizon_markets", 100)),
             prophet_forecast_frequency_minutes=int(pick("prophet_forecast_frequency_minutes", 15)),
             allow_endpoint_anchored_ledger_bootstrap=bool_value(
