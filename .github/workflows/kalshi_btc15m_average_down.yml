@@ -37,50 +37,47 @@ on:
         description: "Enable dynamic base share scaling from realized actual P/L."
         required: false
         type: string
-        default: "true"
+        default: ""
       base_share_increment:
         description: "Base shares to add after a scaling threshold (minimum precision 0.01)."
         required: false
         type: string
-        default: "1"
+        default: ""
       scaling_profit_multiplier:
         description: "Realized profit required per current base share before scaling."
         required: false
         type: string
-        default: "16.5"
+        default: ""
       equity_regime_enabled:
         description: "Enable the persistent Prophet P10/P90 equity-regime controller."
         required: false
-        type: boolean
-        default: false
+        type: string
+        default: ""
       equity_regime_dry_run:
         description: "Run the P10/P90 gate in observation-only mode. False enables state-based entry suppression after successful absolute-balance reconciliation."
         required: false
-        type: boolean
-        default: true
+        type: string
+        default: ""
       prophet_min_history:
         description: "Completed shadow markets required before one-step Prophet forecasts."
         required: false
-        type: number
-        default: 200
+        type: string
+        default: ""
       prophet_refit_every_markets:
         description: "Refit frequency in completed closed-position observations."
         required: false
-        type: number
-        default: 75
+        type: string
+        default: ""
       shadow_fill_model:
         description: "Off-state shadow fill assumption. Trade-through is conservative but remains an approximation."
         required: false
-        type: choice
-        options:
-          - conservative_trade_through
-          - touch
-        default: conservative_trade_through
+        type: string
+        default: ""
       starting_balance:
         description: "Configured starting trading balance; never replaced by current account balance."
         required: false
         type: string
-        default: "100.00"
+        default: ""
       run_seconds:
         description: "Bounded runtime for a manual diagnostic. Default keeps the normal five-hour handoff."
         required: false
