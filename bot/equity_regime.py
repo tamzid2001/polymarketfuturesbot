@@ -635,6 +635,8 @@ class HistorySyncResult:
     settlements: list[NormalizedSettlement]
     duplicate_fills_removed: int
     ambiguous_fills: list[dict[str, Any]]
+    owned_fill_audit: list[dict[str, Any]]
+    ambiguous_settlement_audit: list[dict[str, Any]]
     balance_payload: Mapping[str, Any] | None
 
 
@@ -681,6 +683,7 @@ class HistoricalSynchronizer:
         deduplicated: dict[tuple[str, ...], NormalizedFill] = {}
         duplicate_count = 0
         ambiguous: list[dict[str, Any]] = []
+        owned_fill_audit: list[dict[str, Any]] = []
         for source, row in raw_fills:
             try:
                 fill = normalize_fill(row, source)
@@ -708,13 +711,41 @@ class HistoricalSynchronizer:
                 })
                 continue
             deduplicated[fill.dedupe_key] = fill
+            owned_fill_audit.append({
+                "ownership_evidence": evidence,
+                "fill_id": fill.fill_id,
+                "trade_id": fill.trade_id,
+                "order_id": fill.order_id,
+                "client_order_id": fill.client_order_id,
+                "order_group_id": fill.order_group_id,
+                "ticker": fill.ticker,
+                "created_at": timestamp_text(fill.created_at),
+                "action": fill.action,
+                "side": fill.side,
+                "price": format(fill.price, "f"),
+                "count": format(fill.count, "f"),
+                "fee": format(fill.fee, "f"),
+                "subaccount": fill.subaccount,
+                "source": fill.source,
+            })
         owned_tickers = {fill.ticker for fill in deduplicated.values()}
+        ambiguous_tickers = {str(row.get("ticker")) for row in ambiguous if row.get("ticker")}
         settlements: list[NormalizedSettlement] = []
+        ambiguous_settlement_audit: list[dict[str, Any]] = []
         for row in raw_settlements:
             try:
                 settlement = normalize_settlement(row, "portfolio")
             except ValueError:
                 continue
+            settlement_audit = {
+                "ticker": settlement.ticker,
+                "settled_at": timestamp_text(settlement.settled_at),
+                "result": settlement.result,
+                "payout": None if settlement.payout is None else format(settlement.payout, "f"),
+                "yes_count": None if settlement.yes_count is None else format(settlement.yes_count, "f"),
+                "no_count": None if settlement.no_count is None else format(settlement.no_count, "f"),
+                "source": settlement.source,
+            }
             if (
                 settlement.ticker in owned_tickers
                 and not (
@@ -723,9 +754,20 @@ class HistoricalSynchronizer:
                 )
             ):
                 settlements.append(settlement)
+            elif settlement.ticker in ambiguous_tickers:
+                # This deliberately exposes only a settlement which belongs
+                # to an already-reported ambiguous fill.  It lets the
+                # operator calculate a user-disclosed manual trade's cash
+                # result without promoting that trade into bot accounting.
+                ambiguous_settlement_audit.append(settlement_audit)
         fills = sorted(deduplicated.values(), key=lambda item: (item.created_at or datetime.min.replace(tzinfo=UTC), item.fill_id))
         settlements.sort(key=lambda item: (item.settled_at or datetime.min.replace(tzinfo=UTC), item.ticker))
-        return HistorySyncResult(cutoff, fills, settlements, duplicate_count, ambiguous, balance_payload)
+        owned_fill_audit.sort(key=lambda item: (item["created_at"], item["fill_id"]))
+        ambiguous_settlement_audit.sort(key=lambda item: (item["settled_at"], item["ticker"]))
+        return HistorySyncResult(
+            cutoff, fills, settlements, duplicate_count, ambiguous,
+            owned_fill_audit, ambiguous_settlement_audit, balance_payload,
+        )
 
 
 @dataclass(frozen=True)
@@ -2263,6 +2305,17 @@ class KalshiRawHistoryAPI:
 async def synchronize_history(controller: EquityRegimeController, api: JsonAPI, trader_state: Mapping[str, Any]) -> HistorySyncResult:
     result = await HistoricalSynchronizer(controller.config, trader_state).sync(api)
     controller.state["ambiguous_fills"] = result.ambiguous_fills
+    # Preserve the exact normalized records used (and deliberately excluded)
+    # by this read-only reconciliation.  These artifacts make an accounting
+    # mismatch auditable without allowing a weak ticker match to enter the
+    # bot's P/L curve.
+    controller.output_dir.mkdir(parents=True, exist_ok=True)
+    controller._write_csv(controller.output_dir / "api_owned_fills.csv", result.owned_fill_audit)
+    controller._write_csv(controller.output_dir / "api_ambiguous_fills.csv", result.ambiguous_fills)
+    controller._write_csv(
+        controller.output_dir / "api_ambiguous_fill_settlements.csv",
+        result.ambiguous_settlement_audit,
+    )
     reconstructed = reconstruct_realized_pnl(result.fills, result.settlements)[-controller.config.history_max_markets :]
     ledger_pnl = {
         str(record.get("ticker")): decimal_value(record.get("net_profit_loss"))
