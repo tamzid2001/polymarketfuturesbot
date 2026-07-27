@@ -63,6 +63,11 @@ on:
         required: false
         type: string
         default: ""
+      prophet_refit_every_markets:
+        description: "Deprecated compatibility input; live Prophet always refits after each finalized balance observation."
+        required: false
+        type: string
+        default: ""
       shadow_fill_model:
         description: "Off-state shadow fill assumption. Trade-through is conservative but remains an approximation."
         required: false
@@ -145,6 +150,7 @@ jobs:
           EQUITY_REGIME_ENABLED: ${{ inputs.equity_regime_enabled }}
           EQUITY_REGIME_DRY_RUN: ${{ inputs.equity_regime_dry_run }}
           PROPHET_MIN_HISTORY: ${{ inputs.prophet_min_history }}
+          PROPHET_REFIT_EVERY_MARKETS: ${{ inputs.prophet_refit_every_markets }}
           SHADOW_FILL_MODEL: ${{ inputs.shadow_fill_model }}
           STARTING_BALANCE: ${{ inputs.starting_balance }}
           RUN_SECONDS: ${{ inputs.run_seconds || 19500 }}
@@ -168,6 +174,9 @@ jobs:
             [ "$EQUITY_REGIME_DRY_RUN" = "true" ] && args+=(--equity-regime-dry-run) || args+=(--no-equity-regime-dry-run)
           fi
           [ -z "$PROPHET_MIN_HISTORY" ] || args+=(--prophet-min-history "$PROPHET_MIN_HISTORY")
+          # Accepted only so a still-running prior workflow can hand off.
+          # validate_config pins the live cadence to one regardless of value.
+          [ -z "$PROPHET_REFIT_EVERY_MARKETS" ] || args+=(--prophet-refit-every-markets "$PROPHET_REFIT_EVERY_MARKETS")
           [ -z "$SHADOW_FILL_MODEL" ] || args+=(--shadow-fill-model "$SHADOW_FILL_MODEL")
           [ -z "$STARTING_BALANCE" ] || args+=(--starting-balance "$STARTING_BALANCE")
           if [ "$LIVE_TRADING" = "true" ]; then
