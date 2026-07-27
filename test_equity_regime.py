@@ -603,6 +603,40 @@ class EquityRegimeTests(unittest.TestCase):
             self.assertTrue(controller.should_suppress_new_live_orders())
             self.assertTrue(controller.state["live_vs_shadow"][-1]["live_execution_enabled"])
 
+    def test_startup_gate_suppresses_first_new_market_when_restored_shadow_is_above_p90(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = RegimeConfig(
+                enabled=True,
+                dry_run=False,
+                allow_live_state_transitions=True,
+                prophet_history_source="account_series",
+                prophet_min_history=2,
+                prophet_training_window=None,
+            )
+            controller = EquityRegimeController(config, root / "state.json", root / "outputs")
+            controller.initialize_absolute_balances(Decimal("101"), reason="test")
+            now = datetime.now(tz=UTC)
+            controller.state["shadow_history"] = [
+                {"market_ticker": "old1", "market_close_time": (now - timedelta(hours=2)).isoformat(), "completed_at": (now - timedelta(hours=2)).isoformat(), "shadow_balance_after": "100"},
+                {"market_ticker": "old2", "market_close_time": (now - timedelta(hours=1)).isoformat(), "completed_at": (now - timedelta(hours=1)).isoformat(), "shadow_balance_after": "101"},
+            ]
+            controller.state["shadow_balance"] = "101"
+            controller.state["prophet_history_ready"] = True
+            controller.forecaster = FakeForecaster("95", "100.50")
+            forecast = controller.prepare_forecast(decision("KXBTC15M-BOOTSTRAP", now))
+
+            self.assertTrue(controller.apply_startup_regime_gate())
+            self.assertFalse(controller.execution_enabled_for_market())
+            self.assertTrue(controller.should_suppress_new_live_orders())
+            self.assertEqual(controller.state["state_reason"], "startup_shadow_balance_at_or_above_p90")
+            self.assertTrue(forecast["startup_exit_signal"])
+
+            _, execution_for_next_market = controller.start_market(
+                decision("KXBTC15M-AFTER-BOOTSTRAP", now + timedelta(minutes=15)),
+            )
+            self.assertFalse(execution_for_next_market)
+
     def test_live_finalization_updates_actual_and_shadow_once(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
