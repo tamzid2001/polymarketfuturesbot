@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import unittest
 
-from bot.equity_regime import HistoricalSynchronizer, RegimeConfig
+from bot.equity_regime import HistoricalSynchronizer, RegimeConfig, reconstruct_realized_pnl
 
 
 class HistorySyncAuditTests(unittest.IsolatedAsyncioTestCase):
@@ -57,6 +57,56 @@ class HistorySyncAuditTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([settlement.ticker for settlement in result.settlements], [bot_ticker])
         self.assertEqual(result.owned_settlement_audit[0]["ticker"], bot_ticker)
         self.assertIn('"market_result":"yes"', result.owned_settlement_audit[0]["raw_api_record"])
+
+    async def test_reduce_only_yes_exit_is_not_counted_as_new_no_position_or_settlement_payout(self) -> None:
+        ticker = "KXBTC15M-26JUL261315-15"
+        entry_order_id = "entry"
+        exit_order_id = "exit"
+
+        class API:
+            async def get_json(self, path, params=None):
+                if path == "/historical/cutoff":
+                    return {"trades_created_ts": "2026-05-27T00:00:00Z"}
+                if path == "/historical/fills":
+                    return {"fills": []}
+                if path == "/portfolio/fills":
+                    return {"fills": [
+                        {
+                            "fill_id": "entry-fill", "order_id": entry_order_id, "ticker": ticker,
+                            "side": "yes", "action": "buy", "outcome_side": "yes", "book_side": "bid",
+                            "count_fp": "30", "yes_price_dollars": "0.2000", "no_price_dollars": "0.8000",
+                            "fee_cost": "0.0500", "created_time": "2026-07-26T17:00:00Z",
+                        },
+                        {
+                            # Kalshi's reciprocal representation of a
+                            # reduce-only exit of the held YES contracts.
+                            "fill_id": "exit-fill", "order_id": exit_order_id, "ticker": ticker,
+                            "side": "no", "action": "sell", "outcome_side": "no", "book_side": "ask",
+                            "count_fp": "30", "yes_price_dollars": "0.0420", "no_price_dollars": "0.9580",
+                            "fee_cost": "0.0300", "created_time": "2026-07-26T17:11:00Z",
+                        },
+                    ]}
+                if path == "/portfolio/settlements":
+                    return {"settlements": [{
+                        "ticker": ticker, "market_result": "yes", "settled_time": "2026-07-26T17:15:00Z",
+                    }]}
+                if path == "/portfolio/balance":
+                    return {"balance_dollars": "100.00"}
+                raise AssertionError(path)
+
+        local_state = {"markets": {ticker: {
+            "locked_side": "yes",
+            "orders": {"entry": {"order_id": entry_order_id, "side": "yes"}},
+            "live_exit_orders": [{"order_id": exit_order_id, "held_side": "yes"}],
+        }}}
+        result = await HistoricalSynchronizer(RegimeConfig(), local_state).sync(API())
+        market = reconstruct_realized_pnl(result.fills, result.settlements)[0]
+
+        self.assertEqual(str(market.contracts_bought), "30")
+        self.assertEqual(str(market.contracts_sold), "30")
+        self.assertEqual(str(market.exit_proceeds), "1.2600")
+        self.assertEqual(str(market.settlement_payout), "0")
+        self.assertEqual(str(market.realized_pnl), "-4.8200")
 
 
 if __name__ == "__main__":
