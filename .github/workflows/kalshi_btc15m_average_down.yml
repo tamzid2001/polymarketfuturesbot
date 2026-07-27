@@ -9,10 +9,10 @@ on:
   workflow_dispatch:
     inputs:
       live_trading:
-        description: "Submit real settlement-contrarian orders (scheduled runs are live)."
+        description: "Submit real settlement-contrarian orders. Defaults to false while balance reconciliation is pending."
         required: true
         type: boolean
-        default: true
+        default: false
       initial_position_size:
         description: "Persistent ladder share multiplier. 3 means 3×40c, 6×30c, 9×20c, and 12×10c. Blank keeps the saved value."
         required: false
@@ -52,22 +52,22 @@ on:
         description: "Enable the persistent Prophet P10/P90 equity-regime controller."
         required: false
         type: boolean
-        default: true
+        default: false
       equity_regime_dry_run:
         description: "Run the P10/P90 gate in observation-only mode. False enables state-based entry suppression after successful absolute-balance reconciliation."
         required: false
         type: boolean
-        default: false
+        default: true
       prophet_min_history:
         description: "Completed shadow markets required before one-step Prophet forecasts."
         required: false
         type: number
         default: 200
       prophet_refit_every_markets:
-        description: "Refit frequency in completed markets; primary live configuration is one."
+        description: "Refit frequency in completed closed-position observations."
         required: false
         type: number
-        default: 1
+        default: 75
       shadow_fill_model:
         description: "Off-state shadow fill assumption. Trade-through is conservative but remains an approximation."
         required: false
@@ -137,7 +137,7 @@ jobs:
           KALSHI_DEMO: "false"
           KALSHI_CHECKPOINT_PUBLISH: "true"
           GITHUB_TOKEN: ${{ github.token }}
-          LIVE_TRADING: ${{ github.event_name == 'schedule' || inputs.live_trading == true }}
+          LIVE_TRADING: ${{ inputs.live_trading == true }}
           INITIAL_POSITION_SIZE: ${{ inputs.initial_position_size }}
           MAX_ACTIVE_MARKETS: ${{ inputs.max_active_markets }}
           MAX_CONTRACTS_PER_MARKET: ${{ inputs.max_contracts_per_market }}

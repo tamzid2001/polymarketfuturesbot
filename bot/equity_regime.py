@@ -20,6 +20,7 @@ import logging
 import math
 import os
 import random
+import re
 import tempfile
 import time
 from collections import defaultdict
@@ -38,6 +39,9 @@ ACCOUNTING_TOLERANCE = Decimal("0.01")
 QUANTILES = ("p01", "p10", "p25", "p50", "p75", "p90", "p99")
 QUANTILE_PROBABILITIES = (0.01, 0.10, 0.25, 0.50, 0.75, 0.90, 0.99)
 DEFAULT_CLIENT_ORDER_PREFIX = "settlement-contrarian-"
+KALSHI_TICKER_TIMESTAMP_RE = re.compile(
+    r"KXBTC15M-(\d{2})([A-Z]{3})(\d{2})(\d{2})(\d{2})-(\d{2})"
+)
 
 
 def decimal_value(value: Any, default: Decimal = ZERO) -> Decimal:
@@ -109,6 +113,33 @@ def timestamp_text(value: Any) -> str:
     return parsed.isoformat() if parsed is not None else ""
 
 
+def ticker_clock_timestamp(ticker: Any, fallback: Any = None) -> datetime | None:
+    """Return the ticker clock time used by the supplied Colab notebooks.
+
+    The reference curve's ``ds`` comes from the KXBTC15M ticker rather than
+    the API's settlement/last-updated time.  The latter can differ by hours,
+    which changes intraday seasonality and prevents an otherwise identical
+    Prophet configuration from matching the notebook.
+    """
+
+    matched = KALSHI_TICKER_TIMESTAMP_RE.search(str(ticker or ""))
+    if matched:
+        year, month, day, hour, minute, second = matched.groups()
+        try:
+            return datetime.strptime(
+                f"{year}{month}{day}{hour}{minute}{second}", "%y%b%d%H%M%S",
+            ).replace(tzinfo=UTC)
+        except ValueError:
+            pass
+    return utc_timestamp(fallback)
+
+
+def observation_timestamp(row: Mapping[str, Any]) -> datetime | None:
+    """Use the reference ticker time, falling back only for non-Kalshi tests."""
+
+    return ticker_clock_timestamp(row.get("market_ticker"), row.get("market_close_time"))
+
+
 def bool_value(value: Any, default: bool = False) -> bool:
     if value is None:
         return default
@@ -174,9 +205,10 @@ class RegimeConfig:
     prophet_enabled: bool = True
     prophet_min_history: int = 200
     # A lookback is a row selector, never a P/L rebase.  The production
-    # controller uses the latest 200 absolute shadow-balance observations.
-    prophet_training_window: int | None = 200
-    prophet_refit_every_markets: int = 1
+    # controller uses the latest 200 closed-trade balances plus their opening
+    # balance anchor, matching the 201-row Colab Prophet input.
+    prophet_training_window: int | None = 201
+    prophet_refit_every_markets: int = 75
     # This is a diagnostic horizon only.  The live P10/P90 state machine
     # always consumes the first, actual next-market forecast.
     prophet_future_horizon_markets: int = 100
@@ -234,7 +266,7 @@ class RegimeConfig:
         def pick(name: str, default: Any) -> Any:
             return values.get(name, values.get(name.upper(), default))
 
-        window = pick("prophet_training_window", 200)
+        window = pick("prophet_training_window", 201)
         return cls(
             enabled=bool_value(pick("equity_regime_enabled", False)),
             dry_run=bool_value(pick("equity_regime_dry_run", True), True),
@@ -254,7 +286,7 @@ class RegimeConfig:
             prophet_enabled=bool_value(pick("prophet_enabled", True), True),
             prophet_min_history=int(pick("prophet_min_history", 200)),
             prophet_training_window=None if window in {None, "", "None", "none"} else int(window),
-            prophet_refit_every_markets=int(pick("prophet_refit_every_markets", 1)),
+            prophet_refit_every_markets=int(pick("prophet_refit_every_markets", 75)),
             prophet_future_horizon_markets=int(pick("prophet_future_horizon_markets", 100)),
             prophet_forecast_frequency_minutes=int(pick("prophet_forecast_frequency_minutes", 15)),
             allow_endpoint_anchored_ledger_bootstrap=bool_value(
@@ -327,7 +359,7 @@ class AtomicJsonStore:
 
 def default_regime_state(config: RegimeConfig) -> dict[str, Any]:
     return {
-        "format_version": 2,
+        "format_version": 3,
         "historical_starting_balance": None,
         "actual_balance": None,
         "shadow_balance": None,
@@ -356,6 +388,12 @@ def default_regime_state(config: RegimeConfig) -> dict[str, Any]:
         "forecast_target_ticker": None,
         "prophet_training_end": None,
         "prophet_training_rows": 0,
+        # The balance immediately before the oldest retained closed trade.
+        # It is a model observation (like the $100 row in the Colab curve),
+        # not a new market or a rebased P/L index.
+        "actual_balance_anchor": None,
+        "shadow_balance_anchor": None,
+        "markets_since_refit": 0,
         "actual_history": [],
         "shadow_history": [],
         "forecasts": [],
@@ -759,6 +797,7 @@ class ProphetForecaster:
     def __init__(self, config: RegimeConfig) -> None:
         self.config = config
         self.fit_number = 0
+        self.last_future_timestamps: list[datetime] = []
 
     def forecast(self, observations: list[Mapping[str, Any]], target_time: datetime) -> dict[str, Decimal]:
         """Return the one, actual next-market forecast used by the gate."""
@@ -785,7 +824,7 @@ class ProphetForecaster:
             raise ValueError("horizon_markets must be positive")
         if self.config.prophet_training_window is not None:
             observations = observations[-self.config.prophet_training_window :]
-        training_times = [utc_timestamp(row.get("market_close_time")) for row in observations]
+        training_times = [observation_timestamp(row) for row in observations]
         if not all(training_times) or max(training_times) >= target_time:
             raise ValueError("forecast training contains target or future shadow observation")
         balances = [decimal_value(row.get("shadow_balance_after")) for row in observations]
@@ -797,7 +836,6 @@ class ProphetForecaster:
             from prophet import Prophet
         except ImportError as exc:  # pragma: no cover - dependency is checked by workflow
             raise RuntimeError("Prophet dependencies are unavailable") from exc
-        np.random.seed(self.config.prophet_random_seed + self.fit_number)
         training = pd.DataFrame({
             "ds": [item.replace(tzinfo=None) for item in training_times],
             "y": [math.log(float(value)) if self.config.prophet_use_log_transform else float(value) for value in balances],
@@ -811,11 +849,25 @@ class ProphetForecaster:
             uncertainty_samples=self.config.prophet_uncertainty_samples,
         )
         model.fit(training)
-        future_times = [
-            target_time + timedelta(minutes=self.config.prophet_forecast_frequency_minutes * step)
-            for step in range(horizon_markets)
+        # Match the reference Colab forecast procedure: Prophet samples one
+        # historical-plus-future frame made by ``make_future_dataframe``.
+        # Sampling only a hand-built future frame changes the RNG draw layout
+        # and therefore produces different P01/P10/.../P99 values even when
+        # the fitted balance curve and model settings are identical.
+        future = model.make_future_dataframe(
+            periods=horizon_markets,
+            freq=f"{self.config.prophet_forecast_frequency_minutes}min",
+            include_history=True,
+        )
+        self.last_future_timestamps = [
+            utc_timestamp(value) for value in future["ds"].iloc[-horizon_markets:]
         ]
-        future = pd.DataFrame({"ds": [item.replace(tzinfo=None) for item in future_times]})
+        if any(value is None for value in self.last_future_timestamps):
+            raise RuntimeError("Prophet produced an invalid future timestamp")
+        # The supplied Colab seeds immediately before predictive_samples, not
+        # before fitting.  Use the same stable seed for every refit so a
+        # unchanged 200-row balance curve yields the same published bands.
+        np.random.seed(self.config.prophet_random_seed)
         samples = np.asarray(model.predictive_samples(future).get("yhat"))
         if samples.ndim != 2:
             raise RuntimeError(f"unexpected Prophet predictive sample shape {samples.shape}")
@@ -824,7 +876,7 @@ class ProphetForecaster:
                 samples = samples.T
             else:
                 raise RuntimeError(f"samples do not match requested horizon: {samples.shape}")
-        values = np.quantile(samples, QUANTILE_PROBABILITIES, axis=1).T
+        values = np.quantile(samples, QUANTILE_PROBABILITIES, axis=1).T[-horizon_markets:]
         if self.config.prophet_use_log_transform:
             values = np.exp(values)
         self.fit_number += 1
@@ -1080,7 +1132,41 @@ class EquityRegimeController:
         defaults = default_regime_state(self.config)
         for key, value in defaults.items():
             self.state.setdefault(key, value)
-        self.state["format_version"] = max(int(self.state.get("format_version") or 0), 2)
+        version = int(self.state.get("format_version") or 0)
+        # Version 2's endpoint bootstrap treated unfilled/zero-contract
+        # market attempts as historical balance observations and used API
+        # close timestamps rather than the ticker timestamps used by the
+        # canonical Colab curve.  Those fitted bands are not comparable to
+        # the supplied closed-position export, so never continue from them.
+        if (
+            version < 3
+            and self.state.get("balance_source") == "authenticated_endpoint_anchored_durable_live_bot_ledger"
+        ):
+            prior_actual_rows = len(self.state.get("actual_history") or [])
+            prior_shadow_rows = len(self.state.get("shadow_history") or [])
+            stamp = datetime.now(tz=UTC).strftime("%Y%m%dT%H%M%SZ")
+            archive = self.store.path.with_name(f"{self.store.path.stem}.pre-colab-reference-{stamp}.json")
+            AtomicJsonStore(archive, lambda: {}).save(dict(self.state))
+            self.state.update({
+                "actual_history": [], "shadow_history": [],
+                "actual_balance_anchor": None, "shadow_balance_anchor": None,
+                "forecasts": [], "future_forecast_snapshot": [], "transitions": [], "live_vs_shadow": [],
+                "processed_market_tickers": [], "markets_since_refit": 0,
+                "balance_reconciled": False,
+                "balance_reconciliation_error": "pre_colab_reference_history_invalidated",
+                "balance_source": "requires_verified_closed_position_rebuild",
+                "state_reason": "pre_colab_reference_history_invalidated",
+                "execution_enabled": True,
+                "history_migration": {
+                    "migration_timestamp": timestamp_text(datetime.now(tz=UTC)),
+                    "migration_reason": "market_attempts_and_api_close_timestamps_do_not_match_closed_position_balance_curve",
+                    "prior_actual_rows": prior_actual_rows,
+                    "prior_shadow_rows": prior_shadow_rows,
+                    "archive": str(archive),
+                },
+            })
+            LOG.error("PRE-COLAB-REFERENCE HISTORY INVALIDATED | archive=%s", archive)
+        self.state["format_version"] = max(version, 3)
         self.state["shadow_enabled"] = True  # invariant; regime never disables the shadow strategy
         self.state["execution_enabled"] = bool_value(self.state.get("execution_enabled"), True)
 
@@ -1111,7 +1197,8 @@ class EquityRegimeController:
             "balance_source": "authenticated_api_balance_after_legacy_rebased_migration",
             "balance_reconciled": True,
             "balance_reconciliation_error": None,
-            "actual_history": [], "shadow_history": [], "forecasts": [], "future_forecast_snapshot": [], "transitions": [],
+            "actual_history": [], "shadow_history": [], "actual_balance_anchor": None, "shadow_balance_anchor": None,
+            "markets_since_refit": 0, "forecasts": [], "future_forecast_snapshot": [], "transitions": [],
             "live_vs_shadow": [], "processed_market_tickers": [], "shadow_open": {},
             "last_p01": None, "last_p10": None, "last_p25": None, "last_p50": None,
             "last_p75": None, "last_p90": None, "last_p99": None,
@@ -1246,6 +1333,18 @@ class EquityRegimeController:
         self.state.update({
             "historical_starting_balance": format(historical_starting_balance, "f"),
             "actual_balance": format(actual, "f"), "shadow_balance": format(shadow, "f"),
+            "actual_balance_anchor": {
+                "market_ticker": "__STARTING_BALANCE__",
+                "market_close_time": timestamp_text(observation_timestamp(actual_history[0]) - timedelta(minutes=15)),
+                "completed_at": timestamp_text(observation_timestamp(actual_history[0]) - timedelta(minutes=15)),
+                "actual_balance_after": format(historical_starting_balance, "f"),
+            },
+            "shadow_balance_anchor": {
+                "market_ticker": "__STARTING_BALANCE__",
+                "market_close_time": timestamp_text(observation_timestamp(shadow_history[0]) - timedelta(minutes=15)),
+                "completed_at": timestamp_text(observation_timestamp(shadow_history[0]) - timedelta(minutes=15)),
+                "shadow_balance_after": format(historical_starting_balance, "f"),
+            },
             "actual_history": actual_history, "shadow_history": shadow_history,
             "processed_market_tickers": [row.market_ticker for row in ordered],
             "forecasts": [], "future_forecast_snapshot": [], "transitions": [], "live_vs_shadow": [],
@@ -1270,6 +1369,22 @@ class EquityRegimeController:
         a restart cannot replay a record that remains in API scope.
         """
         limit = self.config.history_max_markets
+        for key, balance_key, anchor_key in (
+            ("actual_history", "actual_balance_after", "actual_balance_anchor"),
+            ("shadow_history", "shadow_balance_after", "shadow_balance_anchor"),
+        ):
+            values = self.state.get(key)
+            if isinstance(values, list) and len(values) > limit:
+                predecessor = values[-limit - 1]
+                observed_at = observation_timestamp(predecessor)
+                if observed_at is not None:
+                    self.state[anchor_key] = {
+                        "market_ticker": "__RETAINED_BALANCE_ANCHOR__",
+                        "market_close_time": timestamp_text(observed_at),
+                        "completed_at": timestamp_text(observed_at),
+                        balance_key: str(predecessor.get(balance_key)),
+                    }
+                self.state[key] = values[-limit:]
         for key in ("actual_history", "shadow_history", "forecasts", "live_vs_shadow", "processed_market_tickers"):
             values = self.state.get(key)
             if isinstance(values, list) and len(values) > limit:
@@ -1308,7 +1423,15 @@ class EquityRegimeController:
             if (completed := utc_timestamp(row.get("completed_at") or row.get("market_close_time"))) is not None
             and completed < decision_time
         ]
-        rows.sort(key=lambda item: (timestamp_text(item.get("market_close_time")), str(item.get("market_ticker"))))
+        anchor = self.state.get("shadow_balance_anchor")
+        if isinstance(anchor, Mapping):
+            completed = utc_timestamp(anchor.get("completed_at") or anchor.get("market_close_time"))
+            if completed is not None and completed < decision_time:
+                rows.append(dict(anchor))
+        rows.sort(key=lambda item: (
+            timestamp_text(observation_timestamp(item)),
+            str(item.get("market_ticker")),
+        ))
         return rows
 
     def prepare_forecast(self, decision: StrategyDecision) -> dict[str, Any] | None:
@@ -1326,7 +1449,11 @@ class EquityRegimeController:
             if self.config.prophet_training_window is not None
             else training
         )
-        if len(training) % self.config.prophet_refit_every_markets != 0:
+        forecast_target_time = ticker_clock_timestamp(decision.target_ticker, decision.target_close_time)
+        if forecast_target_time is None:
+            raise RuntimeError(f"cannot derive a forecast timestamp for {decision.target_ticker}")
+        markets_since_refit = int(self.state.get("markets_since_refit") or 0)
+        if self.state["forecasts"] and markets_since_refit < self.config.prophet_refit_every_markets:
             previous = self.state["forecasts"][-1] if self.state["forecasts"] else None
             if previous is None:
                 return None
@@ -1334,31 +1461,36 @@ class EquityRegimeController:
             fit_error = "refit_deferred_reused_previous_forecast"
         else:
             try:
-                # Fit once to the unmodified latest 200 absolute balance rows.
+                # Fit once to the unmodified latest 200 closed-trade balances
+                # plus their opening-balance anchor (201 rows in the Colab
+                # reference curve).
                 # Row one is the causal next-market forecast.  The additional
                 # rows are exported solely as a 100-market diagnostic path.
                 forecast_horizon = getattr(self.forecaster, "forecast_horizon", None)
                 if callable(forecast_horizon):
                     future_quantiles = forecast_horizon(
                         model_training,
-                        decision.target_close_time,
+                        forecast_target_time,
                         self.config.prophet_future_horizon_markets,
                     )
                     copied = {name: format(value, "f") for name, value in future_quantiles[0].items()}
                     generated_at = timestamp_text(datetime.now(tz=UTC))
+                    sampled_timestamps = getattr(self.forecaster, "last_future_timestamps", [])
                     self.state["future_forecast_snapshot"] = [
                         {
                             "forecast_generated_at": generated_at,
                             "forecast_origin_target_ticker": decision.target_ticker,
                             "forecast_horizon_market": index,
                             "forecast_timestamp": timestamp_text(
-                                decision.target_close_time + timedelta(
+                                sampled_timestamps[index - 1]
+                                if len(sampled_timestamps) >= index
+                                else forecast_target_time + timedelta(
                                     minutes=self.config.prophet_forecast_frequency_minutes * (index - 1),
-                                ),
+                                )
                             ),
                             "used_for_live_filter": index == 1,
-                            "training_start": timestamp_text(utc_timestamp(model_training[0]["market_close_time"])),
-                            "training_end": timestamp_text(utc_timestamp(model_training[-1]["market_close_time"])),
+                            "training_start": timestamp_text(observation_timestamp(model_training[0])),
+                            "training_end": timestamp_text(observation_timestamp(model_training[-1])),
                             "training_rows": len(model_training),
                             **{name: format(value, "f") for name, value in values.items()},
                         }
@@ -1367,9 +1499,10 @@ class EquityRegimeController:
                 else:  # lightweight test doubles retain the old one-row protocol
                     copied = {
                         name: format(value, "f")
-                        for name, value in self.forecaster.forecast(model_training, decision.target_close_time).items()
+                        for name, value in self.forecaster.forecast(model_training, forecast_target_time).items()
                     }
                 fit_error = None
+                self.state["markets_since_refit"] = 0
             except Exception as exc:  # noqa: BLE001 - fail closed to preserved prior forecast only
                 previous = self.state["forecasts"][-1] if self.state["forecasts"] else None
                 self.state["fit_failures"].append({"at": timestamp_text(datetime.now(tz=UTC)), "target": decision.target_ticker, "error": str(exc)})
@@ -1379,14 +1512,14 @@ class EquityRegimeController:
                     return None
                 copied = {name: previous[name] for name in QUANTILES}
                 fit_error = f"fallback_previous_forecast: {exc}"
-        training_start = utc_timestamp(model_training[0]["market_close_time"])
-        training_end = utc_timestamp(model_training[-1]["market_close_time"])
-        if training_end is None or training_start is None or training_end >= decision.target_close_time:
+        training_start = observation_timestamp(model_training[0])
+        training_end = observation_timestamp(model_training[-1])
+        if training_end is None or training_start is None or forecast_target_time is None or training_end >= forecast_target_time:
             raise RuntimeError("refusing to save look-ahead forecast")
         forecast = {
             "forecast_generated_at": timestamp_text(datetime.now(tz=UTC)),
             "forecast_target_ticker": decision.target_ticker,
-            "forecast_target_time": timestamp_text(decision.target_close_time),
+            "forecast_target_time": timestamp_text(forecast_target_time),
             "training_start": timestamp_text(training_start),
             "training_end": timestamp_text(training_end),
             "training_rows": len(model_training),
@@ -1693,6 +1826,7 @@ class EquityRegimeController:
             "shadow_simulation_quality": trade.get("shadow_simulation_quality"),
         })
         open_trades.pop(ticker, None)
+        self.state["markets_since_refit"] = int(self.state.get("markets_since_refit") or 0) + 1
         self.save()
         LOG.info("ACTUAL BALANCE UPDATE | %s pnl=%s balance=%s", ticker, actual_realized_pnl, actual_after)
         LOG.info("SHADOW BALANCE UPDATE | %s pnl=%s balance_change=%s balance=%s", ticker, shadow_pnl, shadow_balance_change, shadow_after)
@@ -1728,14 +1862,19 @@ class EquityRegimeController:
             "entry_skipped_loss_circuit_breaker", "signal_window_missed",
         }
         for record in markets.values():
-            if not isinstance(record, Mapping) or str(record.get("status")) in terminal:
+            if not isinstance(record, Mapping):
                 continue
             filled = sum(
                 (decimal_value(order.get("fill_count")) for order in (record.get("orders") or {}).values() if isinstance(order, Mapping)),
                 ZERO,
             )
             exchange_position = abs(decimal_value(record.get("exchange_position_contracts")))
-            if filled > Decimal("0.004") or exchange_position > Decimal("0.004"):
+            # A non-terminal record with fills is open exposure.  A terminal
+            # record reporting a non-zero exchange position is also unsafe:
+            # it cannot be inserted as an allegedly closed balance point.
+            if exchange_position > Decimal("0.004") or (
+                str(record.get("status")) not in terminal and filled > Decimal("0.004")
+            ):
                 LOG.warning(
                     "ABSOLUTE LEDGER BOOTSTRAP DEFERRED | filled open position ticker=%s filled=%s exchange=%s",
                     record.get("ticker"), filled, exchange_position,
@@ -1744,6 +1883,15 @@ class EquityRegimeController:
         rows: list[tuple[datetime, str, Mapping[str, Any], Decimal]] = []
         for key, record in markets.items():
             if not isinstance(record, Mapping) or str(record.get("status")) not in terminal:
+                continue
+            # The supplied Kalshi closed-position export contains one row per
+            # executed closed position.  Do not substitute watching, skipped,
+            # or zero-contract unfilled market attempts as flat observations;
+            # those extra timestamps materially change Prophet's fit.
+            contracts = abs(decimal_value(record.get("contracts")))
+            entry_cost = abs(decimal_value(record.get("total_cost")))
+            realized_pnl = decimal_value(record.get("net_profit_loss"))
+            if contracts <= Decimal("0.004") and entry_cost <= Decimal("0.0001") and realized_pnl == ZERO:
                 continue
             closed = utc_timestamp(
                 record.get("market_close_time")
@@ -1754,7 +1902,7 @@ class EquityRegimeController:
             ticker = str(record.get("ticker") or key)
             if closed is None or not ticker.startswith(self.config.series_ticker):
                 continue
-            rows.append((closed, ticker, record, decimal_value(record.get("net_profit_loss"))))
+            rows.append((closed, ticker, record, realized_pnl))
         rows.sort(key=lambda item: (item[0], item[1]))
         rows = rows[-self.config.history_max_markets :]
         if len(rows) < self.config.prophet_min_history:
@@ -1819,6 +1967,26 @@ class EquityRegimeController:
         self.state.update({
             "historical_starting_balance": format(historical_start, "f"),
             "actual_balance": format(api_current_balance, "f"), "shadow_balance": format(api_current_balance, "f"),
+            "actual_balance_anchor": {
+                "market_ticker": "__STARTING_BALANCE__",
+                "market_close_time": timestamp_text(
+                    ticker_clock_timestamp(rows[0][1], rows[0][0]) - timedelta(minutes=15)
+                ),
+                "completed_at": timestamp_text(
+                    ticker_clock_timestamp(rows[0][1], rows[0][0]) - timedelta(minutes=15)
+                ),
+                "actual_balance_after": format(historical_start, "f"),
+            },
+            "shadow_balance_anchor": {
+                "market_ticker": "__STARTING_BALANCE__",
+                "market_close_time": timestamp_text(
+                    ticker_clock_timestamp(rows[0][1], rows[0][0]) - timedelta(minutes=15)
+                ),
+                "completed_at": timestamp_text(
+                    ticker_clock_timestamp(rows[0][1], rows[0][0]) - timedelta(minutes=15)
+                ),
+                "shadow_balance_after": format(historical_start, "f"),
+            },
             "actual_history": actual_history, "shadow_history": shadow_history,
             "processed_market_tickers": [ticker for _, ticker, _, _ in rows],
             "forecasts": [], "future_forecast_snapshot": [], "transitions": [], "live_vs_shadow": [], "shadow_open": {},
@@ -1857,7 +2025,7 @@ class EquityRegimeController:
             "p10": last_forecast.get("p10"), "p50": last_forecast.get("p50"), "p90": last_forecast.get("p90"),
             "distance_to_p10": format(shadow - p10, "f") if p10 else None,
             "distance_to_p90": format(p90 - shadow, "f") if p90 else None,
-            "markets_since_refit": 0, "markets_while_disabled": sum(not bool(row.get("live_execution_enabled")) for row in self.state["shadow_history"]),
+            "markets_since_refit": int(self.state.get("markets_since_refit") or 0), "markets_while_disabled": sum(not bool(row.get("live_execution_enabled")) for row in self.state["shadow_history"]),
             "shadow_pnl_while_disabled": self.state["shadow_pnl_while_disabled"],
             "last_actual_trade": self.state["actual_history"][-1].get("market_ticker") if self.state["actual_history"] else None,
             "last_shadow_trade": self.state["shadow_history"][-1].get("market_ticker") if self.state["shadow_history"] else None,

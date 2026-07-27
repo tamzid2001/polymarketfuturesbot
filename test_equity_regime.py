@@ -192,7 +192,10 @@ class EquityRegimeTests(unittest.TestCase):
     def test_p90_and_p10_apply_only_to_next_market_and_restore_from_disk(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            config = RegimeConfig(enabled=True, dry_run=True, prophet_min_history=2, prophet_training_window=None)
+            config = RegimeConfig(
+                enabled=True, dry_run=True, prophet_min_history=2,
+                prophet_training_window=None, prophet_refit_every_markets=1,
+            )
             controller = EquityRegimeController(config, root / "state.json", root / "outputs")
             controller.initialize_absolute_balances(Decimal("100"), reason="test")
             now = datetime.now(tz=UTC)

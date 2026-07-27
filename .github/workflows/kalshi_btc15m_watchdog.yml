@@ -53,12 +53,12 @@ jobs:
           # regime can alter real-order state. This watchdog cannot bypass it.
           gh workflow run kalshi_btc15m_average_down.yml \
             --repo "$REPOSITORY" --ref main \
-            -f live_trading=true \
+            -f live_trading=false \
             -f enable_dynamic_scaling=true \
-            -f equity_regime_enabled=true \
-            -f equity_regime_dry_run=false \
+            -f equity_regime_enabled=false \
+            -f equity_regime_dry_run=true \
             -f prophet_min_history=200 \
-            -f prophet_refit_every_markets=1 \
+            -f prophet_refit_every_markets=75 \
             -f shadow_fill_model=conservative_trade_through \
             -f starting_balance=100.00
-          echo "WATCHDOG DISPATCHED | no active/queued live runner; replacement queued."
+          echo "WATCHDOG DISPATCHED | non-live reconciliation replacement queued."
