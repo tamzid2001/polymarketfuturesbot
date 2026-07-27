@@ -134,6 +134,16 @@ class EquityRegimeTests(unittest.TestCase):
         }, "portfolio")
         self.assertEqual(fill.subaccount, 0)
 
+    def test_explicit_historical_anchor_is_distinct_from_default_starting_balance(self) -> None:
+        config = RegimeConfig.from_mapping({
+            "starting_balance": "100.00",
+            "historical_starting_balance": "100.00",
+            "equity_regime_enabled": True,
+            "equity_regime_dry_run": True,
+        })
+        self.assertEqual(config.starting_balance, Decimal("100.00"))
+        self.assertEqual(config.historical_starting_balance, Decimal("100.00"))
+
     def test_decimal_accounting_handles_partial_exit_and_settlement_without_double_counting(self) -> None:
         fills = [
             normalize_fill({"fill_id": "b1", "ticker": "KXBTC15M-X", "side": "yes", "action": "buy", "price": "0.40", "count_fp": "2", "fee_cost": "0.02"}, "portfolio"),
