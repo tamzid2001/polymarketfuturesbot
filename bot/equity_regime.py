@@ -202,6 +202,10 @@ class RegimeConfig:
     history_max_markets: int = 200
     bot_client_order_prefix: str = DEFAULT_CLIENT_ORDER_PREFIX
     bot_order_group_id: str | None = None
+    # A shared series ticker is not ownership evidence: a user can trade the
+    # same KXBTC15M market manually.  It is disabled by default and exists
+    # only for a deliberately documented legacy import.
+    allow_series_ticker_ownership_fallback: bool = False
     prophet_enabled: bool = True
     prophet_min_history: int = 200
     # A lookback is a row selector, never a P/L rebase.  The production
@@ -283,6 +287,9 @@ class RegimeConfig:
             history_max_markets=int(pick("history_max_markets", 200)),
             bot_client_order_prefix=str(pick("bot_client_order_prefix", DEFAULT_CLIENT_ORDER_PREFIX)),
             bot_order_group_id=(str(pick("bot_order_group_id", "")).strip() or None),
+            allow_series_ticker_ownership_fallback=bool_value(
+                pick("allow_series_ticker_ownership_fallback", False),
+            ),
             prophet_enabled=bool_value(pick("prophet_enabled", True), True),
             prophet_min_history=int(pick("prophet_min_history", 200)),
             prophet_training_window=None if window in {None, "", "None", "none"} else int(window),
@@ -607,10 +614,17 @@ def ownership_evidence(fill: NormalizedFill, config: RegimeConfig, local_order_i
         return "client_order_id_prefix"
     if config.bot_order_group_id and fill.order_group_id == config.bot_order_group_id:
         return "order_group_id"
-    if fill.ticker in local_tickers:
-        return "stored_order_ticker"
-    if fill.ticker.startswith(config.series_ticker + "-") and (fill.subaccount is None or fill.subaccount == config.subaccount):
-        return "configured_series_ticker"
+    # A ticker in the local market ledger does *not* prove this particular
+    # fill belongs to the bot: manual orders can use the same 15-minute
+    # market.  Exact order identifiers are handled above.  The broad series
+    # fallback is opt-in only for audited legacy imports and must never be the
+    # default for live balance reconstruction.
+    if (
+        config.allow_series_ticker_ownership_fallback
+        and fill.ticker.startswith(config.series_ticker + "-")
+        and (fill.subaccount is None or fill.subaccount == config.subaccount)
+    ):
+        return "configured_series_ticker_explicit_legacy_fallback"
     return None
 
 
@@ -685,10 +699,16 @@ class HistoricalSynchronizer:
             if evidence is None:
                 ambiguous.append({
                     "reason": "ambiguous_bot_ownership", "fill_id": fill.fill_id,
-                    "ticker": fill.ticker, "client_order_id": fill.client_order_id,
+                    "ticker": fill.ticker, "order_id": fill.order_id,
+                    "client_order_id": fill.client_order_id, "order_group_id": fill.order_group_id,
+                    "created_at": timestamp_text(fill.created_at), "action": fill.action,
+                    "side": fill.side, "price": format(fill.price, "f"),
+                    "count": format(fill.count, "f"), "fee": format(fill.fee, "f"),
+                    "source": fill.source,
                 })
                 continue
             deduplicated[fill.dedupe_key] = fill
+        owned_tickers = {fill.ticker for fill in deduplicated.values()}
         settlements: list[NormalizedSettlement] = []
         for row in raw_settlements:
             try:
@@ -696,7 +716,7 @@ class HistoricalSynchronizer:
             except ValueError:
                 continue
             if (
-                settlement.ticker.startswith(self.config.series_ticker + "-")
+                settlement.ticker in owned_tickers
                 and not (
                     (self.config.history_start_ts and settlement.settled_at and settlement.settled_at < self.config.history_start_ts)
                     or (self.config.history_end_ts and settlement.settled_at and settlement.settled_at > self.config.history_end_ts)
