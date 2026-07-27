@@ -2061,11 +2061,15 @@ class EquityRegimeController:
                 ZERO,
             )
             exchange_position = abs(decimal_value(record.get("exchange_position_contracts")))
-            # A non-terminal record with fills is open exposure.  A terminal
-            # record reporting a non-zero exchange position is also unsafe:
-            # it cannot be inserted as an allegedly closed balance point.
-            if exchange_position > Decimal("0.004") or (
-                str(record.get("status")) not in terminal and filled > Decimal("0.004")
+            # Only a *non-terminal* market can make the current endpoint
+            # ambiguous.  Old finalized ledger rows can retain a stale
+            # exchange-position snapshot (for example ``-1`` from a market
+            # settled days ago); treating that archival value as live
+            # exposure incorrectly prevents a later 200-market bootstrap and
+            # leaves all Prophet bands null.  Closed rows below are still
+            # included only through their finalized realized P/L.
+            if str(record.get("status")) not in terminal and (
+                exchange_position > Decimal("0.004") or filled > Decimal("0.004")
             ):
                 LOG.warning(
                     "ABSOLUTE LEDGER BOOTSTRAP DEFERRED | filled open position ticker=%s filled=%s exchange=%s",
