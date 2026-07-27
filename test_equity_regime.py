@@ -379,6 +379,51 @@ class EquityRegimeTests(unittest.TestCase):
             self.assertTrue(controller.state["future_forecast_snapshot"][0]["used_for_live_filter"])
             self.assertFalse(controller.state["future_forecast_snapshot"][1]["used_for_live_filter"])
 
+    def test_refit_cadence_consumes_the_matching_future_horizon_row(self) -> None:
+        """A 75-market cadence must not reuse row one on market two."""
+
+        class DistinctHorizonForecaster:
+            fit_number = 0
+
+            def forecast_horizon(self, _observations, _target, horizon):
+                self.fit_number += 1
+                return [
+                    {
+                        "p01": Decimal(str(90 + index)), "p10": Decimal(str(95 + index)),
+                        "p25": Decimal(str(100 + index)), "p50": Decimal(str(105 + index)),
+                        "p75": Decimal(str(110 + index)), "p90": Decimal(str(115 + index)), "p99": Decimal(str(120 + index)),
+                    }
+                    for index in range(horizon)
+                ]
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = RegimeConfig(
+                enabled=True, dry_run=True, prophet_min_history=2,
+                prophet_training_window=2, history_max_markets=2,
+                prophet_refit_every_markets=75, prophet_future_horizon_markets=100,
+            )
+            controller = EquityRegimeController(config, root / "state.json", root / "outputs")
+            controller.initialize_absolute_balances(Decimal("100"), reason="test")
+            now = datetime.now(tz=UTC)
+            controller.state["shadow_history"] = [
+                {"market_ticker": "old1", "market_close_time": (now - timedelta(minutes=30)).isoformat(), "completed_at": (now - timedelta(minutes=30)).isoformat(), "shadow_balance_after": "99"},
+                {"market_ticker": "old2", "market_close_time": (now - timedelta(minutes=15)).isoformat(), "completed_at": (now - timedelta(minutes=15)).isoformat(), "shadow_balance_after": "100"},
+            ]
+            forecaster = DistinctHorizonForecaster()
+            controller.forecaster = forecaster
+            first = controller.prepare_forecast(decision("KXBTC15M-CADENCE-1", now))
+            self.assertEqual(first["p10"], "95")
+            self.assertEqual(forecaster.fit_number, 1)
+            # Market one has closed, so market two must consume horizon row 2.
+            controller.state["markets_since_refit"] = 1
+            second = controller.prepare_forecast(decision("KXBTC15M-CADENCE-2", now + timedelta(minutes=16)))
+            self.assertEqual(second["p10"], "96")
+            self.assertEqual(second["model_fit_error"], "refit_deferred_reused_horizon_row_2")
+            self.assertEqual(forecaster.fit_number, 1)
+            self.assertTrue(controller.state["future_forecast_snapshot"][1]["used_for_live_filter"])
+            self.assertEqual(controller.state["future_forecast_snapshot"][1]["consumed_target_ticker"], "KXBTC15M-CADENCE-2")
+
     def test_finalization_bootstraps_immediately_after_inherited_position_closes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

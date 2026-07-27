@@ -1454,12 +1454,32 @@ class EquityRegimeController:
             raise RuntimeError(f"cannot derive a forecast timestamp for {decision.target_ticker}")
         markets_since_refit = int(self.state.get("markets_since_refit") or 0)
         if self.state["forecasts"] and markets_since_refit < self.config.prophet_refit_every_markets:
-            previous = self.state["forecasts"][-1] if self.state["forecasts"] else None
-            if previous is None:
-                return None
-            copied = {name: previous[name] for name in QUANTILES}
-            fit_error = "refit_deferred_reused_previous_forecast"
-        else:
+            # A cadence fit creates a sequential 100-market Prophet path.  A
+            # prior version incorrectly copied the first row for every market
+            # until the next refit.  That both ignored the requested horizon
+            # and compared each later shadow balance to a prediction made for
+            # a different market.  Consume row N for the Nth completed market
+            # since this fit; force a new fit if the retained horizon is not
+            # long enough.  The snapshot contains model predictions only, so
+            # no later realized balance can enter this branch.
+            snapshot = self.state.get("future_forecast_snapshot") or []
+            snapshot_index = markets_since_refit
+            if snapshot_index >= len(snapshot):
+                LOG.warning(
+                    "PROPHET HORIZON EXHAUSTED | target=%s offset=%d horizon=%d; refitting early",
+                    decision.target_ticker, snapshot_index, len(snapshot),
+                )
+                markets_since_refit = self.config.prophet_refit_every_markets
+            else:
+                horizon_row = snapshot[snapshot_index]
+                copied = {name: str(horizon_row[name]) for name in QUANTILES}
+                horizon_row.update({
+                    "used_for_live_filter": True,
+                    "consumed_target_ticker": decision.target_ticker,
+                    "consumed_target_time": timestamp_text(forecast_target_time),
+                })
+                fit_error = f"refit_deferred_reused_horizon_row_{snapshot_index + 1}"
+        if not self.state["forecasts"] or markets_since_refit >= self.config.prophet_refit_every_markets:
             try:
                 # Fit once to the unmodified latest 200 closed-trade balances
                 # plus their opening-balance anchor (201 rows in the Colab
@@ -1489,6 +1509,8 @@ class EquityRegimeController:
                                 )
                             ),
                             "used_for_live_filter": index == 1,
+                            "consumed_target_ticker": decision.target_ticker if index == 1 else None,
+                            "consumed_target_time": timestamp_text(forecast_target_time) if index == 1 else None,
                             "training_start": timestamp_text(observation_timestamp(model_training[0])),
                             "training_end": timestamp_text(observation_timestamp(model_training[-1])),
                             "training_rows": len(model_training),
