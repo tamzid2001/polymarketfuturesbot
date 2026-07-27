@@ -2337,6 +2337,14 @@ class EquityRegimeController:
         makes the endpoint ambiguous, so the method refuses to run then.
         """
 
+        # The Colab reference mode owns its full balance input from the
+        # supplied closed-positions export.  Replacing that curve after a
+        # later settlement with an endpoint-anchored bot-only ledger silently
+        # changes the model scale and breaks parity with the notebook.  This
+        # recovery path is exclusively for the bot-owned absolute-history
+        # mode.
+        if self.config.prophet_history_source != "bot_owned":
+            return 0
         if not self.config.allow_endpoint_anchored_ledger_bootstrap:
             return 0
         if api_current_balance <= ZERO:
