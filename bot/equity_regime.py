@@ -2328,7 +2328,17 @@ async def _reconcile_command(args: argparse.Namespace) -> int:
     from kalshi_btc15m_average_down import KalshiREST, default_state, load_json
 
     config_values = json.loads(args.config.read_text(encoding="utf-8")) if args.config.exists() else {}
-    config_values.update({"equity_regime_enabled": True, "equity_regime_dry_run": True, "starting_balance": args.starting_balance})
+    # ``starting_balance`` is the caller's explicit, verified balance at the
+    # beginning of the requested historical reconstruction.  The
+    # reconciliation command must pass it through as the historical anchor;
+    # otherwise RegimeConfig correctly withholds the balance curve but the CLI
+    # appears to have accepted an anchor it never used.
+    config_values.update({
+        "equity_regime_enabled": True,
+        "equity_regime_dry_run": True,
+        "starting_balance": args.starting_balance,
+        "historical_starting_balance": args.starting_balance,
+    })
     config = RegimeConfig.from_mapping(config_values)
     controller = EquityRegimeController(config, args.regime_state, args.output_dir)
     trader_state = load_json(args.trader_state, default_state())
