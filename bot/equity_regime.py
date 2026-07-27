@@ -113,6 +113,18 @@ def timestamp_text(value: Any) -> str:
     return parsed.isoformat() if parsed is not None else ""
 
 
+def raw_record_text(record: Mapping[str, Any]) -> str:
+    """Preserve a raw API record in a CSV cell for read-only reconciliation.
+
+    The artifacts contain account-order metadata but no API credentials.  A
+    normalized field can be ambiguous (for example, a Kalshi fill's action
+    versus a maker/taker action), so the exact response is retained solely to
+    audit accounting discrepancies.
+    """
+
+    return json.dumps(dict(record), default=as_json, sort_keys=True, separators=(",", ":"))
+
+
 def ticker_clock_timestamp(ticker: Any, fallback: Any = None) -> datetime | None:
     """Return the ticker clock time used by the supplied Colab notebooks.
 
@@ -636,6 +648,7 @@ class HistorySyncResult:
     duplicate_fills_removed: int
     ambiguous_fills: list[dict[str, Any]]
     owned_fill_audit: list[dict[str, Any]]
+    owned_settlement_audit: list[dict[str, Any]]
     ambiguous_settlement_audit: list[dict[str, Any]]
     balance_payload: Mapping[str, Any] | None
 
@@ -727,10 +740,12 @@ class HistoricalSynchronizer:
                 "fee": format(fill.fee, "f"),
                 "subaccount": fill.subaccount,
                 "source": fill.source,
+                "raw_api_record": raw_record_text(fill.raw),
             })
         owned_tickers = {fill.ticker for fill in deduplicated.values()}
         ambiguous_tickers = {str(row.get("ticker")) for row in ambiguous if row.get("ticker")}
         settlements: list[NormalizedSettlement] = []
+        owned_settlement_audit: list[dict[str, Any]] = []
         ambiguous_settlement_audit: list[dict[str, Any]] = []
         for row in raw_settlements:
             try:
@@ -745,6 +760,7 @@ class HistoricalSynchronizer:
                 "yes_count": None if settlement.yes_count is None else format(settlement.yes_count, "f"),
                 "no_count": None if settlement.no_count is None else format(settlement.no_count, "f"),
                 "source": settlement.source,
+                "raw_api_record": raw_record_text(settlement.raw),
             }
             if (
                 settlement.ticker in owned_tickers
@@ -754,6 +770,7 @@ class HistoricalSynchronizer:
                 )
             ):
                 settlements.append(settlement)
+                owned_settlement_audit.append(settlement_audit)
             elif settlement.ticker in ambiguous_tickers:
                 # This deliberately exposes only a settlement which belongs
                 # to an already-reported ambiguous fill.  It lets the
@@ -763,10 +780,11 @@ class HistoricalSynchronizer:
         fills = sorted(deduplicated.values(), key=lambda item: (item.created_at or datetime.min.replace(tzinfo=UTC), item.fill_id))
         settlements.sort(key=lambda item: (item.settled_at or datetime.min.replace(tzinfo=UTC), item.ticker))
         owned_fill_audit.sort(key=lambda item: (item["created_at"], item["fill_id"]))
+        owned_settlement_audit.sort(key=lambda item: (item["settled_at"], item["ticker"]))
         ambiguous_settlement_audit.sort(key=lambda item: (item["settled_at"], item["ticker"]))
         return HistorySyncResult(
             cutoff, fills, settlements, duplicate_count, ambiguous,
-            owned_fill_audit, ambiguous_settlement_audit, balance_payload,
+            owned_fill_audit, owned_settlement_audit, ambiguous_settlement_audit, balance_payload,
         )
 
 
@@ -2311,6 +2329,7 @@ async def synchronize_history(controller: EquityRegimeController, api: JsonAPI, 
     # bot's P/L curve.
     controller.output_dir.mkdir(parents=True, exist_ok=True)
     controller._write_csv(controller.output_dir / "api_owned_fills.csv", result.owned_fill_audit)
+    controller._write_csv(controller.output_dir / "api_owned_settlements.csv", result.owned_settlement_audit)
     controller._write_csv(controller.output_dir / "api_ambiguous_fills.csv", result.ambiguous_fills)
     controller._write_csv(
         controller.output_dir / "api_ambiguous_fill_settlements.csv",

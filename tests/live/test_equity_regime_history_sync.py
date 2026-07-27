@@ -55,6 +55,8 @@ class HistorySyncAuditTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.ambiguous_settlement_audit[0]["ticker"], manual_ticker)
         self.assertEqual(result.ambiguous_settlement_audit[0]["payout"], "2.00")
         self.assertEqual([settlement.ticker for settlement in result.settlements], [bot_ticker])
+        self.assertEqual(result.owned_settlement_audit[0]["ticker"], bot_ticker)
+        self.assertIn('"market_result":"yes"', result.owned_settlement_audit[0]["raw_api_record"])
 
 
 if __name__ == "__main__":
