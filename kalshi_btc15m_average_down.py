@@ -152,6 +152,10 @@ DEFAULT_CONFIG = {
     "history_start_ts": None,
     "history_end_ts": None,
     "history_max_markets": 200,
+    # Match the supplied Colab notebook: the Prophet curve is based on all
+    # closed KXBTC15M account markets, including manual activity, rather than
+    # bot-ownership attribution.
+    "prophet_history_source": "account_series",
     "allow_endpoint_anchored_ledger_bootstrap": True,
     "accounting_tolerance": "0.01",
     "bot_client_order_prefix": BOT_CLIENT_ORDER_PREFIX,
