@@ -11,7 +11,7 @@
     "bot_order_group_id": null,
     "cooldown_state_source": "separate",
     "enable_dynamic_scaling": true,
-    "equity_regime_dry_run": false,
+    "equity_regime_dry_run": true,
     "equity_regime_enabled": true,
     "fee_reserve": 0.05,
     "format_version": 19,
@@ -32,7 +32,7 @@
     "max_total_capital_auto": true,
     "order_reconcile_seconds": 5.0,
     "poll_seconds": 2.0,
-    "prophet_changepoint_prior_scale": 0.25,
+    "prophet_changepoint_prior_scale": 0.05,
     "prophet_daily_seasonality": true,
     "prophet_enabled": true,
     "prophet_forecast_frequency_minutes": 15,
@@ -40,6 +40,7 @@
     "prophet_history_source": "account_series",
     "prophet_min_history": 200,
     "prophet_random_seed": 42,
+    "prophet_reference_closed_positions_path": "data/closed-positions-2026-07-27.csv",
     "prophet_refit_every_markets": 75,
     "prophet_seasonality_prior_scale": 10.0,
     "prophet_training_window": 201,
@@ -63,9 +64,9 @@
   "current_streak": 2,
   "current_streak_kind": "win",
   "directional_signal_performance": {
-    "current_streak": 2,
+    "current_streak": 3,
     "current_streak_kind": "win",
-    "eligible_signals": 380,
+    "eligible_signals": 381,
     "executed_losses": 145,
     "executed_signals": 251,
     "executed_wins": 106,
@@ -76,10 +77,10 @@
     "loss_skipped_wins": 33,
     "losses": 190,
     "unfilled_ladder_losses": 2,
-    "unfilled_ladder_signals": 53,
-    "unfilled_ladder_wins": 51,
-    "win_rate": 0.5,
-    "wins": 190
+    "unfilled_ladder_signals": 54,
+    "unfilled_ladder_wins": 52,
+    "win_rate": 0.501312,
+    "wins": 191
   },
   "dynamic_base_share_scaling": {
     "base_share_increment": 1.0,
@@ -118,7 +119,7 @@
   },
   "exit_policy": "hold every filled contract to settlement; only fresh full-depth selected-side bid <= $0.05 triggers a reduce-only close",
   "five_cent_stop_exits": 141,
-  "generated_at": "2026-07-27T02:49:33.527032+00:00",
+  "generated_at": "2026-07-27T03:00:48.774249+00:00",
   "last_closed_trade": {
     "closed_at": "2026-07-27T02:46:18.972475+00:00",
     "contracts": 18.0,
@@ -138,46 +139,46 @@
   "losing_trades": 149,
   "markets_skipped_due_to_loss_circuit_breaker": 76,
   "markets_skipped_due_to_source_finalization_window": 1,
-  "markets_started": 383,
+  "markets_started": 384,
   "maximum_drawdown": 109.35,
   "net_profit": 44.302859,
   "return_on_capital": 0.043487,
   "rung_order_activity": {
     "0.10": {
-      "canceled_unfilled_orders": 141,
+      "canceled_unfilled_orders": 142,
       "filled_contracts": 1620.0,
       "filled_order_submissions": 159,
       "resting_orders": 3,
       "rung_price": 0.1,
-      "submitted_contracts": 3068.0,
-      "submitted_orders": 303
+      "submitted_contracts": 3080.0,
+      "submitted_orders": 304
     },
     "0.20": {
-      "canceled_unfilled_orders": 119,
+      "canceled_unfilled_orders": 120,
       "filled_contracts": 1395.0,
       "filled_order_submissions": 181,
       "resting_orders": 3,
       "rung_price": 0.2,
-      "submitted_contracts": 2301.0,
-      "submitted_orders": 303
+      "submitted_contracts": 2310.0,
+      "submitted_orders": 304
     },
     "0.30": {
-      "canceled_unfilled_orders": 85,
+      "canceled_unfilled_orders": 86,
       "filled_contracts": 1084.0,
       "filled_order_submissions": 212,
       "resting_orders": 3,
       "rung_price": 0.3,
-      "submitted_contracts": 1524.0,
-      "submitted_orders": 300
+      "submitted_contracts": 1530.0,
+      "submitted_orders": 301
     },
     "0.40": {
-      "canceled_unfilled_orders": 50,
+      "canceled_unfilled_orders": 51,
       "filled_contracts": 632.0,
       "filled_order_submissions": 248,
       "resting_orders": 1,
       "rung_price": 0.4,
-      "submitted_contracts": 759.0,
-      "submitted_orders": 299
+      "submitted_contracts": 762.0,
+      "submitted_orders": 300
     }
   },
   "rung_performance": {
@@ -235,7 +236,7 @@
   "strategy": "settlement_contrarian_settlement_v2",
   "total_contracts": 4731.0,
   "total_cost": 1018.76,
-  "unfilled_markets": 53,
+  "unfilled_markets": 54,
   "win_rate": 0.406375,
   "winning_trades": 102
 }
