@@ -222,6 +222,9 @@ class RegimeConfig:
     # closed account market in the configured series, including manual
     # activity, solely to construct Prophet's balance input.
     prophet_history_source: str = "bot_owned"
+    # Use the supplied closed-position export when exact Colab parity is
+    # required; its rows include the account's manual and bot positions.
+    prophet_reference_closed_positions_path: Path | None = None
     prophet_enabled: bool = True
     prophet_min_history: int = 200
     # A lookback is a row selector, never a P/L rebase.  The production
@@ -309,6 +312,11 @@ class RegimeConfig:
                 pick("allow_series_ticker_ownership_fallback", False),
             ),
             prophet_history_source=str(pick("prophet_history_source", "bot_owned")),
+            prophet_reference_closed_positions_path=(
+                None
+                if pick("prophet_reference_closed_positions_path", None) in {None, "", "None", "none"}
+                else Path(str(pick("prophet_reference_closed_positions_path", "")))
+            ),
             prophet_enabled=bool_value(pick("prophet_enabled", True), True),
             prophet_min_history=int(pick("prophet_min_history", 200)),
             prophet_training_window=None if window in {None, "", "None", "none"} else int(window),
@@ -1668,6 +1676,10 @@ class EquityRegimeController:
             "actual_history": actual_history, "shadow_history": shadow_history,
             "processed_market_tickers": [row.market_ticker for _, row in selected],
             "forecasts": [], "future_forecast_snapshot": [], "transitions": [], "live_vs_shadow": [], "shadow_open": {},
+            "last_p01": None, "last_p10": None, "last_p25": None, "last_p50": None,
+            "last_p75": None, "last_p90": None, "last_p99": None,
+            "forecast_generated_at": None, "forecast_target_ticker": None,
+            "prophet_training_end": None, "prophet_training_rows": 0,
             "balance_source": "colab_reference_account_series_starting_balance",
             "balance_reconciled": False, "balance_reconciliation_error": "not_requested_for_colab_reference_history",
             "prophet_history_ready": True,
@@ -1678,6 +1690,85 @@ class EquityRegimeController:
             len(selected), self.config.starting_balance, balance, api_current_balance,
         )
         return True
+
+    def rebuild_colab_reference_closed_positions_csv(
+        self,
+        path: Path,
+        *,
+        api_current_balance: Decimal,
+    ) -> bool:
+        """Parse the supplied closed-position export exactly like the Colab notebook.
+
+        The notebook strips column whitespace, extracts KXBTC15M ticker time,
+        parses ``Total return ($)``, sorts chronologically, keeps the last
+        duplicate ticker, and accumulates P/L from one $100 starting row.  Do
+        those same operations here rather than trying to infer a different
+        account statement from raw fills.
+        """
+
+        if not path.is_file():
+            raise RuntimeError(f"Colab reference closed-positions CSV is missing: {path}")
+        parsed: list[tuple[datetime, int, str, Decimal]] = []
+        with path.open("r", encoding="utf-8-sig", newline="") as handle:
+            reader = csv.DictReader(handle)
+            fieldnames = reader.fieldnames or []
+            columns = {str(name).strip(): str(name) for name in fieldnames if name is not None}
+            ticker_column = columns.get("Ticker")
+            return_column = next(
+                (columns[name] for name in ("Total return ($)", "Total return", "Total Return ($)", "Total Return") if name in columns),
+                None,
+            )
+            if ticker_column is None or return_column is None:
+                raise RuntimeError(
+                    "Colab reference CSV must contain Ticker and a Total return column; "
+                    f"available={sorted(columns)}"
+                )
+            for source_index, record in enumerate(reader):
+                ticker = str(record.get(ticker_column) or "")
+                timestamp = ticker_clock_timestamp(ticker)
+                cleaned = re.sub(r"[^0-9.\\-]", "", str(record.get(return_column) or ""))
+                if timestamp is None or not cleaned:
+                    continue
+                try:
+                    pnl = Decimal(cleaned)
+                except InvalidOperation:
+                    continue
+                if not pnl.is_finite():
+                    continue
+                parsed.append((timestamp, source_index, ticker, pnl))
+        parsed.sort(key=lambda item: (item[0], item[1]))
+        deduplicated: dict[str, tuple[datetime, int, str, Decimal]] = {}
+        for item in parsed:
+            # pandas ``drop_duplicates(..., keep='last')`` after a stable
+            # chronological sort has precisely this replacement behavior.
+            deduplicated[item[2]] = item
+        markets = [
+            ReconstructedMarket(
+                market_ticker=ticker, market_close_time=timestamp, selected_side=None,
+                contracts_bought=ZERO, contracts_sold=ZERO, average_entry=None,
+                entry_cost=ZERO, exit_proceeds=ZERO, settlement_payout=ZERO,
+                fees=ZERO, realized_pnl=pnl, exit_method="closed_position_export",
+                source="closed_positions_csv", reconciliation_status="colab_reference_export",
+            )
+            for timestamp, _source_index, ticker, pnl in sorted(
+                deduplicated.values(), key=lambda item: (item[0], item[2]),
+            )
+        ]
+        rebuilt = self.rebuild_colab_reference_account_series_history(
+            markets, api_current_balance=api_current_balance,
+        )
+        if rebuilt:
+            self.state["balance_source"] = "colab_reference_closed_positions_csv"
+            self.state["colab_reference_csv"] = {
+                "path": str(path), "closed_btc_rows": len(markets),
+                "selected_rows": min(len(markets), self.config.history_max_markets),
+                "starting_balance": format(self.config.starting_balance, "f"),
+            }
+            LOG.warning(
+                "COLAB CLOSED-POSITIONS HISTORY BUILT | path=%s rows=%d selected=%d ending_shadow=%s",
+                path, len(markets), min(len(markets), self.config.history_max_markets), self.state["shadow_balance"],
+            )
+        return rebuilt
 
     def save(self) -> None:
         self._bound_persisted_history()
@@ -1897,6 +1988,46 @@ class EquityRegimeController:
         )
         self.save()
         return forecast
+
+    def prime_colab_reference_forecast(self) -> dict[str, Any] | None:
+        """Publish the same initial 100-row forecast as the Colab notebook.
+
+        The notebook fits immediately after loading the 201-row input rather
+        than waiting for a future strategy signal.  Preloading its first
+        forecast keeps heartbeat P10/P50/P90 values non-null and lets the
+        first eligible next market consume that already-causal row.
+        """
+
+        if self.config.prophet_history_source != "account_series" or not self.prophet_history_ready:
+            return None
+        if self.state.get("forecasts"):
+            return self.state["forecasts"][-1]
+        values = [dict(item) for item in self.state.get("shadow_history", [])]
+        anchor = self.state.get("shadow_balance_anchor")
+        if isinstance(anchor, Mapping):
+            values.append(dict(anchor))
+        values.sort(key=lambda item: (timestamp_text(observation_timestamp(item)), str(item.get("market_ticker"))))
+        if len(values) < self.config.prophet_min_history:
+            return None
+        last_time = observation_timestamp(values[-1])
+        if last_time is None:
+            return None
+        target_time = last_time + timedelta(minutes=self.config.prophet_forecast_frequency_minutes)
+        target_ticker = (
+            f"{self.config.series_ticker}-{target_time.strftime('%y%b%d%H%M').upper()}-"
+            f"{target_time.strftime('%S')}"
+        )
+        # ``prepare_forecast`` enforces the same no-look-ahead and
+        # predictive-sample path used for live signals.  This immutable
+        # placeholder is never routed to an executor.
+        preload = StrategyDecision(
+            target_ticker=target_ticker, source_ticker=None, selected_side="yes", eligible=False,
+            skip_reason="startup_colab_forecast_preload",
+            ladder_orders=(LadderOrder(Decimal("0.40"), Decimal("1"), "preload"),),
+            stop_price=Decimal("0.05"), trailing_activation_gain=ZERO, trailing_retracement=ZERO,
+            generated_at=target_time - timedelta(seconds=1), target_close_time=target_time,
+        )
+        return self.prepare_forecast(preload)
 
     def start_market(self, decision: StrategyDecision) -> tuple[dict[str, Any], bool]:
         """Persist the strategy decision before any current-market result exists."""
@@ -2647,10 +2778,16 @@ async def synchronize_history(controller: EquityRegimeController, api: JsonAPI, 
     balance = decimal_value(balance_dollars) if balance_dollars is not None else decimal_value(raw_balance) / Decimal("100")
     if controller.config.prophet_history_source == "account_series":
         controller.migrate_legacy_rebased_state(balance)
-        controller.rebuild_colab_reference_account_series_history(
-            series_reconstructed,
-            api_current_balance=balance,
-        )
+        if controller.config.prophet_reference_closed_positions_path is not None:
+            controller.rebuild_colab_reference_closed_positions_csv(
+                controller.config.prophet_reference_closed_positions_path,
+                api_current_balance=balance,
+            )
+        else:
+            controller.rebuild_colab_reference_account_series_history(
+                series_reconstructed,
+                api_current_balance=balance,
+            )
     elif controller.config.historical_starting_balance is not None:
         controller.migrate_legacy_rebased_state(balance)
         controller.rebuild_absolute_history(
@@ -2668,6 +2805,8 @@ async def synchronize_history(controller: EquityRegimeController, api: JsonAPI, 
             trader_state,
             api_current_balance=balance,
         )
+    if controller.config.prophet_history_source == "account_series":
+        controller.prime_colab_reference_forecast()
     current_actual = decimal_value(controller.state["actual_balance"]) if controller.state.get("actual_balance") else None
     current_difference = None if current_actual is None else current_actual - balance
     reconciliation.append({
