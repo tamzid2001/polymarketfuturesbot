@@ -2734,6 +2734,77 @@ class KalshiRawHistoryAPI:
 
 
 async def synchronize_history(controller: EquityRegimeController, api: JsonAPI, trader_state: Mapping[str, Any]) -> HistorySyncResult:
+    # Exact notebook parity is intentionally driven by the checked-in
+    # closed-positions export, not by Kalshi's historical fill endpoints.
+    # Those endpoints are both unnecessary for this model input and can be
+    # unavailable from an Actions runner even while the authenticated trading
+    # endpoints are healthy.  Do not make a 403 on ``/historical/cutoff``
+    # prevent a live controller from using its durable, already-verified CSV
+    # curve and its persisted operational cash balance.
+    reference_export = controller.config.prophet_reference_closed_positions_path
+    if (
+        controller.config.prophet_history_source == "account_series"
+        and reference_export is not None
+    ):
+        stored_actual = controller.state.get("actual_balance")
+        if stored_actual is None:
+            # A first-ever installation has no persisted cash balance. Only
+            # in that case ask the inexpensive portfolio endpoint; normal
+            # restarts never depend on historical API access.
+            balance_payload = await api.get_json("/portfolio/balance")
+            balance_dollars = value_from(balance_payload, "balance_dollars")
+            raw_balance = balance_dollars if balance_dollars is not None else value_from(balance_payload, "balance")
+            if raw_balance is None:
+                raise RuntimeError("/portfolio/balance returned no usable balance for initial reference-CSV startup")
+            operational_balance = (
+                decimal_value(balance_dollars)
+                if balance_dollars is not None
+                else decimal_value(raw_balance) / Decimal("100")
+            )
+        else:
+            operational_balance = decimal_value(stored_actual)
+        controller.migrate_legacy_rebased_state(operational_balance)
+        controller.rebuild_colab_reference_closed_positions_csv(
+            reference_export,
+            api_current_balance=operational_balance,
+        )
+        controller.prime_colab_reference_forecast()
+        controller.state["ambiguous_fills"] = []
+        controller.state["reconciliation"] = [{
+            "market_ticker": "__colab_reference_closed_positions_csv__",
+            "market_close_time": None,
+            "api_balance": format(operational_balance, "f"),
+            "actual_balance": controller.state["actual_balance"],
+            "shadow_balance": controller.state["shadow_balance"],
+            "difference": None,
+            "reconciliation_status": "not_requested_reference_csv_is_model_source",
+        }]
+        controller.state["history_sync"] = {
+            "historical_live_cutoff": None,
+            "fills": 0,
+            "settlements": 0,
+            "duplicate_fills_removed": 0,
+            "ambiguous_fills": 0,
+            "series_fills": 0,
+            "series_settlements": 0,
+            "prophet_history_source": controller.config.prophet_history_source,
+            "reference_closed_positions_csv": str(reference_export),
+            "historical_api_sync_skipped": True,
+        }
+        controller.save()
+        LOG.info(
+            "COLAB REFERENCE HISTORY SYNC | csv=%s rows=%d actual_balance=%s shadow_balance=%s",
+            reference_export,
+            len(controller.state.get("shadow_history", [])),
+            controller.state["actual_balance"],
+            controller.state["shadow_balance"],
+        )
+        return HistorySyncResult(
+            cutoff=None, fills=[], settlements=[], series_fills=[], series_settlements=[],
+            duplicate_fills_removed=0, ambiguous_fills=[], owned_fill_audit=[],
+            owned_settlement_audit=[], ambiguous_settlement_audit=[], balance_payload=None,
+        )
+
     result = await HistoricalSynchronizer(controller.config, trader_state).sync(api)
     controller.state["ambiguous_fills"] = result.ambiguous_fills
     # Preserve the exact normalized records used (and deliberately excluded)
