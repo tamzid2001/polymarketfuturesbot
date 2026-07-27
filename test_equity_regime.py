@@ -403,6 +403,44 @@ class EquityRegimeTests(unittest.TestCase):
             self.assertTrue(controller.prophet_history_ready)
             self.assertFalse(controller.balance_reconciled)
 
+    def test_closed_position_csv_matches_colab_sort_deduplicate_and_cumulative_pnl(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            export = root / "closed-positions.csv"
+            export.write_text(
+                "Ticker,Total return ($)\n"
+                "KXBTC15M-26JUL260000-00,$1.00\n"
+                "KXBTC15M-26JUL260015-15,-$2.00\n"
+                "KXBTC15M-26JUL260015-15,-$1.50\n"
+                "KXBTC15M-26JUL260030-30,$2.00\n"
+                "KXMVESPORTSMULTIGAMEEXTENDED-X,-$9.00\n",
+                encoding="utf-8",
+            )
+            config = RegimeConfig(
+                enabled=True, dry_run=False, allow_live_state_transitions=True,
+                starting_balance=Decimal("100"), prophet_min_history=2,
+                history_max_markets=2, prophet_training_window=3,
+                prophet_history_source="account_series", prophet_reference_closed_positions_path=export,
+            )
+            controller = EquityRegimeController(config, root / "state.json", root / "outputs")
+            self.assertTrue(controller.rebuild_colab_reference_closed_positions_csv(
+                export, api_current_balance=Decimal("80.13"),
+            ))
+            self.assertEqual(
+                [Decimal(item["shadow_balance_after"]) for item in controller.state["shadow_history"]],
+                [Decimal("98.50"), Decimal("100.50")],
+            )
+            self.assertEqual(controller.state["balance_source"], "colab_reference_closed_positions_csv")
+            self.assertEqual(Decimal(controller.state["shadow_balance"]), Decimal("100.50"))
+
+            controller.forecaster = FakeForecaster("95", "105")
+            forecast = controller.prime_colab_reference_forecast()
+            self.assertIsNotNone(forecast)
+            self.assertEqual(forecast["forecast_target_ticker"], "KXBTC15M-26JUL260045-30")
+            self.assertEqual(controller.state["last_p10"], "95")
+            self.assertEqual(controller.state["last_p50"], "100")
+            self.assertEqual(controller.state["last_p90"], "105")
+
     def test_hundred_row_diagnostic_forecast_uses_only_first_row_for_live_filter(self) -> None:
         class HorizonForecaster:
             fit_number = 0

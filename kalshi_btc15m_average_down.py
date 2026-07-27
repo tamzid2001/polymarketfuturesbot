@@ -156,6 +156,7 @@ DEFAULT_CONFIG = {
     # closed KXBTC15M account markets, including manual activity, rather than
     # bot-ownership attribution.
     "prophet_history_source": "account_series",
+    "prophet_reference_closed_positions_path": "data/closed-positions-2026-07-27.csv",
     "allow_endpoint_anchored_ledger_bootstrap": True,
     "accounting_tolerance": "0.01",
     "bot_client_order_prefix": BOT_CLIENT_ORDER_PREFIX,
