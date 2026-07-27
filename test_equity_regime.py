@@ -433,6 +433,17 @@ class EquityRegimeTests(unittest.TestCase):
             self.assertEqual(controller.state["balance_source"], "colab_reference_closed_positions_csv")
             self.assertEqual(Decimal(controller.state["shadow_balance"]), Decimal("100.50"))
 
+            # A later live settlement must not replace the exact Colab curve
+            # with the unrelated endpoint-anchored bot-only reconstruction.
+            self.assertEqual(
+                controller.bootstrap_from_live_ledger(
+                    {"markets": {}}, api_current_balance=Decimal("80.13"),
+                ),
+                0,
+            )
+            self.assertEqual(controller.state["balance_source"], "colab_reference_closed_positions_csv")
+            self.assertEqual(Decimal(controller.state["shadow_balance"]), Decimal("100.50"))
+
             controller.forecaster = FakeForecaster("95", "105")
             forecast = controller.prime_colab_reference_forecast()
             self.assertIsNotNone(forecast)
