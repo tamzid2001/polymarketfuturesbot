@@ -1,0 +1,51 @@
+name: EMERGENCY — Cancel Kalshi BTC 15m Resting Orders
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_cancel_all:
+        description: "Type/click true to cancel every resting mechanical order owned by this runner. This never submits replacements or liquidates filled positions."
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  cancel-resting-orders:
+    if: inputs.confirm_cancel_all == true
+    runs-on: ubuntu-latest
+    environment: "Kalshi"
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install cancellation dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements_kalshi_settlement_trader.txt
+
+      - name: Write Kalshi RSA private key
+        env:
+          KALSHI_PRIVATE_KEY: ${{ secrets.KALSHI_PRIVATE_KEY }}
+        run: |
+          printf '%s\n' "$KALSHI_PRIVATE_KEY" > kalshi_private_key.pem
+          chmod 600 kalshi_private_key.pem
+
+      - name: Cancel resting mechanical orders only
+        env:
+          KALSHI_API_KEY_ID: ${{ secrets.KALSHI_PROD_API_KEY }}
+          KALSHI_PEM_PATH: kalshi_private_key.pem
+          KALSHI_DEMO: "false"
+          DRY_RUN: "false"
+        run: |
+          set -euo pipefail
+          python kalshi_btc15m_average_down.py \
+            --config kalshi_btc15m_average_down_config.json \
+            --state-file kalshi_btc15m_average_down_state.json \
+            --report kalshi_btc15m_average_down_report.json \
+            --cancel-all-resting-mechanical-orders
