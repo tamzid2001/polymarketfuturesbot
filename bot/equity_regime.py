@@ -407,6 +407,7 @@ def default_regime_state(config: RegimeConfig) -> dict[str, Any]:
         "shadow_enabled": True,
         "state_reason": "initial_state",
         "state_changed_at": None,
+        "startup_gate_forecast_target": None,
         "disabled_since": None,
         "shadow_pnl_while_disabled": "0",
         "last_processed_fill_id": None,
@@ -1680,6 +1681,7 @@ class EquityRegimeController:
             "last_p75": None, "last_p90": None, "last_p99": None,
             "forecast_generated_at": None, "forecast_target_ticker": None,
             "prophet_training_end": None, "prophet_training_rows": 0,
+            "startup_gate_forecast_target": None,
             "balance_source": "colab_reference_account_series_starting_balance",
             "balance_reconciled": False, "balance_reconciliation_error": "not_requested_for_colab_reference_history",
             "prophet_history_ready": True,
@@ -2040,6 +2042,84 @@ class EquityRegimeController:
             generated_at=target_time - timedelta(seconds=1), target_close_time=target_time,
         )
         return self.prepare_forecast(preload)
+
+    def apply_startup_regime_gate(self) -> bool:
+        """Apply the restored balance state before the first new live market.
+
+        A reference CSV supplies a completed balance curve that can end hours
+        before a restarted runner's next eligible market.  There is no prior
+        controller forecast record for that imported final observation, so
+        waiting for another live settlement would incorrectly allow one new
+        ladder while the already-restored shadow balance is above P90.  This
+        one-time bootstrap gate makes the current state effective for the
+        *next* market only; it never changes accounting for an imported or
+        already-open market.
+        """
+
+        if not self.config.enabled or not self.prophet_history_ready:
+            return False
+        forecasts = self.state.get("forecasts") or []
+        if not forecasts or self.state.get("startup_gate_forecast_target") == forecasts[-1].get("forecast_target_ticker"):
+            return False
+        forecast = forecasts[-1]
+        if any(forecast.get(name) in {None, ""} for name in ("p10", "p50", "p90")):
+            return False
+        shadow = decimal_value(self.state.get("shadow_balance"))
+        p10 = decimal_value(forecast["p10"])
+        p90 = decimal_value(forecast["p90"])
+        state_before = self.execution_enabled_for_market()
+        entry = (not state_before) and shadow <= p10
+        exit_signal = state_before and shadow >= p90
+        desired_state = True if entry else (False if exit_signal else state_before)
+        self.state["startup_gate_forecast_target"] = forecast.get("forecast_target_ticker")
+        if desired_state == state_before:
+            return False
+        now = datetime.now(tz=UTC)
+        self.state["execution_enabled"] = desired_state
+        self.state["state_reason"] = (
+            "startup_shadow_balance_at_or_below_p10"
+            if entry
+            else "startup_shadow_balance_at_or_above_p90"
+        )
+        self.state["state_changed_at"] = timestamp_text(now)
+        if desired_state:
+            disabled_since = utc_timestamp(self.state.get("disabled_since"))
+            disabled_seconds = (now - disabled_since).total_seconds() if disabled_since else None
+            self.state["disabled_since"] = None
+            LOG.warning(
+                "P10 LIVE EXECUTION STARTUP RESTART | next_market=%s shadow=%s P10=%s P50=%s P90=%s disabled_seconds=%s",
+                forecast.get("forecast_target_ticker"), shadow, p10, forecast["p50"], p90, disabled_seconds,
+            )
+        else:
+            self.state["disabled_since"] = timestamp_text(now)
+            LOG.warning(
+                "P90 LIVE EXECUTION STARTUP STOP | next_market=%s shadow=%s P10=%s P50=%s P90=%s",
+                forecast.get("forecast_target_ticker"), shadow, p10, forecast["p50"], p90,
+            )
+        forecast["startup_observed_shadow_balance"] = format(shadow, "f")
+        forecast["startup_entry_signal"] = entry
+        forecast["startup_exit_signal"] = exit_signal
+        forecast["state_after"] = "on" if desired_state else "off"
+        self.state["transitions"].append({
+            "transition_time": timestamp_text(now),
+            "effective_market": "next_eligible_market_after_startup",
+            "signal_market": "__restored_balance_curve__",
+            "old_state": "on" if state_before else "off",
+            "new_state": "on" if desired_state else "off",
+            "reason": self.state["state_reason"],
+            "applied": True,
+            "live_order_suppression_effective": self.config.controls_live_execution,
+            "actual_balance": self.state.get("actual_balance"),
+            "shadow_balance": format(shadow, "f"),
+            "p10": forecast["p10"], "p50": forecast["p50"], "p90": forecast["p90"],
+            "markets_disabled": sum(
+                not bool(row.get("live_execution_enabled"))
+                for row in self.state.get("shadow_history", [])
+            ),
+            "shadow_pnl_during_disabled_period": self.state.get("shadow_pnl_while_disabled", "0"),
+        })
+        self.state["transitions"] = self.state["transitions"][-200:]
+        return True
 
     def start_market(self, decision: StrategyDecision) -> tuple[dict[str, Any], bool]:
         """Persist the strategy decision before any current-market result exists."""
@@ -2769,6 +2849,7 @@ async def synchronize_history(controller: EquityRegimeController, api: JsonAPI, 
             api_current_balance=operational_balance,
         )
         controller.prime_colab_reference_forecast()
+        controller.apply_startup_regime_gate()
         controller.state["ambiguous_fills"] = []
         controller.state["reconciliation"] = [{
             "market_ticker": "__colab_reference_closed_positions_csv__",
