@@ -81,6 +81,11 @@ on:
         required: false
         type: string
         default: "100.00"
+      run_seconds:
+        description: "Bounded runtime for a manual diagnostic. Default keeps the normal five-hour handoff."
+        required: false
+        type: number
+        default: 19500
 
 concurrency:
   group: kalshi-btc15m-average-down-singleton
@@ -151,12 +156,13 @@ jobs:
           PROPHET_REFIT_EVERY_MARKETS: ${{ inputs.prophet_refit_every_markets }}
           SHADOW_FILL_MODEL: ${{ inputs.shadow_fill_model }}
           STARTING_BALANCE: ${{ inputs.starting_balance }}
+          RUN_SECONDS: ${{ inputs.run_seconds || 19500 }}
         run: |
           set -euo pipefail
           args=(--config kalshi_btc15m_average_down_config.json
                 --state-file kalshi_btc15m_average_down_state.json
                 --report kalshi_btc15m_average_down_report.json
-                --persist-config --run-seconds 19500)
+                --persist-config --run-seconds "$RUN_SECONDS")
           [ -z "$INITIAL_POSITION_SIZE" ] || args+=(--initial-position-size "$INITIAL_POSITION_SIZE")
           [ -z "$MAX_ACTIVE_MARKETS" ] || args+=(--max-active-markets "$MAX_ACTIVE_MARKETS")
           [ -z "$MAX_CONTRACTS_PER_MARKET" ] || args+=(--max-contracts-per-market "$MAX_CONTRACTS_PER_MARKET")
