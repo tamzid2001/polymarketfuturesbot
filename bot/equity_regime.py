@@ -1883,11 +1883,23 @@ class EquityRegimeController:
             # long enough.  The snapshot contains model predictions only, so
             # no later realized balance can enter this branch.
             snapshot = self.state.get("future_forecast_snapshot") or []
-            snapshot_index = markets_since_refit
-            if snapshot_index >= len(snapshot):
+            # The reference notebook creates a real 15-minute time path. A
+            # process restart, delayed settlement, or a preloaded Colab
+            # snapshot can mean that the next live target is not simply row
+            # ``markets_since_refit + 1``. Match the exact target timestamp;
+            # using row one in that situation misaligns the P10/P90 bands.
+            snapshot_index = next(
+                (
+                    index
+                    for index, row in enumerate(snapshot)
+                    if utc_timestamp(row.get("forecast_timestamp")) == forecast_target_time
+                ),
+                None,
+            )
+            if snapshot_index is None:
                 LOG.warning(
-                    "PROPHET HORIZON EXHAUSTED | target=%s offset=%d horizon=%d; refitting early",
-                    decision.target_ticker, snapshot_index, len(snapshot),
+                    "PROPHET HORIZON DOES NOT COVER TARGET | target=%s target_time=%s horizon_rows=%d; refitting early",
+                    decision.target_ticker, timestamp_text(forecast_target_time), len(snapshot),
                 )
                 markets_since_refit = self.config.prophet_refit_every_markets
             else:

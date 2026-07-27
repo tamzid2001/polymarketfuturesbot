@@ -528,7 +528,7 @@ class EquityRegimeTests(unittest.TestCase):
             self.assertEqual(forecaster.fit_number, 1)
             # Market one has closed, so market two must consume horizon row 2.
             controller.state["markets_since_refit"] = 1
-            second = controller.prepare_forecast(decision("KXBTC15M-CADENCE-2", now + timedelta(minutes=16)))
+            second = controller.prepare_forecast(decision("KXBTC15M-CADENCE-2", now + timedelta(minutes=15)))
             self.assertEqual(second["p10"], "96")
             self.assertEqual(second["model_fit_error"], "refit_deferred_reused_horizon_row_2")
             self.assertEqual(forecaster.fit_number, 1)
