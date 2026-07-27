@@ -451,6 +451,14 @@ class NormalizedFill:
     subaccount: int | None
     source: str
     raw: Mapping[str, Any] = field(compare=False, repr=False)
+    # The portfolio API's canonical direction describes the exchange book,
+    # whereas a reduce-only exit can be represented on the reciprocal leg.
+    # When an exact local order id is available, these fields carry the
+    # strategy's economic position side and cash-flow direction instead.
+    economic_side: str | None = field(default=None, compare=False)
+    economic_action: str | None = field(default=None, compare=False)
+    economic_price: Decimal | None = field(default=None, compare=False)
+    order_role: str | None = field(default=None, compare=False)
 
     @property
     def dedupe_key(self) -> tuple[str, ...]:
@@ -618,6 +626,62 @@ def known_bot_identifiers(local_state: Mapping[str, Any]) -> tuple[set[str], set
     return order_ids, tickers
 
 
+def known_bot_order_metadata(local_state: Mapping[str, Any]) -> dict[str, dict[str, str]]:
+    """Map durable local order ids to their economic strategy meaning.
+
+    Kalshi's canonical fill direction is the current book direction.  A
+    reduce-only exit of a YES position can therefore arrive as an ASK/NO
+    record, which is not an additional NO position.  The existing bot ledger
+    persists the intended held side and gives us the only safe way to map that
+    fill back to cash-flow accounting.
+    """
+
+    metadata: dict[str, dict[str, str]] = {}
+    for ticker, record in (local_state.get("markets") or {}).items():
+        if not isinstance(record, Mapping):
+            continue
+        default_side = str(record.get("locked_side") or record.get("candidate_side") or "").lower()
+        for order in (record.get("orders") or {}).values():
+            if not isinstance(order, Mapping):
+                continue
+            side = str(order.get("side") or default_side).lower()
+            if side not in {"yes", "no"}:
+                continue
+            for key in ("order_id", "client_order_id"):
+                identifier = order.get(key)
+                if identifier:
+                    metadata[str(identifier)] = {
+                        "economic_side": side,
+                        "economic_action": "buy",
+                        "order_role": "entry",
+                        "market_ticker": str(ticker),
+                    }
+        for order in record.get("live_exit_orders") or []:
+            if not isinstance(order, Mapping):
+                continue
+            side = str(order.get("held_side") or order.get("side") or default_side).lower()
+            if side not in {"yes", "no"}:
+                continue
+            for key in ("order_id", "client_order_id"):
+                identifier = order.get(key)
+                if identifier:
+                    metadata[str(identifier)] = {
+                        "economic_side": side,
+                        "economic_action": "sell",
+                        "order_role": "reduce_only_exit",
+                        "market_ticker": str(ticker),
+                    }
+    return metadata
+
+
+def price_for_economic_side(record: Mapping[str, Any], side: str) -> Decimal:
+    """Get the API's fixed-point price on the bot's economic YES/NO leg."""
+
+    if side not in {"yes", "no"}:
+        raise ValueError(f"unsupported economic side: {side!r}")
+    return normalize_price(record, side)
+
+
 def ownership_evidence(fill: NormalizedFill, config: RegimeConfig, local_order_ids: set[str], local_tickers: set[str]) -> str | None:
     identities = {candidate for candidate in (fill.order_id, fill.client_order_id) if candidate}
     if identities & local_order_ids:
@@ -659,6 +723,7 @@ class HistoricalSynchronizer:
     def __init__(self, config: RegimeConfig, local_state: Mapping[str, Any]) -> None:
         self.config = config
         self.local_order_ids, self.local_tickers = known_bot_identifiers(local_state)
+        self.local_order_metadata = known_bot_order_metadata(local_state)
 
     async def sync(self, api: JsonAPI) -> HistorySyncResult:
         cutoff_payload = await api.get_json("/historical/cutoff")
@@ -723,6 +788,19 @@ class HistoricalSynchronizer:
                     "source": fill.source,
                 })
                 continue
+            order_metadata = (
+                self.local_order_metadata.get(fill.order_id or "")
+                or self.local_order_metadata.get(fill.client_order_id or "")
+            )
+            if order_metadata is not None:
+                economic_side = order_metadata["economic_side"]
+                fill = replace(
+                    fill,
+                    economic_side=economic_side,
+                    economic_action=order_metadata["economic_action"],
+                    economic_price=price_for_economic_side(fill.raw, economic_side),
+                    order_role=order_metadata["order_role"],
+                )
             deduplicated[fill.dedupe_key] = fill
             owned_fill_audit.append({
                 "ownership_evidence": evidence,
@@ -738,6 +816,10 @@ class HistoricalSynchronizer:
                 "price": format(fill.price, "f"),
                 "count": format(fill.count, "f"),
                 "fee": format(fill.fee, "f"),
+                "economic_side": fill.economic_side,
+                "economic_action": fill.economic_action,
+                "economic_price": None if fill.economic_price is None else format(fill.economic_price, "f"),
+                "order_role": fill.order_role,
                 "subaccount": fill.subaccount,
                 "source": fill.source,
                 "raw_api_record": raw_record_text(fill.raw),
@@ -825,17 +907,25 @@ def reconstruct_realized_pnl(fills: Iterable[NormalizedFill], settlements: Itera
         entry_units = ZERO
         selected_side: str | None = None
         for fill in market_fills:
+            # A fill matched to a durable local bot order is accounted using
+            # that order's economic side/action.  This is required for
+            # reduce-only exits: Kalshi represents a YES exit on the
+            # reciprocal NO/ASK book leg.  Falling back to raw fields is
+            # retained only for explicitly supported legacy imports.
+            economic_side = fill.economic_side or fill.side
+            economic_action = fill.economic_action or fill.action
+            economic_price = fill.economic_price or fill.price
             fees += fill.fee
-            if fill.action == "buy":
-                held[fill.side] += fill.count
-                bought[fill.side] += fill.count
-                entry_cost += fill.price * fill.count
+            if economic_action == "buy":
+                held[economic_side] += fill.count
+                bought[economic_side] += fill.count
+                entry_cost += economic_price * fill.count
                 entry_units += fill.count
-                selected_side = selected_side or fill.side
+                selected_side = selected_side or economic_side
             else:
-                held[fill.side] -= fill.count
-                sold[fill.side] += fill.count
-                exit_proceeds += fill.price * fill.count
+                held[economic_side] -= fill.count
+                sold[economic_side] += fill.count
+                exit_proceeds += economic_price * fill.count
         settlement = settlement_by_ticker.get(ticker)
         payout = ZERO
         exit_method = "sold" if exit_proceeds > ZERO else "settlement"
