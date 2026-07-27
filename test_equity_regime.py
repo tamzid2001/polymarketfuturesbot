@@ -18,6 +18,7 @@ from bot.equity_regime import (
     StrategyDecision,
     normalize_fill,
     normalize_settlement,
+    ownership_evidence,
     reconstruct_realized_pnl,
 )
 import kalshi_btc15m_average_down as trader
@@ -133,6 +134,19 @@ class EquityRegimeTests(unittest.TestCase):
             "action": "buy", "yes_price_dollars": "0.40", "count_fp": "1", "subaccount_number": 0,
         }, "portfolio")
         self.assertEqual(fill.subaccount, 0)
+
+    def test_shared_series_ticker_is_not_bot_ownership_without_explicit_legacy_opt_in(self) -> None:
+        fill = normalize_fill({
+            "fill_id": "manual-same-series", "ticker": "KXBTC15M-26JUL260000-00",
+            "side": "yes", "action": "buy", "price": "0.40", "count_fp": "1", "subaccount": 0,
+        }, "portfolio")
+        strict = RegimeConfig(enabled=True, dry_run=True)
+        self.assertIsNone(ownership_evidence(fill, strict, set(), {fill.ticker}))
+        legacy = RegimeConfig(enabled=True, dry_run=True, allow_series_ticker_ownership_fallback=True)
+        self.assertEqual(
+            ownership_evidence(fill, legacy, set(), {fill.ticker}),
+            "configured_series_ticker_explicit_legacy_fallback",
+        )
 
     def test_explicit_historical_anchor_is_distinct_from_default_starting_balance(self) -> None:
         config = RegimeConfig.from_mapping({
