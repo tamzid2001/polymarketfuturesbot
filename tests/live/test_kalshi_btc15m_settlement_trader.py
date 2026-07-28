@@ -40,18 +40,28 @@ class SettlementTraderTests(unittest.IsolatedAsyncioTestCase):
         config = trader.validate_config({"prophet_refit_every_markets": 75})
         self.assertEqual(config["prophet_refit_every_markets"], 1)
 
-    def test_equity_regime_shadow_decision_uses_the_same_dynamic_1_2_3_4_ladder(self) -> None:
-        config = trader.validate_config({"enable_dynamic_scaling": True})
+    def test_equity_regime_shadow_decision_always_uses_the_fixed_3_6_9_12_ladder(self) -> None:
+        config = trader.validate_config({
+            "initial_position_size": 5.0,
+            "enable_dynamic_scaling": True,
+            "max_contracts_per_market": 50.0,
+            "max_total_capital": 10.0,
+        })
         close = time.time() + 900
         record = {
             "ticker": "KXBTC15M-shadow-ladder",
             "settlement_contrarian_signal": {"source_ticker": "KXBTC15M-prior"},
+            # A stale snapshot from before this policy must be replaced rather
+            # than carrying dynamic live sizing into a persisted shadow run.
+            "regime_ladder_quantities": {
+                "0.4000": 12.0, "0.3000": 24.0, "0.2000": 36.0, "0.1000": 48.0,
+            },
         }
         market = {"ticker": record["ticker"], "close_time": close}
         state = {
             "dynamic_base_share_scaling": {
                 "enabled": True,
-                "current_base_share_count": 3.0,
+                "current_base_share_count": 12.0,
             },
         }
         decision = trader.build_equity_regime_decision(state, record, market, config, "yes")
@@ -59,16 +69,22 @@ class SettlementTraderTests(unittest.IsolatedAsyncioTestCase):
             [order.quantity for order in decision.ladder_orders],
             [trader.Decimal("3.0"), trader.Decimal("6.0"), trader.Decimal("9.0"), trader.Decimal("12.0")],
         )
-        state["dynamic_base_share_scaling"]["current_base_share_count"] = 3.25
+        self.assertEqual(record["regime_scaling_equity_source"], "fixed_shadow_ladder")
+        self.assertEqual(record["regime_shadow_base_share_count"], 3.0)
+        self.assertEqual(
+            trader.live_rung_quantities(config, state),
+            {0.40: 12.0, 0.30: 24.0, 0.20: 36.0, 0.10: 48.0},
+        )
+        state["dynamic_base_share_scaling"]["current_base_share_count"] = 25.0
         next_record = {
             "ticker": "KXBTC15M-shadow-ladder-next",
             "settlement_contrarian_signal": {"source_ticker": "KXBTC15M-shadow-ladder"},
         }
         next_market = {"ticker": next_record["ticker"], "close_time": close}
-        scaled = trader.build_equity_regime_decision(state, next_record, next_market, config, "yes")
+        next_shadow = trader.build_equity_regime_decision(state, next_record, next_market, config, "yes")
         self.assertEqual(
-            [order.quantity for order in scaled.ladder_orders],
-            [trader.Decimal("3.25"), trader.Decimal("6.5"), trader.Decimal("9.75"), trader.Decimal("13.0")],
+            [order.quantity for order in next_shadow.ladder_orders],
+            [trader.Decimal("3.0"), trader.Decimal("6.0"), trader.Decimal("9.0"), trader.Decimal("12.0")],
         )
 
     async def test_regime_history_requests_sign_the_full_kalshi_api_path(self) -> None:
