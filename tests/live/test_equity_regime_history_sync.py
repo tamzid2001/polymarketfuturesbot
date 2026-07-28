@@ -68,6 +68,88 @@ class HistorySyncAuditTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(API.calls, ["/portfolio/balance"])
             self.assertTrue(controller.state["history_sync"]["historical_api_sync_skipped"])
 
+    async def test_colab_reference_handoff_preserves_post_baseline_shadow_tail(self) -> None:
+        """A new Actions runner must not replay the static CSV over its checkpoint."""
+
+        class HorizonForecaster:
+            fit_number = 0
+            last_future_timestamps = []
+
+            def forecast_horizon(self, _observations, target_time, _horizon_markets):
+                self.fit_number += 1
+                self.last_future_timestamps = [target_time]
+                return [{
+                    "p01": Decimal("90"), "p10": Decimal("95"), "p25": Decimal("97"),
+                    "p50": Decimal("100"), "p75": Decimal("103"), "p90": Decimal("105"),
+                    "p99": Decimal("110"),
+                }]
+
+        class FirstStartupAPI:
+            async def get_json(self, path, params=None):
+                if path != "/portfolio/balance":
+                    raise AssertionError(path)
+                return {"balance_dollars": "80.13"}
+
+        class HandoffAPI:
+            async def get_json(self, path, params=None):
+                raise AssertionError(f"handoff must restore committed state without calling {path}")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            export = root / "closed-positions.csv"
+            export.write_text(
+                "Ticker,Total return ($)\n"
+                "KXBTC15M-26JUL260000-00,$1.00\n"
+                "KXBTC15M-26JUL260015-15,-$1.50\n",
+                encoding="utf-8",
+            )
+            config = RegimeConfig(
+                enabled=True, dry_run=False, prophet_history_source="account_series",
+                prophet_reference_closed_positions_path=export, starting_balance=Decimal("100"),
+                prophet_min_history=2, history_max_markets=3, prophet_training_window=3,
+            )
+            state_path = root / "state.json"
+            controller = EquityRegimeController(config, state_path, root / "outputs")
+            controller.forecaster = HorizonForecaster()
+            await synchronize_history(controller, FirstStartupAPI(), {"markets": {}})
+
+            # Model the durable state left by a completed later live/shadow
+            # market.  This is exactly the tail the next Actions checkout
+            # used to erase by rebuilding the older two-row CSV.
+            controller.state["actual_history"].append({
+                "market_ticker": "KXBTC15M-26JUL260030-30",
+                "market_close_time": "2026-07-26T00:30:30+00:00",
+                "completed_at": "2026-07-26T00:30:30+00:00",
+                "actual_balance_after": "82.13",
+            })
+            controller.state["shadow_history"].append({
+                "market_ticker": "KXBTC15M-26JUL260030-30",
+                "market_close_time": "2026-07-26T00:30:30+00:00",
+                "completed_at": "2026-07-26T00:30:30+00:00",
+                "shadow_balance_before": "99.50",
+                "shadow_balance_after": "103.75",
+                "shadow_realized_pnl": "4.25",
+                "shadow_fill_model": "live_equivalent",
+                "shadow_simulation_quality": "exact_replay",
+                "live_execution_enabled": False,
+            })
+            controller.state.update({
+                "actual_balance": "82.13",
+                "shadow_balance": "103.75",
+                "execution_enabled": False,
+                "state_reason": "shadow_balance_at_or_above_p90",
+            })
+            controller.save()
+
+            successor = EquityRegimeController(config, state_path, root / "successor-outputs")
+            await synchronize_history(successor, HandoffAPI(), {"markets": {}})
+
+            self.assertEqual(Decimal(successor.state["actual_balance"]), Decimal("82.13"))
+            self.assertEqual(Decimal(successor.state["shadow_balance"]), Decimal("103.75"))
+            self.assertEqual(successor.state["shadow_history"][-1]["market_ticker"], "KXBTC15M-26JUL260030-30")
+            self.assertFalse(successor.execution_enabled_for_market())
+            self.assertEqual(successor.state["history_sync"]["reference_curve_mode"], "restored")
+
     async def test_exports_ownership_evidence_and_manual_settlement_without_counting_it(self) -> None:
         manual_ticker = "KXBTC15M-26JUL262100-00"
         bot_ticker = "KXBTC15M-26JUL262115-15"
