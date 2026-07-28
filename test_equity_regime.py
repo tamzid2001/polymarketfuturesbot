@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import csv
 import json
 import tempfile
 import unittest
@@ -82,6 +83,55 @@ def decision(ticker: str, generated: datetime) -> StrategyDecision:
 
 
 class EquityRegimeTests(unittest.TestCase):
+    def test_handoff_restore_preserves_shadow_balance_and_ledger_exactly(self) -> None:
+        """A fresh Actions checkout must retain the exact persisted shadow curve."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state_path = root / "data" / "kalshi_equity_regime_state.json"
+            config = RegimeConfig(enabled=True, dry_run=False, prophet_min_history=2)
+            controller = EquityRegimeController(config, state_path, root / "outputs")
+            controller.state.update({
+                "actual_balance": "127.3121",
+                "shadow_balance": "156.650",
+                "balance_reconciled": False,
+                "actual_history": [{
+                    "market_ticker": "KXBTC15M-26JUL272045-45",
+                    "actual_balance_after": "127.3121",
+                }],
+                "shadow_history": [
+                    {
+                        "market_ticker": "KXBTC15M-26JUL272030-30",
+                        "market_close_time": "2026-07-28T00:30:00+00:00",
+                        "completed_at": "2026-07-28T00:30:00+00:00",
+                        "shadow_balance_before": "130.85",
+                        "shadow_balance_after": "154.85",
+                    },
+                    {
+                        "market_ticker": "KXBTC15M-26JUL272045-45",
+                        "market_close_time": "2026-07-28T00:45:00+00:00",
+                        "completed_at": "2026-07-28T00:45:00+00:00",
+                        "shadow_balance_before": "154.85",
+                        "shadow_balance_after": "156.650",
+                    },
+                ],
+            })
+            controller.save()
+            ledger = state_path.parent / "kalshi_shadow_equity_history.csv"
+            persisted_ledger = ledger.read_bytes()
+
+            # A new controller is the next GitHub Actions handoff: it only
+            # receives the committed state and ledger files from main.
+            successor = EquityRegimeController(config, state_path, root / "successor-outputs")
+            self.assertEqual(successor.state["shadow_balance"], "156.650")
+            self.assertEqual(successor.heartbeat()["shadow_balance"], "156.650")
+            self.assertEqual(successor.state["shadow_history"], controller.state["shadow_history"])
+            self.assertEqual(ledger.read_bytes(), persisted_ledger)
+            with ledger.open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertEqual(rows[-1]["market_ticker"], "KXBTC15M-26JUL272045-45")
+            self.assertEqual(rows[-1]["shadow_balance_after"], "156.650")
+
     def test_checkpoint_fingerprint_tracks_shadow_balance_ledger(self) -> None:
         """A regime-only balance update must trigger the in-run checkpoint."""
 

@@ -220,6 +220,51 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          # The successor checks out main, not this runner's workspace.  Fail
+          # closed if either committed source of the shadow curve differs from
+          # the state that just finished trading.
+          python - <<'PY'
+          import csv
+          import json
+          import sys
+          from pathlib import Path
+
+          state_path = Path("data/kalshi_equity_regime_state.json")
+          ledger_path = Path("data/kalshi_shadow_equity_history.csv")
+          state = json.loads(state_path.read_text(encoding="utf-8"))
+          shadow_balance = state.get("shadow_balance")
+          history = state.get("shadow_history") or []
+          with ledger_path.open(newline="", encoding="utf-8") as handle:
+              ledger = list(csv.DictReader(handle))
+          if not shadow_balance:
+              sys.exit("shadow handoff verification failed: state has no shadow_balance")
+          if bool(history) != bool(ledger):
+              sys.exit("shadow handoff verification failed: state and ledger row counts disagree")
+          if history:
+              state_tail = history[-1]
+              ledger_tail = ledger[-1]
+              if str(state_tail.get("shadow_balance_after")) != str(shadow_balance):
+                  sys.exit("shadow handoff verification failed: state balance does not match state curve tail")
+              if ledger_tail.get("market_ticker") != state_tail.get("market_ticker"):
+                  sys.exit("shadow handoff verification failed: state and ledger tickers differ")
+              if ledger_tail.get("shadow_balance_after") != str(shadow_balance):
+                  sys.exit("shadow handoff verification failed: ledger balance does not match state")
+          print(
+              "SHADOW HANDOFF LOCAL VERIFIED | "
+              f"balance={shadow_balance} rows={len(history)} "
+              f"last_market={history[-1].get('market_ticker') if history else 'none'}"
+          )
+          PY
+          git fetch --depth=1 origin main
+          for file in data/kalshi_equity_regime_state.json data/kalshi_shadow_equity_history.csv; do
+            local_blob="$(git hash-object "$file")"
+            remote_blob="$(git rev-parse "origin/main:$file")"
+            if [ "$local_blob" != "$remote_blob" ]; then
+              echo "::error::Shadow handoff verification failed: $file was not published to main."
+              exit 1
+            fi
+            echo "SHADOW HANDOFF REMOTE VERIFIED | file=$file blob=$remote_blob"
+          done
           scaling_enabled="$(python -c 'import json; c=json.load(open("kalshi_btc15m_average_down_config.json")); print(str(bool(c.get("enable_dynamic_scaling", False))).lower())')"
           scaling_increment="$(python -c 'import json; c=json.load(open("kalshi_btc15m_average_down_config.json")); print(c.get("base_share_increment", 1))')"
           scaling_multiplier="$(python -c 'import json; c=json.load(open("kalshi_btc15m_average_down_config.json")); print(c.get("scaling_profit_multiplier", 16.5))')"
