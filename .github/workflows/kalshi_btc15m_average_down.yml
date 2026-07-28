@@ -109,6 +109,23 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v7
 
+      - name: Refuse a stale queued runner
+        run: |
+          set -euo pipefail
+          # A scheduled run can wait behind the five-hour singleton.  If an
+          # operator cancels that singleton for a hotfix, the queued run must
+          # not wake up with its old source and stale durable state.  Failing
+          # before credentials are configured prevents it from trading or
+          # publishing a historical checkpoint over main.
+          git fetch --depth=1 origin main
+          checked_out_sha="$(git rev-parse HEAD)"
+          current_main_sha="$(git rev-parse origin/main)"
+          if [ "$checked_out_sha" != "$current_main_sha" ]; then
+            echo "::error::Refusing stale queued runner: checked_out=$checked_out_sha current_main=$current_main_sha"
+            exit 1
+          fi
+          echo "RUNNER SOURCE VERIFIED | sha=$checked_out_sha"
+
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
