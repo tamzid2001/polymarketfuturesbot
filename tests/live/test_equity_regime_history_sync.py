@@ -150,6 +150,24 @@ class HistorySyncAuditTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(successor.execution_enabled_for_market())
             self.assertEqual(successor.state["history_sync"]["reference_curve_mode"], "restored")
 
+            # A subsequent handoff below the persisted P10 must take effect
+            # during startup, before another market's directional side is
+            # available.  The durable curve itself remains untouched.
+            successor.state["shadow_history"][-1]["shadow_balance_after"] = "94"
+            successor.state.update({
+                "shadow_balance": "94",
+                "execution_enabled": False,
+                "startup_gate_forecast_target": None,
+            })
+            successor.save()
+            below_p10_successor = EquityRegimeController(config, state_path, root / "below-p10-successor-outputs")
+            await synchronize_history(below_p10_successor, HandoffAPI(), {"markets": {}})
+
+            self.assertEqual(Decimal(below_p10_successor.state["shadow_balance"]), Decimal("94"))
+            self.assertTrue(below_p10_successor.execution_enabled_for_market())
+            self.assertEqual(below_p10_successor.state["state_reason"], "startup_shadow_balance_at_or_below_p10")
+            self.assertTrue(below_p10_successor.state["forecasts"][-1]["startup_entry_signal"])
+
     async def test_exports_ownership_evidence_and_manual_settlement_without_counting_it(self) -> None:
         manual_ticker = "KXBTC15M-26JUL262100-00"
         bot_ticker = "KXBTC15M-26JUL262115-15"
