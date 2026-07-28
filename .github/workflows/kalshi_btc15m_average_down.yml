@@ -83,9 +83,17 @@ on:
         required: false
         type: number
         default: 19500
+      emergency_handoff:
+        description: "Use only after confirming the singleton's trading loop has stopped; starts a short recovery handoff outside a stuck cleanup queue."
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
-  group: kalshi-btc15m-average-down-singleton
+  # The explicit emergency lane is for recovering from a cancelled runner
+  # whose cleanup cannot release the normal singleton. It is never selected
+  # by scheduled or ordinary handoff runs.
+  group: kalshi-btc15m-average-down-${{ inputs.emergency_handoff && 'emergency' || 'singleton' }}
   cancel-in-progress: false
 
 permissions:
