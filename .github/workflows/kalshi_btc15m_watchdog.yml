@@ -51,8 +51,9 @@ jobs:
 
           # A watchdog recovery starts a new live process from main. Validate
           # both durable sources from one immutable main commit before that
-          # process can be dispatched; never recover live from a truncated or
-          # mismatched shadow curve.
+          # process can be dispatched. Equivalent serialization and up to one
+          # cent of rounding are acceptable; a missing or materially divergent
+          # curve is not.
           main_sha="$(gh api "repos/$REPOSITORY/commits/main" --jq .sha)"
           state_file="$(mktemp)"
           ledger_file="$(mktemp)"
@@ -65,6 +66,7 @@ jobs:
           import csv
           import json
           import sys
+          from decimal import Decimal, InvalidOperation
           from pathlib import Path
 
           state = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
@@ -74,20 +76,35 @@ jobs:
           history = state.get("shadow_history") or []
           if not shadow_balance:
               sys.exit("watchdog shadow-state check failed: missing shadow_balance")
+
+          tolerance = Decimal("0.01")
+
+          def money(value, label):
+              try:
+                  parsed = Decimal(str(value))
+              except (InvalidOperation, ValueError) as exc:
+                  raise SystemExit(f"watchdog shadow-state check failed: invalid {label}={value!r}") from exc
+              if not parsed.is_finite():
+                  raise SystemExit(f"watchdog shadow-state check failed: non-finite {label}={value!r}")
+              return parsed
+
+          state_balance = money(shadow_balance, "shadow_balance")
           if bool(history) != bool(ledger):
               sys.exit("watchdog shadow-state check failed: state and ledger presence disagree")
           if history:
               state_tail = history[-1]
               ledger_tail = ledger[-1]
-              if str(state_tail.get("shadow_balance_after")) != str(shadow_balance):
-                  sys.exit("watchdog shadow-state check failed: state balance and curve tail differ")
+              curve_balance = money(state_tail.get("shadow_balance_after"), "state curve balance")
+              ledger_balance = money(ledger_tail.get("shadow_balance_after"), "ledger balance")
+              if abs(curve_balance - state_balance) > tolerance:
+                  sys.exit("watchdog shadow-state check failed: state balance and curve tail materially differ")
               if ledger_tail.get("market_ticker") != state_tail.get("market_ticker"):
                   sys.exit("watchdog shadow-state check failed: state and ledger tickers differ")
-              if ledger_tail.get("shadow_balance_after") != str(shadow_balance):
-                  sys.exit("watchdog shadow-state check failed: ledger balance and state differ")
+              if abs(ledger_balance - state_balance) > tolerance:
+                  sys.exit("watchdog shadow-state check failed: ledger balance and state materially differ")
           print(
               "WATCHDOG SHADOW STATE VERIFIED | "
-              f"balance={shadow_balance} rows={len(history)} "
+              f"balance={state_balance} rows={len(history)} tolerance={tolerance} "
               f"last_market={history[-1].get('market_ticker') if history else 'none'}"
           )
           PY
