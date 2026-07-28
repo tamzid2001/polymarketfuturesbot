@@ -2908,6 +2908,13 @@ async def synchronize_history(controller: EquityRegimeController, api: JsonAPI, 
                 controller.state["actual_balance"],
                 controller.state["shadow_balance"],
             )
+            # Preserve the recovered ledger, but make its latest causal
+            # P10/P90 band authoritative immediately.  A process can restart
+            # after the balance has crossed P10 and before the next strategy
+            # side is available; deferring this gate until that side arrives
+            # leaves the durable controller visibly disabled despite a valid
+            # restart signal.
+            controller.apply_startup_regime_gate()
         controller.state["ambiguous_fills"] = []
         controller.state["reconciliation"] = [{
             "market_ticker": "__colab_reference_closed_positions_csv__",
