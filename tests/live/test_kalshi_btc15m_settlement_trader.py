@@ -405,6 +405,25 @@ class SettlementTraderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(config["max_contracts_per_market"], 40.0)
         self.assertEqual(config["max_total_capital"], 8.0)
 
+    def test_dynamic_scaling_migrates_the_old_incremental_baseline_without_reducing_base(self) -> None:
+        config = trader.validate_config({"enable_dynamic_scaling": True})
+        state = {"dynamic_base_share_scaling": {
+            "enabled": True,
+            "initialized": True,
+            "format_version": 2,
+            "starting_base_share_count": 3.0,
+            "starting_balance": 100.0,
+            "current_base_share_count": 4.0,
+            "actual_balance_baseline": 153.5144,
+            "external_balance_adjustments": [],
+        }}
+        trader.refresh_dynamic_base_share_scaling(state, config, actual_balance=143.8804)
+        snapshot = trader.dynamic_scaling_snapshot(state, config)
+        self.assertEqual(snapshot["current_base_share_count"], 4.0)
+        self.assertEqual(snapshot["actual_balance_baseline"], 100.0)
+        self.assertEqual(snapshot["next_increase_actual_balance"], 166.0)
+        self.assertEqual(state["dynamic_base_share_scaling"]["format_version"], 3)
+
     def test_dynamic_scaling_rebases_for_deposits_and_withdrawals_without_changing_size(self) -> None:
         config = trader.validate_config({
             "enable_dynamic_scaling": True,

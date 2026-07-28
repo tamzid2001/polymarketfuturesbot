@@ -2407,7 +2407,7 @@ def refresh_dynamic_base_share_scaling(
             "profit_since_last_increase": 0.0,
             "last_reset_at": datetime.fromtimestamp(now_epoch, tz=timezone.utc).isoformat(),
             "last_reset_reason": reset_reason,
-            "format_version": 2,
+            "format_version": 3,
         })
         if observed_actual_balance is not None:
             control["actual_balance"] = round(observed_actual_balance, 6)
@@ -2417,6 +2417,39 @@ def refresh_dynamic_base_share_scaling(
                 starting,
             )
         return control
+
+    # Version two reset the baseline at every promotion.  Migrate a durable
+    # v2 record without shrinking the base: retain its funding adjustments
+    # and reconstruct the cumulative threshold baseline from the configured
+    # starting balance.  Version one is handled by the existing authenticated
+    # balance migration below because it has no trustworthy balance baseline.
+    prior_format = int(as_float(control.get("format_version")) or 0)
+    if prior_format == 2 and bool(control.get("initialized")):
+        external_adjustments = control.get("external_balance_adjustments")
+        funding_adjustment = sum(
+            float(as_float(item.get("amount")) or 0.0)
+            for item in external_adjustments
+            if isinstance(item, dict)
+        ) if isinstance(external_adjustments, list) else 0.0
+        cumulative_baseline = round(starting_balance + funding_adjustment, 6)
+        control.update({
+            "format_version": 3,
+            "actual_balance_baseline": cumulative_baseline,
+            "profit_since_last_increase": round(
+                (observed_actual_balance - cumulative_baseline)
+                if observed_actual_balance is not None
+                else float(as_float(control.get("profit_since_last_increase")) or 0.0),
+                6,
+            ),
+            "threshold_policy": "funding_baseline_plus_current_base_multiplier",
+            "last_reset_at": datetime.fromtimestamp(now_epoch, tz=timezone.utc).isoformat(),
+            "last_reset_reason": "cumulative_balance_threshold_migration",
+        })
+        LOG.warning(
+            "DYNAMIC BASE SCALING MIGRATED | base=%.2f funding_baseline=$%.4f; "
+            "the next increase uses baseline + current_base × multiplier.",
+            dynamic_base_share_count(state, config), cumulative_baseline,
+        )
 
     if (
         not prior_enabled
@@ -2447,7 +2480,8 @@ def refresh_dynamic_base_share_scaling(
             "profit_since_last_increase": 0.0,
             "last_reset_at": datetime.fromtimestamp(now_epoch, tz=timezone.utc).isoformat(),
             "last_reset_reason": reset_reason,
-            "format_version": 2,
+            "format_version": 3,
+            "threshold_policy": "funding_baseline_plus_current_base_multiplier",
         })
         _ensure_auto_scaling_capacity(config, starting)
         LOG.warning(
@@ -2462,6 +2496,7 @@ def refresh_dynamic_base_share_scaling(
         return control
 
     control["actual_balance"] = round(observed_actual_balance, 6)
+    control["threshold_policy"] = "funding_baseline_plus_current_base_multiplier"
     balance_baseline = as_float(control.get("actual_balance_baseline"))
     if balance_baseline is None:
         balance_baseline = starting_balance
