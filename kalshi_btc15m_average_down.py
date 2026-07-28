@@ -2248,12 +2248,14 @@ def live_completed_trade_records(state: dict[str, Any]) -> list[tuple[tuple[int,
 
 
 def _dynamic_scaling_control(state: dict[str, Any]) -> dict[str, Any]:
-    """Return the durable live-only base-share scaling control record."""
+    """Return the durable actual-balance base-share scaling control record."""
     control = state.get("dynamic_base_share_scaling")
     if not isinstance(control, dict):
         control = {}
         state["dynamic_base_share_scaling"] = control
-    control["format_version"] = 1
+    # Version one accumulated only the local bot ledger's realized P/L.  Keep
+    # its version until refresh migrates it with an authenticated balance.
+    control.setdefault("format_version", 1)
     control.setdefault("enabled", False)
     control.setdefault("initialized", False)
     control.setdefault("scale_events", [])
@@ -2262,25 +2264,18 @@ def _dynamic_scaling_control(state: dict[str, Any]) -> dict[str, Any]:
     return control
 
 
-def _dynamic_scaling_cursor(control: dict[str, Any]) -> tuple[int, str] | None:
-    epoch = as_float(control.get("last_processed_completion_epoch"))
-    ticker = control.get("last_processed_completion_ticker")
-    if epoch is None or ticker is None:
-        return None
-    return int(epoch), str(ticker)
+def dynamic_scaling_starting_balance(config: dict[str, Any]) -> float:
+    """Return the fixed account-equity baseline for live base scaling.
 
-
-def _set_dynamic_scaling_cursor_to_latest(
-    control: dict[str, Any], state: dict[str, Any],
-) -> None:
-    completed = live_completed_trade_records(state)
-    if not completed:
-        control.pop("last_processed_completion_epoch", None)
-        control.pop("last_processed_completion_ticker", None)
-        return
-    key, _ = completed[-1]
-    control["last_processed_completion_epoch"] = key[0]
-    control["last_processed_completion_ticker"] = key[1]
+    This is intentionally the configured original account balance, not a
+    replayed ledger total and not the shadow-equity balance.  The setting is
+    shared with the equity controller so a restart cannot silently choose a
+    new base for either component.
+    """
+    starting_balance = as_float(config.get("starting_balance"))
+    if starting_balance is None or starting_balance <= 0:
+        raise ValueError("starting_balance must be positive for dynamic scaling")
+    return starting_balance
 
 
 def _ensure_auto_scaling_capacity(config: dict[str, Any], base_share_count: float) -> bool:
@@ -2308,14 +2303,26 @@ def _ensure_auto_scaling_capacity(config: dict[str, Any], base_share_count: floa
 
 
 def dynamic_scaling_snapshot(state: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
-    """Expose current sizing and the next threshold without replaying history."""
+    """Expose sizing from the durable authenticated actual-balance snapshot."""
     control = state.get("dynamic_base_share_scaling") if isinstance(state, dict) else None
     control = control if isinstance(control, dict) else {}
     enabled = bool(config.get("enable_dynamic_scaling"))
     starting = share_quantity(config["initial_position_size"], "initial_position_size")
+    starting_balance = dynamic_scaling_starting_balance(config)
     current = dynamic_base_share_count(state, config)
     multiplier = float(config["scaling_profit_multiplier"])
-    profit = float(as_float(control.get("profit_since_last_increase")) or 0.0) if enabled else 0.0
+    balance_baseline = as_float(control.get("actual_balance_baseline"))
+    if balance_baseline is None:
+        balance_baseline = starting_balance
+    actual_balance = as_float(control.get("actual_balance"))
+    # A version-one state has no persisted authenticated balance. Keep its
+    # prior number only until refresh receives the actual account balance;
+    # live execution never treats that provisional value as a scale trigger.
+    profit = (
+        actual_balance - balance_baseline
+        if enabled and actual_balance is not None
+        else (float(as_float(control.get("profit_since_last_increase")) or 0.0) if enabled else 0.0)
+    )
     required = round(current * multiplier, 6)
     events = control.get("scale_events") if isinstance(control.get("scale_events"), list) else []
     return {
@@ -2324,6 +2331,9 @@ def dynamic_scaling_snapshot(state: dict[str, Any], config: dict[str, Any]) -> d
         "current_base_share_count": current,
         "base_share_increment": float(config["base_share_increment"]),
         "scaling_profit_multiplier": multiplier,
+        "starting_balance": round(starting_balance, 6),
+        "actual_balance": None if actual_balance is None else round(actual_balance, 6),
+        "actual_balance_baseline": round(balance_baseline, 6),
         "profit_since_last_increase": round(profit, 6),
         "required_profit": required,
         "profit_remaining_to_increase": round(required - profit, 6),
@@ -2340,27 +2350,37 @@ def dynamic_scaling_snapshot(state: dict[str, Any], config: dict[str, Any]) -> d
 
 def refresh_dynamic_base_share_scaling(
     state: dict[str, Any], config: dict[str, Any], now_epoch: float | None = None,
+    actual_balance: float | None = None,
 ) -> dict[str, Any]:
-    """Apply new realized live P&L to the opt-in dynamic base-share rule.
+    """Apply the actual account balance to the opt-in base-share rule.
 
-    Enabling begins from the configured starting base and only counts trades
-    completed after enablement. This deliberately avoids retrospectively
-    resizing from historical ledger P&L. Every completed filled live trade,
-    including a 5c stop, contributes its realized net P&L. A threshold hit
-    produces one base increase and resets the accumulator exactly as specified.
+    The fixed ``starting_balance`` is the first scaling baseline.  At each
+    increase the baseline moves to the authenticated actual balance, so the
+    next threshold measures new account profit only.  The shadow ledger is
+    never read or mutated here: shadow performance may control the regime,
+    but cannot enlarge real orders.
     """
     now_epoch = time.time() if now_epoch is None else float(now_epoch)
     control = _dynamic_scaling_control(state)
     enabled = bool(config.get("enable_dynamic_scaling"))
     starting = share_quantity(config["initial_position_size"], "initial_position_size")
+    starting_balance = dynamic_scaling_starting_balance(config)
     prior_starting = as_float(control.get("starting_base_share_count"))
+    prior_starting_balance = as_float(control.get("starting_balance"))
     prior_enabled = bool(control.get("enabled"))
+    observed_actual_balance = as_float(actual_balance)
+    if observed_actual_balance is None:
+        observed_actual_balance = as_float(control.get("actual_balance"))
+    if observed_actual_balance is not None and observed_actual_balance <= 0:
+        raise ValueError("actual balance must be positive for dynamic scaling")
     if not enabled:
         already_reset = (
             bool(control.get("initialized"))
             and not prior_enabled
             and prior_starting is not None
             and math.isclose(prior_starting, starting, abs_tol=1e-9)
+            and prior_starting_balance is not None
+            and math.isclose(prior_starting_balance, starting_balance, abs_tol=1e-9)
             and math.isclose(as_float(control.get("current_base_share_count")) or starting, starting, abs_tol=1e-9)
             and math.isclose(as_float(control.get("profit_since_last_increase")) or 0.0, 0.0, abs_tol=1e-9)
         )
@@ -2373,12 +2393,16 @@ def refresh_dynamic_base_share_scaling(
             "initialized": True,
             "initialized_at": datetime.fromtimestamp(now_epoch, tz=timezone.utc).isoformat(),
             "starting_base_share_count": starting,
+            "starting_balance": starting_balance,
             "current_base_share_count": starting,
+            "actual_balance_baseline": starting_balance,
             "profit_since_last_increase": 0.0,
             "last_reset_at": datetime.fromtimestamp(now_epoch, tz=timezone.utc).isoformat(),
             "last_reset_reason": reset_reason,
+            "format_version": 2,
         })
-        _set_dynamic_scaling_cursor_to_latest(control, state)
+        if observed_actual_balance is not None:
+            control["actual_balance"] = round(observed_actual_balance, 6)
         if prior_enabled or (prior_current is not None and not math.isclose(prior_current, starting, abs_tol=1e-9)):
             LOG.warning(
                 "DYNAMIC BASE SCALING DISABLED | base reset to %.2f; new ladders remain fixed until re-enabled.",
@@ -2391,78 +2415,83 @@ def refresh_dynamic_base_share_scaling(
         or not bool(control.get("initialized"))
         or prior_starting is None
         or not math.isclose(prior_starting, starting, abs_tol=1e-9)
+        or prior_starting_balance is None
+        or not math.isclose(prior_starting_balance, starting_balance, abs_tol=1e-9)
+        or int(as_float(control.get("format_version")) or 0) < 2
     ):
         reset_reason = (
             "configured_starting_base_changed"
             if prior_starting is not None and not math.isclose(prior_starting, starting, abs_tol=1e-9)
-            else "dynamic_scaling_enabled"
+            else (
+                "configured_starting_balance_changed"
+                if prior_starting_balance is not None and not math.isclose(prior_starting_balance, starting_balance, abs_tol=1e-9)
+                else "actual_balance_scaling_migration"
+            )
         )
-        prior_current = as_float(control.get("current_base_share_count"))
         control.update({
             "enabled": enabled,
             "initialized": True,
             "initialized_at": datetime.fromtimestamp(now_epoch, tz=timezone.utc).isoformat(),
             "starting_base_share_count": starting,
+            "starting_balance": starting_balance,
             "current_base_share_count": starting,
+            "actual_balance_baseline": starting_balance,
             "profit_since_last_increase": 0.0,
             "last_reset_at": datetime.fromtimestamp(now_epoch, tz=timezone.utc).isoformat(),
             "last_reset_reason": reset_reason,
+            "format_version": 2,
         })
-        _set_dynamic_scaling_cursor_to_latest(control, state)
         _ensure_auto_scaling_capacity(config, starting)
         LOG.warning(
-            "DYNAMIC BASE SCALING ENABLED | starting_base=%.2f increment=%.2f threshold=$%.4f; prior ledger P&L is not replayed.",
-            starting, float(config["base_share_increment"]), starting * float(config["scaling_profit_multiplier"]),
+            "DYNAMIC BASE SCALING INITIALIZED | starting_balance=$%.4f starting_base=%.2f increment=%.2f threshold=$%.4f; authenticated actual balance is the only equity source.",
+            starting_balance, starting, float(config["base_share_increment"]),
+            starting * float(config["scaling_profit_multiplier"]),
         )
+    if observed_actual_balance is None:
+        # Never infer account equity from the local order ledger.  A later
+        # authenticated snapshot will migrate any old version-one state and
+        # calculate the balance delta atomically.
         return control
 
-    cursor = _dynamic_scaling_cursor(control)
-    for key, record in live_completed_trade_records(state):
-        if cursor is not None and key <= cursor:
-            continue
-        completed_epoch, ticker = key
-        profit_loss = float(record.get("net_profit_loss") or 0.0)
-        accumulated = float(as_float(control.get("profit_since_last_increase")) or 0.0) + profit_loss
-        control["last_processed_completion_epoch"] = completed_epoch
-        control["last_processed_completion_ticker"] = ticker
-        control["last_completed_trade"] = {
-            "ticker": ticker,
-            "completed_at": record.get("exited_at") or record.get("settled_at"),
-            "net_profit_loss": profit_loss,
+    control["actual_balance"] = round(observed_actual_balance, 6)
+    balance_baseline = as_float(control.get("actual_balance_baseline"))
+    if balance_baseline is None:
+        balance_baseline = starting_balance
+        control["actual_balance_baseline"] = round(balance_baseline, 6)
+    accumulated = observed_actual_balance - balance_baseline
+    control["profit_since_last_increase"] = round(accumulated, 6)
+    current = dynamic_base_share_count(state, config)
+    required = current * float(config["scaling_profit_multiplier"])
+    if accumulated + 1e-9 >= required:
+        increased = share_quantity(
+            current + float(config["base_share_increment"]), "current_base_share_count",
+        )
+        event = {
+            "at": datetime.fromtimestamp(now_epoch, tz=timezone.utc).isoformat(),
+            "actual_balance": round(observed_actual_balance, 6),
+            "actual_balance_baseline_before": round(balance_baseline, 6),
+            "profit_since_last_increase": round(accumulated, 6),
+            "profit_threshold": round(required, 6),
+            "base_share_count_before": current,
+            "base_share_count_after": increased,
         }
-        control["profit_since_last_increase"] = round(accumulated, 6)
-        current = dynamic_base_share_count(state, config)
-        required = current * float(config["scaling_profit_multiplier"])
-        if accumulated + 1e-9 >= required:
-            increased = share_quantity(
-                current + float(config["base_share_increment"]), "current_base_share_count",
-            )
-            event = {
-                "at": datetime.fromtimestamp(completed_epoch, tz=timezone.utc).isoformat(),
-                "triggering_ticker": ticker,
-                "triggering_net_profit_loss": round(profit_loss, 6),
-                "profit_threshold": round(required, 6),
-                "base_share_count_before": current,
-                "base_share_count_after": increased,
-            }
-            events = control.setdefault("scale_events", [])
-            events.append(event)
-            del events[:-50]
-            control.update({
-                "current_base_share_count": increased,
-                "profit_since_last_increase": 0.0,
-                "last_scale_at": event["at"],
-                "last_scale_ticker": ticker,
-            })
-            auto_capacity_changed = _ensure_auto_scaling_capacity(config, increased)
-            rungs = rung_quantities_for_base_share_count(increased)
-            LOG.warning(
-                "DYNAMIC BASE SCALE INCREASE | %s realized $%+.4f; threshold=$%.4f base=%.2f→%.2f ladder=%s caps=%s.",
-                ticker, profit_loss, required, current, increased,
-                "/".join(f"{rungs[level]:.2f}x${level:.2f}" for level in LADDER_LEVELS),
-                "auto-expanded" if auto_capacity_changed else "unchanged",
-            )
-        cursor = key
+        events = control.setdefault("scale_events", [])
+        events.append(event)
+        del events[:-50]
+        control.update({
+            "current_base_share_count": increased,
+            "actual_balance_baseline": round(observed_actual_balance, 6),
+            "profit_since_last_increase": 0.0,
+            "last_scale_at": event["at"],
+        })
+        auto_capacity_changed = _ensure_auto_scaling_capacity(config, increased)
+        rungs = rung_quantities_for_base_share_count(increased)
+        LOG.warning(
+            "DYNAMIC BASE SCALE INCREASE | actual_balance=$%.4f profit=$%+.4f threshold=$%.4f base=%.2f→%.2f ladder=%s caps=%s.",
+            observed_actual_balance, accumulated, required, current, increased,
+            "/".join(f"{rungs[level]:.2f}x${level:.2f}" for level in LADDER_LEVELS),
+            "auto-expanded" if auto_capacity_changed else "unchanged",
+        )
     return control
 
 
@@ -5675,10 +5704,16 @@ def log_performance_summary(report: dict[str, Any], context: str) -> None:
         loss_skip["last_reset_reason"] or "none",
     )
     scaling = report["dynamic_base_share_scaling"]
+    actual_balance_text = (
+        "unavailable"
+        if scaling["actual_balance"] is None
+        else f"${scaling['actual_balance']:.4f}"
+    )
     LOG.info(
-        "LIVE DYNAMIC BASE SCALING | %s enabled=%s base=%.2f(start %.2f) increment=%.2f multiplier=$%.4f "
+        "LIVE DYNAMIC BASE SCALING | %s enabled=%s actual_balance=%s(start $%.4f) base=%.2f(start %.2f) increment=%.2f multiplier=$%.4f "
         "profit_since_increase=$%+.4f next_threshold=$%.4f remaining=$%.4f increases=%d caps=contracts:%s/capital:%s.",
-        context, scaling["enabled"], scaling["current_base_share_count"], scaling["starting_base_share_count"],
+        context, scaling["enabled"], actual_balance_text, scaling["actual_balance_baseline"],
+        scaling["current_base_share_count"], scaling["starting_base_share_count"],
         scaling["base_share_increment"], scaling["scaling_profit_multiplier"],
         scaling["profit_since_last_increase"], scaling["required_profit"], scaling["profit_remaining_to_increase"],
         scaling["scale_count"], "auto" if scaling["max_contracts_per_market_auto"] else "explicit",
@@ -6333,9 +6368,9 @@ async def run_settlement_only(args: argparse.Namespace) -> int:
                 "settlement_only_migration_note": "retired model/gate path; retain position to settlement with 5c stop only",
             })
     # Initialize the persisted completed-loss circuit breaker before a
-    # recovered or newly discovered market can submit an order.
+    # recovered or newly discovered market can submit an order. Dynamic
+    # scaling waits for the authenticated actual-balance source below.
     if not dry_run:
-        refresh_dynamic_base_share_scaling(state, config)
         refresh_entry_loss_skip(state, config)
     regime_state_path = args.equity_regime_state.expanduser()
     regime_data_dir = regime_state_path.parent
@@ -6390,6 +6425,14 @@ async def run_settlement_only(args: argparse.Namespace) -> int:
                 await rest.close()
                 raise
             regime = None
+    if not dry_run:
+        # The regime's actual balance is persisted from the authenticated
+        # portfolio endpoint at startup/finalization. Dynamic scaling reads
+        # that value only; it never consumes or alters the shadow ledger.
+        actual_balance = as_float(regime.state.get("actual_balance")) if regime is not None else None
+        if actual_balance is None:
+            actual_balance = as_float(await rest.balance_decimal())
+        refresh_dynamic_base_share_scaling(state, config, actual_balance=actual_balance)
     if control_only:
         try:
             canceled = (
@@ -6465,6 +6508,7 @@ async def run_settlement_only(args: argparse.Namespace) -> int:
             ]
             feed.set_tickers(tracked + [str(field(market, "ticker") or "") for market in active_markets])
             private_update = feed.private_update_count != last_private_update_count
+            reconciled_orders = False
             if private_update or monotonic_now - last_order_reconcile_at >= config["order_reconcile_seconds"]:
                 for ticker, record in list(state["markets"].items()):
                     if not isinstance(record, dict):
@@ -6522,12 +6566,17 @@ async def run_settlement_only(args: argparse.Namespace) -> int:
                         await account_equity_regime_finalization(rest, regime, state, record, market, dry_run=dry_run)
                 last_order_reconcile_at = monotonic_now
                 last_private_update_count = feed.private_update_count
+                reconciled_orders = True
             # A settlement or completed 5c stop above may have changed the
-            # realized sequence. Refresh scaling and the loss skip before
-            # handling a new signal; each one therefore applies to this same
-            # loop's next market without changing an already-posted ladder.
+            # authenticated actual balance. Refresh scaling and the loss skip
+            # before handling a new signal; each one therefore applies to
+            # this same loop's next market without changing an already-posted
+            # ladder.
             if not dry_run:
-                refresh_dynamic_base_share_scaling(state, config)
+                actual_balance = as_float(regime.state.get("actual_balance")) if regime is not None else None
+                if actual_balance is None and reconciled_orders:
+                    actual_balance = as_float(await rest.balance_decimal())
+                refresh_dynamic_base_share_scaling(state, config, actual_balance=actual_balance)
                 refresh_entry_loss_skip(state, config)
             for market in active_markets:
                 ticker = str(field(market, "ticker") or "")

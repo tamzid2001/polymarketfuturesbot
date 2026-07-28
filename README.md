@@ -18,15 +18,15 @@ Dynamic scaling is enabled by default. Configure it from the **Kalshi BTC 15m Se
 
 - `enable_dynamic_scaling`: `true` or `false` (default `true`)
 - `base_share_increment`: base shares added after a threshold, in 0.01-share increments (default `1`)
-- `scaling_profit_multiplier`: realized net profit required per current base share (default `16.5`)
+- `scaling_profit_multiplier`: actual account profit required per current base share (default `16.5`)
 
-When enabled, the runner starts a fresh scaling balance at the configured base. It accumulates realized net P&L from subsequently completed, filled live trades. At:
+When enabled, the runner uses the configured `starting_balance` (default **$100**) as the fixed first baseline and the authenticated Kalshi account balance as the only equity source. For example, an actual balance of `$134.8222` reports `profit_since_increase=$+34.8222` and `$14.6778` remaining to the first `$49.5000` threshold. It never derives scaling profit from the local order ledger or from the shadow-equity curve. At:
 
 ```text
 profit_since_last_increase >= current_base_share_count × scaling_profit_multiplier
 ```
 
-it increases the base by `base_share_increment`, resets that balance to zero, and uses the new **1/2/3/4** ladder only for later markets. Bases and rungs retain 0.01-share precision (for example, base `3.25` creates `3.25 / 6.50 / 9.75 / 13.00`). Existing GTC ladders retain their original size. Runner-owned contract and principal caps grow as needed; explicitly supplied caps are never overridden and will safely block an oversized full ladder rather than submit it partially.
+it increases the base by `base_share_increment`, sets the next actual-balance baseline to the balance that triggered that increase, and uses the new **1/2/3/4** ladder only for later markets. Bases and rungs retain 0.01-share precision (for example, base `3.25` creates `3.25 / 6.50 / 9.75 / 13.00`). Existing GTC ladders retain their original size. Runner-owned contract and principal caps grow as needed; explicitly supplied caps are never overridden and will safely block an oversized full ladder rather than submit it partially.
 
 The live report and periodic `LIVE DYNAMIC BASE SCALING` log include the active base, profit balance, next threshold, increase count, and whether capacity is automatic or explicit. Settings are persisted across controlled GitHub Actions handoffs.
 
@@ -36,7 +36,7 @@ The live controller is enabled with live state transitions (`equity_regime_enabl
 
 - It stops new real entries after a saved shadow-equity P90 observation and leaves already-filled positions to the existing 5¢ stop or settlement logic.
 - While stopped, it still creates the same immutable settlement-contrarian shadow decision. A base share of **3** therefore produces shadow limits of **3/6/9/12** at **40¢/30¢/20¢/10¢**, exactly matching the live ladder. The shadow fill model uses only post-decision public trades and is explicitly a conservative approximation, not a queue-aware replay.
-- Dynamic base-share scaling remains sourced from **actual realized P/L** (`scaling_equity_source=actual`). Hypothetical shadow gains while the bot is stopped cannot increase real or shadow ladder size. The current actual base is persisted with the live state and is used for both live and shadow decisions.
+- Dynamic base-share scaling remains sourced from the persisted **authenticated actual balance** (`scaling_equity_source=actual`). Hypothetical shadow gains while the bot is stopped cannot increase real or shadow ladder size. The current actual base is persisted with the live state and is used for both live and shadow decisions.
 - A P10 observation restarts real entry placement for the following eligible market. The controller persists its state, forecasts, shadow curve, and actual curve under `data/`; the workflow includes them in checkpoints and audit artifacts.
 
 The retained diagnostic horizon is exploratory sensitivity evidence, not an unbiased live-performance claim. Its P10–P90 interval coverage was poor in the strict 200-trade review, so the saved forecast and shadow-simulation records should be monitored rather than treated as a deployment guarantee.

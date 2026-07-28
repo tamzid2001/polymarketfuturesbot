@@ -268,7 +268,7 @@ class SettlementTraderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(config["max_contracts_per_market"], 20.0)
         self.assertEqual(config["max_total_capital"], 4.0)
 
-    def test_dynamic_scaling_disabled_keeps_starting_base_and_ignores_ledger_profit(self) -> None:
+    def test_dynamic_scaling_disabled_keeps_starting_base_and_ignores_actual_balance(self) -> None:
         config = trader.validate_config({
             "enable_dynamic_scaling": False,
             "base_share_increment": 2,
@@ -280,7 +280,7 @@ class SettlementTraderTests(unittest.IsolatedAsyncioTestCase):
                 "KXBTC15M-historical-win", base, 500.0,
             ),
         }}
-        trader.refresh_dynamic_base_share_scaling(state, config, now_epoch=base + 1)
+        trader.refresh_dynamic_base_share_scaling(state, config, now_epoch=base + 1, actual_balance=600.0)
         snapshot = trader.dynamic_scaling_snapshot(state, config)
         self.assertFalse(snapshot["enabled"])
         self.assertEqual(snapshot["current_base_share_count"], 3.0)
@@ -290,7 +290,7 @@ class SettlementTraderTests(unittest.IsolatedAsyncioTestCase):
             {0.40: 3.0, 0.30: 6.0, 0.20: 9.0, 0.10: 12.0},
         )
 
-    def test_dynamic_scaling_starts_fresh_then_increases_and_expands_auto_caps(self) -> None:
+    def test_dynamic_scaling_uses_authenticated_balance_from_the_fixed_hundred_dollar_baseline(self) -> None:
         config = trader.validate_config({
             "enable_dynamic_scaling": True,
             "base_share_increment": 1,
@@ -298,19 +298,36 @@ class SettlementTraderTests(unittest.IsolatedAsyncioTestCase):
         })
         base = 1_700_001_100
         state = {"markets": {
-            # Enabling must not replay this older completed trade.
+            # The local ledger is intentionally irrelevant to account equity.
             "KXBTC15M-before-enable": self.completed_live_record(
                 "KXBTC15M-before-enable", base, 999.0,
             ),
         }}
-        trader.refresh_dynamic_base_share_scaling(state, config, now_epoch=base + 1)
-        self.assertEqual(trader.dynamic_base_share_count(state, config), 3.0)
-        state["markets"]["KXBTC15M-new-threshold-win"] = self.completed_live_record(
-            "KXBTC15M-new-threshold-win", base + 2, 49.5,
+        trader.refresh_dynamic_base_share_scaling(
+            state, config, now_epoch=base + 1, actual_balance=134.8222,
         )
-        trader.refresh_dynamic_base_share_scaling(state, config, now_epoch=base + 3)
+        snapshot = trader.dynamic_scaling_snapshot(state, config)
+        self.assertEqual(snapshot["actual_balance"], 134.8222)
+        self.assertEqual(snapshot["actual_balance_baseline"], 100.0)
+        self.assertEqual(snapshot["profit_since_last_increase"], 34.8222)
+        self.assertEqual(snapshot["required_profit"], 49.5)
+        self.assertEqual(snapshot["profit_remaining_to_increase"], 14.6778)
+        self.assertEqual(snapshot["current_base_share_count"], 3.0)
+        self.assertEqual(snapshot["scale_count"], 0)
+
+    def test_dynamic_scaling_increases_and_expands_auto_caps_from_actual_balance(self) -> None:
+        config = trader.validate_config({
+            "enable_dynamic_scaling": True,
+            "base_share_increment": 1,
+            "scaling_profit_multiplier": 16.5,
+        })
+        base = 1_700_001_150
+        state = {"markets": {}}
+        trader.refresh_dynamic_base_share_scaling(state, config, now_epoch=base, actual_balance=100.0)
+        trader.refresh_dynamic_base_share_scaling(state, config, now_epoch=base + 1, actual_balance=149.5)
         snapshot = trader.dynamic_scaling_snapshot(state, config)
         self.assertEqual(snapshot["current_base_share_count"], 4.0)
+        self.assertEqual(snapshot["actual_balance_baseline"], 149.5)
         self.assertEqual(snapshot["profit_since_last_increase"], 0.0)
         self.assertEqual(snapshot["scale_count"], 1)
         self.assertEqual(
@@ -320,7 +337,7 @@ class SettlementTraderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(config["max_contracts_per_market"], 40.0)
         self.assertEqual(config["max_total_capital"], 8.0)
 
-    def test_dynamic_scaling_uses_net_profit_since_last_increase_and_increment(self) -> None:
+    def test_dynamic_scaling_resets_the_actual_balance_baseline_after_an_increment(self) -> None:
         config = trader.validate_config({
             "enable_dynamic_scaling": True,
             "base_share_increment": 2,
@@ -328,14 +345,13 @@ class SettlementTraderTests(unittest.IsolatedAsyncioTestCase):
         })
         base = 1_700_001_200
         state = {"markets": {}}
-        trader.refresh_dynamic_base_share_scaling(state, config, now_epoch=base)
-        state["markets"]["KXBTC15M-loss"] = self.completed_live_record("KXBTC15M-loss", base + 1, -1.0)
-        state["markets"]["KXBTC15M-win"] = self.completed_live_record("KXBTC15M-win", base + 2, 4.0)
-        trader.refresh_dynamic_base_share_scaling(state, config, now_epoch=base + 3)
+        trader.refresh_dynamic_base_share_scaling(state, config, now_epoch=base, actual_balance=100.0)
+        trader.refresh_dynamic_base_share_scaling(state, config, now_epoch=base + 3, actual_balance=103.0)
         snapshot = trader.dynamic_scaling_snapshot(state, config)
-        # -$1 + $4 reaches the $3 threshold for base three, then the exact
-        # specified reset leaves no carried profit after a 3 -> 5 increase.
+        # A $3 actual-balance gain reaches the $3 threshold for base three,
+        # then the exact specified reset records $103 as the next baseline.
         self.assertEqual(snapshot["current_base_share_count"], 5.0)
+        self.assertEqual(snapshot["actual_balance_baseline"], 103.0)
         self.assertEqual(snapshot["profit_since_last_increase"], 0.0)
         self.assertEqual(
             trader.live_rung_quantities(config, state),
@@ -351,11 +367,8 @@ class SettlementTraderTests(unittest.IsolatedAsyncioTestCase):
         })
         base = 1_700_001_250
         state = {"markets": {}}
-        trader.refresh_dynamic_base_share_scaling(state, config, now_epoch=base)
-        state["markets"]["KXBTC15M-fractional-threshold-win"] = self.completed_live_record(
-            "KXBTC15M-fractional-threshold-win", base + 1, 2.25,
-        )
-        trader.refresh_dynamic_base_share_scaling(state, config, now_epoch=base + 2)
+        trader.refresh_dynamic_base_share_scaling(state, config, now_epoch=base, actual_balance=100.0)
+        trader.refresh_dynamic_base_share_scaling(state, config, now_epoch=base + 2, actual_balance=102.25)
         snapshot = trader.dynamic_scaling_snapshot(state, config)
         self.assertEqual(snapshot["required_profit"], 2.4375)
         self.assertEqual(snapshot["current_base_share_count"], 3.25)
@@ -438,11 +451,8 @@ class SettlementTraderTests(unittest.IsolatedAsyncioTestCase):
         })
         now = time.time()
         state = {"markets": {}}
-        trader.refresh_dynamic_base_share_scaling(state, config, now_epoch=now)
-        state["markets"]["KXBTC15M-scale-win"] = self.completed_live_record(
-            "KXBTC15M-scale-win", int(now) + 1, 2.25,
-        )
-        trader.refresh_dynamic_base_share_scaling(state, config, now_epoch=now + 2)
+        trader.refresh_dynamic_base_share_scaling(state, config, now_epoch=now, actual_balance=100.0)
+        trader.refresh_dynamic_base_share_scaling(state, config, now_epoch=now + 2, actual_balance=102.25)
         ticker = "KXBTC15M-scaled-entry"
         market = {"ticker": ticker, "status": "active", "open_time": now - 1, "close_time": now + 300}
         rest = Rest()
