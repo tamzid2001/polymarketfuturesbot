@@ -90,6 +90,10 @@ CHECKPOINT_RETRY_SECONDS = max(1.0, float(os.getenv("KALSHI_CHECKPOINT_RETRY_SEC
 # This avoids substituting an older result while still leaving at least one
 # minute before close for the same-side GTC ladder to rest.
 SETTLEMENT_CONTRARIAN_ENTRY_GRACE_SECONDS = 840.0
+# Shadow-equity results must remain comparable across live account-size
+# changes. The shadow executor therefore always models this fixed 1/2/3/4
+# ladder, independently of the real account's dynamic base-share scaling.
+EQUITY_REGIME_SHADOW_BASE_SHARES = 3.0
 # Polling metadata changes every few seconds and must never turn the bot-state
 # branch into a stream of commits. Everything else is material trading state.
 CHECKPOINT_IGNORED_KEYS = {
@@ -2742,13 +2746,12 @@ def start_market_watcher(state: dict[str, Any], market: Any, config: dict[str, A
 def build_equity_regime_decision(
     state: dict[str, Any], record: dict[str, Any], market: Any, config: dict[str, Any], side: str,
 ) -> StrategyDecision:
-    """Adapt the active settlement-only strategy without reimplementing it.
+    """Build the fixed-size shadow decision for the settlement strategy.
 
-    The immutable decision is constructed from the same frozen settlement
-    signal and the same 1/2/3/4 ladder sizes that ``consider_initial_entry``
-    will use for this market.  Prophet gating may decide whether that shared
-    decision reaches the live executor, but cannot choose a new side, price,
-    rung, or exit policy.
+    Live entry sizing is calculated independently in ``consider_initial_entry``
+    and may use dynamic scaling from the authenticated account balance. The
+    shadow curve always uses the fixed 3/6/9/12 ladder so its balance is never
+    rebased or resized by a real-account threshold crossing.
     """
     ticker = str(field(market, "ticker") or record.get("ticker") or "")
     close_epoch = timestamp_epoch(field(market, "close_time", "expected_expiration_time") or record.get("market_close_time"))
@@ -2758,20 +2761,16 @@ def build_equity_regime_decision(
     target_close = datetime.fromtimestamp(close_epoch, tz=timezone.utc)
     if target_close <= generated:
         raise ValueError("refusing an equity-regime decision for an expired market")
-    snapshot = record.get("regime_ladder_quantities")
-    if isinstance(snapshot, dict) and all(f"{level:.4f}" in snapshot for level in LADDER_LEVELS):
-        rungs = {level: float(snapshot[f"{level:.4f}"]) for level in LADDER_LEVELS}
-    else:
-        # The active dynamic base is based on realized actual P/L by default.
-        # Freeze this exact 1/2/3/4 quantity snapshot before either executor
-        # can observe the target market, so live and shadow cannot drift.
-        base = dynamic_base_share_count(state, config)
-        rungs = rung_quantities_for_base_share_count(base)
-        record["regime_base_share_count"] = base
-        record["regime_scaling_equity_source"] = config.get("scaling_equity_source", "actual")
-        record["regime_ladder_quantities"] = {
-            f"{level:.4f}": rungs[level] for level in LADDER_LEVELS
-        }
+    # Deliberately overwrite any pre-threshold/restart snapshot. A stale
+    # dynamically-sized snapshot must not leak into shadow accounting.
+    _ = state, config
+    rungs = rung_quantities_for_base_share_count(EQUITY_REGIME_SHADOW_BASE_SHARES)
+    record["regime_shadow_base_share_count"] = EQUITY_REGIME_SHADOW_BASE_SHARES
+    record["regime_base_share_count"] = EQUITY_REGIME_SHADOW_BASE_SHARES
+    record["regime_scaling_equity_source"] = "fixed_shadow_ladder"
+    record["regime_ladder_quantities"] = {
+        f"{level:.4f}": rungs[level] for level in LADDER_LEVELS
+    }
     source = record.get("settlement_contrarian_signal") or {}
     return StrategyDecision(
         target_ticker=ticker,
