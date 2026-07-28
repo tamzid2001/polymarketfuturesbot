@@ -1774,6 +1774,41 @@ class EquityRegimeController:
             )
         return rebuilt
 
+    def has_durable_colab_reference_history(self) -> bool:
+        """Return whether a committed Colab curve can safely survive a handoff.
+
+        The checked-in closed-position CSV is an initial model-input snapshot,
+        not an instruction to discard later shadow accounting.  Once a live
+        runner has checkpointed a curve derived from that snapshot, its tail
+        contains the post-snapshot shadow observations and the gate state
+        needed by the next Actions runner.  Rebuilding from the static CSV at
+        every startup would silently erase that tail.
+
+        Require the lightweight invariants that are also meaningful after the
+        200-row retention window moves: the state remains identified as a
+        Colab-reference curve, it has enough rows to forecast, and its
+        persisted shadow balance agrees with the retained curve tail.
+        """
+
+        if self.config.prophet_history_source != "account_series":
+            return False
+        if self.state.get("balance_source") not in {
+            "colab_reference_closed_positions_csv",
+            "colab_reference_account_series_starting_balance",
+        }:
+            return False
+        history = self.state.get("shadow_history")
+        if not isinstance(history, list) or len(history) < self.config.prophet_min_history:
+            return False
+        tail = history[-1] if history else None
+        shadow_balance = self.state.get("shadow_balance")
+        if not isinstance(tail, Mapping) or shadow_balance in {None, ""}:
+            return False
+        tail_balance = tail.get("shadow_balance_after")
+        if tail_balance in {None, ""}:
+            return False
+        return abs(decimal_value(tail_balance) - decimal_value(shadow_balance)) <= self.config.accounting_tolerance
+
     def save(self) -> None:
         self._bound_persisted_history()
         self._assert_state_integrity()
@@ -2828,35 +2863,46 @@ async def synchronize_history(controller: EquityRegimeController, api: JsonAPI, 
         controller.config.prophet_history_source == "account_series"
         and reference_export is not None
     ):
-        stored_actual = controller.state.get("actual_balance")
-        if stored_actual is None:
-            # A first-ever installation has no persisted cash balance. Only
-            # in that case ask the inexpensive portfolio endpoint; normal
-            # restarts never depend on historical API access.
-            balance_payload = await api.get_json("/portfolio/balance")
-            balance_dollars = value_from(balance_payload, "balance_dollars")
-            raw_balance = balance_dollars if balance_dollars is not None else value_from(balance_payload, "balance")
-            if raw_balance is None:
-                raise RuntimeError("/portfolio/balance returned no usable balance for initial reference-CSV startup")
-            operational_balance = (
-                decimal_value(balance_dollars)
-                if balance_dollars is not None
-                else decimal_value(raw_balance) / Decimal("100")
+        restored = controller.has_durable_colab_reference_history()
+        if not restored:
+            stored_actual = controller.state.get("actual_balance")
+            if stored_actual is None:
+                # A first-ever installation has no persisted cash balance. Only
+                # in that case ask the inexpensive portfolio endpoint; normal
+                # restarts never depend on historical API access.
+                balance_payload = await api.get_json("/portfolio/balance")
+                balance_dollars = value_from(balance_payload, "balance_dollars")
+                raw_balance = balance_dollars if balance_dollars is not None else value_from(balance_payload, "balance")
+                if raw_balance is None:
+                    raise RuntimeError("/portfolio/balance returned no usable balance for initial reference-CSV startup")
+                operational_balance = (
+                    decimal_value(balance_dollars)
+                    if balance_dollars is not None
+                    else decimal_value(raw_balance) / Decimal("100")
+                )
+            else:
+                operational_balance = decimal_value(stored_actual)
+            controller.migrate_legacy_rebased_state(operational_balance)
+            controller.rebuild_colab_reference_closed_positions_csv(
+                reference_export,
+                api_current_balance=operational_balance,
             )
+            controller.prime_colab_reference_forecast()
+            controller.apply_startup_regime_gate()
         else:
-            operational_balance = decimal_value(stored_actual)
-        controller.migrate_legacy_rebased_state(operational_balance)
-        controller.rebuild_colab_reference_closed_positions_csv(
-            reference_export,
-            api_current_balance=operational_balance,
-        )
-        controller.prime_colab_reference_forecast()
-        controller.apply_startup_regime_gate()
+            LOG.warning(
+                "COLAB REFERENCE HISTORY RESTORED | csv=%s rows=%d actual_balance=%s shadow_balance=%s; "
+                "preserving post-baseline shadow observations and execution state",
+                reference_export,
+                len(controller.state["shadow_history"]),
+                controller.state["actual_balance"],
+                controller.state["shadow_balance"],
+            )
         controller.state["ambiguous_fills"] = []
         controller.state["reconciliation"] = [{
             "market_ticker": "__colab_reference_closed_positions_csv__",
             "market_close_time": None,
-            "api_balance": format(operational_balance, "f"),
+            "api_balance": controller.state["actual_balance"],
             "actual_balance": controller.state["actual_balance"],
             "shadow_balance": controller.state["shadow_balance"],
             "difference": None,
@@ -2873,11 +2919,13 @@ async def synchronize_history(controller: EquityRegimeController, api: JsonAPI, 
             "prophet_history_source": controller.config.prophet_history_source,
             "reference_closed_positions_csv": str(reference_export),
             "historical_api_sync_skipped": True,
+            "reference_curve_mode": "restored" if restored else "rebuilt",
         }
         controller.save()
         LOG.info(
-            "COLAB REFERENCE HISTORY SYNC | csv=%s rows=%d actual_balance=%s shadow_balance=%s",
+            "COLAB REFERENCE HISTORY SYNC | csv=%s mode=%s rows=%d actual_balance=%s shadow_balance=%s",
             reference_export,
+            "restored" if restored else "rebuilt",
             len(controller.state.get("shadow_history", [])),
             controller.state["actual_balance"],
             controller.state["shadow_balance"],
