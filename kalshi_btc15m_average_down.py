@@ -2341,6 +2341,7 @@ def dynamic_scaling_snapshot(state: dict[str, Any], config: dict[str, Any]) -> d
         "profit_since_last_increase": round(profit, 6),
         "required_profit": required,
         "profit_remaining_to_increase": round(required - profit, 6),
+        "next_increase_actual_balance": round(balance_baseline + required, 6),
         "scale_count": len(events),
         "last_scale": events[-1] if events else None,
         "max_contracts_per_market_auto": bool(config.get("max_contracts_per_market_auto")),
@@ -2358,11 +2359,14 @@ def refresh_dynamic_base_share_scaling(
 ) -> dict[str, Any]:
     """Apply the actual account balance to the opt-in base-share rule.
 
-    The fixed ``starting_balance`` is the first scaling baseline.  At each
-    increase the baseline moves to the authenticated actual balance, so the
-    next threshold measures new account profit only.  The shadow ledger is
-    never read or mutated here: shadow performance may control the regime,
-    but cannot enlarge real orders.
+    The authenticated funding-adjusted balance baseline remains fixed across
+    scale increases.  Consequently, base three promotes at baseline +
+    (3 × multiplier), base four at baseline + (4 × multiplier), and so on.
+    Losses never reduce an already-earned base.  Deposits and withdrawals
+    rebase only this funding baseline, preventing cash movements from either
+    triggering or undoing a size change.  The shadow ledger is never read or
+    mutated here: shadow performance may control the regime, but cannot
+    enlarge real orders.
     """
     now_epoch = time.time() if now_epoch is None else float(now_epoch)
     control = _dynamic_scaling_control(state)
@@ -2465,6 +2469,11 @@ def refresh_dynamic_base_share_scaling(
     accumulated = observed_actual_balance - balance_baseline
     control["profit_since_last_increase"] = round(accumulated, 6)
     current = dynamic_base_share_count(state, config)
+    # A restart can restore an already-increased base while loading the
+    # original 3-share auto-cap values from configuration.  Auto capacity is
+    # owned by the runner, so reconcile it on every authenticated refresh,
+    # not only in the transaction that originally increased the base.
+    _ensure_auto_scaling_capacity(config, current)
     required = current * float(config["scaling_profit_multiplier"])
     if accumulated + 1e-9 >= required:
         increased = share_quantity(
@@ -2484,8 +2493,10 @@ def refresh_dynamic_base_share_scaling(
         del events[:-50]
         control.update({
             "current_base_share_count": increased,
-            "actual_balance_baseline": round(observed_actual_balance, 6),
-            "profit_since_last_increase": 0.0,
+            # Keep the funding-adjusted baseline fixed: the next promotion is
+            # based on the original baseline plus the newly-current base's
+            # multiplier, rather than requiring a fresh full profit interval.
+            "profit_since_last_increase": round(accumulated, 6),
             "last_scale_at": event["at"],
         })
         auto_capacity_changed = _ensure_auto_scaling_capacity(config, increased)
@@ -5761,12 +5772,12 @@ def log_performance_summary(report: dict[str, Any], context: str) -> None:
         else f"${scaling['actual_balance']:.4f}"
     )
     LOG.info(
-        "LIVE DYNAMIC BASE SCALING | %s enabled=%s actual_balance=%s(start $%.4f) base=%.2f(start %.2f) increment=%.2f multiplier=$%.4f "
-        "profit_since_increase=$%+.4f next_threshold=$%.4f remaining=$%.4f increases=%d caps=contracts:%s/capital:%s.",
+        "LIVE DYNAMIC BASE SCALING | %s enabled=%s actual_balance=%s(baseline $%.4f) base=%.2f(start %.2f) increment=%.2f multiplier=$%.4f "
+        "profit_since_baseline=$%+.4f next_balance_threshold=$%.4f remaining=$%.4f increases=%d caps=contracts:%s/capital:%s.",
         context, scaling["enabled"], actual_balance_text, scaling["actual_balance_baseline"],
         scaling["current_base_share_count"], scaling["starting_base_share_count"],
         scaling["base_share_increment"], scaling["scaling_profit_multiplier"],
-        scaling["profit_since_last_increase"], scaling["required_profit"], scaling["profit_remaining_to_increase"],
+        scaling["profit_since_last_increase"], scaling["next_increase_actual_balance"], scaling["profit_remaining_to_increase"],
         scaling["scale_count"], "auto" if scaling["max_contracts_per_market_auto"] else "explicit",
         "auto" if scaling["max_total_capital_auto"] else "explicit",
     )
@@ -6545,9 +6556,9 @@ async def run_settlement_only(args: argparse.Namespace) -> int:
     )
     LOG.warning(
         "DYNAMIC BASE SCALING POLICY | enabled=%s base=%.2f start=%.2f increment=%.2f multiplier=$%.4f "
-        "next_threshold=$%.4f; auto_caps=contracts:%s/capital:%s.",
+        "next_balance_threshold=$%.4f; auto_caps=contracts:%s/capital:%s.",
         scaling["enabled"], scaling["current_base_share_count"], scaling["starting_base_share_count"],
-        scaling["base_share_increment"], scaling["scaling_profit_multiplier"], scaling["required_profit"],
+        scaling["base_share_increment"], scaling["scaling_profit_multiplier"], scaling["next_increase_actual_balance"],
         scaling["max_contracts_per_market_auto"], scaling["max_total_capital_auto"],
     )
     try:
