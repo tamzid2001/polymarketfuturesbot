@@ -741,6 +741,45 @@ class EquityRegimeTests(unittest.TestCase):
             )
             self.assertFalse(execution_for_next_market)
 
+    def test_start_market_restarts_live_execution_when_restored_shadow_is_below_p10(self) -> None:
+        """A below-P10 handoff must enable the same next eligible market."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = RegimeConfig(
+                enabled=True,
+                dry_run=False,
+                allow_live_state_transitions=True,
+                prophet_history_source="account_series",
+                prophet_min_history=2,
+                prophet_training_window=None,
+            )
+            controller = EquityRegimeController(config, root / "state.json", root / "outputs")
+            controller.initialize_absolute_balances(Decimal("100"), reason="test")
+            now = datetime.now(tz=UTC)
+            controller.state.update({
+                "execution_enabled": False,
+                "disabled_since": (now - timedelta(minutes=15)).isoformat(),
+                "shadow_balance": "94",
+                "prophet_history_ready": True,
+                "shadow_history": [
+                    {"market_ticker": "old1", "market_close_time": (now - timedelta(hours=2)).isoformat(), "completed_at": (now - timedelta(hours=2)).isoformat(), "shadow_balance_after": "95"},
+                    {"market_ticker": "old2", "market_close_time": (now - timedelta(hours=1)).isoformat(), "completed_at": (now - timedelta(hours=1)).isoformat(), "shadow_balance_after": "94"},
+                ],
+            })
+            controller.forecaster = FakeForecaster("95", "105")
+
+            forecast, execution_for_market = controller.start_market(
+                decision("KXBTC15M-RESTART-NOW", now),
+            )
+
+            self.assertTrue(execution_for_market)
+            self.assertTrue(controller.execution_enabled_for_market())
+            self.assertFalse(controller.should_suppress_new_live_orders())
+            self.assertEqual(controller.state["state_reason"], "startup_shadow_balance_at_or_below_p10")
+            self.assertTrue(forecast["startup_entry_signal"])
+            self.assertTrue(controller.state["shadow_open"]["KXBTC15M-RESTART-NOW"]["live_execution_enabled"])
+
     def test_live_finalization_updates_actual_and_shadow_once(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

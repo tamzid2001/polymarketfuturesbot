@@ -2162,6 +2162,16 @@ class EquityRegimeController:
         """Persist the strategy decision before any current-market result exists."""
 
         forecast = self.prepare_forecast(decision)
+        # A handoff can restore a stopped controller after the most recent
+        # shadow observation has already crossed below P10.  That observation
+        # may not have a matching forecast record (for example after a
+        # recovery from a durable checkpoint), so waiting for this *new*
+        # market to settle would suppress one more otherwise eligible live
+        # entry.  Evaluate the freshly causal forecast before recording this
+        # market's execution mode, making the restored P10/P90 state
+        # effective for this same next eligible market.
+        if forecast and forecast.get("forecast_target_ticker") == decision.target_ticker:
+            self.apply_startup_regime_gate()
         execution_before = self.execution_enabled_for_market()
         existing = self.state.get("shadow_open", {}).get(decision.target_ticker)
         if existing is None:
