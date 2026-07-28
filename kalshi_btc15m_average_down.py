@@ -2282,6 +2282,48 @@ def dynamic_scaling_starting_balance(config: dict[str, Any]) -> float:
     return starting_balance
 
 
+def _dynamic_scaling_threshold_base_units(
+    control: dict[str, Any], *, starting: float, current: float, increment: float,
+) -> float:
+    """Return the cumulative base-share units required for the next promotion.
+
+    The first promotion charges one interval at the configured starting base.
+    Every later promotion adds another interval at the newly-current base.  For
+    example, with a 3-share start and one-share increments, the thresholds use
+    3 units, then 3 + 4, then 3 + 4 + 5, and so on.  The persisted value keeps
+    that history intact if an operator later changes the configured increment.
+    """
+    persisted = as_float(control.get("threshold_base_share_units"))
+    if persisted is not None and persisted > 0:
+        return round(persisted, 6)
+
+    completed_increases = max(0, int(round((current - starting) / increment)))
+    expected_current = starting + (completed_increases * increment)
+    if math.isclose(current, expected_current, abs_tol=1e-9):
+        # Arithmetic-series form of starting + ... + current, avoiding the
+        # rounding accumulation that a loop over fractional share increments
+        # would introduce.
+        return round(
+            ((completed_increases + 1) * starting)
+            + (increment * completed_increases * (completed_increases + 1) / 2),
+            6,
+        )
+
+    # A pre-v4 state may have been saved after its increment setting changed.
+    # Its retained events are a better reconstruction than silently charging
+    # only the current base.  New v4 states always persist the exact units.
+    events = control.get("scale_events")
+    if isinstance(events, list) and events:
+        prior_bases = [
+            as_float(event.get("base_share_count_before"))
+            for event in events
+            if isinstance(event, dict)
+        ]
+        if all(base is not None and base > 0 for base in prior_bases):
+            return round(sum(float(base) for base in prior_bases) + current, 6)
+    return round(current, 6)
+
+
 def _ensure_auto_scaling_capacity(config: dict[str, Any], base_share_count: float) -> bool:
     """Expand only runner-owned limits needed by a newly increased base.
 
@@ -2314,6 +2356,7 @@ def dynamic_scaling_snapshot(state: dict[str, Any], config: dict[str, Any]) -> d
     starting = share_quantity(config["initial_position_size"], "initial_position_size")
     starting_balance = dynamic_scaling_starting_balance(config)
     current = dynamic_base_share_count(state, config)
+    increment = float(config["base_share_increment"])
     multiplier = float(config["scaling_profit_multiplier"])
     balance_baseline = as_float(control.get("actual_balance_baseline"))
     if balance_baseline is None:
@@ -2327,18 +2370,22 @@ def dynamic_scaling_snapshot(state: dict[str, Any], config: dict[str, Any]) -> d
         if enabled and actual_balance is not None
         else (float(as_float(control.get("profit_since_last_increase")) or 0.0) if enabled else 0.0)
     )
-    required = round(current * multiplier, 6)
+    threshold_base_units = _dynamic_scaling_threshold_base_units(
+        control, starting=starting, current=current, increment=increment,
+    )
+    required = round(threshold_base_units * multiplier, 6)
     events = control.get("scale_events") if isinstance(control.get("scale_events"), list) else []
     return {
         "enabled": enabled,
         "starting_base_share_count": starting,
         "current_base_share_count": current,
-        "base_share_increment": float(config["base_share_increment"]),
+        "base_share_increment": increment,
         "scaling_profit_multiplier": multiplier,
         "starting_balance": round(starting_balance, 6),
         "actual_balance": None if actual_balance is None else round(actual_balance, 6),
         "actual_balance_baseline": round(balance_baseline, 6),
         "profit_since_last_increase": round(profit, 6),
+        "threshold_base_share_units": threshold_base_units,
         "required_profit": required,
         "profit_remaining_to_increase": round(required - profit, 6),
         "next_increase_actual_balance": round(balance_baseline + required, 6),
@@ -2360,13 +2407,13 @@ def refresh_dynamic_base_share_scaling(
     """Apply the actual account balance to the opt-in base-share rule.
 
     The authenticated funding-adjusted balance baseline remains fixed across
-    scale increases.  Consequently, base three promotes at baseline +
-    (3 × multiplier), base four at baseline + (4 × multiplier), and so on.
-    Losses never reduce an already-earned base.  Deposits and withdrawals
-    rebase only this funding baseline, preventing cash movements from either
-    triggering or undoing a size change.  The shadow ledger is never read or
-    mutated here: shadow performance may control the regime, but cannot
-    enlarge real orders.
+    scale increases.  Each promotion adds an interval sized at that stage's
+    base: base three promotes at baseline + (3 × multiplier); base four then
+    promotes at baseline + ((3 + 4) × multiplier), and so on.  Losses never
+    reduce an already-earned base.  Deposits and withdrawals rebase only this
+    funding baseline, preventing cash movements from either triggering or
+    undoing a size change.  The shadow ledger is never read or mutated here:
+    shadow performance may control the regime, but cannot enlarge real orders.
     """
     now_epoch = time.time() if now_epoch is None else float(now_epoch)
     control = _dynamic_scaling_control(state)
@@ -2407,7 +2454,9 @@ def refresh_dynamic_base_share_scaling(
             "profit_since_last_increase": 0.0,
             "last_reset_at": datetime.fromtimestamp(now_epoch, tz=timezone.utc).isoformat(),
             "last_reset_reason": reset_reason,
-            "format_version": 3,
+            "format_version": 4,
+            "threshold_base_share_units": starting,
+            "threshold_policy": "funding_baseline_plus_cumulative_base_intervals",
         })
         if observed_actual_balance is not None:
             control["actual_balance"] = round(observed_actual_balance, 6)
@@ -2418,37 +2467,54 @@ def refresh_dynamic_base_share_scaling(
             )
         return control
 
-    # Version two reset the baseline at every promotion.  Migrate a durable
-    # v2 record without shrinking the base: retain its funding adjustments
-    # and reconstruct the cumulative threshold baseline from the configured
-    # starting balance.  Version one is handled by the existing authenticated
-    # balance migration below because it has no trustworthy balance baseline.
+    # Version two reset the balance baseline at every promotion, while version
+    # three reused only the current base for every threshold.  Preserve the
+    # already-earned base while moving both formats to the stage-by-stage
+    # cumulative threshold policy.  Version one is handled by the existing
+    # authenticated-balance initialization below because it has no trustworthy
+    # balance baseline.
     prior_format = int(as_float(control.get("format_version")) or 0)
-    if prior_format == 2 and bool(control.get("initialized")):
-        external_adjustments = control.get("external_balance_adjustments")
-        funding_adjustment = sum(
-            float(as_float(item.get("amount")) or 0.0)
-            for item in external_adjustments
-            if isinstance(item, dict)
-        ) if isinstance(external_adjustments, list) else 0.0
-        cumulative_baseline = round(starting_balance + funding_adjustment, 6)
+    if prior_format in {2, 3} and bool(control.get("initialized")):
+        if prior_format == 2:
+            external_adjustments = control.get("external_balance_adjustments")
+            funding_adjustment = sum(
+                float(as_float(item.get("amount")) or 0.0)
+                for item in external_adjustments
+                if isinstance(item, dict)
+            ) if isinstance(external_adjustments, list) else 0.0
+            cumulative_baseline = round(starting_balance + funding_adjustment, 6)
+        else:
+            # v3 already stored a funding-adjusted baseline correctly.  Keep
+            # it, including any cash-movement rebase made by the live runner.
+            cumulative_baseline = round(
+                as_float(control.get("actual_balance_baseline")) or starting_balance,
+                6,
+            )
+        current = dynamic_base_share_count(state, config)
+        threshold_base_units = _dynamic_scaling_threshold_base_units(
+            control,
+            starting=starting,
+            current=current,
+            increment=float(config["base_share_increment"]),
+        )
         control.update({
-            "format_version": 3,
+            "format_version": 4,
             "actual_balance_baseline": cumulative_baseline,
+            "threshold_base_share_units": threshold_base_units,
             "profit_since_last_increase": round(
                 (observed_actual_balance - cumulative_baseline)
                 if observed_actual_balance is not None
                 else float(as_float(control.get("profit_since_last_increase")) or 0.0),
                 6,
             ),
-            "threshold_policy": "funding_baseline_plus_current_base_multiplier",
+            "threshold_policy": "funding_baseline_plus_cumulative_base_intervals",
             "last_reset_at": datetime.fromtimestamp(now_epoch, tz=timezone.utc).isoformat(),
-            "last_reset_reason": "cumulative_balance_threshold_migration",
+            "last_reset_reason": "cumulative_stage_threshold_migration",
         })
         LOG.warning(
             "DYNAMIC BASE SCALING MIGRATED | base=%.2f funding_baseline=$%.4f; "
-            "the next increase uses baseline + current_base × multiplier.",
-            dynamic_base_share_count(state, config), cumulative_baseline,
+            "the next increase includes every base interval through the current base.",
+            current, cumulative_baseline,
         )
 
     if (
@@ -2458,7 +2524,7 @@ def refresh_dynamic_base_share_scaling(
         or not math.isclose(prior_starting, starting, abs_tol=1e-9)
         or prior_starting_balance is None
         or not math.isclose(prior_starting_balance, starting_balance, abs_tol=1e-9)
-        or int(as_float(control.get("format_version")) or 0) < 2
+        or int(as_float(control.get("format_version")) or 0) < 4
     ):
         reset_reason = (
             "configured_starting_base_changed"
@@ -2480,8 +2546,9 @@ def refresh_dynamic_base_share_scaling(
             "profit_since_last_increase": 0.0,
             "last_reset_at": datetime.fromtimestamp(now_epoch, tz=timezone.utc).isoformat(),
             "last_reset_reason": reset_reason,
-            "format_version": 3,
-            "threshold_policy": "funding_baseline_plus_current_base_multiplier",
+            "format_version": 4,
+            "threshold_base_share_units": starting,
+            "threshold_policy": "funding_baseline_plus_cumulative_base_intervals",
         })
         _ensure_auto_scaling_capacity(config, starting)
         LOG.warning(
@@ -2496,7 +2563,7 @@ def refresh_dynamic_base_share_scaling(
         return control
 
     control["actual_balance"] = round(observed_actual_balance, 6)
-    control["threshold_policy"] = "funding_baseline_plus_current_base_multiplier"
+    control["threshold_policy"] = "funding_baseline_plus_cumulative_base_intervals"
     balance_baseline = as_float(control.get("actual_balance_baseline"))
     if balance_baseline is None:
         balance_baseline = starting_balance
@@ -2509,7 +2576,13 @@ def refresh_dynamic_base_share_scaling(
     # owned by the runner, so reconcile it on every authenticated refresh,
     # not only in the transaction that originally increased the base.
     _ensure_auto_scaling_capacity(config, current)
-    required = current * float(config["scaling_profit_multiplier"])
+    threshold_base_units = _dynamic_scaling_threshold_base_units(
+        control,
+        starting=starting,
+        current=current,
+        increment=float(config["base_share_increment"]),
+    )
+    required = threshold_base_units * float(config["scaling_profit_multiplier"])
     if accumulated + 1e-9 >= required:
         increased = share_quantity(
             current + float(config["base_share_increment"]), "current_base_share_count",
@@ -2520,6 +2593,7 @@ def refresh_dynamic_base_share_scaling(
             "actual_balance_baseline_before": round(balance_baseline, 6),
             "profit_since_last_increase": round(accumulated, 6),
             "profit_threshold": round(required, 6),
+            "threshold_base_share_units": threshold_base_units,
             "base_share_count_before": current,
             "base_share_count_after": increased,
         }
@@ -2529,9 +2603,9 @@ def refresh_dynamic_base_share_scaling(
         control.update({
             "current_base_share_count": increased,
             # Keep the funding-adjusted baseline fixed: the next promotion is
-            # based on the original baseline plus the newly-current base's
-            # multiplier, rather than requiring a fresh full profit interval.
+            # based on every base interval through the newly-current base.
             "profit_since_last_increase": round(accumulated, 6),
+            "threshold_base_share_units": round(threshold_base_units + increased, 6),
             "last_scale_at": event["at"],
         })
         auto_capacity_changed = _ensure_auto_scaling_capacity(config, increased)

@@ -23,10 +23,10 @@ Dynamic scaling is enabled by default. Configure it from the **Kalshi BTC 15m Se
 When enabled, the runner uses the configured `starting_balance` (default **$100**) as the fixed first baseline and the authenticated Kalshi account balance as the only equity source. For example, an actual balance of `$134.8222` reports `profit_since_increase=$+34.8222` and `$14.6778` remaining to the first `$49.5000` threshold. It never derives scaling profit from the local order ledger or from the shadow-equity curve. At:
 
 ```text
-profit_since_last_increase >= current_base_share_count × scaling_profit_multiplier
+profit_since_baseline >= (starting_base + each promoted base through current_base) × scaling_profit_multiplier
 ```
 
-it increases the base by `base_share_increment`, sets the next actual-balance baseline to the balance that triggered that increase, and uses the new **1/2/3/4** ladder only for later markets. Bases and rungs retain 0.01-share precision (for example, base `3.25` creates `3.25 / 6.50 / 9.75 / 13.00`). Existing GTC ladders retain their original size. Runner-owned contract and principal caps grow as needed; explicitly supplied caps are never overridden and will safely block an oversized full ladder rather than submit it partially.
+It increases the base by `base_share_increment` once that cumulative threshold is reached. With a 3-share start, 1-share increments, and a $16.50 multiplier, the thresholds are `$100 + (3 × $16.50) = $149.50`, then `$100 + ((3 + 4) × $16.50) = $215.50`, then `$100 + ((3 + 4 + 5) × $16.50) = $298.00`. A funding adjustment moves the `$100` baseline only; it does not erase already-earned intervals. The new **1/2/3/4** ladder is used only for later markets. Bases and rungs retain 0.01-share precision (for example, base `3.25` creates `3.25 / 6.50 / 9.75 / 13.00`). Existing GTC ladders retain their original size. Runner-owned contract and principal caps grow as needed; explicitly supplied caps are never overridden and will safely block an oversized full ladder rather than submit it partially.
 
 The live report and periodic `LIVE DYNAMIC BASE SCALING` log include the active base, profit balance, next threshold, increase count, and whether capacity is automatic or explicit. Settings are persisted across controlled GitHub Actions handoffs.
 

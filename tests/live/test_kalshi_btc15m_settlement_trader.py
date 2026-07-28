@@ -349,7 +349,8 @@ class SettlementTraderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot["current_base_share_count"], 4.0)
         self.assertEqual(snapshot["actual_balance_baseline"], 100.0)
         self.assertEqual(snapshot["profit_since_last_increase"], 49.5)
-        self.assertEqual(snapshot["next_increase_actual_balance"], 166.0)
+        self.assertEqual(snapshot["threshold_base_share_units"], 7.0)
+        self.assertEqual(snapshot["next_increase_actual_balance"], 215.5)
         self.assertEqual(snapshot["scale_count"], 1)
         self.assertEqual(
             trader.live_rung_quantities(config, state),
@@ -370,12 +371,13 @@ class SettlementTraderTests(unittest.IsolatedAsyncioTestCase):
         trader.refresh_dynamic_base_share_scaling(state, config, now_epoch=base + 3, actual_balance=103.0)
         snapshot = trader.dynamic_scaling_snapshot(state, config)
         # A $3 actual-balance gain reaches the $3 threshold for base three.
-        # Base five's next threshold is the fixed funding baseline plus $5,
-        # rather than a second full $5 gain from the scale event.
+        # Base five's next threshold includes both stages: $3 for the
+        # starting base and $5 for the newly-current base.
         self.assertEqual(snapshot["current_base_share_count"], 5.0)
         self.assertEqual(snapshot["actual_balance_baseline"], 100.0)
         self.assertEqual(snapshot["profit_since_last_increase"], 3.0)
-        self.assertEqual(snapshot["next_increase_actual_balance"], 105.0)
+        self.assertEqual(snapshot["threshold_base_share_units"], 8.0)
+        self.assertEqual(snapshot["next_increase_actual_balance"], 108.0)
         self.assertEqual(
             trader.live_rung_quantities(config, state),
             {0.40: 5.0, 0.30: 10.0, 0.20: 15.0, 0.10: 20.0},
@@ -401,7 +403,8 @@ class SettlementTraderTests(unittest.IsolatedAsyncioTestCase):
         trader.refresh_dynamic_base_share_scaling(state, config, actual_balance=143.88)
         snapshot = trader.dynamic_scaling_snapshot(state, config)
         self.assertEqual(snapshot["current_base_share_count"], 4.0)
-        self.assertEqual(snapshot["next_increase_actual_balance"], 166.0)
+        self.assertEqual(snapshot["threshold_base_share_units"], 7.0)
+        self.assertEqual(snapshot["next_increase_actual_balance"], 215.5)
         self.assertEqual(config["max_contracts_per_market"], 40.0)
         self.assertEqual(config["max_total_capital"], 8.0)
 
@@ -421,8 +424,29 @@ class SettlementTraderTests(unittest.IsolatedAsyncioTestCase):
         snapshot = trader.dynamic_scaling_snapshot(state, config)
         self.assertEqual(snapshot["current_base_share_count"], 4.0)
         self.assertEqual(snapshot["actual_balance_baseline"], 100.0)
-        self.assertEqual(snapshot["next_increase_actual_balance"], 166.0)
-        self.assertEqual(state["dynamic_base_share_scaling"]["format_version"], 3)
+        self.assertEqual(snapshot["threshold_base_share_units"], 7.0)
+        self.assertEqual(snapshot["next_increase_actual_balance"], 215.5)
+        self.assertEqual(state["dynamic_base_share_scaling"]["format_version"], 4)
+
+    def test_dynamic_scaling_v3_migration_preserves_funding_baseline_and_adds_each_stage(self) -> None:
+        config = trader.validate_config({"enable_dynamic_scaling": True})
+        state = {"dynamic_base_share_scaling": {
+            "enabled": True,
+            "initialized": True,
+            "format_version": 3,
+            "starting_base_share_count": 3.0,
+            "starting_balance": 100.0,
+            "current_base_share_count": 4.0,
+            "actual_balance_baseline": 106.7543,
+        }}
+        trader.refresh_dynamic_base_share_scaling(state, config, actual_balance=138.1658)
+        snapshot = trader.dynamic_scaling_snapshot(state, config)
+        self.assertEqual(snapshot["current_base_share_count"], 4.0)
+        self.assertEqual(snapshot["actual_balance_baseline"], 106.7543)
+        self.assertEqual(snapshot["profit_since_last_increase"], 31.4115)
+        self.assertEqual(snapshot["threshold_base_share_units"], 7.0)
+        self.assertEqual(snapshot["next_increase_actual_balance"], 222.2543)
+        self.assertEqual(state["dynamic_base_share_scaling"]["format_version"], 4)
 
     def test_dynamic_scaling_rebases_for_deposits_and_withdrawals_without_changing_size(self) -> None:
         config = trader.validate_config({
@@ -468,7 +492,9 @@ class SettlementTraderTests(unittest.IsolatedAsyncioTestCase):
         trader.refresh_dynamic_base_share_scaling(state, config, now_epoch=base, actual_balance=100.0)
         trader.refresh_dynamic_base_share_scaling(state, config, now_epoch=base + 2, actual_balance=102.25)
         snapshot = trader.dynamic_scaling_snapshot(state, config)
-        self.assertEqual(snapshot["required_profit"], 2.4375)
+        self.assertEqual(snapshot["threshold_base_share_units"], 6.25)
+        self.assertEqual(snapshot["required_profit"], 4.6875)
+        self.assertEqual(snapshot["next_increase_actual_balance"], 104.6875)
         self.assertEqual(snapshot["current_base_share_count"], 3.25)
         self.assertEqual(
             trader.live_rung_quantities(config, state),
