@@ -297,12 +297,16 @@ class SettlementTraderTests(unittest.IsolatedAsyncioTestCase):
             "scaling_profit_multiplier": 16.5,
         })
         base = 1_700_001_100
-        state = {"markets": {
-            # The local ledger is intentionally irrelevant to account equity.
-            "KXBTC15M-before-enable": self.completed_live_record(
-                "KXBTC15M-before-enable", base, 999.0,
-            ),
-        }}
+        state = {
+            # The local ledger and a profitable shadow curve are intentionally
+            # irrelevant to real account equity and live sizing.
+            "shadow_balance": 1_000_000.0,
+            "markets": {
+                "KXBTC15M-before-enable": self.completed_live_record(
+                    "KXBTC15M-before-enable", base, 999.0,
+                ),
+            },
+        }
         trader.refresh_dynamic_base_share_scaling(
             state, config, now_epoch=base + 1, actual_balance=134.8222,
         )
