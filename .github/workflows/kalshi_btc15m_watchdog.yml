@@ -1,12 +1,17 @@
 name: Kalshi BTC 15m Live Trader Watchdog
 
 # A recovery safety net for the settlement-only trader. The trader's normal
-# 5h25m self-handoff remains primary. This runs every five minutes only to
-# dispatch a replacement when no trader is active/queued and the last success
-# has had time to enqueue its successor.
+# 5h25m self-handoff remains primary. A failed *live* runner invokes this
+# immediately; the offset five-minute schedule remains a fallback when a
+# handoff disappears without creating a failure event.
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    # Avoid minute zero, when GitHub Actions is most likely to delay or drop
+    # scheduled jobs under load.
+    - cron: "2-59/5 * * * *"
+  workflow_run:
+    workflows: ["Kalshi BTC 15m Settlement Contrarian"]
+    types: [completed]
   workflow_dispatch:
 
 concurrency:
@@ -19,24 +24,46 @@ permissions:
 
 jobs:
   ensure-live-runner:
+    # A successful runner owns its normal handoff.  Failed runs need recovery,
+    # but only if their title identifies them as LIVE (or they are a legacy
+    # scheduled run, which is always live).  This prevents a completed dry-run
+    # reconciliation from starting real trading on its own.
+    if: >-
+      github.event_name != 'workflow_run' ||
+      (github.event.workflow_run.conclusion != 'success' &&
+       (github.event.workflow_run.event == 'schedule' ||
+        endsWith(github.event.workflow_run.display_title, 'LIVE')))
     runs-on: ubuntu-latest
     steps:
-      - name: Dispatch only when the live runner is absent
+      - name: Dispatch a live recovery only when no trader owns the singleton
         env:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
+          TRIGGER: ${{ github.event_name }}
         run: |
           set -euo pipefail
+          # A controlled restart cancels a live run before it queues its
+          # reconciliation replacement. Give that replacement a brief window
+          # to claim the singleton so a deliberate handoff never races a live
+          # recovery dispatch.
+          if [ "$TRIGGER" = "workflow_run" ]; then
+            sleep 45
+          fi
           runs="$(gh run list --repo "$REPOSITORY" \
             --workflow kalshi_btc15m_average_down.yml --limit 20 \
-            --json databaseId,status,conclusion,updatedAt)"
+            --json databaseId,status,conclusion,updatedAt,displayTitle,event)"
           active="$(jq '[.[] | select(.status == "in_progress" or .status == "queued" or .status == "waiting")] | length' <<<"$runs")"
+          active_live="$(jq '[.[] | select(.status == "in_progress" or .status == "queued" or .status == "waiting") | select(((.displayTitle // "") | endswith("LIVE")) or .event == "schedule")] | length' <<<"$runs")"
+          if [ "$active_live" -gt 0 ]; then
+            echo "WATCHDOG OK | active_or_queued_live_runs=$active_live"
+            exit 0
+          fi
           if [ "$active" -gt 0 ]; then
-            echo "WATCHDOG OK | active_or_queued_live_runs=$active"
+            echo "WATCHDOG HOLD | active reconciliation or legacy runner count=$active; refusing to overlap it with live trading."
             exit 0
           fi
 
-          latest="$(jq -c 'sort_by(.updatedAt // "") | last // {}' <<<"$runs")"
+          latest="$(jq -c '[.[] | select(((.displayTitle // "") | endswith("LIVE")) or .event == "schedule")] | sort_by(.updatedAt // "") | last // {}' <<<"$runs")"
           conclusion="$(jq -r '.conclusion // "none"' <<<"$latest")"
           completed="$(jq -r '.updatedAt // ""' <<<"$latest")"
           if [ "$conclusion" = "success" ] && [ -n "$completed" ]; then

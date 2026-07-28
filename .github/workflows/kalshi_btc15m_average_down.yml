@@ -1,5 +1,11 @@
 name: Kalshi BTC 15m Settlement Contrarian
 
+# Make the operating mode visible to the recovery watchdog.  Scheduled runs
+# are always live; a manual run is live only when its explicit input is true.
+run-name: >-
+  Kalshi BTC 15m Settlement Contrarian —
+  ${{ (github.event_name == 'schedule' || inputs.live_trading == true) && 'LIVE' || 'RECONCILIATION' }}
+
 # Each run owns the trader for 5h25m, checkpoints durable state, and queues
 # the next run. The 35-minute margin keeps persistence and handoff inside the
 # GitHub-hosted six-hour maximum instead of relying on a SIGTERM at the edge.
