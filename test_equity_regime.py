@@ -343,15 +343,24 @@ class EquityRegimeTests(unittest.TestCase):
             self.assertEqual([row["market_ticker"] for row in controller.state["actual_history"]], ["1", "2"])
             self.assertEqual(controller.state["processed_market_tickers"], ["1", "2"])
 
-    def test_live_market_is_exact_shadow_even_with_conservative_off_state_model(self) -> None:
+    def test_live_market_keeps_the_independent_fixed_shadow_ladder(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             config = RegimeConfig(enabled=True, dry_run=True, prophet_min_history=2, shadow_fill_model="conservative_trade_through")
             controller = EquityRegimeController(config, root / "state.json", root / "outputs")
             controller.initialize_absolute_balances(Decimal("100"), reason="test")
             now = datetime.now(tz=UTC)
-            target = decision("KXBTC15M-LIVE", now)
+            target = StrategyDecision(
+                target_ticker="KXBTC15M-LIVE", source_ticker="KXBTC15M-SOURCE", selected_side="yes",
+                eligible=True, skip_reason=None,
+                ladder_orders=(LadderOrder(Decimal("0.40"), Decimal("3"), "fixed-shadow"),),
+                stop_price=Decimal("0.05"), trailing_activation_gain=Decimal("2"), trailing_retracement=Decimal("2"),
+                generated_at=now, target_close_time=now + timedelta(minutes=15),
+            )
             controller.start_market(target)
+            shadow_trade = controller.state["shadow_open"][target.target_ticker]
+            shadow_trade["orders"][0]["filled"] = "3"
+            shadow_trade["entry_cost"] = "1.2"
             controller.close_market(
                 ticker=target.target_ticker,
                 outcome="yes",
@@ -362,11 +371,71 @@ class EquityRegimeTests(unittest.TestCase):
                 actual_balance_after=Decimal("100.60"),
             )
             shadow = controller.state["shadow_history"][-1]
-            self.assertEqual(Decimal(shadow["shadow_realized_pnl"]), Decimal("0.60"))
-            self.assertEqual(shadow["shadow_simulation_quality"], "exact_replay")
+            self.assertEqual(Decimal(shadow["shadow_contracts"]), Decimal("3"))
+            self.assertEqual(Decimal(shadow["shadow_realized_pnl"]), Decimal("1.8"))
+            self.assertEqual(shadow["shadow_fill_model"], "conservative_trade_through")
 
-    def test_live_cash_timing_uses_authenticated_balance_change_without_rebasing_shadow(self) -> None:
-        """A position opened before recovery debits cash before its P/L closes."""
+    def test_repairs_dynamic_live_overwrite_using_persisted_fixed_ladder(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            controller = EquityRegimeController(
+                RegimeConfig(enabled=True, dry_run=True, prophet_min_history=2),
+                root / "state.json", root / "outputs",
+            )
+            controller.state.update({
+                "actual_balance": "100", "shadow_balance": "94.7733",
+                "shadow_history": [
+                    {
+                        "market_ticker": "KXBTC15M-SCALED-WIN", "shadow_balance_before": "100",
+                        "shadow_balance_after": "102.4", "shadow_realized_pnl": "2.4",
+                        "shadow_fill_model": "live_equivalent", "live_execution_enabled": True,
+                    },
+                    {
+                        "market_ticker": "KXBTC15M-SCALED-STOP", "shadow_balance_before": "102.4",
+                        "shadow_balance_after": "94.7733", "shadow_realized_pnl": "-7.6267",
+                        "shadow_fill_model": "live_equivalent", "live_execution_enabled": True,
+                    },
+                ],
+                "forecasts": [{"forecast_target_ticker": "KXBTC15M-SCALED-WIN"}],
+                "live_vs_shadow": [
+                    {"market_ticker": "KXBTC15M-SCALED-WIN", "actual_realized_pnl": "2.4"},
+                    {"market_ticker": "KXBTC15M-SCALED-STOP", "actual_realized_pnl": "-7.6267"},
+                ],
+            })
+            fixed_rungs = {"0.4000": 3.0, "0.3000": 6.0, "0.2000": 9.0, "0.1000": 12.0}
+            trader_state = {"markets": {
+                "KXBTC15M-SCALED-WIN": {
+                    "execution_mode": "live", "regime_ladder_quantities": fixed_rungs,
+                    "locked_side": "yes", "settlement_outcome": "yes", "settlement_contracts": "4",
+                    "gross_payout": "4", "kalshi_fees": "0",
+                    "orders": {"0.4000": {"quantity": "4", "fill_count": "4", "position_price": "0.4"}},
+                },
+                "KXBTC15M-SCALED-STOP": {
+                    "execution_mode": "live", "regime_ladder_quantities": fixed_rungs,
+                    "locked_side": "yes", "settlement_outcome": "no", "settlement_contracts": "0",
+                    "gross_payout": "0.44", "kalshi_fees": "0.0667",
+                    "orders": {
+                        "0.4000": {"quantity": "4", "fill_count": "4", "position_price": "0.4"},
+                        "0.3000": {"quantity": "8", "fill_count": "8", "position_price": "0.3"},
+                        "0.2000": {"quantity": "12", "fill_count": "12", "position_price": "0.2"},
+                        "0.1000": {"quantity": "16", "fill_count": "16", "position_price": "0.1"},
+                    },
+                },
+            }}
+            self.assertEqual(controller.repair_legacy_live_equivalent_shadow_rows(trader_state), 2)
+            win, stopped = controller.state["shadow_history"]
+            self.assertEqual(Decimal(win["shadow_contracts"]), Decimal("3"))
+            self.assertEqual(Decimal(win["shadow_realized_pnl"]), Decimal("1.8"))
+            self.assertEqual(Decimal(stopped["shadow_contracts"]), Decimal("30"))
+            self.assertEqual(Decimal(stopped["shadow_realized_pnl"]), Decimal("-5.720025"))
+            self.assertEqual(Decimal(controller.state["shadow_balance"]), Decimal("96.079975"))
+            self.assertEqual(
+                controller.state["fixed_shadow_ladder_replay_migration"]["repaired_tickers"],
+                ["KXBTC15M-SCALED-WIN", "KXBTC15M-SCALED-STOP"],
+            )
+
+    def test_live_cash_timing_never_replaces_fixed_shadow_pnl(self) -> None:
+        """A live cash delta cannot alter an independent shadow observation."""
 
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -385,10 +454,10 @@ class EquityRegimeTests(unittest.TestCase):
                 actual_balance_after=Decimal("78.9868"),
             )
             self.assertEqual(Decimal(controller.state["actual_balance"]), Decimal("78.9868"))
-            self.assertEqual(Decimal(controller.state["shadow_balance"]), Decimal("78.9868"))
+            self.assertEqual(Decimal(controller.state["shadow_balance"]), Decimal("75.9868"))
             shadow = controller.state["shadow_history"][-1]
-            self.assertEqual(Decimal(shadow["shadow_market_pnl"]), Decimal("1.8"))
-            self.assertEqual(Decimal(shadow["shadow_balance_change"]), Decimal("3"))
+            self.assertEqual(Decimal(shadow["shadow_market_pnl"]), Decimal("0"))
+            self.assertEqual(Decimal(shadow["shadow_balance_change"]), Decimal("0"))
             self.assertEqual(controller.state["balance_adjustments"][-1]["adjustment_type"], "entry_or_open_position_cash_timing")
             self.assertTrue(controller.balance_reconciled)
 
@@ -809,7 +878,7 @@ class EquityRegimeTests(unittest.TestCase):
             asyncio.run(trader.account_equity_regime_finalization(FakeRest(), controller, {"markets": {}}, record, None, dry_run=False))
             self.assertTrue(record["regime_accounted"])
             self.assertEqual(Decimal(controller.state["actual_balance"]), Decimal("100.60"))
-            self.assertEqual(Decimal(controller.state["shadow_balance"]), Decimal("100.60"))
+            self.assertEqual(Decimal(controller.state["shadow_balance"]), Decimal("100"))
             asyncio.run(trader.account_equity_regime_finalization(FakeRest(), controller, {"markets": {}}, record, None, dry_run=False))
             self.assertEqual(len(controller.state["actual_history"]), 1)
 

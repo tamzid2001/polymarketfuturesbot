@@ -2270,6 +2270,152 @@ class EquityRegimeController:
             changed = True
         return changed
 
+    def repair_legacy_live_equivalent_shadow_rows(self, trader_state: Mapping[str, Any]) -> int:
+        """Repair fixed-shadow rows overwritten by the retired live-fill shortcut.
+
+        A brief production version replaced an already-persisted fixed 3/6/9/12
+        shadow trade with the dynamically-sized live fill at finalization.  The
+        original independent shadow fill record is no longer available after
+        finalization, but the durable trader ledger retains the live rung fill
+        fractions and the intended fixed rung quantities.  Replay those same
+        fractions against the fixed ladder exactly once.  This is deliberately
+        labelled as a proportional replay, rather than an exact shadow-tape
+        observation.
+        """
+
+        migration = self.state.get("fixed_shadow_ladder_replay_migration")
+        if isinstance(migration, Mapping) and migration.get("version") == 1:
+            return 0
+        markets = trader_state.get("markets") if isinstance(trader_state, Mapping) else None
+        histories = self.state.get("shadow_history")
+        if not isinstance(markets, Mapping) or not isinstance(histories, list):
+            return 0
+
+        repaired: dict[str, dict[str, Decimal]] = {}
+        for ticker, row in ((str(item.get("market_ticker") or ""), item) for item in histories if isinstance(item, dict)):
+            record = markets.get(ticker)
+            if (
+                not isinstance(record, Mapping)
+                or row.get("shadow_fill_model") != "live_equivalent"
+                or str(record.get("execution_mode") or "") != "live"
+            ):
+                continue
+            fixed_rungs = record.get("regime_ladder_quantities")
+            orders = record.get("orders")
+            if not isinstance(fixed_rungs, Mapping) or not isinstance(orders, Mapping):
+                continue
+            live_contracts = ZERO
+            shadow_contracts = ZERO
+            shadow_cost = ZERO
+            dynamically_sized = False
+            for level, order in orders.items():
+                if not isinstance(order, Mapping):
+                    continue
+                fixed_quantity = decimal_value(fixed_rungs.get(str(level)))
+                live_quantity = decimal_value(order.get("quantity"))
+                live_filled = decimal_value(order.get("fill_count"))
+                if fixed_quantity <= ZERO or live_quantity <= ZERO:
+                    continue
+                dynamically_sized = dynamically_sized or abs(live_quantity - fixed_quantity) > Decimal("0.0001")
+                filled_fraction = min(ONE, max(ZERO, live_filled / live_quantity))
+                fixed_filled = fixed_quantity * filled_fraction
+                live_contracts += live_filled
+                shadow_contracts += fixed_filled
+                shadow_cost += fixed_filled * decimal_value(order.get("position_price", level))
+            if not dynamically_sized or live_contracts <= ZERO:
+                continue
+            scale = shadow_contracts / live_contracts
+            selected_side = str(record.get("locked_side") or record.get("candidate_side") or "").lower()
+            outcome = str(record.get("settlement_outcome") or "").lower()
+            live_settlement_contracts = decimal_value(record.get("settlement_contracts"))
+            live_settlement_payout = live_settlement_contracts if selected_side == outcome else ZERO
+            live_gross_payout = decimal_value(record.get("gross_payout"))
+            shadow_payout = live_settlement_payout * scale
+            shadow_proceeds = (live_gross_payout - live_settlement_payout) * scale
+            shadow_fees = decimal_value(record.get("kalshi_fees")) * scale
+            shadow_pnl = shadow_proceeds + shadow_payout - shadow_cost - shadow_fees
+            repaired[ticker] = {
+                "contracts": shadow_contracts,
+                "cost": shadow_cost,
+                "proceeds": shadow_proceeds,
+                "payout": shadow_payout,
+                "fees": shadow_fees,
+                "pnl": shadow_pnl,
+            }
+
+        if not repaired:
+            return 0
+
+        running_balance = decimal_value(histories[0].get("shadow_balance_before"))
+        forecast_by_ticker = {
+            str(row.get("forecast_target_ticker") or ""): row
+            for row in self.state.get("forecasts", [])
+            if isinstance(row, dict)
+        }
+        live_vs_shadow_by_ticker = {
+            str(row.get("market_ticker") or ""): row
+            for row in self.state.get("live_vs_shadow", [])
+            if isinstance(row, dict)
+        }
+        repaired_tickers: list[str] = []
+        for row in histories:
+            if not isinstance(row, dict):
+                continue
+            ticker = str(row.get("market_ticker") or "")
+            values = repaired.get(ticker)
+            if values is not None:
+                contracts = values["contracts"]
+                row.update({
+                    "shadow_contracts": format(contracts, "f"),
+                    "shadow_average_entry": format(values["cost"] / contracts, "f") if contracts > ZERO else None,
+                    "shadow_cost": format(values["cost"], "f"),
+                    "shadow_proceeds": format(values["proceeds"], "f"),
+                    "shadow_payout": format(values["payout"], "f"),
+                    "shadow_fees": format(values["fees"], "f"),
+                    "shadow_market_pnl": format(values["pnl"], "f"),
+                    "shadow_realized_pnl": format(values["pnl"], "f"),
+                    "shadow_fill_model": "fixed_shadow_ladder_proportional_replay",
+                    "shadow_simulation_quality": "legacy_live_equivalent_repaired",
+                    "shadow_repair_reason": "live_dynamic_ladder_overwrote_persisted_fixed_shadow_ladder",
+                })
+                repaired_tickers.append(ticker)
+            pnl = decimal_value(row.get("shadow_realized_pnl"))
+            row["shadow_balance_before"] = format(running_balance, "f")
+            row["shadow_balance_change"] = format(pnl, "f")
+            running_balance += pnl
+            row["shadow_balance_after"] = format(running_balance, "f")
+            forecast = forecast_by_ticker.get(ticker)
+            if forecast is not None:
+                forecast["observed_shadow_balance"] = format(running_balance, "f")
+            comparison = live_vs_shadow_by_ticker.get(ticker)
+            if comparison is not None:
+                actual_pnl = decimal_value(comparison.get("actual_realized_pnl"))
+                comparison.update({
+                    "shadow_realized_pnl": format(pnl, "f"),
+                    "difference": format(pnl - actual_pnl, "f"),
+                    "shadow_simulation_quality": row.get("shadow_simulation_quality"),
+                })
+        self.state["shadow_balance"] = format(running_balance, "f")
+        self.state["shadow_pnl_while_disabled"] = format(
+            sum(
+                (decimal_value(row.get("shadow_realized_pnl")) for row in histories
+                 if isinstance(row, Mapping) and not bool(row.get("live_execution_enabled"))),
+                ZERO,
+            ),
+            "f",
+        )
+        self.state["fixed_shadow_ladder_replay_migration"] = {
+            "version": 1,
+            "repaired_tickers": repaired_tickers,
+            "completed_at": timestamp_text(datetime.now(tz=UTC)),
+            "method": "fixed_ladder_proportional_replay_from_persisted_live_fill_fractions",
+        }
+        LOG.warning(
+            "FIXED SHADOW LADDER REPAIR | corrected=%s shadow_balance=%s; live actual balance was not changed.",
+            ",".join(repaired_tickers), running_balance,
+        )
+        return len(repaired_tickers)
+
     def close_market(
         self, *, ticker: str, outcome: str | None, market_close_time: datetime,
         actual_realized_pnl: Decimal, actual_metadata: Mapping[str, Any] | None = None,
@@ -2285,24 +2431,10 @@ class EquityRegimeController:
             # An eligible market that has no decision is still explicitly
             # represented; it cannot quietly disappear from the shadow curve.
             trade = {"target_ticker": ticker, "market_close_time": timestamp_text(market_close_time), "status": "skipped", "shadow_realized_pnl": "0", "shadow_simulation_quality": "unavailable", "shadow_fill_model": self.config.shadow_fill_model, "exit_method": "no_decision", "selected_side": None, "eligible": False, "skip_reason": "missing_strategy_decision", "contracts": "0", "entry_cost": "0", "proceeds": "0", "payout": "0", "fees": "0", "live_execution_enabled": self.execution_enabled_for_market()}
-        if actual_was_live:
-            metadata = dict(actual_metadata or {})
-            # This is the only supported use of a real fill in the shadow
-            # ledger: the exact same bot order was actually submitted. It is
-            # always preferred while execution was on, irrespective of the
-            # configured *off-state* simulator, so the shadow and actual
-            # curves cannot diverge merely because a public trade tape has no
-            # queue-position information.
-            trade.update({
-                "status": "finalized", "shadow_realized_pnl": format(actual_realized_pnl, "f"),
-                "contracts": str(metadata.get("contracts_bought", "0")),
-                "entry_cost": str(metadata.get("entry_cost", "0")),
-                "proceeds": str(metadata.get("exit_proceeds", "0")),
-                "payout": str(metadata.get("settlement_payout", "0")),
-                "fees": str(metadata.get("fees", "0")),
-                "exit_method": metadata.get("exit_method") or "settlement",
-                "shadow_simulation_quality": "exact_replay", "shadow_fill_model": "live_equivalent",
-            })
+        # A live order can use dynamic sizing, while the shadow decision is a
+        # persisted fixed 3/6/9/12 counterfactual.  Never replace the latter
+        # with the former at close: doing so makes the shadow curve a duplicate
+        # of the actual account whenever live execution is enabled.
         self.shadow_executor.finalize(trade, outcome)
         shadow_pnl = decimal_value(trade.get("shadow_realized_pnl"))
         state_before = self.execution_enabled_for_market()
@@ -2318,15 +2450,11 @@ class EquityRegimeController:
         # actual and shadow on the same absolute balance scale; the separate
         # realized-P/L columns retain the market P/L for performance analysis.
         actual_balance_change = actual_after - actual_before
-        # Colab-reference history is a $starting_balance + cumulative realized
-        # P/L curve.  Continue that curve with market P/L even while orders
-        # are live; never replace a synthetic model observation with the
-        # portfolio cash delta (which includes entry reservation timing).
-        shadow_balance_change = (
-            shadow_pnl
-            if self.config.prophet_history_source == "account_series"
-            else (actual_balance_change if actual_was_live else shadow_pnl)
-        )
+        # The shadow curve is always its independently simulated fixed ladder.
+        # Authenticated cash also contains live order reservation timing,
+        # deposits, withdrawals, transfers, and unrelated activity, none of
+        # which belongs in a counterfactual strategy observation.
+        shadow_balance_change = shadow_pnl
         shadow_after = shadow_before + shadow_balance_change
         if actual_after <= ZERO or shadow_after <= ZERO:
             raise RuntimeError("equity update would make balance non-positive; manual intervention is required")

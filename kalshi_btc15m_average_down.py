@@ -2499,6 +2499,51 @@ def refresh_dynamic_base_share_scaling(
     return control
 
 
+def rebase_dynamic_scaling_for_authenticated_balance_adjustment(
+    state: dict[str, Any], *, adjustment: Decimal, actual_balance: Decimal, ticker: str,
+) -> bool:
+    """Keep deposits, withdrawals, and other non-strategy cash changes out of sizing.
+
+    Dynamic scaling measures realized account performance, not funding events.
+    When the authenticated post-close balance differs from the known strategy
+    P/L, move the live scaling baseline by that unexplained cash amount.  This
+    keeps the current ladder unchanged and makes the next threshold measure
+    only profit/loss after the deposit or withdrawal.
+    """
+
+    if abs(adjustment) <= Decimal("0.0001"):
+        return False
+    control = _dynamic_scaling_control(state)
+    if not bool(control.get("enabled")) or not bool(control.get("initialized")):
+        return False
+    baseline = as_float(control.get("actual_balance_baseline"))
+    if baseline is None:
+        return False
+    adjusted_baseline = Decimal(str(baseline)) + adjustment
+    control["actual_balance_baseline"] = round(float(adjusted_baseline), 6)
+    control["actual_balance"] = round(float(actual_balance), 6)
+    control["profit_since_last_increase"] = round(float(actual_balance - adjusted_baseline), 6)
+    events = control.setdefault("external_balance_adjustments", [])
+    if not isinstance(events, list):
+        events = []
+        control["external_balance_adjustments"] = events
+    events.append({
+        "at": now_iso(),
+        "ticker": ticker,
+        "amount": format(adjustment, "f"),
+        "actual_balance": format(actual_balance, "f"),
+        "actual_balance_baseline_after": format(adjusted_baseline, "f"),
+        "reason": "authenticated_balance_change_not_explained_by_strategy_realized_pnl",
+    })
+    del events[:-50]
+    LOG.warning(
+        "DYNAMIC SCALING BALANCE REBASED | %s adjustment=$%+.4f actual=$%.4f baseline=$%.4f; "
+        "deposit/withdrawal or other non-strategy cash movement does not change ladder size.",
+        ticker, adjustment, actual_balance, adjusted_baseline,
+    )
+    return True
+
+
 def _entry_loss_skip_control(state: dict[str, Any]) -> dict[str, Any]:
     """Return the durable two-loss/two-signal circuit-breaker state."""
     control = state.get("entry_loss_skip")
@@ -2819,6 +2864,7 @@ async def account_equity_regime_finalization(
     actual_balance_after = await rest.balance_decimal()
     if actual_balance_after is None:
         raise RuntimeError("Cannot account an equity-regime market without authenticated current Kalshi balance")
+    actual_balance_before = Decimal(str(regime.state.get("actual_balance") or actual_balance_after))
     selected_side = record.get("locked_side") or record.get("candidate_side")
     suppressed = bool(record.get("regime_live_entry_suppressed"))
     # ``execution_mode`` is the source of truth for this historical market.
@@ -2850,6 +2896,12 @@ async def account_equity_regime_finalization(
         },
         actual_was_live=actual_was_live,
         actual_balance_after=actual_balance_after,
+    )
+    rebase_dynamic_scaling_for_authenticated_balance_adjustment(
+        trader_state,
+        adjustment=actual_balance_after - actual_balance_before - actual_pnl,
+        actual_balance=actual_balance_after,
+        ticker=str(record.get("ticker") or ""),
     )
     record["regime_accounted"] = True
     # Startup may correctly defer the endpoint-anchored 200-market balance
@@ -6398,6 +6450,12 @@ async def run_settlement_only(args: argparse.Namespace) -> int:
         )
         try:
             await synchronize_history(regime, KalshiRawHistoryAPI(rest), state)
+            repaired_shadow_rows = regime.repair_legacy_live_equivalent_shadow_rows(state)
+            if repaired_shadow_rows:
+                LOG.warning(
+                    "EQUITY REGIME STARTUP REPAIRED | rows=%d fixed-shadow ledger rows were replayed before live recovery.",
+                    repaired_shadow_rows,
+                )
             # Every finalized record present before this process started is
             # historical scope.  The controller bootstrapped/reconciled its
             # bounded 200-market universe above; marking the pre-existing

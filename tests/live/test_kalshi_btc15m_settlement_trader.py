@@ -378,6 +378,38 @@ class SettlementTraderTests(unittest.IsolatedAsyncioTestCase):
             {0.40: 5.0, 0.30: 10.0, 0.20: 15.0, 0.10: 20.0},
         )
 
+    def test_dynamic_scaling_rebases_for_deposits_and_withdrawals_without_changing_size(self) -> None:
+        config = trader.validate_config({
+            "enable_dynamic_scaling": True,
+            "base_share_increment": 1,
+            "scaling_profit_multiplier": 1.0,
+        })
+        base = 1_700_001_225
+        state = {"markets": {}}
+        trader.refresh_dynamic_base_share_scaling(state, config, now_epoch=base, actual_balance=100.0)
+        self.assertTrue(trader.rebase_dynamic_scaling_for_authenticated_balance_adjustment(
+            state,
+            adjustment=trader.Decimal("100"),
+            actual_balance=trader.Decimal("200"),
+            ticker="__deposit__",
+        ))
+        trader.refresh_dynamic_base_share_scaling(state, config, now_epoch=base + 1, actual_balance=200.0)
+        deposited = trader.dynamic_scaling_snapshot(state, config)
+        self.assertEqual(deposited["current_base_share_count"], 3.0)
+        self.assertEqual(deposited["actual_balance_baseline"], 200.0)
+        self.assertEqual(deposited["profit_since_last_increase"], 0.0)
+        self.assertTrue(trader.rebase_dynamic_scaling_for_authenticated_balance_adjustment(
+            state,
+            adjustment=trader.Decimal("-25"),
+            actual_balance=trader.Decimal("175"),
+            ticker="__withdrawal__",
+        ))
+        trader.refresh_dynamic_base_share_scaling(state, config, now_epoch=base + 2, actual_balance=175.0)
+        withdrawn = trader.dynamic_scaling_snapshot(state, config)
+        self.assertEqual(withdrawn["current_base_share_count"], 3.0)
+        self.assertEqual(withdrawn["actual_balance_baseline"], 175.0)
+        self.assertEqual(len(state["dynamic_base_share_scaling"]["external_balance_adjustments"]), 2)
+
     def test_dynamic_scaling_accepts_fractional_base_increment_at_cent_precision(self) -> None:
         config = trader.validate_config({
             "initial_position_size": 3.0,
