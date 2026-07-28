@@ -49,16 +49,60 @@ jobs:
             fi
           fi
 
-          # Absolute-balance migration/reconciliation must complete before the
-          # regime can alter real-order state. This watchdog cannot bypass it.
+          # A watchdog recovery starts a new live process from main. Validate
+          # both durable sources from one immutable main commit before that
+          # process can be dispatched; never recover live from a truncated or
+          # mismatched shadow curve.
+          main_sha="$(gh api "repos/$REPOSITORY/commits/main" --jq .sha)"
+          state_file="$(mktemp)"
+          ledger_file="$(mktemp)"
+          trap 'rm -f "$state_file" "$ledger_file"' EXIT
+          gh api "repos/$REPOSITORY/contents/data/kalshi_equity_regime_state.json?ref=$main_sha" --jq .content \
+            | tr -d '\n' | base64 --decode > "$state_file"
+          gh api "repos/$REPOSITORY/contents/data/kalshi_shadow_equity_history.csv?ref=$main_sha" --jq .content \
+            | tr -d '\n' | base64 --decode > "$ledger_file"
+          python - "$state_file" "$ledger_file" <<'PY'
+          import csv
+          import json
+          import sys
+          from pathlib import Path
+
+          state = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          with Path(sys.argv[2]).open(newline="", encoding="utf-8") as handle:
+              ledger = list(csv.DictReader(handle))
+          shadow_balance = state.get("shadow_balance")
+          history = state.get("shadow_history") or []
+          if not shadow_balance:
+              sys.exit("watchdog shadow-state check failed: missing shadow_balance")
+          if bool(history) != bool(ledger):
+              sys.exit("watchdog shadow-state check failed: state and ledger presence disagree")
+          if history:
+              state_tail = history[-1]
+              ledger_tail = ledger[-1]
+              if str(state_tail.get("shadow_balance_after")) != str(shadow_balance):
+                  sys.exit("watchdog shadow-state check failed: state balance and curve tail differ")
+              if ledger_tail.get("market_ticker") != state_tail.get("market_ticker"):
+                  sys.exit("watchdog shadow-state check failed: state and ledger tickers differ")
+              if ledger_tail.get("shadow_balance_after") != str(shadow_balance):
+                  sys.exit("watchdog shadow-state check failed: ledger balance and state differ")
+          print(
+              "WATCHDOG SHADOW STATE VERIFIED | "
+              f"balance={shadow_balance} rows={len(history)} "
+              f"last_market={history[-1].get('market_ticker') if history else 'none'}"
+          )
+          PY
+
+          # This is an explicit live-recovery path.  The new runner still
+          # restores the durable state and applies its normal absolute-balance
+          # reconciliation and regime gate before it can place an order.
           gh workflow run kalshi_btc15m_average_down.yml \
             --repo "$REPOSITORY" --ref main \
-            -f live_trading=false \
+            -f live_trading=true \
             -f enable_dynamic_scaling=true \
-            -f equity_regime_enabled=false \
-            -f equity_regime_dry_run=true \
+            -f equity_regime_enabled=true \
+            -f equity_regime_dry_run=false \
             -f prophet_min_history=200 \
             -f prophet_refit_every_markets=1 \
             -f shadow_fill_model=conservative_trade_through \
             -f starting_balance=100.00
-          echo "WATCHDOG DISPATCHED | non-live reconciliation replacement queued."
+          echo "WATCHDOG DISPATCHED | live replacement queued; durable reconciliation and the regime gate remain enforced."
