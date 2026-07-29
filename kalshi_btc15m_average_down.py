@@ -2358,9 +2358,10 @@ def dynamic_scaling_snapshot(state: dict[str, Any], config: dict[str, Any]) -> d
     current = dynamic_base_share_count(state, config)
     increment = float(config["base_share_increment"])
     multiplier = float(config["scaling_profit_multiplier"])
-    balance_baseline = as_float(control.get("actual_balance_baseline"))
-    if balance_baseline is None:
-        balance_baseline = starting_balance
+    # The configured starting balance is intentionally immutable for a live
+    # scaling run.  Do not let an old checkpoint's funding rebase leak into a
+    # report (or its threshold) before refresh has migrated that checkpoint.
+    balance_baseline = starting_balance
     actual_balance = as_float(control.get("actual_balance"))
     # A version-one state has no persisted authenticated balance. Keep its
     # prior number only until refresh receives the actual account balance;
@@ -2406,13 +2407,11 @@ def refresh_dynamic_base_share_scaling(
 ) -> dict[str, Any]:
     """Apply the actual account balance to the opt-in base-share rule.
 
-    The authenticated funding-adjusted balance baseline remains fixed across
-    scale increases.  Each promotion adds an interval sized at that stage's
+    The configured starting balance remains fixed across scale increases and
+    external cash movements.  Each promotion adds an interval sized at that stage's
     base: base three promotes at baseline + (3 × multiplier); base four then
     promotes at baseline + ((3 + 4) × multiplier), and so on.  Losses never
-    reduce an already-earned base.  Deposits and withdrawals rebase only this
-    funding baseline, preventing cash movements from either triggering or
-    undoing a size change.  The shadow ledger is never read or mutated here:
+    reduce an already-earned base.  The shadow ledger is never read or mutated here:
     shadow performance may control the regime, but cannot enlarge real orders.
     """
     now_epoch = time.time() if now_epoch is None else float(now_epoch)
@@ -2438,6 +2437,7 @@ def refresh_dynamic_base_share_scaling(
             and math.isclose(prior_starting_balance, starting_balance, abs_tol=1e-9)
             and math.isclose(as_float(control.get("current_base_share_count")) or starting, starting, abs_tol=1e-9)
             and math.isclose(as_float(control.get("profit_since_last_increase")) or 0.0, 0.0, abs_tol=1e-9)
+            and int(as_float(control.get("format_version")) or 0) >= 5
         )
         if already_reset:
             return control
@@ -2454,9 +2454,9 @@ def refresh_dynamic_base_share_scaling(
             "profit_since_last_increase": 0.0,
             "last_reset_at": datetime.fromtimestamp(now_epoch, tz=timezone.utc).isoformat(),
             "last_reset_reason": reset_reason,
-            "format_version": 4,
+            "format_version": 5,
             "threshold_base_share_units": starting,
-            "threshold_policy": "funding_baseline_plus_cumulative_base_intervals",
+            "threshold_policy": "configured_starting_balance_plus_cumulative_base_intervals",
         })
         if observed_actual_balance is not None:
             control["actual_balance"] = round(observed_actual_balance, 6)
@@ -2467,29 +2467,14 @@ def refresh_dynamic_base_share_scaling(
             )
         return control
 
-    # Version two reset the balance baseline at every promotion, while version
-    # three reused only the current base for every threshold.  Preserve the
-    # already-earned base while moving both formats to the stage-by-stage
-    # cumulative threshold policy.  Version one is handled by the existing
-    # authenticated-balance initialization below because it has no trustworthy
-    # balance baseline.
+    # Versions two through four could retain a funding-adjusted baseline.
+    # Preserve the already-earned base while restoring the configured starting
+    # balance and the stage-by-stage cumulative threshold policy.  Version one
+    # is handled by the authenticated-balance initialization below because it
+    # has no trustworthy balance baseline.
     prior_format = int(as_float(control.get("format_version")) or 0)
-    if prior_format in {2, 3} and bool(control.get("initialized")):
-        if prior_format == 2:
-            external_adjustments = control.get("external_balance_adjustments")
-            funding_adjustment = sum(
-                float(as_float(item.get("amount")) or 0.0)
-                for item in external_adjustments
-                if isinstance(item, dict)
-            ) if isinstance(external_adjustments, list) else 0.0
-            cumulative_baseline = round(starting_balance + funding_adjustment, 6)
-        else:
-            # v3 already stored a funding-adjusted baseline correctly.  Keep
-            # it, including any cash-movement rebase made by the live runner.
-            cumulative_baseline = round(
-                as_float(control.get("actual_balance_baseline")) or starting_balance,
-                6,
-            )
+    if prior_format in {2, 3, 4} and bool(control.get("initialized")):
+        fixed_baseline = round(starting_balance, 6)
         current = dynamic_base_share_count(state, config)
         threshold_base_units = _dynamic_scaling_threshold_base_units(
             control,
@@ -2498,23 +2483,23 @@ def refresh_dynamic_base_share_scaling(
             increment=float(config["base_share_increment"]),
         )
         control.update({
-            "format_version": 4,
-            "actual_balance_baseline": cumulative_baseline,
+            "format_version": 5,
+            "actual_balance_baseline": fixed_baseline,
             "threshold_base_share_units": threshold_base_units,
             "profit_since_last_increase": round(
-                (observed_actual_balance - cumulative_baseline)
+                (observed_actual_balance - fixed_baseline)
                 if observed_actual_balance is not None
                 else float(as_float(control.get("profit_since_last_increase")) or 0.0),
                 6,
             ),
-            "threshold_policy": "funding_baseline_plus_cumulative_base_intervals",
+            "threshold_policy": "configured_starting_balance_plus_cumulative_base_intervals",
             "last_reset_at": datetime.fromtimestamp(now_epoch, tz=timezone.utc).isoformat(),
-            "last_reset_reason": "cumulative_stage_threshold_migration",
+            "last_reset_reason": "fixed_starting_balance_migration",
         })
         LOG.warning(
-            "DYNAMIC BASE SCALING MIGRATED | base=%.2f funding_baseline=$%.4f; "
+            "DYNAMIC BASE SCALING MIGRATED | base=%.2f fixed_starting_balance=$%.4f; "
             "the next increase includes every base interval through the current base.",
-            current, cumulative_baseline,
+            current, fixed_baseline,
         )
 
     if (
@@ -2524,7 +2509,7 @@ def refresh_dynamic_base_share_scaling(
         or not math.isclose(prior_starting, starting, abs_tol=1e-9)
         or prior_starting_balance is None
         or not math.isclose(prior_starting_balance, starting_balance, abs_tol=1e-9)
-        or int(as_float(control.get("format_version")) or 0) < 4
+        or int(as_float(control.get("format_version")) or 0) < 5
     ):
         reset_reason = (
             "configured_starting_base_changed"
@@ -2546,9 +2531,9 @@ def refresh_dynamic_base_share_scaling(
             "profit_since_last_increase": 0.0,
             "last_reset_at": datetime.fromtimestamp(now_epoch, tz=timezone.utc).isoformat(),
             "last_reset_reason": reset_reason,
-            "format_version": 4,
+            "format_version": 5,
             "threshold_base_share_units": starting,
-            "threshold_policy": "funding_baseline_plus_cumulative_base_intervals",
+            "threshold_policy": "configured_starting_balance_plus_cumulative_base_intervals",
         })
         _ensure_auto_scaling_capacity(config, starting)
         LOG.warning(
@@ -2563,11 +2548,11 @@ def refresh_dynamic_base_share_scaling(
         return control
 
     control["actual_balance"] = round(observed_actual_balance, 6)
-    control["threshold_policy"] = "funding_baseline_plus_cumulative_base_intervals"
-    balance_baseline = as_float(control.get("actual_balance_baseline"))
-    if balance_baseline is None:
-        balance_baseline = starting_balance
-        control["actual_balance_baseline"] = round(balance_baseline, 6)
+    control["threshold_policy"] = "configured_starting_balance_plus_cumulative_base_intervals"
+    # Always repair this field as well as using the fixed value below.  This
+    # makes a stale checkpoint self-heal before it can be published again.
+    balance_baseline = starting_balance
+    control["actual_balance_baseline"] = round(balance_baseline, 6)
     accumulated = observed_actual_balance - balance_baseline
     control["profit_since_last_increase"] = round(accumulated, 6)
     current = dynamic_base_share_count(state, config)
@@ -2602,7 +2587,7 @@ def refresh_dynamic_base_share_scaling(
         del events[:-50]
         control.update({
             "current_base_share_count": increased,
-            # Keep the funding-adjusted baseline fixed: the next promotion is
+            # Keep the configured starting balance fixed: the next promotion is
             # based on every base interval through the newly-current base.
             "profit_since_last_increase": round(accumulated, 6),
             "threshold_base_share_units": round(threshold_base_units + increased, 6),
@@ -2622,13 +2607,12 @@ def refresh_dynamic_base_share_scaling(
 def rebase_dynamic_scaling_for_authenticated_balance_adjustment(
     state: dict[str, Any], *, adjustment: Decimal, actual_balance: Decimal, ticker: str,
 ) -> bool:
-    """Keep deposits, withdrawals, and other non-strategy cash changes out of sizing.
+    """Record external cash changes without changing the fixed scaling baseline.
 
-    Dynamic scaling measures realized account performance, not funding events.
-    When the authenticated post-close balance differs from the known strategy
-    P/L, move the live scaling baseline by that unexplained cash amount.  This
-    keeps the current ladder unchanged and makes the next threshold measure
-    only profit/loss after the deposit or withdrawal.
+    Dynamic scaling is explicitly measured from the configured starting
+    balance for the run.  The authenticated post-close balance can still be
+    recorded with its unexplained cash adjustment for auditability, but that
+    adjustment must never move the next scaling threshold.
     """
 
     if abs(adjustment) <= Decimal("0.0001"):
@@ -2636,13 +2620,16 @@ def rebase_dynamic_scaling_for_authenticated_balance_adjustment(
     control = _dynamic_scaling_control(state)
     if not bool(control.get("enabled")) or not bool(control.get("initialized")):
         return False
-    baseline = as_float(control.get("actual_balance_baseline"))
+    # Use the persisted configured starting balance even if this hook is
+    # invoked before the normal refresh has migrated an old checkpoint.
+    baseline = as_float(control.get("starting_balance"))
+    if baseline is None:
+        baseline = as_float(control.get("actual_balance_baseline"))
     if baseline is None:
         return False
-    adjusted_baseline = Decimal(str(baseline)) + adjustment
-    control["actual_balance_baseline"] = round(float(adjusted_baseline), 6)
+    control["actual_balance_baseline"] = round(baseline, 6)
     control["actual_balance"] = round(float(actual_balance), 6)
-    control["profit_since_last_increase"] = round(float(actual_balance - adjusted_baseline), 6)
+    control["profit_since_last_increase"] = round(float(actual_balance - Decimal(str(baseline))), 6)
     events = control.setdefault("external_balance_adjustments", [])
     if not isinstance(events, list):
         events = []
@@ -2652,14 +2639,14 @@ def rebase_dynamic_scaling_for_authenticated_balance_adjustment(
         "ticker": ticker,
         "amount": format(adjustment, "f"),
         "actual_balance": format(actual_balance, "f"),
-        "actual_balance_baseline_after": format(adjusted_baseline, "f"),
+        "actual_balance_baseline_after": format(Decimal(str(baseline)), "f"),
         "reason": "authenticated_balance_change_not_explained_by_strategy_realized_pnl",
     })
     del events[:-50]
     LOG.warning(
-        "DYNAMIC SCALING BALANCE REBASED | %s adjustment=$%+.4f actual=$%.4f baseline=$%.4f; "
-        "deposit/withdrawal or other non-strategy cash movement does not change ladder size.",
-        ticker, adjustment, actual_balance, adjusted_baseline,
+        "DYNAMIC SCALING BALANCE ADJUSTMENT RECORDED | %s adjustment=$%+.4f actual=$%.4f fixed_baseline=$%.4f; "
+        "the configured starting balance does not move.",
+        ticker, adjustment, actual_balance, baseline,
     )
     return True
 

@@ -426,33 +426,33 @@ class SettlementTraderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot["actual_balance_baseline"], 100.0)
         self.assertEqual(snapshot["threshold_base_share_units"], 7.0)
         self.assertEqual(snapshot["next_increase_actual_balance"], 215.5)
-        self.assertEqual(state["dynamic_base_share_scaling"]["format_version"], 4)
+        self.assertEqual(state["dynamic_base_share_scaling"]["format_version"], 5)
 
-    def test_dynamic_scaling_v3_migration_preserves_funding_baseline_and_adds_each_stage(self) -> None:
+    def test_dynamic_scaling_migration_restores_configured_starting_balance(self) -> None:
         config = trader.validate_config({"enable_dynamic_scaling": True})
         state = {"dynamic_base_share_scaling": {
             "enabled": True,
             "initialized": True,
-            "format_version": 3,
+            "format_version": 4,
             "starting_base_share_count": 3.0,
             "starting_balance": 100.0,
             "current_base_share_count": 4.0,
-            "actual_balance_baseline": 106.7543,
+            "actual_balance_baseline": 107.0343,
         }}
-        trader.refresh_dynamic_base_share_scaling(state, config, actual_balance=138.1658)
+        trader.refresh_dynamic_base_share_scaling(state, config, actual_balance=130.3838)
         snapshot = trader.dynamic_scaling_snapshot(state, config)
         self.assertEqual(snapshot["current_base_share_count"], 4.0)
-        self.assertEqual(snapshot["actual_balance_baseline"], 106.7543)
-        self.assertEqual(snapshot["profit_since_last_increase"], 31.4115)
+        self.assertEqual(snapshot["actual_balance_baseline"], 100.0)
+        self.assertEqual(snapshot["profit_since_last_increase"], 30.3838)
         self.assertEqual(snapshot["threshold_base_share_units"], 7.0)
-        self.assertEqual(snapshot["next_increase_actual_balance"], 222.2543)
-        self.assertEqual(state["dynamic_base_share_scaling"]["format_version"], 4)
+        self.assertEqual(snapshot["next_increase_actual_balance"], 215.5)
+        self.assertEqual(state["dynamic_base_share_scaling"]["format_version"], 5)
 
-    def test_dynamic_scaling_rebases_for_deposits_and_withdrawals_without_changing_size(self) -> None:
+    def test_dynamic_scaling_records_external_adjustments_without_rebasing_starting_balance(self) -> None:
         config = trader.validate_config({
             "enable_dynamic_scaling": True,
             "base_share_increment": 1,
-            "scaling_profit_multiplier": 1.0,
+            "scaling_profit_multiplier": 1000.0,
         })
         base = 1_700_001_225
         state = {"markets": {}}
@@ -466,8 +466,8 @@ class SettlementTraderTests(unittest.IsolatedAsyncioTestCase):
         trader.refresh_dynamic_base_share_scaling(state, config, now_epoch=base + 1, actual_balance=200.0)
         deposited = trader.dynamic_scaling_snapshot(state, config)
         self.assertEqual(deposited["current_base_share_count"], 3.0)
-        self.assertEqual(deposited["actual_balance_baseline"], 200.0)
-        self.assertEqual(deposited["profit_since_last_increase"], 0.0)
+        self.assertEqual(deposited["actual_balance_baseline"], 100.0)
+        self.assertEqual(deposited["profit_since_last_increase"], 100.0)
         self.assertTrue(trader.rebase_dynamic_scaling_for_authenticated_balance_adjustment(
             state,
             adjustment=trader.Decimal("-25"),
@@ -477,7 +477,8 @@ class SettlementTraderTests(unittest.IsolatedAsyncioTestCase):
         trader.refresh_dynamic_base_share_scaling(state, config, now_epoch=base + 2, actual_balance=175.0)
         withdrawn = trader.dynamic_scaling_snapshot(state, config)
         self.assertEqual(withdrawn["current_base_share_count"], 3.0)
-        self.assertEqual(withdrawn["actual_balance_baseline"], 175.0)
+        self.assertEqual(withdrawn["actual_balance_baseline"], 100.0)
+        self.assertEqual(withdrawn["profit_since_last_increase"], 75.0)
         self.assertEqual(len(state["dynamic_base_share_scaling"]["external_balance_adjustments"]), 2)
 
     def test_dynamic_scaling_accepts_fractional_base_increment_at_cent_precision(self) -> None:
