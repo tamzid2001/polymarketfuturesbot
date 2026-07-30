@@ -1,42 +1,12 @@
 {
-  "actual_balance": "44.5195",
+  "actual_balance": "38.4989",
   "actual_balance_anchor": {
     "actual_balance_after": "134.8222",
-    "completed_at": "2026-07-28T11:00:00+00:00",
-    "market_close_time": "2026-07-28T11:00:00+00:00",
+    "completed_at": "2026-07-28T11:15:15+00:00",
+    "market_close_time": "2026-07-28T11:15:15+00:00",
     "market_ticker": "__RETAINED_BALANCE_ANCHOR__"
   },
   "actual_history": [
-    {
-      "actual_balance_after": "134.8222",
-      "actual_balance_before": "134.8222",
-      "actual_realized_pnl": "0",
-      "average_entry": null,
-      "balance_source": "authenticated_kalshi_api",
-      "completed_at": "2026-07-28T15:15:32.559421+00:00",
-      "contracts_bought": 0.0,
-      "contracts_sold": 0,
-      "entry_cost": 0.0,
-      "entry_signal_after_market": false,
-      "execution_enabled_for_market": false,
-      "exit_method": "settlement",
-      "exit_proceeds": "0",
-      "exit_signal_after_market": false,
-      "fees": 0.0,
-      "market_close_time": "2026-07-28T15:15:32.487005+00:00",
-      "market_ticker": "KXBTC15M-26JUL281115-15",
-      "p10": "172.8846015275456",
-      "p50": "189.2801516869893",
-      "p90": "206.7789611427997",
-      "reconciled": true,
-      "reconciliation_status": "pending_api_reconciliation",
-      "selected_side": "no",
-      "settlement_payout": "0",
-      "source": "live_bot_ledger",
-      "state_after_market": "off",
-      "state_before_market": "off",
-      "timestamp": "2026-07-28T15:15:32.559399+00:00"
-    },
     {
       "actual_balance_after": "134.8222",
       "actual_balance_before": "134.8222",
@@ -5982,6 +5952,36 @@
       "state_after_market": "on",
       "state_before_market": "on",
       "timestamp": "2026-07-30T19:45:23.469274+00:00"
+    },
+    {
+      "actual_balance_after": "38.4989",
+      "actual_balance_before": "44.5195",
+      "actual_realized_pnl": "-5.88",
+      "average_entry": 0.2,
+      "balance_source": "authenticated_kalshi_api",
+      "completed_at": "2026-07-30T20:00:05.245400+00:00",
+      "contracts_bought": 40.0,
+      "contracts_sold": 0,
+      "entry_cost": 8.0,
+      "entry_signal_after_market": false,
+      "execution_enabled_for_market": true,
+      "exit_method": "live_reduce_only_absolute_5c_stop",
+      "exit_proceeds": "2.12",
+      "exit_signal_after_market": false,
+      "fees": 0.0,
+      "market_close_time": "2026-07-30T20:00:00+00:00",
+      "market_ticker": "KXBTC15M-26JUL301600-00",
+      "p10": "147.82273170832602",
+      "p50": "155.84416197512357",
+      "p90": "164.0805775945268",
+      "reconciled": true,
+      "reconciliation_status": "cash_timing_differs_from_realized_pnl",
+      "selected_side": "yes",
+      "settlement_payout": "0",
+      "source": "live_bot_ledger",
+      "state_after_market": "on",
+      "state_before_market": "on",
+      "timestamp": "2026-07-30T20:00:05.245376+00:00"
     }
   ],
   "ambiguous_fills": [],
@@ -6441,6 +6441,14 @@
       "balance_before": "51.1769",
       "source": "portfolio_balance_after_market",
       "timestamp": "2026-07-30T19:00:11.087114+00:00"
+    },
+    {
+      "adjustment_type": "entry_or_open_position_cash_timing",
+      "amount": "-0.1406",
+      "balance_after": "38.4989",
+      "balance_before": "44.5195",
+      "source": "portfolio_balance_after_market",
+      "timestamp": "2026-07-30T20:00:05.245439+00:00"
     }
   ],
   "balance_reconciled": false,
@@ -10865,7 +10873,7 @@
       "forecast_target_ticker": "KXBTC15M-26JUL301600-00",
       "forecast_target_time": "2026-07-30T16:00:00+00:00",
       "model_fit_error": null,
-      "observed_shadow_balance": null,
+      "observed_shadow_balance": "136.547015",
       "p01": "141.24247966114973",
       "p10": "147.82273170832602",
       "p25": "151.72662473053902",
@@ -10874,7 +10882,7 @@
       "p90": "164.0805775945268",
       "p99": "170.72812977354008",
       "refit_number": 22,
-      "state_after": null,
+      "state_after": "on",
       "state_before": "on",
       "training_end": "2026-07-30T15:45:45+00:00",
       "training_rows": 201,
@@ -12813,7 +12821,7 @@
   "last_p90": "164.0805775945268",
   "last_p99": "170.72812977354008",
   "last_processed_fill_id": "8d69e555-5b8b-63bc-e820-4d56887457d7",
-  "last_processed_market_ticker": "KXBTC15M-26JUL301545-45",
+  "last_processed_market_ticker": "KXBTC15M-26JUL301600-00",
   "last_processed_settlement_ticker": "KXBTC15M-26JUL262245-45",
   "ledger_endpoint_bootstrap": {
     "assumption": "no deposits_withdrawals_transfers_or_filled_open_positions_within_selected_ledger_scope",
@@ -12835,15 +12843,6 @@
   "live_cooldown_state": {},
   "live_dynamic_base": null,
   "live_vs_shadow": [
-    {
-      "actual_realized_pnl": "0",
-      "difference": "-5.52000",
-      "live_execution_enabled": false,
-      "market_close_time": "2026-07-28T15:15:32.487005+00:00",
-      "market_ticker": "KXBTC15M-26JUL281115-15",
-      "shadow_realized_pnl": "-5.52000",
-      "shadow_simulation_quality": "conservative_approximation"
-    },
     {
       "actual_realized_pnl": "0",
       "difference": "0",
@@ -14634,12 +14633,20 @@
       "market_ticker": "KXBTC15M-26JUL301545-45",
       "shadow_realized_pnl": "0",
       "shadow_simulation_quality": "conservative_approximation"
+    },
+    {
+      "actual_realized_pnl": "-5.88",
+      "difference": "1.380",
+      "live_execution_enabled": true,
+      "market_close_time": "2026-07-30T20:00:00+00:00",
+      "market_ticker": "KXBTC15M-26JUL301600-00",
+      "shadow_realized_pnl": "-4.500",
+      "shadow_simulation_quality": "conservative_approximation"
     }
   ],
-  "markets_since_refit": 0,
+  "markets_since_refit": 1,
   "processed_fill_ids": [],
   "processed_market_tickers": [
-    "KXBTC15M-26JUL281115-15",
     "KXBTC15M-26JUL281130-30",
     "KXBTC15M-26JUL281145-45",
     "KXBTC15M-26JUL281200-00",
@@ -14838,7 +14845,8 @@
     "KXBTC15M-26JUL301500-00",
     "KXBTC15M-26JUL301515-15",
     "KXBTC15M-26JUL301530-30",
-    "KXBTC15M-26JUL301545-45"
+    "KXBTC15M-26JUL301545-45",
+    "KXBTC15M-26JUL301600-00"
   ],
   "processed_settlement_tickers": [],
   "prophet_history_ready": true,
@@ -14855,17 +14863,17 @@
       "shadow_balance": "141.047015"
     }
   ],
-  "shadow_balance": "141.047015",
+  "shadow_balance": "136.547015",
   "shadow_balance_anchor": {
-    "completed_at": "2026-07-28T11:00:00+00:00",
-    "market_close_time": "2026-07-28T11:00:00+00:00",
+    "completed_at": "2026-07-28T11:15:15+00:00",
+    "market_close_time": "2026-07-28T11:15:15+00:00",
     "market_ticker": "__RETAINED_BALANCE_ANCHOR__",
-    "shadow_balance_after": "184.04000"
+    "shadow_balance_after": "178.52000"
   },
   "shadow_cooldown_state": {
     "consecutive_completed_losses": 2,
     "last_resolution": "completed_losing_shadow_trade",
-    "markets_remaining_to_skip": 0,
+    "markets_remaining_to_skip": 2,
     "skipped_markets": [
       {
         "at": "2026-07-26T22:45:38.562059+00:00",
@@ -15452,30 +15460,6 @@
   "shadow_dynamic_base": null,
   "shadow_enabled": true,
   "shadow_history": [
-    {
-      "completed_at": "2026-07-28T15:15:32.559436+00:00",
-      "live_execution_enabled": false,
-      "market_close_time": "2026-07-28T15:15:32.487005+00:00",
-      "market_ticker": "KXBTC15M-26JUL281115-15",
-      "shadow_average_entry": "0.2",
-      "shadow_balance_after": "178.52000",
-      "shadow_balance_before": "184.04000",
-      "shadow_balance_change": "-5.52000",
-      "shadow_contracts": "30.00",
-      "shadow_cost": "6.000",
-      "shadow_eligible": true,
-      "shadow_exit_method": "absolute_stop",
-      "shadow_fees": "0",
-      "shadow_fill_model": "conservative_trade_through",
-      "shadow_market_pnl": "-5.52000",
-      "shadow_payout": "0",
-      "shadow_proceeds": "0.48000",
-      "shadow_realized_pnl": "-5.52000",
-      "shadow_selected_side": "no",
-      "shadow_simulation_quality": "conservative_approximation",
-      "shadow_skip_reason": null,
-      "timestamp": "2026-07-28T15:15:32.559430+00:00"
-    },
     {
       "completed_at": "2026-07-28T15:30:12.534296+00:00",
       "live_execution_enabled": false,
@@ -20254,151 +20238,33 @@
       "shadow_simulation_quality": "conservative_approximation",
       "shadow_skip_reason": null,
       "timestamp": "2026-07-30T19:45:23.469337+00:00"
-    }
-  ],
-  "shadow_open": {
-    "KXBTC15M-26JUL301600-00": {
-      "consumed_public_trade_count": {
-        "01d84747-5c47-4e92-7c2c-bc9754d031b2": "2.0",
-        "1434d3bb-6cb0-5583-7d33-55e63dfe00dc": "3.0",
-        "19e61e3b-e6e0-7ccf-5507-4d402182ce4d": "1.2",
-        "bab87aaf-2b5c-7f83-b072-8c14777d1889": "6.6",
-        "d45f7ca3-3598-7c4f-2670-07a4e30bf73d": "1.2",
-        "e4666f8a-8df2-5cef-d9f6-941027ff3925": "5.0",
-        "f944e5cf-700a-64d7-db7a-52810a7df254": "10.0",
-        "fa910deb-8b40-5797-c51b-578fbb2c1163": "1.0"
-      },
-      "eligible": true,
-      "entry_cost": "6.00",
-      "exit_contracts": "30.0",
-      "exit_method": "absolute_stop",
-      "fees": "0",
-      "fill_notes": [
-        {
-          "events_seen": 57,
-          "reason": "post_order_public_tape_checked"
-        },
-        {
-          "fill": "3.0",
-          "modeled_price": "0.4",
-          "order_key": "0.4000",
-          "public_trade_id": "1434d3bb-6cb0-5583-7d33-55e63dfe00dc",
-          "public_trade_price": "0.4",
-          "public_trade_timestamp": 1785440775991,
-          "reason": "post_order_public_trade_through"
-        },
-        {
-          "fill": "1.0",
-          "modeled_price": "0.3",
-          "order_key": "0.3000",
-          "public_trade_id": "fa910deb-8b40-5797-c51b-578fbb2c1163",
-          "public_trade_price": "0.3",
-          "public_trade_timestamp": 1785440799695,
-          "reason": "post_order_public_trade_through"
-        },
-        {
-          "fill": "5.0",
-          "modeled_price": "0.3",
-          "order_key": "0.3000",
-          "public_trade_id": "e4666f8a-8df2-5cef-d9f6-941027ff3925",
-          "public_trade_price": "0.3",
-          "public_trade_timestamp": 1785440799695,
-          "reason": "post_order_public_trade_through"
-        },
-        {
-          "fill": "1.2",
-          "modeled_price": "0.2",
-          "order_key": "0.2000",
-          "public_trade_id": "19e61e3b-e6e0-7ccf-5507-4d402182ce4d",
-          "public_trade_price": "0.2",
-          "public_trade_timestamp": 1785440912802,
-          "reason": "post_order_public_trade_through"
-        },
-        {
-          "fill": "1.2",
-          "modeled_price": "0.2",
-          "order_key": "0.2000",
-          "public_trade_id": "d45f7ca3-3598-7c4f-2670-07a4e30bf73d",
-          "public_trade_price": "0.2",
-          "public_trade_timestamp": 1785440913090,
-          "reason": "post_order_public_trade_through"
-        },
-        {
-          "fill": "6.6",
-          "modeled_price": "0.2",
-          "order_key": "0.2000",
-          "public_trade_id": "bab87aaf-2b5c-7f83-b072-8c14777d1889",
-          "public_trade_price": "0.2",
-          "public_trade_timestamp": 1785440913188,
-          "reason": "post_order_public_trade_through"
-        },
-        {
-          "fill": "10.0",
-          "modeled_price": "0.1",
-          "order_key": "0.1000",
-          "public_trade_id": "f944e5cf-700a-64d7-db7a-52810a7df254",
-          "public_trade_price": "0.1",
-          "public_trade_timestamp": 1785441353797,
-          "reason": "post_order_public_trade_through"
-        },
-        {
-          "fill": "2.0",
-          "modeled_price": "0.1",
-          "order_key": "0.1000",
-          "public_trade_id": "01d84747-5c47-4e92-7c2c-bc9754d031b2",
-          "public_trade_price": "0.1",
-          "public_trade_timestamp": 1785441353801,
-          "reason": "post_order_public_trade_through"
-        }
-      ],
-      "generated_at": "2026-07-30T19:45:34.465621+00:00",
-      "highest_bid": "0.71",
+    },
+    {
+      "completed_at": "2026-07-30T20:00:05.245416+00:00",
       "live_execution_enabled": true,
       "market_close_time": "2026-07-30T20:00:00+00:00",
-      "orders": [
-        {
-          "created_at": "2026-07-30T19:45:34.465621+00:00",
-          "filled": "3.0",
-          "order_key": "0.4000",
-          "price": "0.4",
-          "quantity": "3.0"
-        },
-        {
-          "created_at": "2026-07-30T19:45:34.465621+00:00",
-          "filled": "6.0",
-          "order_key": "0.3000",
-          "price": "0.3",
-          "quantity": "6.0"
-        },
-        {
-          "created_at": "2026-07-30T19:45:34.465621+00:00",
-          "filled": "9.0",
-          "order_key": "0.2000",
-          "price": "0.2",
-          "quantity": "9.0"
-        },
-        {
-          "created_at": "2026-07-30T19:45:34.465621+00:00",
-          "filled": "12.0",
-          "order_key": "0.1000",
-          "price": "0.1",
-          "quantity": "12.0"
-        }
-      ],
-      "payout": "0",
-      "proceeds": "1.500",
-      "selected_side": "yes",
+      "market_ticker": "KXBTC15M-26JUL301600-00",
+      "shadow_average_entry": "0.2",
+      "shadow_balance_after": "136.547015",
+      "shadow_balance_before": "141.047015",
+      "shadow_balance_change": "-4.500",
+      "shadow_contracts": "30.0",
+      "shadow_cost": "6.00",
+      "shadow_eligible": true,
+      "shadow_exit_method": "absolute_stop",
+      "shadow_fees": "0",
       "shadow_fill_model": "conservative_trade_through",
+      "shadow_market_pnl": "-4.500",
+      "shadow_payout": "0",
+      "shadow_proceeds": "1.500",
+      "shadow_realized_pnl": "-4.500",
+      "shadow_selected_side": "yes",
       "shadow_simulation_quality": "conservative_approximation",
-      "skip_reason": null,
-      "source_ticker": "KXBTC15M-26JUL301545-45",
-      "status": "exited",
-      "stop_price": "0.05",
-      "target_ticker": "KXBTC15M-26JUL301600-00",
-      "trailing_activation_gain": "2",
-      "trailing_retracement": "2"
+      "shadow_skip_reason": null,
+      "timestamp": "2026-07-30T20:00:05.245410+00:00"
     }
-  },
+  ],
+  "shadow_open": {},
   "shadow_pnl_while_disabled": "34.02000",
   "starting_balance": "100.00",
   "startup_gate_forecast_target": "KXBTC15M-26JUL301600-00",
