@@ -20646,11 +20646,14 @@
     "KXBTC15M-26AUG010545-45": {
       "consumed_public_trade_count": {
         "2ea78f3f-3861-5f65-62bd-725752179717": "6.0",
-        "4cf2d264-bdc4-68d9-32aa-ef9dae809026": "3.0"
+        "31b70f40-c7d0-72a8-f9bd-6c14c79c9e7e": "12.0",
+        "4cf2d264-bdc4-68d9-32aa-ef9dae809026": "3.0",
+        "d5e027d9-dcb9-7b6b-0b16-aaaa7ba29455": "9.0"
       },
       "eligible": true,
-      "entry_cost": "3.00",
-      "exit_method": null,
+      "entry_cost": "6.00",
+      "exit_contracts": "30.0",
+      "exit_method": "absolute_stop",
       "fees": "0",
       "fill_notes": [
         {
@@ -20673,6 +20676,24 @@
           "public_trade_id": "2ea78f3f-3861-5f65-62bd-725752179717",
           "public_trade_price": "0.3",
           "public_trade_timestamp": 1785577409954,
+          "reason": "post_order_public_trade_through"
+        },
+        {
+          "fill": "9.0",
+          "modeled_price": "0.2",
+          "order_key": "0.2000",
+          "public_trade_id": "d5e027d9-dcb9-7b6b-0b16-aaaa7ba29455",
+          "public_trade_price": "0.2",
+          "public_trade_timestamp": 1785577411748,
+          "reason": "post_order_public_trade_through"
+        },
+        {
+          "fill": "12.0",
+          "modeled_price": "0.1",
+          "order_key": "0.1000",
+          "public_trade_id": "31b70f40-c7d0-72a8-f9bd-6c14c79c9e7e",
+          "public_trade_price": "0.1",
+          "public_trade_timestamp": 1785577432140,
           "reason": "post_order_public_trade_through"
         }
       ],
@@ -20697,27 +20718,27 @@
         },
         {
           "created_at": "2026-08-01T09:30:24.473796+00:00",
-          "filled": "0",
+          "filled": "9.0",
           "order_key": "0.2000",
           "price": "0.2",
           "quantity": "9.0"
         },
         {
           "created_at": "2026-08-01T09:30:24.473796+00:00",
-          "filled": "0",
+          "filled": "12.0",
           "order_key": "0.1000",
           "price": "0.1",
           "quantity": "12.0"
         }
       ],
       "payout": "0",
-      "proceeds": "0",
+      "proceeds": "0.1200",
       "selected_side": "yes",
       "shadow_fill_model": "conservative_trade_through",
       "shadow_simulation_quality": "conservative_approximation",
       "skip_reason": null,
       "source_ticker": "KXBTC15M-26AUG010530-30",
-      "status": "active",
+      "status": "exited",
       "stop_price": "0.05",
       "target_ticker": "KXBTC15M-26AUG010545-45",
       "trailing_activation_gain": "2",
