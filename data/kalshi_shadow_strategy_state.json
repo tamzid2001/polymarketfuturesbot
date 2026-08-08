@@ -1810,7 +1810,16 @@
           "time_in_force": "good_till_canceled"
         }
       ],
-      "exit_orders": [],
+      "exit_orders": [
+        {
+          "average_fill_price": "0.33",
+          "fees_paid": "0",
+          "fill_count": "1.03",
+          "order_id": null,
+          "remaining_count": "0",
+          "shadow_execution": "fresh_executable_bid"
+        }
+      ],
       "intended_quantity": "1.03",
       "market_close_epoch": 1786231800.0,
       "market_open_epoch": 1786230900.0,
@@ -1831,11 +1840,17 @@
       "signal_side": "yes",
       "signal_timestamp": "2026-08-08T23:15:10.595873+00:00",
       "source_market_ticker": "KXBTC15M-26AUG081915-15",
-      "status": "POSITION_OPEN",
-      "status_reason": "entry_fill_observed",
+      "status": "STOP_PENDING",
+      "status_reason": "shadow_40c_executable_bid",
+      "stop_trigger": {
+        "at": "2026-08-08T23:29:29.627770+00:00",
+        "best_executable_bid": "0.33",
+        "requested_quantity": "1.03",
+        "shadow": true
+      },
       "strategy_version": "kxbtc15m-hybrid-live-v1",
       "ticker": "KXBTC15M-26AUG081930-30",
-      "updated_at": "2026-08-08T23:15:32.751722+00:00"
+      "updated_at": "2026-08-08T23:29:29.627778+00:00"
     }
   },
   "outcome_verification": {
@@ -1880,5 +1895,5 @@
   },
   "state_version": 1,
   "strategy_version": "kxbtc15m-hybrid-live-v1",
-  "updated_at": "2026-08-08T23:15:32.751952+00:00"
+  "updated_at": "2026-08-08T23:29:29.627994+00:00"
 }
