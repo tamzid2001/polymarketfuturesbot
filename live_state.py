@@ -47,6 +47,7 @@ def default_state(config: dict[str, Any]) -> dict[str, Any]:
         "last_completed_trade": None,
         "api_failure_count": 0,
         "last_reconciliation": None,
+        "handoff": None,
     }
 
 

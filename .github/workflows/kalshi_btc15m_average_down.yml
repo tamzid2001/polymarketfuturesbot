@@ -68,7 +68,7 @@ on:
         type: string
         default: ""
       entry_timeout_seconds:
-        description: "Resting entry lifetime. Blank keeps persisted configuration."
+        description: "Exact 15-second post-only maker window before the single protected IOC fallback. Only 15 is accepted."
         required: false
         type: string
         default: ""
@@ -92,11 +92,16 @@ on:
         required: false
         type: string
         default: ""
-      run_seconds:
-        description: "Bounded worker duration; default leaves a handoff margin below GitHub's six-hour job limit."
+      handoff_guard_seconds:
+        description: "Boundary buffer for worker handoff; 60 keeps the first and final minute of each market with the current worker."
         required: false
         type: string
-        default: "20700"
+        default: ""
+      run_seconds:
+        description: "Minimum worker duration. At expiry the worker exits only in the quiet middle 13 minutes of a market."
+        required: false
+        type: string
+        default: "18000"
 
 # Serialized runs are intentional.  Cancel-in-progress is false because a new
 # worker must never kill another worker mid-order; the next scheduled wakeup
@@ -107,6 +112,7 @@ concurrency:
 
 permissions:
   contents: write
+  actions: write
 
 jobs:
   trade:
@@ -157,7 +163,7 @@ jobs:
           KALSHI_DEMO: "false"
           KALSHI_LIVE_ENABLED: ${{ vars.KALSHI_LIVE_ENABLED || 'false' }}
           KALSHI_CHECKPOINT_PUBLISH: "true"
-          RUN_SECONDS: ${{ inputs.run_seconds || '20700' }}
+          RUN_SECONDS: ${{ inputs.run_seconds || '18000' }}
           REQUESTED_LIVE: ${{ github.event_name == 'schedule' && vars.KALSHI_LIVE_ENABLED == 'true' || github.event_name == 'workflow_dispatch' && inputs.live_enabled && !inputs.dry_run && vars.KALSHI_LIVE_ENABLED == 'true' }}
           RECONCILE_ONLY: ${{ inputs.reconcile_only || false }}
           RESET_STATE: ${{ inputs.reset_state || false }}
@@ -173,6 +179,7 @@ jobs:
           OUTCOME_OBSERVATION_SECONDS: ${{ inputs.outcome_observation_seconds || '' }}
           PROVISIONAL_OUTCOME_THRESHOLD: ${{ inputs.provisional_outcome_threshold || '' }}
           STARTING_SHADOW_BALANCE: ${{ inputs.starting_shadow_balance || '' }}
+          HANDOFF_GUARD_SECONDS: ${{ inputs.handoff_guard_seconds || '' }}
         run: |
           set -euo pipefail
           # Shadow runs have a fully separate ledger/state.  Reconciliation
@@ -203,6 +210,7 @@ jobs:
           [ -z "$OUTCOME_OBSERVATION_SECONDS" ] || args+=(--outcome-observation-seconds "$OUTCOME_OBSERVATION_SECONDS")
           [ -z "$PROVISIONAL_OUTCOME_THRESHOLD" ] || args+=(--provisional-outcome-threshold "$PROVISIONAL_OUTCOME_THRESHOLD")
           [ -z "$STARTING_SHADOW_BALANCE" ] || args+=(--starting-shadow-balance "$STARTING_SHADOW_BALANCE")
+          [ -z "$HANDOFF_GUARD_SECONDS" ] || args+=(--handoff-guard-seconds "$HANDOFF_GUARD_SECONDS")
           if [ "$REQUESTED_LIVE" = "true" ]; then
             python kalshi_live_trader.py "${args[@]}" --live-enabled
           else
@@ -229,6 +237,35 @@ jobs:
           done
           echo "::error::Unable to publish durable live state after three retries."
           exit 1
+
+      - name: Queue the next five-hour worker only after a safe handoff
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          REQUESTED_LIVE: ${{ github.event_name == 'schedule' && vars.KALSHI_LIVE_ENABLED == 'true' || github.event_name == 'workflow_dispatch' && inputs.live_enabled && !inputs.dry_run && vars.KALSHI_LIVE_ENABLED == 'true' }}
+          RECONCILE_ONLY: ${{ inputs.reconcile_only || false }}
+        run: |
+          set -euo pipefail
+          [ "$RECONCILE_ONLY" = "true" ] && exit 0
+          if [ "$REQUESTED_LIVE" = "true" ]; then
+            state_file=data/kalshi_live_strategy_state.json
+          else
+            state_file=data/kalshi_shadow_strategy_state.json
+          fi
+          ready="$(python -c 'import json, pathlib; p=pathlib.Path("'"$state_file"'"); print(str(bool(json.loads(p.read_text()).get("handoff", {}).get("ready"))).lower() if p.exists() else "false")')"
+          if [ "$ready" != "true" ]; then
+            echo "HANDOFF NOT QUEUED | no persisted safe-handoff marker."
+            exit 0
+          fi
+          if [ "$REQUESTED_LIVE" = "true" ]; then
+            gh workflow run kalshi_btc15m_average_down.yml --repo "$REPOSITORY" --ref main \
+              -f live_enabled=true -f dry_run=false -f reconcile_only=false -f reset_state=false -f run_seconds=18000
+          else
+            gh workflow run kalshi_btc15m_average_down.yml --repo "$REPOSITORY" --ref main \
+              -f live_enabled=false -f dry_run=true -f reconcile_only=false -f reset_state=false -f run_seconds=18000
+          fi
+          echo "SAFE HANDOFF QUEUED | next serialized five-hour worker requested."
 
       - name: Remove private key
         if: always()

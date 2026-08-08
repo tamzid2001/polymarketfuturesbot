@@ -1,9 +1,8 @@
 name: Kalshi KXBTC15M Hybrid Live Watchdog
 
-# A recovery safety net for the settlement-only trader. The trader's normal
-# 5h25m self-handoff remains primary. A failed *live* runner invokes this
-# immediately; the offset five-minute schedule remains a fallback when a
-# handoff disappears without creating a failure event.
+# A recovery safety net for the hybrid trader. Normal five-hour workers only
+# hand off in the middle 13 minutes of a KXBTC15M market. This workflow is a
+# recovery path for a failed/missing worker; it never bypasses the live gate.
 on:
   schedule:
     # Avoid minute zero, when GitHub Actions is most likely to delay or drop
@@ -23,23 +22,20 @@ permissions:
   contents: read
 
 jobs:
-  ensure-live-runner:
-    # A successful runner owns its normal handoff.  Failed runs need recovery,
-    # but only if their title identifies them as LIVE (or they are a legacy
-    # scheduled run, which is always live).  This prevents a completed dry-run
-    # reconciliation from starting real trading on its own.
+  ensure-hybrid-runner:
+    # A successful worker queues its own safe handoff. Failed workers and an
+    # absent scheduled worker are recovered in their prior/safe mode.
     if: >-
       github.event_name != 'workflow_run' ||
-      (github.event.workflow_run.conclusion != 'success' &&
-       (github.event.workflow_run.event == 'schedule' ||
-        endsWith(github.event.workflow_run.display_title, 'LIVE')))
+      github.event.workflow_run.conclusion != 'success'
     runs-on: ubuntu-latest
     steps:
-      - name: Dispatch a live recovery only when no trader owns the singleton
+      - name: Dispatch a mode-preserving recovery only when no worker owns the singleton
         env:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
           TRIGGER: ${{ github.event_name }}
+          KALSHI_LIVE_ENABLED: ${{ vars.KALSHI_LIVE_ENABLED || 'false' }}
         run: |
           set -euo pipefail
           # A controlled restart cancels a live run before it queues its
@@ -53,17 +49,12 @@ jobs:
             --workflow kalshi_btc15m_average_down.yml --limit 20 \
             --json databaseId,status,conclusion,updatedAt,displayTitle,event)"
           active="$(jq '[.[] | select(.status == "in_progress" or .status == "queued" or .status == "waiting")] | length' <<<"$runs")"
-          active_live="$(jq '[.[] | select(.status == "in_progress" or .status == "queued" or .status == "waiting") | select(((.displayTitle // "") | endswith("LIVE")) or .event == "schedule")] | length' <<<"$runs")"
-          if [ "$active_live" -gt 0 ]; then
-            echo "WATCHDOG OK | active_or_queued_live_runs=$active_live"
-            exit 0
-          fi
           if [ "$active" -gt 0 ]; then
-            echo "WATCHDOG HOLD | active reconciliation or legacy runner count=$active; refusing to overlap it with live trading."
+            echo "WATCHDOG HOLD | active_or_queued_hybrid_runs=$active; refusing overlap."
             exit 0
           fi
 
-          latest="$(jq -c '[.[] | select(((.displayTitle // "") | endswith("LIVE")) or .event == "schedule")] | sort_by(.updatedAt // "") | last // {}' <<<"$runs")"
+          latest="$(jq -c 'sort_by(.updatedAt // "") | last // {}' <<<"$runs")"
           conclusion="$(jq -r '.conclusion // "none"' <<<"$latest")"
           completed="$(jq -r '.updatedAt // ""' <<<"$latest")"
           if [ "$conclusion" = "success" ] && [ -n "$completed" ]; then
@@ -76,12 +67,13 @@ jobs:
             fi
           fi
 
-          # The runner itself requires the repository live-enable variable as
-          # a second gate; this dispatch cannot enable money movement alone.
-          gh workflow run kalshi_btc15m_average_down.yml \
-            --repo "$REPOSITORY" --ref main \
-            -f live_enabled=true \
-            -f dry_run=false \
-            -f reconcile_only=false \
-            -f reset_state=false
-          echo "WATCHDOG DISPATCHED | hybrid live worker queued."
+          prior_live="$(jq -r '(.displayTitle // "") | endswith("LIVE")' <<<"$latest")"
+          if [ "$KALSHI_LIVE_ENABLED" = "true" ] && { [ "$TRIGGER" = "schedule" ] || [ "$prior_live" = "true" ]; }; then
+            gh workflow run kalshi_btc15m_average_down.yml --repo "$REPOSITORY" --ref main \
+              -f live_enabled=true -f dry_run=false -f reconcile_only=false -f reset_state=false -f run_seconds=18000
+            echo "WATCHDOG DISPATCHED | gated live hybrid recovery queued."
+          else
+            gh workflow run kalshi_btc15m_average_down.yml --repo "$REPOSITORY" --ref main \
+              -f live_enabled=false -f dry_run=true -f reconcile_only=false -f reset_state=false -f run_seconds=18000
+            echo "WATCHDOG DISPATCHED | shadow hybrid recovery queued."
+          fi

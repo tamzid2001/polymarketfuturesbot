@@ -82,7 +82,7 @@ DECIMAL_CONFIG_FIELDS = {
 }
 INTEGER_CONFIG_FIELDS = {
     "signal_delay_seconds", "entry_timeout_seconds", "entry_lateness_seconds", "outcome_observation_seconds",
-    "max_recovery_exponent", "max_api_failures",
+    "max_recovery_exponent", "max_api_failures", "handoff_guard_seconds",
 }
 FLOAT_CONFIG_FIELDS = {"stop_poll_interval", "reconciliation_interval", "max_outcome_quote_age_seconds", "max_stale_quote_seconds"}
 
@@ -116,7 +116,9 @@ def load_config(path: Path) -> dict[str, Any]:
     value.setdefault("shadow_fill_model", "conservative_trade_through")
     value.setdefault("starting_shadow_balance", "1000.00")
     value.setdefault("signal_delay_seconds", 0)
-    value.setdefault("entry_timeout_seconds", 120)
+    # A maker entry has exactly this much time from market open.  At expiry,
+    # the separate IOC fallback below is evaluated once using a fresh book.
+    value.setdefault("entry_timeout_seconds", 15)
     value.setdefault("entry_lateness_seconds", 30)
     value.setdefault("stop_poll_interval", 1.0)
     value.setdefault("reconciliation_interval", 5.0)
@@ -128,12 +130,17 @@ def load_config(path: Path) -> dict[str, Any]:
     value.setdefault("max_recovery_cycle_loss", "50.00")
     value.setdefault("max_daily_realized_loss", "25.00")
     value.setdefault("max_api_failures", 5)
+    value.setdefault("handoff_guard_seconds", 60)
     if value["shadow_fill_model"] != "conservative_trade_through":
         raise ValueError("only conservative_trade_through is supported for shadow maker-fill evidence")
     if decimal(value["entry_price"]) <= decimal(value["stop_price"]):
         raise ValueError("entry_price must be above stop_price")
     if decimal(value["starting_base"]) != Decimal("1.00"):
         raise ValueError("the hybrid strategy must start at exactly 1.00 share")
+    if int(value["entry_timeout_seconds"]) != 15:
+        raise ValueError("the hybrid strategy uses an exact 15-second maker-entry window")
+    if int(value["handoff_guard_seconds"]) < 60:
+        raise ValueError("handoff_guard_seconds must keep at least one minute clear at each market boundary")
     return value
 
 
@@ -173,8 +180,14 @@ def load_config_from_value(value: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("entry_price must be above stop_price")
     temporary.setdefault("shadow_fill_model", "conservative_trade_through")
     temporary.setdefault("starting_shadow_balance", "1000.00")
+    temporary.setdefault("entry_timeout_seconds", 15)
+    temporary.setdefault("handoff_guard_seconds", 60)
     if temporary["shadow_fill_model"] != "conservative_trade_through":
         raise ValueError("only conservative_trade_through is supported for shadow maker-fill evidence")
+    if int(temporary["entry_timeout_seconds"]) != 15:
+        raise ValueError("the hybrid strategy uses an exact 15-second maker-entry window")
+    if int(temporary["handoff_guard_seconds"]) < 60:
+        raise ValueError("handoff_guard_seconds must keep at least one minute clear at each market boundary")
     return temporary
 
 
@@ -487,6 +500,40 @@ class LiveEngine:
         quote, _ = feed.executable_shadow_exit_quote(ticker, side, 0.0, float(self.config["max_stale_quote_seconds"]))
         return Decimal(str(quote["economic_price"])) if quote else None
 
+    def handoff_ready(self, now: float) -> tuple[bool, dict[str, Any]]:
+        """Permit an Actions handoff only in the quiet middle 13 minutes.
+
+        The final minute is reserved for outcome observation/preloading, and
+        the first minute is reserved for signal, maker, and IOC entry work.
+        Entry/stop/settlement transitions also block handoff even in that
+        middle window.  A plain open position may be transferred because the
+        next serialized worker starts with authoritative reconciliation.
+        """
+
+        active = self.active_market(now)
+        if active is None:
+            return False, {"reason": "no_current_exchange_market"}
+        guard = int(self.config["handoff_guard_seconds"])
+        window_start = float(active["open_epoch"]) + guard
+        window_end = float(active["close_epoch"]) - guard
+        if now < window_start or now > window_end:
+            return False, {
+                "reason": "outside_middle_13_minute_window", "ticker": active["ticker"],
+                "window_start_epoch": window_start, "window_end_epoch": window_end,
+            }
+        blocking_states = {"SIGNAL_PENDING", "ENTRY_PENDING", "ENTRY_PARTIAL", "STOP_PENDING", "SETTLEMENT_PENDING"}
+        blockers = [
+            {"ticker": item.get("ticker"), "status": item.get("status")}
+            for item in self.state.get("markets", {}).values()
+            if isinstance(item, dict) and item.get("status") in blocking_states
+        ]
+        if blockers:
+            return False, {"reason": "operational_state_requires_current_worker", "ticker": active["ticker"], "blockers": blockers}
+        return True, {
+            "reason": "safe_middle_13_minute_handoff", "ticker": active["ticker"],
+            "window_start_epoch": window_start, "window_end_epoch": window_end,
+        }
+
     async def managed_orders(self, rest: KalshiREST) -> list[Any]:
         try:
             response = await rest.orders.get_orders(status="resting", limit=1000)
@@ -666,6 +713,157 @@ class LiveEngine:
         self.state["average_entry"] = self.config["entry_price"] if fill else None
         return fill
 
+    def entry_deadline(self, record: dict[str, Any]) -> float:
+        """The 50c maker phase always ends 15 seconds after market open."""
+
+        configured = float(record["market_open_epoch"]) + int(self.config["entry_timeout_seconds"])
+        return min(float(record["market_close_epoch"]) - 1.0, configured)
+
+    def finish_entry_attempt(self, record: dict[str, Any], filled: Decimal, reason: str) -> None:
+        """Close an exhausted entry attempt without ever changing recovery on a zero fill."""
+
+        if filled > 0:
+            self.transition(record, "POSITION_OPEN", reason)
+            return
+        self.transition(record, "ZERO_FILL", reason)
+        self.state["sizing"] = zero_fill_snapshot(self.current_parameters(), self.state.get("sizing"))
+        self.note_zero_fill()
+        self.audit("zero_fill", ticker=record["ticker"], reason=reason)
+
+    def reserve_shadow_entry_cash(self, quantity: Decimal, price: Decimal) -> None:
+        """Reserve only simulated exposure actually supported by a fresh displayed quote."""
+
+        if quantity <= 0:
+            return
+        metrics = self.shadow_metrics()
+        reserved = Decimal(str(metrics["reserved_cash"])) + quantity * price
+        metrics["reserved_cash"] = format(reserved, "f")
+        metrics["max_reserved_cash"] = format(max(Decimal(str(metrics["max_reserved_cash"])), reserved), "f")
+
+    async def submit_market_fallback(
+        self, rest: KalshiREST, feed: KalshiLiveFeed, record: dict[str, Any], filled: Decimal,
+    ) -> None:
+        """Submit one idempotent, price-protected IOC for the post-maker remainder.
+
+        Kalshi's safe equivalent of a market buy is an immediate-or-cancel
+        limit at the current executable ask.  It cannot pay through that
+        observed price, and it is never sent at or below the configured stop.
+        """
+
+        if record.get("market_fallback_attempted"):
+            return
+        record["market_fallback_attempted"] = True
+        side = str(record["signal_side"])
+        intended = Decimal(str(record["intended_quantity"]))
+
+        if not self.dry_run:
+            exchange_position = await rest.position_for_ticker(record["ticker"])
+            if exchange_position is None:
+                self.trip("market_fallback_position_reconciliation_failed")
+                return
+            exchange_position = Decimal(str(exchange_position))
+            if (side == "yes" and exchange_position < 0) or (side == "no" and exchange_position > 0):
+                self.trip("market_fallback_position_direction_mismatch")
+                return
+            filled = max(filled, abs(exchange_position))
+            record["actual_quantity"] = format(filled, "f")
+
+        remaining = round_shares(max(Decimal("0"), intended - filled))
+        if remaining == 0:
+            self.finish_entry_attempt(record, filled, "maker_fully_filled_before_market_fallback")
+            return
+
+        quote, quote_state = feed.executable_shadow_quote(
+            record["ticker"], side, 0.0, float(self.config["max_stale_quote_seconds"]),
+        )
+        if quote is None:
+            record["market_fallback"] = {"attempted_at": utc_now(), "status": "not_submitted", "reason": quote_state}
+            self.finish_entry_attempt(record, filled, "market_fallback_quote_unavailable")
+            return
+        price = Decimal(str(quote["economic_price"]))
+        if price <= Decimal(self.config["stop_price"]):
+            record["market_fallback"] = {
+                "attempted_at": utc_now(), "status": "not_submitted", "reason": "best_available_price_at_or_below_stop",
+                "best_available_price": format(price, "f"), "quote": quote,
+            }
+            self.finish_entry_attempt(record, filled, "market_fallback_at_or_below_stop")
+            return
+
+        available = self.shadow_available_cash() if self.dry_run else await rest.balance_decimal()
+        required = remaining * price
+        if self.dry_run:
+            metrics = self.shadow_metrics()
+            metrics["max_required_cash"] = format(max(Decimal(str(metrics["max_required_cash"])), required), "f")
+        if available is None or available < required:
+            details = {
+                "at": utc_now(), "available_balance": None if available is None else format(available, "f"),
+                "required_cash": format(required, "f"), "quantity": format(remaining, "f"),
+                "best_available_price": format(price, "f"),
+            }
+            record["market_fallback"] = {"attempted_at": utc_now(), "status": "not_submitted", "reason": "insufficient_cash", **details}
+            if self.dry_run:
+                self.shadow_metrics()["funding_failures"] = int(self.shadow_metrics()["funding_failures"]) + 1
+            if filled > 0:
+                self.transition(record, "POSITION_OPEN", "market_fallback_insufficient_cash_partial_maker_fill")
+            else:
+                record["funding_failure"] = details
+                self.transition(record, "FUNDING_FAILURE", "market_fallback_insufficient_cash")
+            self.audit("funding_failure", ticker=record["ticker"], **details)
+            return
+
+        client_id = deterministic_client_order_id(record["ticker"], side, "market-fallback", self.config)
+        if self.dry_run:
+            # The shadow IOC is bounded by the fresh displayed top-of-book
+            # size; it is evidence of a possible IOC fill, never an exchange
+            # execution claim.
+            displayed = Decimal(str(quote.get("displayed_depth") or "0"))
+            shadow_fill = round_shares(min(remaining, displayed))
+            affordable = (self.shadow_available_cash() / price).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+            shadow_fill = min(shadow_fill, affordable)
+            order = {
+                "order_id": None, "client_order_id": client_id, "ticker": record["ticker"], "side": side,
+                "quantity": format(remaining, "f"), "position_price": format(price, "f"),
+                "time_in_force": "immediate_or_cancel", "post_only": False,
+                "fill_count": format(shadow_fill, "f"), "remaining_count": format(round_shares(remaining - shadow_fill), "f"),
+                "average_fill_price": format(price, "f"), "fees_paid": "0", "entry_phase": "market_fallback",
+                "status": "shadow_ioc_filled" if shadow_fill == remaining else "shadow_ioc_partial_or_unfilled",
+                "shadow_execution": "fresh_displayed_top_of_book_ioc", "shadow_quote": quote,
+                "submitted_at": utc_now(),
+            }
+            self.reserve_shadow_entry_cash(shadow_fill, price)
+        else:
+            order = await rest.create_order(
+                ticker=record["ticker"], side=side, position_price=float(price), quantity=float(remaining),
+                tif="immediate_or_cancel", expiration_time=None, dry_run=False, order_key="hybrid-market-fallback",
+                post_only=False, client_order_id_override=client_id,
+            )
+            order["entry_phase"] = "market_fallback"
+            order["fallback_quote"] = quote
+            if order.get("status") in {"submit_failed", "paused", "direction_mismatch"}:
+                record["market_fallback"] = {"attempted_at": utc_now(), "status": "submission_unknown_or_rejected", "quote": quote}
+                self.transition(record, "ERROR_RECONCILIATION", "market_fallback_not_accepted")
+                return
+        record.setdefault("entry_orders", []).append(order)
+        record["market_fallback"] = {
+            "attempted_at": utc_now(), "status": "submitted", "requested_quantity": format(remaining, "f"),
+            "best_available_price": format(price, "f"), "client_order_id": client_id,
+            "exchange_order_id": order.get("order_id"), "quote": quote,
+        }
+        final_filled = (
+            filled + Decimal(str(order.get("fill_count") or "0"))
+            if self.dry_run else await self.refresh_entry(rest, record)
+        )
+        record["actual_quantity"] = format(final_filled, "f")
+        self.state["current_position"] = record["actual_quantity"]
+        if self.dry_run and final_filled > 0:
+            self.state["average_entry"] = format(self.entry_cost(record) / final_filled, "f")
+        self.finish_entry_attempt(record, final_filled, "market_fallback_ioc_completed")
+        self.audit(
+            "market_fallback_submitted", ticker=record["ticker"], side=side,
+            requested_quantity=format(remaining, "f"), best_available_price=format(price, "f"),
+            client_order_id=client_id, exchange_order_id=order.get("order_id"), shadow=self.dry_run,
+        )
+
     async def submit_entry(self, rest: KalshiREST, feed: KalshiLiveFeed, record: dict[str, Any], now: float) -> None:
         if record.get("status") != "SIGNAL_PENDING" or not self.circuit_allows_entry():
             return
@@ -673,6 +871,10 @@ class LiveEngine:
             self.transition(record, "MISSED_SIGNAL", "entry_lateness_exceeded")
             return
         side = str(record["signal_side"])
+        deadline = float(record.setdefault("entry_deadline_epoch", self.entry_deadline(record)))
+        if now >= deadline:
+            await self.submit_market_fallback(rest, feed, record, Decimal(str(record.get("actual_quantity") or "0")))
+            return
         ask = self.selected_quote(feed, record["ticker"], side, "ask")
         if ask is None:
             return
@@ -684,13 +886,10 @@ class LiveEngine:
             self.audit("zero_fill", ticker=record["ticker"], reason="selected_side_started_at_or_below_stop", selected_ask=format(ask, "f"))
             return
         if ask <= Decimal(self.config["entry_price"]):
-            # A post-only order at this price would cross the displayed book.
-            # Do not convert the planned maker entry into an accidental taker
-            # fill and do not reprice/chase it.
-            self.transition(record, "ZERO_FILL", "post_only_would_cross_current_book")
-            self.state["sizing"] = zero_fill_snapshot(self.current_parameters(), self.state.get("sizing"))
-            self.note_zero_fill()
-            self.audit("zero_fill", ticker=record["ticker"], reason="post_only_would_cross_current_book", selected_ask=format(ask, "f"))
+            # The 50c maker cannot cross. Wait out the remaining 15-second
+            # maker phase, then evaluate the one price-protected IOC fallback.
+            record["maker_submission_skipped"] = {"at": utc_now(), "reason": "post_only_would_cross_current_book", "selected_ask": format(ask, "f")}
+            self.transition(record, "ENTRY_PENDING", "waiting_for_market_fallback_after_post_only_cross")
             return
         balance = self.shadow_available_cash() if self.dry_run else await rest.balance_decimal()
         quantity = Decimal(str(record["intended_quantity"]))
@@ -710,7 +909,7 @@ class LiveEngine:
             self.trip("existing_position_before_entry")
             return
         client_id = deterministic_client_order_id(record["ticker"], side, "entry", self.config)
-        expiry = min(int(record["market_close_epoch"]) - 1, int(now) + int(self.config["entry_timeout_seconds"]))
+        expiry = int(deadline)
         if expiry <= int(now):
             self.transition(record, "MISSED_SIGNAL", "entry_expiry_elapsed")
             return
@@ -724,6 +923,7 @@ class LiveEngine:
             self.transition(record, "ERROR_RECONCILIATION", "post_only_entry_not_accepted")
             return
         record["entry_orders"].append(order)
+        order["entry_phase"] = "maker"
         self.state["current_order_id"] = order.get("order_id")
         record["entry_deadline_epoch"] = expiry
         self.transition(record, "ENTRY_PENDING", "post_only_limit_submitted")
@@ -747,20 +947,22 @@ class LiveEngine:
         side = str(record["signal_side"])
         ask = self.selected_quote(feed, record["ticker"], side, "ask")
         deadline = float(record.get("entry_deadline_epoch") or 0)
-        if (ask is not None and ask <= Decimal(self.config["stop_price"])) or now >= deadline or now >= float(record["market_close_epoch"]):
+        if now >= deadline:
             for order in record.get("entry_orders", []):
-                await rest.cancel_order(order, self.dry_run)
+                if order.get("entry_phase", "maker") == "maker":
+                    await rest.cancel_order(order, self.dry_run)
             # For shadow mode, preserve only the trade-through evidence that
             # existed before cancellation; later public trades cannot fill a
             # cancelled simulated maker order.
             filled = filled if self.dry_run else await self.refresh_entry(rest, record)
-            if filled == 0:
-                self.transition(record, "ZERO_FILL", "entry_window_expired")
-                self.state["sizing"] = zero_fill_snapshot(self.current_parameters(), self.state.get("sizing"))
-                self.note_zero_fill()
-                self.audit("zero_fill", ticker=record["ticker"], reason="entry_window_expired")
-            else:
-                self.transition(record, "POSITION_OPEN", "entry_remainder_canceled")
+            await self.submit_market_fallback(rest, feed, record, filled)
+            return
+        if (ask is not None and ask <= Decimal(self.config["stop_price"])) or now >= float(record["market_close_epoch"]):
+            for order in record.get("entry_orders", []):
+                if order.get("entry_phase", "maker") == "maker":
+                    await rest.cancel_order(order, self.dry_run)
+            filled = filled if self.dry_run else await self.refresh_entry(rest, record)
+            self.finish_entry_attempt(record, filled, "selected_side_at_or_below_stop_before_fallback")
 
     async def close_at_stop(self, rest: KalshiREST, record: dict[str, Any], executable_bid: Decimal) -> None:
         side = str(record["signal_side"])
@@ -910,8 +1112,10 @@ class LiveEngine:
             LOG.warning("RECONCILE_ONLY COMPLETE | no entry endpoint was called")
             return 0
         start = time.monotonic()
+        self.state["handoff"] = {"ready": False, "started_at": utc_now(), "minimum_run_seconds": run_seconds}
         last_update = feed.update_count
-        while time.monotonic() - start < run_seconds:
+        handoff_wait_logged_at = 0.0
+        while True:
             now = time.time()
             if time.monotonic() - self.last_market_discovery >= 10.0:
                 await self.discover(rest)
@@ -959,6 +1163,21 @@ class LiveEngine:
                 sizing = sizing_state(self.current_parameters(), self.state.get("sizing"))
                 LOG.warning("HEARTBEAT | mode=%s ticker=%s state=%s base=%s exponent=%d target=%s deficit=%s threshold=%s active=%s breaker=%s", "DRY_RUN" if self.dry_run else "LIVE", active and active["ticker"], (self.state.get("markets", {}).get(active["ticker"], {}) if active else {}).get("status"), sizing.base_share_count, sizing.recovery_exponent, sizing.prescribed_quantity(), sizing.recovery_cycle_pnl, sizing.next_base_threshold, self.state.get("active_market"), self.state["circuit_breaker"].get("blocked"))
                 self.last_heartbeat = time.monotonic()
+            elapsed = time.monotonic() - start
+            if elapsed >= run_seconds:
+                ready, details = self.handoff_ready(now)
+                if ready:
+                    self.state["handoff"] = {"ready": True, "at": utc_now(), "elapsed_seconds": round(elapsed, 3), **details}
+                    self.audit("safe_handoff_ready", **details, elapsed_seconds=round(elapsed, 3))
+                    self.checkpoint("safe_handoff_ready")
+                    LOG.warning(
+                        "SAFE HANDOFF READY | ticker=%s elapsed=%.1fs window=%s..%s; queuing may proceed.",
+                        details["ticker"], elapsed, details["window_start_epoch"], details["window_end_epoch"],
+                    )
+                    return 0
+                if time.monotonic() - handoff_wait_logged_at >= 60:
+                    LOG.warning("HANDOFF DEFERRED | elapsed=%.1fs reason=%s", elapsed, details.get("reason"))
+                    handoff_wait_logged_at = time.monotonic()
             self.checkpoint()
             last_update = await feed.wait_for_update(0.25, last_update)
         return 0
