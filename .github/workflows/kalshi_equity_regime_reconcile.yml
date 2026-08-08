@@ -1,60 +1,17 @@
-name: Kalshi Equity-Regime Reconciliation (Read Only)
+name: Retired — Kalshi Equity-Regime Reconciliation
 
+# Kept as a visible manual endpoint so an old bookmark cannot silently invoke
+# the Prophet/equity-regime code path.  The hybrid KXBTC15M engine owns all
+# current reconciliation; this workflow intentionally has no credentials.
 on:
   workflow_dispatch:
-    inputs:
-      starting_balance:
-        description: "Verified balance immediately before the reconstructed bot closed-position history. This is used as the explicit historical anchor, never replaced with current balance."
-        required: true
-        type: string
-        default: "100.00"
 
-permissions:
-  contents: read
+permissions: {}
 
 jobs:
-  reconcile:
+  retired:
     runs-on: ubuntu-latest
-    environment: Kalshi
     steps:
-      - uses: actions/checkout@v7
-
-      - uses: actions/setup-python@v6
-        with:
-          python-version: "3.13"
-
-      - name: Install reconciliation dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements_kalshi_settlement_trader.txt
-
-      - name: Write Kalshi RSA private key
-        env:
-          KALSHI_PRIVATE_KEY: ${{ secrets.KALSHI_PRIVATE_KEY }}
-        run: |
-          printf '%s\n' "$KALSHI_PRIVATE_KEY" > kalshi_private_key.pem
-          chmod 600 kalshi_private_key.pem
-
-      - name: Reconcile fills, settlements, and authenticated balance
-        env:
-          KALSHI_API_KEY_ID: ${{ secrets.KALSHI_PROD_API_KEY }}
-          KALSHI_PEM_PATH: kalshi_private_key.pem
-          KALSHI_DEMO: "false"
-        run: |
-          python -m bot.equity_regime reconcile \
-            --config kalshi_btc15m_average_down_config.json \
-            --trader-state kalshi_btc15m_average_down_state.json \
-            --regime-state data/kalshi_equity_regime_state.json \
-            --output-dir outputs/reconciliation \
-            --starting-balance "${{ inputs.starting_balance }}"
-
-      - name: Upload reconciliation evidence
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: kalshi-equity-regime-reconciliation-${{ github.run_id }}
-          path: |
-            outputs/reconciliation/
-            data/kalshi_equity_regime_state.json
-          if-no-files-found: warn
-          retention-days: 90
+      - run: |
+          echo "This Prophet/equity-regime reconciliation workflow is retired."
+          echo "Use Kalshi KXBTC15M Hybrid Live with reconcile_only=true instead."

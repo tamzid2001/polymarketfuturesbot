@@ -1,4 +1,4 @@
-name: EMERGENCY — Cancel Kalshi BTC 15m Resting Orders
+name: EMERGENCY — Cancel KXBTC15M Hybrid Resting Orders
 
 on:
   workflow_dispatch:
@@ -44,8 +44,8 @@ jobs:
           DRY_RUN: "false"
         run: |
           set -euo pipefail
-          python kalshi_btc15m_average_down.py \
-            --config kalshi_btc15m_average_down_config.json \
-            --state-file kalshi_btc15m_average_down_state.json \
-            --report kalshi_btc15m_average_down_report.json \
-            --cancel-all-resting-mechanical-orders
+          python kalshi_live_trader.py \
+            --config selected_live_strategy.json \
+            --state-file data/kalshi_live_strategy_state.json \
+            --audit-ledger data/kalshi_live_strategy_audit.jsonl \
+            --cancel-managed-entries

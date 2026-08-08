@@ -1,65 +1,73 @@
 # Trading Automation
 
-This repository contains a live Kalshi BTC 15-minute settlement-contrarian trader and a separate Polymarket portfolio system. Retired ML and paper-study material is preserved under [`archive/`](archive/README.md) and is not deployed.
+This repository contains a KXBTC15M hybrid Kalshi trader and a separate Polymarket portfolio system. Retired ML and paper-study material is preserved under [`archive/`](archive/README.md) and is not deployed.
 
 ## Kalshi BTC 15-minute trader
 
-[`kalshi_btc15m_average_down.py`](kalshi_btc15m_average_down.py) is the only active Kalshi execution path.
+[`kalshi_live_trader.py`](kalshi_live_trader.py) is the only active Kalshi execution path. It reuses the established signed Kalshi REST/WebSocket transport, but never invokes the legacy ladder, shadow-balance, loss-skip, Prophet, or equity-regime logic.
 
-- At a market open, it waits through the **penultimate minute** (up to 14 minutes) for the **immediately preceding** KXBTC15M market to finalize. It locks the opposite YES/NO side and submits the GTC ladder immediately when that result is available, with no fallback to an older result. A source that misses this causal window is recorded once as a terminal no-order skip.
-- It posts a single-side GTC ladder at 40¢ / 30¢ / 20¢ / 10¢, expiring at the market close. The default base is **3**, giving **3 / 6 / 9 / 12** contracts (30 total, $6 principal before fees).
-- Filled contracts hold to settlement. The only early exit is a reduce-only stop when the selected-side fresh full-depth bid is **≤5¢**. There is no ML signal, profit gate, or trailing stop in the live path.
-- After two consecutive realized losses on filled live trades, it still computes and records the normal next two signals, but sends no balance check or exchange orders for those two markets. It then resets and resumes. A realized win resets the loss count immediately.
-- Signal accuracy is reported separately from execution: every frozen settlement-contrarian side is scored against the target market's final YES/NO outcome, including zero-fill ladders and intentional loss-skip markets. Financial P&L, the realized-trade W/L, and the two-loss entry guard remain based only on contracts that actually filled.
+- It subscribes to the active/previous/upcoming exchange-provided KXBTC15M markets. In the final configurable observation window it freezes a provisional prior outcome only when the latest pre-boundary executable YES or NO bid is at least 99¢ and fresh. The next signal is the inverse side at the new market open. A missing, stale, or conflicting outcome fails closed; it never substitutes the market from two windows ago.
+- The default is a 50¢ post-only maker limit. A crossed maker order is never converted to a taker order, and an entry is refused if the selected-side ask is at or below the 40¢ stop. A no-fill changes neither recovery nor permanent-base state.
+- The permanent base starts at **1.00** and all quantities are two-decimal `Decimal` values. Filled trade P&L alone advances recovery and geometric permanent-base scaling through the shared [`strategy_core.py`](strategy_core.py) functions used by the historical replay.
+- A fresh executable bid at or below the configured 40¢ stop cancels remaining entries and sends reduce-only exits for the exchange-confirmed filled position only. Otherwise a filled position is reconciled through official settlement. Every completed trade records actual entry/exit fills, fees, and net P&L once.
+- [`selected_live_strategy.json`](selected_live_strategy.json) is the canonical persistent live configuration. The workflow writes configuration-input changes back to it. The optimizer can produce the same schema with `optimizer.py --entry-price .50`.
 
-### Dynamic base-share scaling
+The worker persists atomic durable state and append-only JSONL audit records under `data/`. It reconciles authenticated balance, open hybrid-prefixed orders, positions, fills, and settlement state before any new risk. Unknown ownership, stale/ambiguous state, position-direction mismatch, insufficient funding, stale quote, or a circuit breaker blocks entries. State and audit are separate for dry/shadow runs so observation mode cannot alter live recovery state.
 
-Dynamic scaling is enabled by default. Configure it from the **Kalshi BTC 15m Settlement Contrarian** Action with:
+Real money requires both the repository/environment variable `KALSHI_LIVE_ENABLED=true` and the workflow-dispatch `live_enabled=true` with `dry_run=false`. Scheduled jobs use the same repository variable and are dry by default when it is unset. Credentials are only `KALSHI_API_KEY_ID` and `KALSHI_PRIVATE_KEY` secrets; no credential values are persisted or logged.
 
-- `enable_dynamic_scaling`: `true` or `false` (default `true`)
-- `base_share_increment`: base shares added after a threshold, in 0.01-share increments (default `1`)
-- `scaling_profit_multiplier`: actual account profit required per current base share (default `16.5`)
+### Historical Kalshi hybrid backtest
 
-When enabled, the runner uses the configured `starting_balance` (default **$100**) as the fixed first baseline and the authenticated Kalshi account balance as the only equity source. For example, an actual balance of `$134.8222` reports `profit_since_increase=$+34.8222` and `$14.6778` remaining to the first `$49.5000` threshold. It never derives scaling profit from the local order ledger or from the shadow-equity curve. At:
+The research framework is a **historical settlement replay with Monte Carlo execution-path simulation**. It caches actual KXBTC15M settlement outcomes, reconstructs the causal 45-second settlement-contrarian signal, and never redraws a directional result. Because Kalshi's settlement history has no complete intramarket path, 49¢ maker fills, adverse rung depth, and stops are simulated.
 
-```text
-profit_since_baseline >= (starting_base + each promoted base through current_base) × scaling_profit_multiplier
+The observed 139/(139+318) and 209/(209+221) old-ladder rates calibrate the joint adverse **40¢-region** probability conditional on the actual settlement outcome. They do not identify a 49¢ maker-order fill rate. The optimizer therefore reports 49¢ participation as an explicit conservative/base/optimistic scenario; `reconstruction_compatible` is a clearly labelled full-participation comparison to the earlier reconstruction, not a factual historical-fill assertion.
+
+```bash
+python3.13 -m venv .venv
+.venv/bin/pip install -r requirements_kalshi_hybrid_backtest.txt
+.venv/bin/python kalshi_settlement_loader.py --refresh
+.venv/bin/python optimizer.py --output-dir outputs/kalshi_hybrid_backtest/base_case --execution-scenario base_case --entry-price .50
+# Optional like-for-like comparison to the older 1,500-market reconstruction:
+.venv/bin/python optimizer.py --output-dir outputs/kalshi_hybrid_backtest/base_case --execution-scenario base_case --reconciliation-simulations 50000
 ```
 
-It increases the base by `base_share_increment` once that cumulative threshold is reached. With a 3-share start, 1-share increments, and a $16.50 multiplier, the thresholds are `$100 + (3 × $16.50) = $149.50`, then `$100 + ((3 + 4) × $16.50) = $215.50`, then `$100 + ((3 + 4 + 5) × $16.50) = $298.00`. The configured `$100` starting balance remains fixed for the whole run: deposits, withdrawals, and other authenticated cash adjustments are retained for audit but never shift the scaling baseline or next threshold. The new **1/2/3/4** ladder is used only for later markets. Bases and rungs retain 0.01-share precision (for example, base `3.25` creates `3.25 / 6.50 / 9.75 / 13.00`). Existing GTC ladders retain their original size. Runner-owned contract and principal caps grow as needed; explicitly supplied caps are never overridden and will safely block an oversized full ladder rather than submit it partially.
-
-The live report and periodic `LIVE DYNAMIC BASE SCALING` log include the active base, profit balance, next threshold, increase count, and whether capacity is automatic or explicit. Settings are persisted across controlled GitHub Actions handoffs.
-
-### Live Prophet equity regime
-
-The live controller is enabled with live state transitions (`equity_regime_enabled=true`, `equity_regime_dry_run=false`). It retains the most recent 200 completed markets, refits Prophet for the next eligible market after every finalized balance observation, and applies a P90/P10 signal only to that next market.
-
-- It stops new real entries after a saved shadow-equity P90 observation and leaves already-filled positions to the existing 5¢ stop or settlement logic.
-- While stopped, it always creates a fixed settlement-contrarian shadow decision: **3/6/9/12** contracts at **40¢/30¢/20¢/10¢**. The shadow fill model uses only post-decision public trades and is explicitly a conservative approximation, not a queue-aware replay.
-- Dynamic base-share scaling applies only to the real, authenticated account balance. It can change a later live order, but it never changes the shadow ladder or rebases the shadow balance.
-- A P10 observation restarts real entry placement for the following eligible market. The controller persists its state, forecasts, shadow curve, and actual curve under `data/`; the workflow includes them in checkpoints and audit artifacts.
-
-The retained diagnostic horizon is exploratory sensitivity evidence, not an unbiased live-performance claim. Its P10–P90 interval coverage was poor in the strict 200-trade review, so the saved forecast and shadow-simulation records should be monitored rather than treated as a deployment guarantee.
+The loader writes `historical_signals.parquet`; the optimization directory contains calibration, grid, Pareto, walk-forward, stress, bankroll, regime, and plot artifacts. Simulated fills and stop events are explicitly hypothetical execution paths, not asserted historical events.
 
 ## Operations
 
 Use these active Actions:
 
-1. **Kalshi BTC 15m Settlement Contrarian** — continuous trader and configuration inputs.
-2. **Controlled Restart — Kalshi BTC 15m Settlement Contrarian** — safe runner replacement.
-3. **Kalshi BTC 15m Live Trader Watchdog** — recovery safety net.
+1. **Kalshi KXBTC15M Hybrid Live** — serialized continuous worker, with configuration inputs.
+2. **Controlled Restart — Kalshi KXBTC15M Hybrid** — queues a reconcile-only handoff.
+3. **Kalshi KXBTC15M Hybrid Live Watchdog** — recovery safety net.
 4. **Kalshi BTC 15m Position Audit (Read Only)** — position inspection without orders.
 
-Every live start runs [`tests/live/test_kalshi_btc15m_settlement_trader.py`](tests/live/test_kalshi_btc15m_settlement_trader.py) first. The runner checkpoints the configuration, trade state, compact report, loss-skip state, and dynamic-scaling state before handoff.
+Every worker starts with the shared-core, execution, reconciliation, and historical-replay unit suite. A manual dry run is:
+
+```bash
+KALSHI_API_KEY_ID=... KALSHI_PEM_PATH=kalshi_private_key.pem \
+  .venv/bin/python kalshi_live_trader.py --config selected_live_strategy.json \
+  --state-file data/kalshi_shadow_strategy_state.json \
+  --audit-ledger data/kalshi_shadow_strategy_audit.jsonl --dry-run --run-seconds 120
+```
+
+Reconciliation only is:
+
+```bash
+KALSHI_API_KEY_ID=... KALSHI_PEM_PATH=kalshi_private_key.pem \
+  .venv/bin/python kalshi_live_trader.py --config selected_live_strategy.json --reconcile-only
+```
 
 ## Layout
 
 ```text
 .github/workflows/   active workflows
 archive/             retired code and research
-tests/live/          live-trader safety checks
-kalshi_btc15m_average_down.py
-kalshi_btc15m_average_down_{config,state,report}.json
+tests/               hybrid live/backtest safety checks
+kalshi_live_trader.py
+strategy_core.py
+selected_live_strategy.json
+data/kalshi_{live,shadow}_strategy_{state,audit}.json*
 kalshi_btc15m_position_audit.py
 polymarket_bot.py
 ```

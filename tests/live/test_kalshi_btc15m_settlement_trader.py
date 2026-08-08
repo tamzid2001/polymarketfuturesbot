@@ -30,15 +30,23 @@ class SettlementTraderTests(unittest.IsolatedAsyncioTestCase):
     def test_default_three_share_ladder_and_reserve(self) -> None:
         config = trader.validate_config({})
         self.assertTrue(config["enable_dynamic_scaling"])
-        self.assertEqual(config["prophet_refit_every_markets"], 1)
+        self.assertFalse(config["equity_regime_enabled"])
+        self.assertFalse(config["prophet_enabled"])
         self.assertEqual(trader.live_rung_quantities(config), {0.40: 3.0, 0.30: 6.0, 0.20: 9.0, 0.10: 12.0})
         self.assertEqual(config["max_contracts_per_market"], 30.0)
         self.assertEqual(config["max_total_capital"], 6.0)
         self.assertEqual(trader.ladder_principal_for_rungs(trader.live_rung_quantities(config)), 6.0)
 
-    def test_live_config_cannot_restore_a_multi_market_prophet_refit_cadence(self) -> None:
-        config = trader.validate_config({"prophet_refit_every_markets": 75})
-        self.assertEqual(config["prophet_refit_every_markets"], 1)
+    def test_live_config_cannot_restore_prophet_forecasts(self) -> None:
+        config = trader.validate_config({
+            "equity_regime_enabled": True,
+            "equity_regime_dry_run": False,
+            "prophet_enabled": True,
+            "prophet_refit_every_markets": 75,
+        })
+        self.assertFalse(config["equity_regime_enabled"])
+        self.assertTrue(config["equity_regime_dry_run"])
+        self.assertFalse(config["prophet_enabled"])
 
     def test_equity_regime_shadow_decision_always_uses_the_fixed_3_6_9_12_ladder(self) -> None:
         config = trader.validate_config({
@@ -676,7 +684,7 @@ class SettlementTraderTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(SystemExit):
                 parser.parse_args(["--live-inverse-ml-hold-gate", "0.60"])
 
-    def test_two_completed_losses_skip_next_two_normal_signals(self) -> None:
+    def test_completed_losses_never_arm_a_retired_skip(self) -> None:
         config = trader.validate_config({})
         state = {"markets": {}}
         base = 1_700_000_000
@@ -685,35 +693,22 @@ class SettlementTraderTests(unittest.IsolatedAsyncioTestCase):
             "KXBTC15M-loss-1", base + 1, -0.40,
         )
         trader.refresh_entry_loss_skip(state, config, now_epoch=base + 2)
-        self.assertEqual(state["entry_loss_skip"]["consecutive_completed_losses"], 1)
+        self.assertEqual(state["entry_loss_skip"]["consecutive_completed_losses"], 0)
         state["markets"]["KXBTC15M-loss-2"] = self.completed_live_record(
             "KXBTC15M-loss-2", base + 3, -0.30,
         )
         trader.refresh_entry_loss_skip(state, config, now_epoch=base + 4)
-        self.assertEqual(state["entry_loss_skip"]["markets_remaining_to_skip"], 2)
+        self.assertEqual(state["entry_loss_skip"]["markets_remaining_to_skip"], 0)
 
         skipped_one = {
             "ticker": "KXBTC15M-skip-1", "status": "watching", "orders": {},
             "settlement_contrarian_signal": {"side": "yes", "source_ticker": "KXBTC15M-loss-2"},
         }
-        self.assertTrue(trader.consume_entry_loss_skip(state, skipped_one, "yes", config))
-        self.assertEqual(skipped_one["status"], "entry_skipped_loss_circuit_breaker")
-        self.assertEqual(skipped_one["candidate_side"], "yes")
-        self.assertEqual(skipped_one["settlement_contrarian_signal"]["side"], "yes")
-        self.assertEqual(skipped_one["orders"], {})
-        self.assertEqual(state["entry_loss_skip"]["markets_remaining_to_skip"], 1)
-
-        skipped_two = {"ticker": "KXBTC15M-skip-2", "status": "watching", "orders": {}}
-        self.assertTrue(trader.consume_entry_loss_skip(state, skipped_two, "no", config))
-        self.assertEqual(skipped_two["status"], "entry_skipped_loss_circuit_breaker")
+        self.assertFalse(trader.consume_entry_loss_skip(state, skipped_one, "yes", config))
+        self.assertEqual(skipped_one["status"], "watching")
         self.assertEqual(state["entry_loss_skip"]["markets_remaining_to_skip"], 0)
-        self.assertEqual(state["entry_loss_skip"]["consecutive_completed_losses"], 0)
 
-        next_normal_signal = {"ticker": "KXBTC15M-resume", "status": "watching", "orders": {}}
-        self.assertFalse(trader.consume_entry_loss_skip(state, next_normal_signal, "yes", config))
-        self.assertEqual(next_normal_signal["status"], "watching")
-
-    def test_completed_win_immediately_clears_pending_skips(self) -> None:
+    def test_stale_pending_skip_is_cleared_by_retirement(self) -> None:
         config = trader.validate_config({})
         base = 1_700_000_100
         state = {
@@ -732,9 +727,9 @@ class SettlementTraderTests(unittest.IsolatedAsyncioTestCase):
         trader.refresh_entry_loss_skip(state, config, now_epoch=base + 2)
         self.assertEqual(state["entry_loss_skip"]["consecutive_completed_losses"], 0)
         self.assertEqual(state["entry_loss_skip"]["markets_remaining_to_skip"], 0)
-        self.assertEqual(state["entry_loss_skip"]["last_reset_reason"], "completed_winning_trade")
+        self.assertEqual(state["entry_loss_skip"]["last_reset_reason"], "retired_loss_skip_policy")
 
-    def test_completed_loss_while_skip_is_pending_does_not_extend_two_market_skip(self) -> None:
+    def test_stale_skip_counters_are_cleared(self) -> None:
         config = trader.validate_config({})
         base = 1_700_000_150
         state = {
@@ -751,8 +746,8 @@ class SettlementTraderTests(unittest.IsolatedAsyncioTestCase):
             },
         }
         trader.refresh_entry_loss_skip(state, config, now_epoch=base + 2)
-        self.assertEqual(state["entry_loss_skip"]["markets_remaining_to_skip"], 1)
-        self.assertEqual(state["entry_loss_skip"]["consecutive_completed_losses"], 2)
+        self.assertEqual(state["entry_loss_skip"]["markets_remaining_to_skip"], 0)
+        self.assertEqual(state["entry_loss_skip"]["consecutive_completed_losses"], 0)
 
     def test_zero_fill_or_dry_run_records_never_count_as_completed_losses(self) -> None:
         config = trader.validate_config({})
@@ -856,11 +851,7 @@ class SettlementTraderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(record["directional_signal"]["prediction"], "yes")
         self.assertTrue(record["directional_signal"]["correct"])
 
-    async def test_loss_skip_blocks_the_actual_order_path_after_normal_signal(self) -> None:
-        class Rest:
-            async def balance_dollars(self):
-                raise AssertionError("a skipped signal must not check balance or submit an order")
-
+    async def test_loss_skip_never_blocks_an_actual_order_path(self) -> None:
         config = trader.validate_config({})
         ticker = "KXBTC15M-skip-order-path"
         now = time.time()
@@ -879,14 +870,10 @@ class SettlementTraderTests(unittest.IsolatedAsyncioTestCase):
                 "markets_remaining_to_skip": 2,
             },
         }
-        market = {"ticker": ticker, "status": "active", "open_time": now - 1, "close_time": now + 300}
-        submitted = await trader.consider_initial_entry(
-            Rest(), state, market, config, dry_run=False, ml_side="no", signal_source="settlement_contrarian",
-        )
+        submitted = trader.consume_entry_loss_skip(state, state["markets"][ticker], "no", config)
         self.assertFalse(submitted)
         record = state["markets"][ticker]
-        self.assertEqual(record["status"], "entry_skipped_loss_circuit_breaker")
-        self.assertEqual(record["locked_side"], "no")
+        self.assertEqual(record["status"], "watching")
         self.assertEqual(record["orders"], {})
 
 

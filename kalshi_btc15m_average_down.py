@@ -69,7 +69,7 @@ except ImportError:  # pragma: no cover - exercised only in minimal local enviro
 LOG = logging.getLogger("kalshi_btc15m_average_down")
 SERIES_TICKER = "KXBTC15M"
 LADDER_LEVELS = (0.40, 0.30, 0.20, 0.10)
-CONFIG_VERSION = 19
+CONFIG_VERSION = 20
 STATE_VERSION = 9
 ORDER_NAMESPACE = uuid.UUID("4d85857e-4dc6-43ec-960f-0b342523bdb7")
 BOT_CLIENT_ORDER_PREFIX = DEFAULT_CLIENT_ORDER_PREFIX
@@ -139,33 +139,31 @@ DEFAULT_CONFIG = {
     "live_absolute_stop_price": 0.05,
     "live_quote_max_age_seconds": 3.0,
     "settlement_contrarian_entry_grace_seconds": SETTLEMENT_CONTRARIAN_ENTRY_GRACE_SECONDS,
-    # Realized-trade circuit breaker. These are intentionally fixed by the
-    # live policy rather than exposed as workflow inputs: two completed losses
-    # skip the next two causally generated market signals. A completed winner
-    # clears the loss count immediately.
-    "live_consecutive_loss_limit": 2,
-    "live_markets_to_skip_after_loss_limit": 2,
+    # Retained only to migrate prior state. Every eligible current market is
+    # traded; the retired two-loss skip may never suppress a signal or order.
+    "live_consecutive_loss_limit": 0,
+    "live_markets_to_skip_after_loss_limit": 0,
     "status_log_seconds": 60.0,
-    # The P10/P90 controller acts only after its absolute balance history is
-    # reconciled.  Its 200-row lookback preserves balance values unchanged.
-    "equity_regime_enabled": True,
-    "equity_regime_dry_run": False,
+    # Prophet equity forecasts are retired from the live execution path.  The
+    # settlement-contrarian signal is the only live direction source and no
+    # persisted configuration or Action input may restore the former gate.
+    "equity_regime_enabled": False,
+    "equity_regime_dry_run": True,
     "allow_live_state_transitions": True,
     "subaccount": 0,
     "starting_balance": "100.00",
     "history_start_ts": None,
     "history_end_ts": None,
     "history_max_markets": 200,
-    # Match the supplied Colab notebook: the Prophet curve is based on all
-    # closed KXBTC15M account markets, including manual activity, rather than
-    # bot-ownership attribution.
+    # Retained only so historical state files can be read and stripped during
+    # migration.  The active runner never constructs a Prophet controller.
     "prophet_history_source": "account_series",
     "prophet_reference_closed_positions_path": "data/closed-positions-2026-07-27.csv",
     "allow_endpoint_anchored_ledger_bootstrap": True,
     "accounting_tolerance": "0.01",
     "bot_client_order_prefix": BOT_CLIENT_ORDER_PREFIX,
     "bot_order_group_id": None,
-    "prophet_enabled": True,
+    "prophet_enabled": False,
     "prophet_min_history": 200,
     "prophet_training_window": 201,
     # The live P10/P90 gate must use a fit that includes the most recently
@@ -731,19 +729,20 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
     # A deployment may not select its source dynamically. This prevents an
     # inherited Action input from restoring a retired model/gate strategy.
     merged["live_execution_strategy"] = LIVE_EXECUTION_STRATEGY
-    # This risk circuit breaker is a fixed live safeguard. Do not let an old
-    # persisted config or an Action input silently change its two-loss /
-    # two-market behavior.
-    merged["live_consecutive_loss_limit"] = 2
-    merged["live_markets_to_skip_after_loss_limit"] = 2
+    # Every eligible market receives its settlement-contrarian signal.  A
+    # persisted two-loss skip state is observational legacy data only.
+    merged["live_consecutive_loss_limit"] = 0
+    merged["live_markets_to_skip_after_loss_limit"] = 0
     # The source must be the immediately preceding finalized market, but it
     # may arrive at any time in this post-open submission window.  This fixed
     # value prevents old state or Action inputs from silently shortening it.
     merged["settlement_contrarian_entry_grace_seconds"] = SETTLEMENT_CONTRARIAN_ENTRY_GRACE_SECONDS
-    # A prediction can only control the next live entry after it incorporates
-    # the prior finalized balance observation.  Keep the old config key for
-    # state-file compatibility, but do not allow a workflow or saved config to
-    # restore the former multi-market refit cadence.
+    # Fail closed against persisted Action inputs/configuration that predate
+    # the retirement of live Prophet forecasts.  This runner must never
+    # construct the equity-regime controller or emit a new forecast.
+    merged["equity_regime_enabled"] = False
+    merged["equity_regime_dry_run"] = True
+    merged["prophet_enabled"] = False
     merged["prophet_refit_every_markets"] = 1
     for name in ("enable_dynamic_scaling", "max_contracts_per_market_auto", "max_total_capital_auto"):
         value = as_bool(merged.get(name))
@@ -785,10 +784,8 @@ def apply_config_overrides(config: dict[str, Any], args: argparse.Namespace) -> 
         "max_total_capital", "fee_reserve", "poll_seconds", "market_refresh_seconds",
         "order_reconcile_seconds", "watch_start_grace_seconds", "status_log_seconds",
         "enable_dynamic_scaling", "base_share_increment", "scaling_profit_multiplier",
-        "equity_regime_enabled", "equity_regime_dry_run", "allow_live_state_transitions",
-        "subaccount", "starting_balance", "history_max_markets", "history_start_ts", "history_end_ts",
-        "accounting_tolerance", "prophet_min_history", "prophet_training_window",
-        "prophet_refit_every_markets", "shadow_fill_model",
+        "allow_live_state_transitions", "subaccount", "starting_balance", "history_max_markets",
+        "history_start_ts", "history_end_ts", "accounting_tolerance", "shadow_fill_model",
     )
     changed = False
     updated = dict(config)
@@ -1844,13 +1841,14 @@ class KalshiREST:
     async def create_order(
         self, *, ticker: str, side: str, position_price: float, quantity: float,
         tif: str, expiration_time: int | None, dry_run: bool, order_key: str,
+        post_only: bool = False, client_order_id_override: str | None = None,
     ) -> dict[str, Any]:
         # Never silently round an invalid caller quantity at the live API
         # boundary. Every entry order must preserve the same cent precision
         # used for dynamic base sizing, ledger accounting, and cap checks.
         quantity = share_quantity(quantity, "entry order quantity")
         record = {
-            "client_order_id": client_order_id(ticker, side, order_key),
+            "client_order_id": client_order_id_override or client_order_id(ticker, side, order_key),
             "ticker": ticker,
             "side": side,
             "order_type": "ioc_protected" if tif == "immediate_or_cancel" else "limit",
@@ -1859,6 +1857,7 @@ class KalshiREST:
             "expected_outcome_side": side,
             "quantity": round(quantity, 2),
             "time_in_force": tif,
+            "post_only": post_only,
             "submitted_at": now_iso(),
             "status": "dry_run" if dry_run else "submitting",
             "fill_count": 0.0,
@@ -1882,6 +1881,7 @@ class KalshiREST:
             "client_order_id": record["client_order_id"],
             "self_trade_prevention_type": SelfTradePreventionType.TAKER_AT_CROSS,
             "reduce_only": False,
+            "post_only": post_only,
         }
         if expiration_time is not None:
             kwargs["expiration_time"] = int(expiration_time)
@@ -1929,7 +1929,7 @@ class KalshiREST:
 
     async def create_reduce_only_exit(
         self, *, ticker: str, held_side: str, economic_exit_price: float, quantity: float,
-        dry_run: bool, order_key: str,
+        dry_run: bool, order_key: str, client_order_id_override: str | None = None,
     ) -> dict[str, Any]:
         """Close an existing YES/NO position with a marketable, reduce-only IOC.
 
@@ -1946,7 +1946,7 @@ class KalshiREST:
         api_price = economic_exit_price if held_side == "yes" else 1.0 - economic_exit_price
         book_side = BookSide.ASK if held_side == "yes" else BookSide.BID
         record = {
-            "client_order_id": client_order_id(ticker, f"reduce-{held_side}", order_key),
+            "client_order_id": client_order_id_override or client_order_id(ticker, f"reduce-{held_side}", order_key),
             "ticker": ticker,
             "side": held_side,
             "held_side": held_side,
@@ -2753,8 +2753,16 @@ def refresh_entry_loss_skip(
     trades leave the current count unchanged.
     """
     now_epoch = time.time() if now_epoch is None else float(now_epoch)
-    control = _initialize_entry_loss_skip_from_live_ledger(state, config, now_epoch)
     limit = int(config["live_consecutive_loss_limit"])
+    if limit <= 0 or int(config["live_markets_to_skip_after_loss_limit"]) <= 0:
+        # Migration is explicit: old loss-skip counters remain auditable but
+        # can never defer a current eligible market.
+        control = _entry_loss_skip_control(state)
+        control["initialized"] = True
+        control.setdefault("initialized_at", datetime.fromtimestamp(now_epoch, tz=timezone.utc).isoformat())
+        _clear_entry_loss_skip(control, "retired_loss_skip_policy", now_epoch)
+        return control
+    control = _initialize_entry_loss_skip_from_live_ledger(state, config, now_epoch)
     cursor = _entry_loss_skip_cursor(control)
     for key, record in live_completed_trade_records(state):
         if cursor is not None and key <= cursor:
@@ -2863,6 +2871,7 @@ def entry_loss_skip_snapshot(state: dict[str, Any], config: dict[str, Any]) -> d
         "last_completed_trade": control.get("last_completed_trade"),
         "last_reset_at": control.get("last_reset_at"),
         "last_reset_reason": control.get("last_reset_reason"),
+        "retired": int(config["live_consecutive_loss_limit"]) <= 0,
     }
 
 
@@ -2889,7 +2898,7 @@ def start_market_watcher(state: dict[str, Any], market: Any, config: dict[str, A
         "watch_started_at": now_iso(),
     })
     LOG.info(
-        "WATCH STARTED | %s awaiting the immediately preceding KXBTC15M finalization; it will lock the opposite side and post the persistent 1/2/3/4 GTC ladder as soon as that result is available, up to %.0fs after open, unless the two-loss entry skip is pending.",
+        "WATCH STARTED | %s awaiting the immediately preceding KXBTC15M finalization; it will lock the opposite side and post the persistent 1/2/3/4 GTC ladder as soon as that result is available, up to %.0fs after open.",
         ticker, entry_start_grace_seconds(config),
     )
     return record

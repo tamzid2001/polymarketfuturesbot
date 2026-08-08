@@ -1,240 +1,225 @@
-name: Kalshi BTC 15m Settlement Contrarian
+name: Kalshi KXBTC15M Hybrid Live
 
-# Make the operating mode visible to the recovery watchdog.  Scheduled runs
-# are always live; a manual run is live only when its explicit input is true.
+# The schedule only keeps a worker available.  The Python worker maintains the
+# WebSocket and reacts to Kalshi's market timestamps at each boundary; it does
+# not assume a cron invocation occurred at exactly a 15-minute open.
 run-name: >-
-  Kalshi BTC 15m Settlement Contrarian —
-  ${{ (github.event_name == 'schedule' || inputs.live_trading == true) && 'LIVE' || 'RECONCILIATION' }}
+  Kalshi KXBTC15M Hybrid —
+  ${{ ((github.event_name == 'schedule' && vars.KALSHI_LIVE_ENABLED == 'true') || (github.event_name == 'workflow_dispatch' && inputs.live_enabled && !inputs.dry_run && vars.KALSHI_LIVE_ENABLED == 'true')) && 'LIVE' || 'DRY_RUN' }}
 
-# Each run owns the trader for 5h25m, checkpoints durable state, and queues
-# the next run. The 35-minute margin keeps persistence and handoff inside the
-# GitHub-hosted six-hour maximum instead of relying on a SIGTERM at the edge.
 on:
   schedule:
-    - cron: "11 */6 * * *"
+    - cron: "*/5 * * * *"
   workflow_dispatch:
     inputs:
-      live_trading:
-        description: "Submit real settlement-contrarian orders. Defaults to false while balance reconciliation is pending."
+      live_enabled:
+        description: "Permit real orders only when repository variable KALSHI_LIVE_ENABLED is also true."
         required: true
         type: boolean
         default: false
-      initial_position_size:
-        description: "Persistent ladder share multiplier. 3 means 3×40c, 6×30c, 9×20c, and 12×10c. Blank keeps the saved value."
+      dry_run:
+        description: "Shadow/dry-run mode. Must be turned off as well as enabling live mode to submit orders."
+        required: true
+        type: boolean
+        default: true
+      reconcile_only:
+        description: "Authenticate and reconcile orders/positions only; never create an entry."
+        required: true
+        type: boolean
+        default: false
+      reset_state:
+        description: "Replace idle local state only after authoritative exchange checks find no KXBTC15M risk."
+        required: true
+        type: boolean
+        default: false
+      entry_price:
+        description: "Post-only maker entry price, e.g. 0.50. Blank keeps persisted configuration."
         required: false
         type: string
         default: ""
-      max_active_markets:
-        description: "Blank keeps the saved value."
+      stop_price:
+        description: "Fixed executable stop, e.g. 0.40. Blank keeps persisted configuration."
         required: false
         type: string
         default: ""
-      max_contracts_per_market:
-        description: "Optional explicit total cap. Blank auto-scales with the 1/2/3/4 ladder."
+      recovery_multiplier:
+        description: "Decimal recovery multiplier. Blank keeps persisted configuration."
         required: false
         type: string
         default: ""
-      max_total_capital:
-        description: "Optional explicit principal cap. Blank auto-scales with the 1/2/3/4 ladder."
+      first_base_threshold:
+        description: "First realized-profit base-scale threshold. Blank keeps persisted configuration."
         required: false
         type: string
         default: ""
-      enable_dynamic_scaling:
-        description: "Enable dynamic base share scaling from Kalshi's authenticated real account balance only."
+      threshold_growth_multiplier:
+        description: "Geometric threshold multiplier. Blank keeps persisted configuration."
         required: false
         type: string
         default: ""
-      base_share_increment:
-        description: "Base shares to add after a scaling threshold (minimum precision 0.01)."
+      base_increment:
+        description: "Permanent-base increment (0.25, 0.50, or 1.00). Blank keeps persisted configuration."
         required: false
         type: string
         default: ""
-      scaling_profit_multiplier:
-        description: "Authenticated account-balance gain required per current base share before scaling."
+      max_position:
+        description: "Maximum two-decimal contract quantity. Blank keeps persisted configuration."
         required: false
         type: string
         default: ""
-      equity_regime_enabled:
-        description: "Enable the persistent Prophet P10/P90 equity-regime controller."
+      entry_timeout_seconds:
+        description: "Resting entry lifetime. Blank keeps persisted configuration."
         required: false
         type: string
         default: ""
-      equity_regime_dry_run:
-        description: "Run the P10/P90 gate in observation-only mode. False enables state-based entry suppression after successful absolute-balance reconciliation."
+      entry_lateness_seconds:
+        description: "Maximum age after exchange open to submit a new entry. Blank keeps persisted configuration."
         required: false
         type: string
         default: ""
-      prophet_min_history:
-        description: "Completed shadow markets required before one-step Prophet forecasts."
+      outcome_observation_seconds:
+        description: "Final-quote buffer duration for the provisional previous outcome."
         required: false
         type: string
         default: ""
-      prophet_refit_every_markets:
-        description: "Deprecated compatibility input; live Prophet always refits after each finalized balance observation."
+      provisional_outcome_threshold:
+        description: "Executable bid threshold used for immediate outcome inference, e.g. 0.99."
         required: false
         type: string
         default: ""
-      shadow_fill_model:
-        description: "Off-state shadow fill assumption. Trade-through is conservative but remains an approximation."
-        required: false
-        type: string
-        default: ""
-      starting_balance:
-        description: "Configured starting trading balance; never replaced by current account balance."
+      starting_shadow_balance:
+        description: "Initial isolated shadow-account balance. Blank keeps the persisted value."
         required: false
         type: string
         default: ""
       run_seconds:
-        description: "Bounded runtime for a manual diagnostic. Default keeps the normal five-hour handoff."
+        description: "Bounded worker duration; default leaves a handoff margin below GitHub's six-hour job limit."
         required: false
-        type: number
-        default: 19500
-      emergency_handoff:
-        description: "Use only after confirming the singleton's trading loop has stopped; starts a short recovery handoff outside a stuck cleanup queue."
-        required: false
-        type: boolean
-        default: false
+        type: string
+        default: "20700"
 
+# Serialized runs are intentional.  Cancel-in-progress is false because a new
+# worker must never kill another worker mid-order; the next scheduled wakeup
+# waits and begins by exchange reconciliation.
 concurrency:
-  # The explicit emergency lane is for recovering from a cancelled runner
-  # whose cleanup cannot release the normal singleton. It is never selected
-  # by scheduled or ordinary handoff runs.
-  group: kalshi-btc15m-average-down-${{ inputs.emergency_handoff && 'emergency' || 'singleton' }}
+  group: kalshi-kxbtc15m-live
   cancel-in-progress: false
 
 permissions:
   contents: write
-  actions: write
 
 jobs:
   trade:
     runs-on: ubuntu-latest
-    environment: "Kalshi"
+    environment: Kalshi
     timeout-minutes: 360
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v7
+      - uses: actions/checkout@v7
 
-      - name: Refuse a stale queued runner
-        run: |
-          set -euo pipefail
-          # A scheduled run can wait behind the five-hour singleton.  If an
-          # operator cancels that singleton for a hotfix, the queued run must
-          # not wake up with its old source and stale durable state.  Failing
-          # before credentials are configured prevents it from trading or
-          # publishing a historical checkpoint over main.
-          git fetch --depth=1 origin main
-          checked_out_sha="$(git rev-parse HEAD)"
-          current_main_sha="$(git rev-parse origin/main)"
-          if [ "$checked_out_sha" != "$current_main_sha" ]; then
-            echo "::error::Refusing stale queued runner: checked_out=$checked_out_sha current_main=$current_main_sha"
-            exit 1
-          fi
-          echo "RUNNER SOURCE VERIFIED | sha=$checked_out_sha"
-
-      - name: Set up Python
-        uses: actions/setup-python@v6
+      - uses: actions/setup-python@v6
         with:
-          # kalshi-python-async >=3.22 and Prophet 1.3 both require Python
-          # 3.13 or newer.  Keep the live runner on the same supported
-          # interpreter as the read-only position audit.
           python-version: "3.13"
 
-      - name: Install settlement trader dependencies
+      - name: Install production dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements_kalshi_settlement_trader.txt
 
-      - name: Verify settlement trader
+      - name: Verify shared live strategy engine
         run: |
-          python -m py_compile kalshi_btc15m_average_down.py bot/equity_regime.py
-          PYTHONPATH=. python tests/live/test_kalshi_btc15m_settlement_trader.py
-          PYTHONPATH=. python test_equity_regime.py
+          set -euo pipefail
+          python -m py_compile strategy_core.py live_state.py audit_ledger.py kalshi_live_trader.py optimizer.py
+          PYTHONPATH=. python -m unittest -v \
+            tests.test_strategy_core \
+            tests.test_live_execution \
+            tests.test_reconciliation \
+            tests.test_recovery_sizing \
+            tests.test_execution_path_model \
+            tests.test_historical_replay
 
       - name: Write Kalshi RSA private key
         env:
           KALSHI_PRIVATE_KEY: ${{ secrets.KALSHI_PRIVATE_KEY }}
         run: |
+          set -euo pipefail
+          umask 077
           printf '%s\n' "$KALSHI_PRIVATE_KEY" > kalshi_private_key.pem
-          chmod 600 kalshi_private_key.pem
 
-      - name: Configure durable state checkpoint identity
+      - name: Configure durable-state publisher
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      - name: Run settlement-contrarian BTC 15-minute loop
+      - name: Run KXBTC15M hybrid worker
         env:
           KALSHI_API_KEY_ID: ${{ secrets.KALSHI_PROD_API_KEY }}
           KALSHI_PEM_PATH: kalshi_private_key.pem
           KALSHI_DEMO: "false"
+          KALSHI_LIVE_ENABLED: ${{ vars.KALSHI_LIVE_ENABLED || 'false' }}
           KALSHI_CHECKPOINT_PUBLISH: "true"
-          GITHUB_TOKEN: ${{ github.token }}
-          LIVE_TRADING: ${{ github.event_name == 'schedule' || inputs.live_trading == true }}
-          INITIAL_POSITION_SIZE: ${{ inputs.initial_position_size }}
-          MAX_ACTIVE_MARKETS: ${{ inputs.max_active_markets }}
-          MAX_CONTRACTS_PER_MARKET: ${{ inputs.max_contracts_per_market }}
-          MAX_TOTAL_CAPITAL: ${{ inputs.max_total_capital }}
-          ENABLE_DYNAMIC_SCALING: ${{ inputs.enable_dynamic_scaling }}
-          BASE_SHARE_INCREMENT: ${{ inputs.base_share_increment }}
-          SCALING_PROFIT_MULTIPLIER: ${{ inputs.scaling_profit_multiplier }}
-          EQUITY_REGIME_ENABLED: ${{ inputs.equity_regime_enabled }}
-          EQUITY_REGIME_DRY_RUN: ${{ inputs.equity_regime_dry_run }}
-          PROPHET_MIN_HISTORY: ${{ inputs.prophet_min_history }}
-          PROPHET_REFIT_EVERY_MARKETS: ${{ inputs.prophet_refit_every_markets }}
-          SHADOW_FILL_MODEL: ${{ inputs.shadow_fill_model }}
-          STARTING_BALANCE: ${{ inputs.starting_balance }}
-          RUN_SECONDS: ${{ inputs.run_seconds || 19500 }}
+          RUN_SECONDS: ${{ inputs.run_seconds || '20700' }}
+          REQUESTED_LIVE: ${{ github.event_name == 'schedule' && vars.KALSHI_LIVE_ENABLED == 'true' || github.event_name == 'workflow_dispatch' && inputs.live_enabled && !inputs.dry_run && vars.KALSHI_LIVE_ENABLED == 'true' }}
+          RECONCILE_ONLY: ${{ inputs.reconcile_only || false }}
+          RESET_STATE: ${{ inputs.reset_state || false }}
+          ENTRY_PRICE: ${{ inputs.entry_price || '' }}
+          STOP_PRICE: ${{ inputs.stop_price || '' }}
+          RECOVERY_MULTIPLIER: ${{ inputs.recovery_multiplier || '' }}
+          FIRST_BASE_THRESHOLD: ${{ inputs.first_base_threshold || '' }}
+          THRESHOLD_GROWTH_MULTIPLIER: ${{ inputs.threshold_growth_multiplier || '' }}
+          BASE_INCREMENT: ${{ inputs.base_increment || '' }}
+          MAX_POSITION: ${{ inputs.max_position || '' }}
+          ENTRY_TIMEOUT_SECONDS: ${{ inputs.entry_timeout_seconds || '' }}
+          ENTRY_LATENESS_SECONDS: ${{ inputs.entry_lateness_seconds || '' }}
+          OUTCOME_OBSERVATION_SECONDS: ${{ inputs.outcome_observation_seconds || '' }}
+          PROVISIONAL_OUTCOME_THRESHOLD: ${{ inputs.provisional_outcome_threshold || '' }}
+          STARTING_SHADOW_BALANCE: ${{ inputs.starting_shadow_balance || '' }}
         run: |
           set -euo pipefail
-          args=(--config kalshi_btc15m_average_down_config.json
-                --state-file kalshi_btc15m_average_down_state.json
-                --report kalshi_btc15m_average_down_report.json
-                --persist-config --run-seconds "$RUN_SECONDS")
-          [ -z "$INITIAL_POSITION_SIZE" ] || args+=(--initial-position-size "$INITIAL_POSITION_SIZE")
-          [ -z "$MAX_ACTIVE_MARKETS" ] || args+=(--max-active-markets "$MAX_ACTIVE_MARKETS")
-          [ -z "$MAX_CONTRACTS_PER_MARKET" ] || args+=(--max-contracts-per-market "$MAX_CONTRACTS_PER_MARKET")
-          [ -z "$MAX_TOTAL_CAPITAL" ] || args+=(--max-total-capital "$MAX_TOTAL_CAPITAL")
-          [ -z "$ENABLE_DYNAMIC_SCALING" ] || args+=(--enable-dynamic-scaling "$ENABLE_DYNAMIC_SCALING")
-          [ -z "$BASE_SHARE_INCREMENT" ] || args+=(--base-share-increment "$BASE_SHARE_INCREMENT")
-          [ -z "$SCALING_PROFIT_MULTIPLIER" ] || args+=(--scaling-profit-multiplier "$SCALING_PROFIT_MULTIPLIER")
-          if [ -n "$EQUITY_REGIME_ENABLED" ]; then
-            [ "$EQUITY_REGIME_ENABLED" = "true" ] && args+=(--equity-regime-enabled) || args+=(--no-equity-regime-enabled)
-          fi
-          if [ -n "$EQUITY_REGIME_DRY_RUN" ]; then
-            [ "$EQUITY_REGIME_DRY_RUN" = "true" ] && args+=(--equity-regime-dry-run) || args+=(--no-equity-regime-dry-run)
-          fi
-          [ -z "$PROPHET_MIN_HISTORY" ] || args+=(--prophet-min-history "$PROPHET_MIN_HISTORY")
-          # Accepted only so a still-running prior workflow can hand off.
-          # validate_config pins the live cadence to one regardless of value.
-          [ -z "$PROPHET_REFIT_EVERY_MARKETS" ] || args+=(--prophet-refit-every-markets "$PROPHET_REFIT_EVERY_MARKETS")
-          [ -z "$SHADOW_FILL_MODEL" ] || args+=(--shadow-fill-model "$SHADOW_FILL_MODEL")
-          [ -z "$STARTING_BALANCE" ] || args+=(--starting-balance "$STARTING_BALANCE")
-          if [ "$LIVE_TRADING" = "true" ]; then
-            DRY_RUN=false python kalshi_btc15m_average_down.py "${args[@]}" --submit --allow-live
+          # Shadow runs have a fully separate ledger/state.  Reconciliation
+          # intentionally reads the live state but still cannot submit an
+          # entry because the Python worker receives --reconcile-only.
+          if [ "$REQUESTED_LIVE" = "true" ] || [ "$RECONCILE_ONLY" = "true" ]; then
+            state_file=data/kalshi_live_strategy_state.json
+            audit_file=data/kalshi_live_strategy_audit.jsonl
           else
-            DRY_RUN=true python kalshi_btc15m_average_down.py "${args[@]}"
+            state_file=data/kalshi_shadow_strategy_state.json
+            audit_file=data/kalshi_shadow_strategy_audit.jsonl
+          fi
+          args=(--config selected_live_strategy.json
+                --state-file "$state_file"
+                --audit-ledger "$audit_file"
+                --persist-config --run-seconds "$RUN_SECONDS")
+          [ "$RECONCILE_ONLY" = "true" ] && args+=(--reconcile-only)
+          [ "$RESET_STATE" = "true" ] && args+=(--reset-state)
+          [ -z "$ENTRY_PRICE" ] || args+=(--entry-price "$ENTRY_PRICE")
+          [ -z "$STOP_PRICE" ] || args+=(--stop-price "$STOP_PRICE")
+          [ -z "$RECOVERY_MULTIPLIER" ] || args+=(--recovery-multiplier "$RECOVERY_MULTIPLIER")
+          [ -z "$FIRST_BASE_THRESHOLD" ] || args+=(--first-base-threshold "$FIRST_BASE_THRESHOLD")
+          [ -z "$THRESHOLD_GROWTH_MULTIPLIER" ] || args+=(--threshold-growth-multiplier "$THRESHOLD_GROWTH_MULTIPLIER")
+          [ -z "$BASE_INCREMENT" ] || args+=(--base-increment "$BASE_INCREMENT")
+          [ -z "$MAX_POSITION" ] || args+=(--max-position "$MAX_POSITION")
+          [ -z "$ENTRY_TIMEOUT_SECONDS" ] || args+=(--entry-timeout-seconds "$ENTRY_TIMEOUT_SECONDS")
+          [ -z "$ENTRY_LATENESS_SECONDS" ] || args+=(--entry-lateness-seconds "$ENTRY_LATENESS_SECONDS")
+          [ -z "$OUTCOME_OBSERVATION_SECONDS" ] || args+=(--outcome-observation-seconds "$OUTCOME_OBSERVATION_SECONDS")
+          [ -z "$PROVISIONAL_OUTCOME_THRESHOLD" ] || args+=(--provisional-outcome-threshold "$PROVISIONAL_OUTCOME_THRESHOLD")
+          [ -z "$STARTING_SHADOW_BALANCE" ] || args+=(--starting-shadow-balance "$STARTING_SHADOW_BALANCE")
+          if [ "$REQUESTED_LIVE" = "true" ]; then
+            python kalshi_live_trader.py "${args[@]}" --live-enabled
+          else
+            python kalshi_live_trader.py "${args[@]}" --dry-run
           fi
 
-      - name: Persist settlement trader state and configuration
+      - name: Persist state, audit ledger, and chosen configuration
         if: always()
         run: |
           set -euo pipefail
-          files=(
-            kalshi_btc15m_average_down_config.json
-            kalshi_btc15m_average_down_state.json
-            kalshi_btc15m_average_down_report.json
-            data/kalshi_equity_regime_state.json
-            data/kalshi_actual_equity_history.csv
-            data/kalshi_shadow_equity_history.csv
-          )
-          for file in "${files[@]}"; do
-            test ! -f "$file" || git add "$file"
-          done
+          git add selected_live_strategy.json \
+            data/kalshi_live_strategy_state.json data/kalshi_live_strategy_audit.jsonl \
+            data/kalshi_shadow_strategy_state.json data/kalshi_shadow_strategy_audit.jsonl 2>/dev/null || true
           if git diff --cached --quiet; then
             exit 0
           fi
-          git commit -m "chore: record BTC settlement trader state [skip ci]"
+          git commit -m "chore: checkpoint KXBTC15M hybrid state [skip ci]"
           for attempt in 1 2 3; do
             if git pull --rebase --autostash origin main && git push origin HEAD:main; then
               exit 0
@@ -242,92 +227,24 @@ jobs:
             git rebase --abort 2>/dev/null || true
             sleep "$attempt"
           done
-          echo "::error::Unable to publish settlement trader state after three retries."
+          echo "::error::Unable to publish durable live state after three retries."
           exit 1
 
-      - name: Queue the next live handoff
-        if: success() && (github.event_name == 'schedule' || inputs.live_trading == true)
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Remove private key
+        if: always()
         run: |
-          set -euo pipefail
-          # The successor checks out main, not this runner's workspace.  Fail
-          # closed if either committed source of the shadow curve differs from
-          # the state that just finished trading.
-          python - <<'PY'
-          import csv
-          import json
-          import sys
-          from pathlib import Path
+          rm -f kalshi_private_key.pem
 
-          state_path = Path("data/kalshi_equity_regime_state.json")
-          ledger_path = Path("data/kalshi_shadow_equity_history.csv")
-          state = json.loads(state_path.read_text(encoding="utf-8"))
-          shadow_balance = state.get("shadow_balance")
-          history = state.get("shadow_history") or []
-          with ledger_path.open(newline="", encoding="utf-8") as handle:
-              ledger = list(csv.DictReader(handle))
-          if not shadow_balance:
-              sys.exit("shadow handoff verification failed: state has no shadow_balance")
-          if bool(history) != bool(ledger):
-              sys.exit("shadow handoff verification failed: state and ledger row counts disagree")
-          if history:
-              state_tail = history[-1]
-              ledger_tail = ledger[-1]
-              if str(state_tail.get("shadow_balance_after")) != str(shadow_balance):
-                  sys.exit("shadow handoff verification failed: state balance does not match state curve tail")
-              if ledger_tail.get("market_ticker") != state_tail.get("market_ticker"):
-                  sys.exit("shadow handoff verification failed: state and ledger tickers differ")
-              if ledger_tail.get("shadow_balance_after") != str(shadow_balance):
-                  sys.exit("shadow handoff verification failed: ledger balance does not match state")
-          print(
-              "SHADOW HANDOFF LOCAL VERIFIED | "
-              f"balance={shadow_balance} rows={len(history)} "
-              f"last_market={history[-1].get('market_ticker') if history else 'none'}"
-          )
-          PY
-          git fetch --depth=1 origin main
-          for file in data/kalshi_equity_regime_state.json data/kalshi_shadow_equity_history.csv; do
-            local_blob="$(git hash-object "$file")"
-            remote_blob="$(git rev-parse "origin/main:$file")"
-            if [ "$local_blob" != "$remote_blob" ]; then
-              echo "::error::Shadow handoff verification failed: $file was not published to main."
-              exit 1
-            fi
-            echo "SHADOW HANDOFF REMOTE VERIFIED | file=$file blob=$remote_blob"
-          done
-          scaling_enabled="$(python -c 'import json; c=json.load(open("kalshi_btc15m_average_down_config.json")); print(str(bool(c.get("enable_dynamic_scaling", False))).lower())')"
-          scaling_increment="$(python -c 'import json; c=json.load(open("kalshi_btc15m_average_down_config.json")); print(c.get("base_share_increment", 1))')"
-          scaling_multiplier="$(python -c 'import json; c=json.load(open("kalshi_btc15m_average_down_config.json")); print(c.get("scaling_profit_multiplier", 16.5))')"
-          regime_enabled="$(python -c 'import json; c=json.load(open("kalshi_btc15m_average_down_config.json")); print(str(bool(c.get("equity_regime_enabled", True))).lower())')"
-          regime_dry_run="$(python -c 'import json; c=json.load(open("kalshi_btc15m_average_down_config.json")); print(str(bool(c.get("equity_regime_dry_run", False))).lower())')"
-          prophet_min_history="$(python -c 'import json; c=json.load(open("kalshi_btc15m_average_down_config.json")); print(c.get("prophet_min_history", 100))')"
-          shadow_fill_model="$(python -c 'import json; c=json.load(open("kalshi_btc15m_average_down_config.json")); print(c.get("shadow_fill_model", "conservative_trade_through"))')"
-          starting_balance="$(python -c 'import json; c=json.load(open("kalshi_btc15m_average_down_config.json")); print(c.get("starting_balance", "100.00"))')"
-          gh workflow run kalshi_btc15m_average_down.yml --repo "$GITHUB_REPOSITORY" --ref main \
-            -f live_trading=true \
-            -f enable_dynamic_scaling="$scaling_enabled" \
-            -f base_share_increment="$scaling_increment" \
-            -f scaling_profit_multiplier="$scaling_multiplier" \
-            -f equity_regime_enabled="$regime_enabled" \
-            -f equity_regime_dry_run="$regime_dry_run" \
-            -f prophet_min_history="$prophet_min_history" \
-            -f shadow_fill_model="$shadow_fill_model" \
-            -f starting_balance="$starting_balance"
-          echo "HANDOFF QUEUED | next run keeps the persisted base size, dynamic-scaling settings, and settlement-only exit policy."
-
-      - name: Upload execution audit artifact
+      - name: Upload safe execution evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: kalshi-btc15m-settlement-trader-${{ github.run_id }}
+          name: kalshi-kxbtc15m-hybrid-${{ github.run_id }}
           path: |
-            kalshi_btc15m_average_down_config.json
-            kalshi_btc15m_average_down_state.json
-            kalshi_btc15m_average_down_report.json
-            data/kalshi_equity_regime_state.json
-            data/kalshi_actual_equity_history.csv
-            data/kalshi_shadow_equity_history.csv
-            outputs/
+            selected_live_strategy.json
+            data/kalshi_live_strategy_state.json
+            data/kalshi_live_strategy_audit.jsonl
+            data/kalshi_shadow_strategy_state.json
+            data/kalshi_shadow_strategy_audit.jsonl
           if-no-files-found: warn
-          retention-days: 90
+          retention-days: 30

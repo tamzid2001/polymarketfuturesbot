@@ -1,4 +1,4 @@
-name: Kalshi BTC 15m Live Trader Watchdog
+name: Kalshi KXBTC15M Hybrid Live Watchdog
 
 # A recovery safety net for the settlement-only trader. The trader's normal
 # 5h25m self-handoff remains primary. A failed *live* runner invokes this
@@ -10,7 +10,7 @@ on:
     # scheduled jobs under load.
     - cron: "2-59/5 * * * *"
   workflow_run:
-    workflows: ["Kalshi BTC 15m Settlement Contrarian"]
+    workflows: ["Kalshi KXBTC15M Hybrid Live"]
     types: [completed]
   workflow_dispatch:
 
@@ -76,77 +76,12 @@ jobs:
             fi
           fi
 
-          # A watchdog recovery starts a new live process from main. Validate
-          # both durable sources from one immutable main commit before that
-          # process can be dispatched. Equivalent serialization and up to one
-          # cent of rounding are acceptable; a missing or materially divergent
-          # curve is not.
-          main_sha="$(gh api "repos/$REPOSITORY/commits/main" --jq .sha)"
-          state_file="$(mktemp)"
-          ledger_file="$(mktemp)"
-          trap 'rm -f "$state_file" "$ledger_file"' EXIT
-          gh api "repos/$REPOSITORY/contents/data/kalshi_equity_regime_state.json?ref=$main_sha" --jq .content \
-            | tr -d '\n' | base64 --decode > "$state_file"
-          gh api "repos/$REPOSITORY/contents/data/kalshi_shadow_equity_history.csv?ref=$main_sha" --jq .content \
-            | tr -d '\n' | base64 --decode > "$ledger_file"
-          python - "$state_file" "$ledger_file" <<'PY'
-          import csv
-          import json
-          import sys
-          from decimal import Decimal, InvalidOperation
-          from pathlib import Path
-
-          state = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-          with Path(sys.argv[2]).open(newline="", encoding="utf-8") as handle:
-              ledger = list(csv.DictReader(handle))
-          shadow_balance = state.get("shadow_balance")
-          history = state.get("shadow_history") or []
-          if not shadow_balance:
-              sys.exit("watchdog shadow-state check failed: missing shadow_balance")
-
-          tolerance = Decimal("0.01")
-
-          def money(value, label):
-              try:
-                  parsed = Decimal(str(value))
-              except (InvalidOperation, ValueError) as exc:
-                  raise SystemExit(f"watchdog shadow-state check failed: invalid {label}={value!r}") from exc
-              if not parsed.is_finite():
-                  raise SystemExit(f"watchdog shadow-state check failed: non-finite {label}={value!r}")
-              return parsed
-
-          state_balance = money(shadow_balance, "shadow_balance")
-          if bool(history) != bool(ledger):
-              sys.exit("watchdog shadow-state check failed: state and ledger presence disagree")
-          if history:
-              state_tail = history[-1]
-              ledger_tail = ledger[-1]
-              curve_balance = money(state_tail.get("shadow_balance_after"), "state curve balance")
-              ledger_balance = money(ledger_tail.get("shadow_balance_after"), "ledger balance")
-              if abs(curve_balance - state_balance) > tolerance:
-                  sys.exit("watchdog shadow-state check failed: state balance and curve tail materially differ")
-              if ledger_tail.get("market_ticker") != state_tail.get("market_ticker"):
-                  sys.exit("watchdog shadow-state check failed: state and ledger tickers differ")
-              if abs(ledger_balance - state_balance) > tolerance:
-                  sys.exit("watchdog shadow-state check failed: ledger balance and state materially differ")
-          print(
-              "WATCHDOG SHADOW STATE VERIFIED | "
-              f"balance={state_balance} rows={len(history)} tolerance={tolerance} "
-              f"last_market={history[-1].get('market_ticker') if history else 'none'}"
-          )
-          PY
-
-          # This is an explicit live-recovery path.  The new runner still
-          # restores the durable state and applies its normal absolute-balance
-          # reconciliation and regime gate before it can place an order.
+          # The runner itself requires the repository live-enable variable as
+          # a second gate; this dispatch cannot enable money movement alone.
           gh workflow run kalshi_btc15m_average_down.yml \
             --repo "$REPOSITORY" --ref main \
-            -f live_trading=true \
-            -f enable_dynamic_scaling=true \
-            -f equity_regime_enabled=true \
-            -f equity_regime_dry_run=false \
-            -f prophet_min_history=200 \
-            -f prophet_refit_every_markets=1 \
-            -f shadow_fill_model=conservative_trade_through \
-            -f starting_balance=100.00
-          echo "WATCHDOG DISPATCHED | live replacement queued; durable reconciliation and the regime gate remain enforced."
+            -f live_enabled=true \
+            -f dry_run=false \
+            -f reconcile_only=false \
+            -f reset_state=false
+          echo "WATCHDOG DISPATCHED | hybrid live worker queued."

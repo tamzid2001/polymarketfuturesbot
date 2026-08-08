@@ -1,4 +1,4 @@
-name: Controlled Restart — Kalshi BTC 15m Settlement Contrarian
+name: Controlled Restart — Kalshi KXBTC15M Hybrid
 
 # This workflow is intentionally manual.  It provides a safe live-code
 # handoff: stop one known older runner, retain its resting deterministic ladder
@@ -18,7 +18,7 @@ permissions:
   actions: write
 
 concurrency:
-  group: kalshi-btc15m-average-down-controlled-restart
+  group: kalshi-kxbtc15m-live-controlled-restart
   cancel-in-progress: false
 
 jobs:
@@ -49,8 +49,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
-          # Match the live runner: kalshi-python-async >=3.22 and Prophet
-          # 1.3 publish for Python 3.13+.
+          # Match the live runner's supported Kalshi async SDK interpreter.
           python-version: "3.13"
 
       - name: Install controlled-handoff dependencies
@@ -72,12 +71,8 @@ jobs:
           set -euo pipefail
           gh workflow run kalshi_btc15m_average_down.yml \
             --repo "$GITHUB_REPOSITORY" --ref main \
-            -f live_trading=false \
-            -f enable_dynamic_scaling=true \
-            -f equity_regime_enabled=false \
-            -f equity_regime_dry_run=true \
-            -f prophet_min_history=200 \
-            -f prophet_refit_every_markets=1 \
-            -f shadow_fill_model=conservative_trade_through \
-            -f starting_balance=100.00
+            -f live_enabled=false \
+            -f dry_run=true \
+            -f reconcile_only=true \
+            -f reset_state=false
           echo "NON-LIVE RECONCILIATION RUNNER QUEUED | it cannot submit orders while balance reconciliation is pending."
