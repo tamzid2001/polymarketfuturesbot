@@ -194,6 +194,37 @@ class LiveExecutionTests(unittest.TestCase):
         self.assertEqual(record["entry_orders"][0]["shadow_fill_evidence"]["model"], "conservative_trade_through")
         self.assertEqual(record["actual_quantity"], "0.30")
         self.assertEqual(engine.shadow_metrics()["reserved_cash"], "0.1470")
+        self.assertEqual(record["entry_execution_type"], "maker_limit")
+        self.assertEqual(record["entry_execution_summary"]["maker_limit_filled_quantity"], "0.30")
+        self.assertEqual(record["entry_execution_summary"]["market_ioc_filled_quantity"], "0")
+
+    def test_entry_execution_summary_separates_maker_ioc_and_mixed_fills(self) -> None:
+        engine = self.engine()
+        record = {
+            "ticker": "KXBTC15M-execution-summary",
+            "entry_orders": [
+                {
+                    "entry_phase": "maker", "order_id": "maker-1", "fill_count": "0.30",
+                    "average_fill_price": "0.51",
+                },
+                {
+                    "entry_phase": "market_fallback", "order_id": "ioc-1", "fill_count": "0.70",
+                    "average_fill_price": "0.55",
+                },
+            ],
+        }
+        self.assertTrue(engine.update_entry_execution_summary(record))
+        summary = record["entry_execution_summary"]
+        self.assertEqual(record["entry_execution_type"], "mixed")
+        self.assertTrue(summary["maker_limit_filled"])
+        self.assertTrue(summary["market_ioc_filled"])
+        self.assertEqual(summary["maker_limit_filled_quantity"], "0.30")
+        self.assertEqual(summary["maker_limit_average_fill_price"], "0.51")
+        self.assertEqual(summary["market_ioc_filled_quantity"], "0.70")
+        self.assertEqual(summary["market_ioc_average_fill_price"], "0.55")
+        self.assertEqual(summary["actual_weighted_average_entry_price"], "0.538")
+        self.assertEqual(summary["maker_limit_order_ids"], ["maker-1"])
+        self.assertEqual(summary["market_ioc_order_ids"], ["ioc-1"])
 
     def test_fifteen_second_maker_expiry_uses_one_price_protected_ioc_fallback(self) -> None:
         async def scenario() -> None:
@@ -219,6 +250,10 @@ class LiveExecutionTests(unittest.TestCase):
             self.assertEqual(record["status"], "POSITION_OPEN")
             self.assertEqual(record["actual_quantity"], "1.00")
             self.assertTrue(record["market_fallback_attempted"])
+            self.assertEqual(record["entry_execution_type"], "market_ioc")
+            self.assertEqual(record["entry_execution_summary"]["maker_limit_filled_quantity"], "0")
+            self.assertEqual(record["entry_execution_summary"]["market_ioc_filled_quantity"], "1.00")
+            self.assertEqual(record["entry_execution_summary"]["market_ioc_average_fill_price"], "0.6")
         asyncio.run(scenario())
 
     def test_market_fallback_refuses_a_40c_or_lower_selected_side(self) -> None:

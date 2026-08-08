@@ -547,6 +547,24 @@ class LiveEngine:
             "recovery_exponent_before": sizing_state(parameters, self.state.get("sizing")).recovery_exponent,
             "recovery_cycle_pnl_before": str(self.state.get("sizing", {}).get("recovery_cycle_pnl", "0")),
             "status": "SIGNAL_PENDING", "entry_orders": [], "exit_orders": [], "actual_quantity": "0.00",
+            # This is a durable summary of what actually opened exposure.
+            # ``market_ioc`` means the price-protected IOC fallback below,
+            # never an unbounded market order.
+            "entry_execution_type": "none",
+            "entry_execution_summary": {
+                "entry_execution_type": "none",
+                "maker_limit_filled": False,
+                "market_ioc_filled": False,
+                "maker_limit_filled_quantity": "0.00",
+                "maker_limit_average_fill_price": None,
+                "market_ioc_filled_quantity": "0.00",
+                "market_ioc_average_fill_price": None,
+                "other_entry_filled_quantity": "0.00",
+                "total_filled_quantity": "0.00",
+                "actual_weighted_average_entry_price": None,
+                "maker_limit_order_ids": [],
+                "market_ioc_order_ids": [],
+            },
             "strategy_version": self.config["strategy_version"], "config_hash": config_hash(self.config),
             "config_snapshot": self.current_parameters().as_dict(), "created_at": utc_now(),
             # ``entry_price`` is the historical-reference price. The actual
@@ -622,6 +640,106 @@ class LiveEngine:
                 total_quantity += filled
                 total_cost += filled * price
         return total_cost / total_quantity if total_quantity > 0 else None
+
+    def update_entry_execution_summary(self, record: dict[str, Any]) -> bool:
+        """Persist how the entry exposure was actually opened.
+
+        An entry can be wholly filled by the resting post-only maker limit,
+        wholly filled by the one-shot price-protected IOC fallback, or be a
+        mixture when a partial maker fill precedes an IOC remainder.  This
+        method deliberately uses the exchange-reported filled quantities and
+        average prices; requested order sizes are never treated as fills.
+
+        It returns whether the durable summary materially changed, allowing
+        callers to emit one audit/checkpoint update per fill change.
+        """
+
+        buckets: dict[str, dict[str, Any]] = {
+            "maker_limit": {"quantity": Decimal("0"), "cost": Decimal("0"), "priced_quantity": Decimal("0"), "order_ids": []},
+            "market_ioc": {"quantity": Decimal("0"), "cost": Decimal("0"), "priced_quantity": Decimal("0"), "order_ids": []},
+            "other": {"quantity": Decimal("0"), "cost": Decimal("0"), "priced_quantity": Decimal("0"), "order_ids": []},
+        }
+        for order in record.get("entry_orders", []):
+            try:
+                filled = Decimal(str(order.get("fill_count") or "0"))
+            except (ArithmeticError, TypeError, ValueError):
+                continue
+            if filled <= 0:
+                continue
+            phase = str(order.get("entry_phase") or "maker")
+            bucket_name = "maker_limit" if phase == "maker" else "market_ioc" if phase == "market_fallback" else "other"
+            bucket = buckets[bucket_name]
+            bucket["quantity"] += filled
+            order_id = order.get("order_id") or order.get("client_order_id")
+            if order_id is not None:
+                bucket["order_ids"].append(str(order_id))
+            try:
+                price = Decimal(str(order.get("average_fill_price")))
+            except (ArithmeticError, TypeError, ValueError):
+                price = None
+            if price is not None and Decimal("0") < price < Decimal("1"):
+                bucket["cost"] += filled * price
+                bucket["priced_quantity"] += filled
+
+        maker, ioc, other = buckets["maker_limit"], buckets["market_ioc"], buckets["other"]
+        total_quantity = maker["quantity"] + ioc["quantity"] + other["quantity"]
+        total_priced_quantity = maker["priced_quantity"] + ioc["priced_quantity"] + other["priced_quantity"]
+        total_cost = maker["cost"] + ioc["cost"] + other["cost"]
+
+        def average(bucket: dict[str, Any]) -> str | None:
+            if bucket["quantity"] <= 0 or bucket["priced_quantity"] != bucket["quantity"]:
+                return None
+            return format(bucket["cost"] / bucket["quantity"], "f")
+
+        if total_quantity <= 0:
+            execution_type = "none"
+        elif maker["quantity"] > 0 and ioc["quantity"] > 0:
+            execution_type = "mixed"
+        elif maker["quantity"] > 0 and other["quantity"] == 0:
+            execution_type = "maker_limit"
+        elif ioc["quantity"] > 0 and other["quantity"] == 0:
+            execution_type = "market_ioc"
+        else:
+            execution_type = "other"
+
+        summary = {
+            "entry_execution_type": execution_type,
+            "maker_limit_filled": maker["quantity"] > 0,
+            "market_ioc_filled": ioc["quantity"] > 0,
+            "maker_limit_filled_quantity": format(maker["quantity"], "f"),
+            "maker_limit_average_fill_price": average(maker),
+            "market_ioc_filled_quantity": format(ioc["quantity"], "f"),
+            "market_ioc_average_fill_price": average(ioc),
+            "other_entry_filled_quantity": format(other["quantity"], "f"),
+            "total_filled_quantity": format(total_quantity, "f"),
+            "actual_weighted_average_entry_price": (
+                format(total_cost / total_quantity, "f")
+                if total_quantity > 0 and total_priced_quantity == total_quantity else None
+            ),
+            "maker_limit_order_ids": maker["order_ids"],
+            "market_ioc_order_ids": ioc["order_ids"],
+        }
+        changed = summary != record.get("entry_execution_summary") or execution_type != record.get("entry_execution_type")
+        record["entry_execution_summary"] = summary
+        record["entry_execution_type"] = execution_type
+        return changed
+
+    def note_entry_execution_summary(self, record: dict[str, Any], reason: str) -> None:
+        """Audit and checkpoint an actual maker/IOC fill composition change."""
+
+        if not self.update_entry_execution_summary(record):
+            return
+        summary = record["entry_execution_summary"]
+        self.audit(
+            "entry_execution_updated", ticker=record["ticker"], reason=reason,
+            entry_execution_type=summary["entry_execution_type"],
+            maker_limit_filled_quantity=summary["maker_limit_filled_quantity"],
+            maker_limit_average_fill_price=summary["maker_limit_average_fill_price"],
+            market_ioc_filled_quantity=summary["market_ioc_filled_quantity"],
+            market_ioc_average_fill_price=summary["market_ioc_average_fill_price"],
+            actual_weighted_average_entry_price=summary["actual_weighted_average_entry_price"],
+        )
+        self.checkpoint("entry_execution_updated")
 
     def update_effective_stop_price(self, record: dict[str, Any]) -> Decimal | None:
         """Persist the actual-entry-derived stop used for active monitoring."""
@@ -975,6 +1093,7 @@ class LiveEngine:
             )
             self.state["average_entry"] = format(total_cost / total, "f") if total else None
             self.update_effective_stop_price(record)
+        self.note_entry_execution_summary(record, "exchange_order_refresh")
         return total
 
     def refresh_shadow_entry(self, feed: KalshiLiveFeed, record: dict[str, Any]) -> Decimal:
@@ -1028,6 +1147,7 @@ class LiveEngine:
         self.state["average_entry"] = format(limit, "f") if fill else None
         if fill > 0:
             self.update_effective_stop_price(record)
+        self.note_entry_execution_summary(record, "shadow_trade_through_refresh")
         return fill
 
     def entry_deadline(self, record: dict[str, Any]) -> float:
@@ -1039,14 +1159,20 @@ class LiveEngine:
     def finish_entry_attempt(self, record: dict[str, Any], filled: Decimal, reason: str) -> None:
         """Close an exhausted entry attempt without ever changing recovery on a zero fill."""
 
+        self.note_entry_execution_summary(record, reason)
         if filled > 0:
             self.update_effective_stop_price(record)
             self.transition(record, "POSITION_OPEN", reason)
+            self.audit(
+                "entry_completed", ticker=record["ticker"], reason=reason,
+                actual_quantity=format(filled, "f"), entry_execution_type=record["entry_execution_type"],
+                entry_execution_summary=record["entry_execution_summary"],
+            )
             return
         self.transition(record, "ZERO_FILL", reason)
         self.state["sizing"] = zero_fill_snapshot(self.current_parameters(), self.state.get("sizing"))
         self.note_zero_fill()
-        self.audit("zero_fill", ticker=record["ticker"], reason=reason)
+        self.audit("zero_fill", ticker=record["ticker"], reason=reason, entry_execution_type=record["entry_execution_type"])
 
     def reserve_shadow_entry_cash(self, quantity: Decimal, price: Decimal) -> None:
         """Reserve only simulated exposure actually supported by a fresh displayed quote."""
@@ -1180,6 +1306,8 @@ class LiveEngine:
             "market_fallback_submitted", ticker=record["ticker"], side=side,
             requested_quantity=format(remaining, "f"), best_available_price=format(price, "f"),
             client_order_id=client_id, exchange_order_id=order.get("order_id"), shadow=self.dry_run,
+            entry_execution_type=record["entry_execution_type"],
+            entry_execution_summary=record["entry_execution_summary"],
         )
 
     async def submit_entry(self, rest: KalshiREST, feed: KalshiLiveFeed, record: dict[str, Any], now: float) -> None:
@@ -1255,6 +1383,7 @@ class LiveEngine:
             return
         record["entry_orders"].append(order)
         order["entry_phase"] = "maker"
+        self.note_entry_execution_summary(record, "maker_limit_submitted")
         self.state["current_order_id"] = order.get("order_id")
         record["entry_deadline_epoch"] = expiry
         self.transition(record, "ENTRY_PENDING", "post_only_limit_submitted")
@@ -1362,6 +1491,7 @@ class LiveEngine:
     def record_realized(self, record: dict[str, Any], net: Decimal, method: str, settlement_id: str) -> None:
         if settlement_id in self.state["processed_settlements"]:
             return
+        self.note_entry_execution_summary(record, "realized_trade_finalization")
         parameters = self.record_parameters(record)
         before = dict(self.state.get("sizing") or {})
         after, changes = apply_realized_filled_trade(parameters, before, net)
@@ -1397,7 +1527,12 @@ class LiveEngine:
         if self.state.get("active_market") == record["ticker"]:
             self.state["active_market"] = None
         self.state.update({"current_order_id": None, "current_position": "0.00", "average_entry": None, "last_completed_trade": record["ticker"]})
-        self.audit("trade_closed", ticker=record["ticker"], method=method, net_pnl=format(net, "f"), quantity=record.get("actual_quantity"), recovery_reset=changes["recovery_reset"], base_increased=changes["base_increased"])
+        self.audit(
+            "trade_closed", ticker=record["ticker"], method=method, net_pnl=format(net, "f"),
+            quantity=record.get("actual_quantity"), recovery_reset=changes["recovery_reset"],
+            base_increased=changes["base_increased"], entry_execution_type=record["entry_execution_type"],
+            entry_execution_summary=record["entry_execution_summary"],
+        )
 
     async def finalize_stop(self, record: dict[str, Any]) -> None:
         proceeds, exit_fees = self.exit_proceeds(record)
