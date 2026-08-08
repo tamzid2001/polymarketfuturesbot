@@ -8,7 +8,15 @@ from tempfile import TemporaryDirectory
 from optimizer import export_selected_live_strategy
 from recovery_sizing import RecoverySizingState
 from strategy_core import StrategyParameters, apply_realized_filled_trade, prescribed_quantity, sizing_state, zero_fill_snapshot
-from kalshi_live_trader import load_config
+from kalshi_live_trader import (
+    ACTIVE_CONFIG_SCHEMA_VERSION,
+    ACTIVE_STRATEGY_VERSION,
+    load_config,
+    load_config_from_value,
+)
+
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 class StrategyCoreTests(unittest.TestCase):
@@ -75,6 +83,17 @@ class StrategyCoreTests(unittest.TestCase):
         self.assertEqual(config["entry_price"], "0.50")
         self.assertEqual(config["starting_base"], "1.00")
         self.assertEqual(config["base_increment"], "1.00")
+        self.assertEqual(config["strategy_version"], ACTIVE_STRATEGY_VERSION)
+        self.assertEqual(config["config_schema_version"], ACTIVE_CONFIG_SCHEMA_VERSION)
+
+    def test_legacy_live_configuration_fails_closed(self) -> None:
+        config = load_config(ROOT / "selected_live_strategy.json")
+        legacy_version = dict(config, strategy_version="kxbtc15m-hybrid-live-v1")
+        legacy_schema = dict(config, config_schema_version=1)
+        with self.assertRaisesRegex(ValueError, "non-current live strategy"):
+            load_config_from_value(legacy_version)
+        with self.assertRaisesRegex(ValueError, "non-current live configuration schema"):
+            load_config_from_value(legacy_schema)
 
 
 if __name__ == "__main__":

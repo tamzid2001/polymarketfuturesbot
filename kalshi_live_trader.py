@@ -52,6 +52,12 @@ from strategy_core import (
 LOG = logging.getLogger("kalshi_live_trader")
 ORDER_NAMESPACE = uuid.UUID("602ca251-d5dc-43c7-ae11-a6be6f19a43b")
 ORDER_PREFIX = "kxbtc15m-hybrid-v1-"
+# This is an execution contract, not a cosmetic label.  A worker may never
+# silently reinterpret an older selected configuration after a restart or a
+# watchdog handoff.  Bump both values deliberately with a reviewed migration
+# whenever the shared live/backtest strategy semantics change.
+ACTIVE_STRATEGY_VERSION = "kxbtc15m-hybrid-live-v2"
+ACTIVE_CONFIG_SCHEMA_VERSION = 2
 TERMINAL_STATES = {"CLOSED", "ZERO_FILL", "FUNDING_FAILURE", "MISSED_SIGNAL", "ERROR_RECONCILIATION"}
 ACTIVE_STATES = {"SIGNAL_PENDING", "ENTRY_PENDING", "ENTRY_PARTIAL", "POSITION_OPEN", "STOP_PENDING", "SETTLEMENT_PENDING"}
 
@@ -87,6 +93,27 @@ INTEGER_CONFIG_FIELDS = {
 FLOAT_CONFIG_FIELDS = {"stop_poll_interval", "reconciliation_interval", "max_outcome_quote_age_seconds", "max_stale_quote_seconds"}
 
 
+def assert_active_strategy_contract(value: dict[str, Any]) -> None:
+    """Fail closed rather than load a legacy or underspecified live config."""
+
+    if value.get("strategy_version") != ACTIVE_STRATEGY_VERSION:
+        raise ValueError(
+            "refusing non-current live strategy configuration; "
+            f"expected strategy_version={ACTIVE_STRATEGY_VERSION!r}"
+        )
+    try:
+        schema_version = int(value.get("config_schema_version"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "refusing live configuration without the current config_schema_version"
+        ) from exc
+    if schema_version != ACTIVE_CONFIG_SCHEMA_VERSION:
+        raise ValueError(
+            "refusing non-current live configuration schema; "
+            f"expected config_schema_version={ACTIVE_CONFIG_SCHEMA_VERSION}"
+        )
+
+
 def load_config(path: Path) -> dict[str, Any]:
     value = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(value, dict):
@@ -98,6 +125,7 @@ def load_config(path: Path) -> dict[str, Any]:
     missing = required - value.keys()
     if missing:
         raise ValueError(f"live strategy configuration is missing: {', '.join(sorted(missing))}")
+    assert_active_strategy_contract(value)
     if value["series"] != "KXBTC15M":
         raise ValueError("this production runner is intentionally limited to KXBTC15M")
     for name in DECIMAL_CONFIG_FIELDS & value.keys():
@@ -173,6 +201,7 @@ def load_config_from_value(value: dict[str, Any]) -> dict[str, Any]:
     required = {"strategy_version", "series", "entry_price", "stop_price", "starting_base", "recovery_multiplier", "first_base_threshold", "threshold_growth_multiplier", "base_increment", "max_position"}
     if required - temporary.keys():
         raise ValueError("invalid overridden live strategy configuration")
+    assert_active_strategy_contract(temporary)
     # Reuse the normal rules without doing a file round-trip.
     if temporary["series"] != "KXBTC15M" or decimal(temporary["starting_base"]) != Decimal("1.00"):
         raise ValueError("invalid strategy series or starting base")
