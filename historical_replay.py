@@ -13,7 +13,7 @@ from decimal import Decimal
 from typing import Any, Iterable, Sequence
 
 from execution_path_model import ExecutionPath, ExecutionPathModel
-from strategy_core import RecoverySizingState, decimal
+from strategy_core import RecoverySizingState, decimal, effective_stop_price
 
 
 ZERO = Decimal("0")
@@ -27,6 +27,7 @@ class ReplayConfiguration:
     base_increment: Decimal = Decimal("0.25")
     threshold_growth_multiplier: Decimal | None = None
     stop_price: Decimal | None = Decimal("0.40")
+    stop_baseline_entry_price: Decimal = Decimal("0.50")
     entry_price: Decimal = Decimal("0.49")
     stop_slippage: Decimal = ZERO
     fee_per_share: Decimal = ZERO
@@ -40,6 +41,7 @@ class ReplayConfiguration:
         object.__setattr__(self, "base_increment", decimal(self.base_increment))
         object.__setattr__(self, "threshold_growth_multiplier", decimal(self.threshold_growth_multiplier or self.recovery_multiplier))
         object.__setattr__(self, "stop_price", None if self.stop_price is None else decimal(self.stop_price))
+        object.__setattr__(self, "stop_baseline_entry_price", decimal(self.stop_baseline_entry_price))
         object.__setattr__(self, "entry_price", decimal(self.entry_price))
         object.__setattr__(self, "stop_slippage", decimal(self.stop_slippage))
         object.__setattr__(self, "fee_per_share", decimal(self.fee_per_share))
@@ -50,8 +52,20 @@ class ReplayConfiguration:
             raise ValueError("entry_price must be between zero and one")
         if self.stop_price is not None and not ZERO < self.stop_price < self.entry_price:
             raise ValueError("stop_price must be below entry_price")
+        if self.stop_price is not None and self.entry_price > self.stop_baseline_entry_price:
+            raise ValueError(
+                "entry-adjusted stops above 50c require observed 41c-49c path calibration; "
+                "the historical replay must not invent those touches"
+            )
         if self.stop_slippage < ZERO or self.fee_per_share < ZERO:
             raise ValueError("slippage and fees cannot be negative")
+
+    def effective_stop_price(self) -> Decimal | None:
+        """Use the shared policy only where calibrated historical paths exist."""
+
+        if self.stop_price is None:
+            return None
+        return effective_stop_price(self.entry_price, self.stop_price, self.stop_baseline_entry_price)
 
 
 @dataclass(frozen=True)
@@ -139,7 +153,9 @@ def trade_pnl_per_share(
     if not path.entry_filled:
         return ZERO, ZERO, "zero_fill"
     if path.stop_triggered:
-        gross = (configuration.stop_price - configuration.stop_slippage) - configuration.entry_price  # type: ignore[operator]
+        stop_price = configuration.effective_stop_price()
+        assert stop_price is not None
+        gross = (stop_price - configuration.stop_slippage) - configuration.entry_price
         return gross, gross - configuration.fee_per_share, "stop"
     gross = (ONE - configuration.entry_price) if directional_win else -configuration.entry_price
     return gross, gross - configuration.fee_per_share, "settlement"
@@ -197,7 +213,7 @@ def replay_one(
         path = model.sample_from_uniforms(
             directional_win,
             rng.random(), (rng.random(), rng.random(), rng.random(), rng.random()),
-            None if configuration.stop_price is None else float(configuration.stop_price),
+            None if configuration.effective_stop_price() is None else float(configuration.effective_stop_price()),
         )
         if not path.entry_filled:
             metrics["zero_fills"] += 1

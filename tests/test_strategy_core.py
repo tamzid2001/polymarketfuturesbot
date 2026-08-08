@@ -7,7 +7,14 @@ from tempfile import TemporaryDirectory
 
 from optimizer import export_selected_live_strategy
 from recovery_sizing import RecoverySizingState
-from strategy_core import StrategyParameters, apply_realized_filled_trade, prescribed_quantity, sizing_state, zero_fill_snapshot
+from strategy_core import (
+    StrategyParameters,
+    apply_realized_filled_trade,
+    effective_stop_price,
+    prescribed_quantity,
+    sizing_state,
+    zero_fill_snapshot,
+)
 from kalshi_live_trader import (
     ACTIVE_CONFIG_SCHEMA_VERSION,
     ACTIVE_STRATEGY_VERSION,
@@ -85,6 +92,8 @@ class StrategyCoreTests(unittest.TestCase):
         self.assertEqual(config["base_increment"], "1.00")
         self.assertEqual(config["opening_price_discovery_seconds"], 3)
         self.assertEqual(config["maker_price_offset"], "0.01")
+        self.assertEqual(config["stop_policy"], "floor_with_entry_above_baseline")
+        self.assertEqual(config["stop_baseline_entry_price"], "0.50")
         self.assertEqual(config["strategy_version"], ACTIVE_STRATEGY_VERSION)
         self.assertEqual(config["config_schema_version"], ACTIVE_CONFIG_SCHEMA_VERSION)
 
@@ -101,6 +110,14 @@ class StrategyCoreTests(unittest.TestCase):
         config = load_config(ROOT / "selected_live_strategy.json")
         with self.assertRaisesRegex(ValueError, "maker_price_offset"):
             load_config_from_value(dict(config, maker_price_offset="0.02"))
+
+    def test_entry_adjusted_stop_never_moves_below_the_40c_floor(self) -> None:
+        floor = Decimal("0.40")
+        baseline = Decimal("0.50")
+        self.assertEqual(effective_stop_price(Decimal("0.49"), floor, baseline), floor)
+        self.assertEqual(effective_stop_price(Decimal("0.50"), floor, baseline), floor)
+        self.assertEqual(effective_stop_price(Decimal("0.52"), floor, baseline), Decimal("0.42"))
+        self.assertEqual(effective_stop_price(Decimal("0.54"), floor, baseline), Decimal("0.44"))
 
 
 if __name__ == "__main__":

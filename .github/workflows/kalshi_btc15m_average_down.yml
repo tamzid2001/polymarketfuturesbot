@@ -53,7 +53,12 @@ on:
         type: string
         default: ""
       stop_price:
-        description: "Fixed executable stop, e.g. 0.40. Blank keeps persisted configuration."
+        description: "Fixed executable stop floor, e.g. 0.40. Blank keeps persisted configuration."
+        required: false
+        type: string
+        default: ""
+      stop_baseline_entry_price:
+        description: "Baseline for the entry-adjusted stop. Only 0.50 is accepted: fills at/below it retain the 40c floor."
         required: false
         type: string
         default: ""
@@ -192,6 +197,7 @@ jobs:
           OPENING_PRICE_DISCOVERY_SECONDS: ${{ inputs.opening_price_discovery_seconds || '' }}
           OPENING_QUOTE_MAX_OBSERVATIONS: ${{ inputs.opening_quote_max_observations || '' }}
           STOP_PRICE: ${{ inputs.stop_price || '' }}
+          STOP_BASELINE_ENTRY_PRICE: ${{ inputs.stop_baseline_entry_price || '' }}
           RECOVERY_MULTIPLIER: ${{ inputs.recovery_multiplier || '' }}
           FIRST_BASE_THRESHOLD: ${{ inputs.first_base_threshold || '' }}
           THRESHOLD_GROWTH_MULTIPLIER: ${{ inputs.threshold_growth_multiplier || '' }}
@@ -226,6 +232,7 @@ jobs:
           [ -z "$OPENING_PRICE_DISCOVERY_SECONDS" ] || args+=(--opening-price-discovery-seconds "$OPENING_PRICE_DISCOVERY_SECONDS")
           [ -z "$OPENING_QUOTE_MAX_OBSERVATIONS" ] || args+=(--opening-quote-max-observations "$OPENING_QUOTE_MAX_OBSERVATIONS")
           [ -z "$STOP_PRICE" ] || args+=(--stop-price "$STOP_PRICE")
+          [ -z "$STOP_BASELINE_ENTRY_PRICE" ] || args+=(--stop-baseline-entry-price "$STOP_BASELINE_ENTRY_PRICE")
           [ -z "$RECOVERY_MULTIPLIER" ] || args+=(--recovery-multiplier "$RECOVERY_MULTIPLIER")
           [ -z "$FIRST_BASE_THRESHOLD" ] || args+=(--first-base-threshold "$FIRST_BASE_THRESHOLD")
           [ -z "$THRESHOLD_GROWTH_MULTIPLIER" ] || args+=(--threshold-growth-multiplier "$THRESHOLD_GROWTH_MULTIPLIER")

@@ -43,6 +43,12 @@ class HistoricalReplayTests(unittest.TestCase):
         stopped = ExecutionPathModel(ExecutionCalibration(win_entry_fill_probability=1, loss_entry_fill_probability=1, win_reach_40_joint_probability=1, loss_reach_40_joint_probability=1)).sample(True, __import__("random").Random(3), .40)
         self.assertEqual(trade_pnl_per_share(True, stopped, config)[0], Decimal("-.09"))
 
+    def test_shared_stop_policy_keeps_49c_at_40c_and_refuses_unobserved_upper_touches(self) -> None:
+        self.assertEqual(ReplayConfiguration(entry_price=Decimal(".49")).effective_stop_price(), Decimal(".40"))
+        self.assertEqual(ReplayConfiguration(entry_price=Decimal(".50")).effective_stop_price(), Decimal(".40"))
+        with self.assertRaisesRegex(ValueError, "41c-49c path calibration"):
+            ReplayConfiguration(entry_price=Decimal(".51"))
+
     def test_bankroll_is_checked_before_entry(self) -> None:
         result = replay_one(
             [{"ticker": "funding", "directional_win": False}], self.fixed_model(),

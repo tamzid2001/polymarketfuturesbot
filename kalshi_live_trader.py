@@ -41,6 +41,7 @@ from strategy_core import (
     StrategyParameters,
     apply_realized_filled_trade,
     decimal,
+    effective_stop_price,
     full_snapshot,
     prescribed_quantity,
     round_shares,
@@ -56,8 +57,8 @@ ORDER_PREFIX = "kxbtc15m-hybrid-v1-"
 # silently reinterpret an older selected configuration after a restart or a
 # watchdog handoff.  Bump both values deliberately with a reviewed migration
 # whenever the shared live/backtest strategy semantics change.
-ACTIVE_STRATEGY_VERSION = "kxbtc15m-hybrid-live-v3"
-ACTIVE_CONFIG_SCHEMA_VERSION = 3
+ACTIVE_STRATEGY_VERSION = "kxbtc15m-hybrid-live-v4"
+ACTIVE_CONFIG_SCHEMA_VERSION = 4
 TERMINAL_STATES = {"CLOSED", "ZERO_FILL", "FUNDING_FAILURE", "MISSED_SIGNAL", "ERROR_RECONCILIATION"}
 ACTIVE_STATES = {"SIGNAL_PENDING", "ENTRY_PENDING", "ENTRY_PARTIAL", "POSITION_OPEN", "STOP_PENDING", "SETTLEMENT_PENDING"}
 
@@ -85,6 +86,7 @@ DECIMAL_CONFIG_FIELDS = {
     "entry_price", "stop_price", "starting_base", "recovery_multiplier", "first_base_threshold",
     "threshold_growth_multiplier", "base_increment", "max_position", "provisional_outcome_threshold",
     "max_recovery_cycle_loss", "max_daily_realized_loss", "starting_shadow_balance", "maker_price_offset",
+    "stop_baseline_entry_price",
 }
 INTEGER_CONFIG_FIELDS = {
     "signal_delay_seconds", "entry_timeout_seconds", "entry_lateness_seconds", "outcome_observation_seconds",
@@ -116,15 +118,24 @@ def assert_active_strategy_contract(value: dict[str, Any]) -> None:
 
 
 def validate_entry_price_contract(value: dict[str, Any]) -> None:
-    """Validate the fixed historical reference and dynamic live maker offset."""
+    """Validate the fixed historical reference, entry rule, and stop rule."""
 
     entry = decimal(value["entry_price"])
     offset = decimal(value["maker_price_offset"])
     stop = decimal(value["stop_price"])
+    stop_baseline = decimal(value["stop_baseline_entry_price"])
     if offset != Decimal("0.01"):
         raise ValueError("the hybrid strategy requires maker_price_offset to equal exactly 0.01")
     if not stop < entry < Decimal("1"):
         raise ValueError("reference entry_price must satisfy stop < entry_price < 1")
+    if value.get("stop_policy") != "floor_with_entry_above_baseline":
+        raise ValueError("the hybrid strategy requires stop_policy=floor_with_entry_above_baseline")
+    if stop_baseline != Decimal("0.50"):
+        raise ValueError("the hybrid strategy requires stop_baseline_entry_price to equal exactly 0.50")
+    # Exercise the shared Decimal implementation at the fixed baseline so a
+    # malformed floor/baseline contract cannot reach live monitoring.
+    if effective_stop_price(stop_baseline, stop, stop_baseline) != stop:
+        raise ValueError("stop floor must remain the effective stop at the 50-cent baseline")
     if int(value["opening_quote_max_observations"]) < 1:
         raise ValueError("opening_quote_max_observations must be at least one")
     discovery_seconds = int(value["opening_price_discovery_seconds"])
@@ -139,6 +150,7 @@ def load_config(path: Path) -> dict[str, Any]:
     required = {
         "strategy_version", "series", "entry_price", "stop_price", "starting_base", "recovery_multiplier",
         "first_base_threshold", "threshold_growth_multiplier", "base_increment", "max_position",
+        "stop_policy", "stop_baseline_entry_price",
     }
     missing = required - value.keys()
     if missing:
@@ -162,6 +174,8 @@ def load_config(path: Path) -> dict[str, Any]:
     value.setdefault("shadow_fill_model", "conservative_trade_through")
     value.setdefault("starting_shadow_balance", "1000.00")
     value.setdefault("maker_price_offset", "0.01")
+    value.setdefault("stop_policy", "floor_with_entry_above_baseline")
+    value.setdefault("stop_baseline_entry_price", "0.50")
     value.setdefault("signal_delay_seconds", 0)
     # A maker entry has exactly this much time from market open.  At expiry,
     # the separate IOC fallback below is evaluated once using a fresh book.
@@ -218,7 +232,7 @@ def load_config_from_value(value: dict[str, Any]) -> dict[str, Any]:
         temporary[name] = int(temporary[name])
     for name in FLOAT_CONFIG_FIELDS & temporary.keys():
         temporary[name] = float(temporary[name])
-    required = {"strategy_version", "series", "entry_price", "stop_price", "starting_base", "recovery_multiplier", "first_base_threshold", "threshold_growth_multiplier", "base_increment", "max_position"}
+    required = {"strategy_version", "series", "entry_price", "stop_price", "starting_base", "recovery_multiplier", "first_base_threshold", "threshold_growth_multiplier", "base_increment", "max_position", "stop_policy", "stop_baseline_entry_price"}
     if required - temporary.keys():
         raise ValueError("invalid overridden live strategy configuration")
     assert_active_strategy_contract(temporary)
@@ -228,6 +242,8 @@ def load_config_from_value(value: dict[str, Any]) -> dict[str, Any]:
     temporary.setdefault("shadow_fill_model", "conservative_trade_through")
     temporary.setdefault("starting_shadow_balance", "1000.00")
     temporary.setdefault("maker_price_offset", "0.01")
+    temporary.setdefault("stop_policy", "floor_with_entry_above_baseline")
+    temporary.setdefault("stop_baseline_entry_price", "0.50")
     temporary.setdefault("entry_timeout_seconds", 15)
     temporary.setdefault("handoff_guard_seconds", 60)
     temporary.setdefault("opening_quote_max_observations", 500)
@@ -538,6 +554,15 @@ class LiveEngine:
             "maker_entry_price": None,
             "reference_maker_entry_price": self.config["entry_price"],
             "maker_price_offset": self.config["maker_price_offset"],
+            # The fixed 40c floor only rises when the *actual average filled
+            # entry* is above 50c.  These values are per-market immutable
+            # policy inputs, so a later config update cannot reinterpret an
+            # already-open position after a runner restart.
+            "stop_policy": self.config["stop_policy"],
+            "stop_floor_price": self.config["stop_price"],
+            "stop_baseline_entry_price": self.config["stop_baseline_entry_price"],
+            "actual_average_entry_price": None,
+            "effective_stop_price": None,
             "opening_quote_observations": [],
             "opening_quote_capture": {
                 "window_seconds": int(self.config["entry_timeout_seconds"]),
@@ -575,6 +600,83 @@ class LiveEngine:
             return Decimal(str(value)) if value is not None else None
         quote, _ = feed.executable_shadow_exit_quote(ticker, side, 0.0, float(self.config["max_stale_quote_seconds"]))
         return Decimal(str(quote["economic_price"])) if quote else None
+
+    @staticmethod
+    def average_filled_entry_price(record: dict[str, Any]) -> Decimal | None:
+        """Return the weighted actual entry price, excluding fees.
+
+        Stops are price triggers, so fee-inclusive accounting must not move
+        their threshold.  The realized-P&L path continues to use actual fees
+        through ``entry_cost``.
+        """
+
+        total_quantity = Decimal("0")
+        total_cost = Decimal("0")
+        for order in record.get("entry_orders", []):
+            try:
+                filled = Decimal(str(order.get("fill_count") or "0"))
+                price = Decimal(str(order.get("average_fill_price")))
+            except (ArithmeticError, TypeError, ValueError):
+                continue
+            if filled > 0 and Decimal("0") < price < Decimal("1"):
+                total_quantity += filled
+                total_cost += filled * price
+        return total_cost / total_quantity if total_quantity > 0 else None
+
+    def update_effective_stop_price(self, record: dict[str, Any]) -> Decimal | None:
+        """Persist the actual-entry-derived stop used for active monitoring."""
+
+        average = self.average_filled_entry_price(record)
+        if average is None:
+            return None
+        floor = Decimal(str(record.get("stop_floor_price") or self.config["stop_price"]))
+        baseline = Decimal(str(record.get("stop_baseline_entry_price") or self.config["stop_baseline_entry_price"]))
+        effective = effective_stop_price(average, floor, baseline)
+        prior = record.get("effective_stop_price")
+        record.update({
+            "actual_average_entry_price": format(average, "f"),
+            "effective_stop_price": format(effective, "f"),
+            "stop_adjustment_from_floor": format(effective - floor, "f"),
+        })
+        if prior != record["effective_stop_price"]:
+            self.audit(
+                "effective_stop_price_updated", ticker=record["ticker"], policy=record.get("stop_policy"),
+                actual_average_entry_price=record["actual_average_entry_price"], stop_floor_price=format(floor, "f"),
+                stop_baseline_entry_price=format(baseline, "f"), effective_stop_price=record["effective_stop_price"],
+            )
+            self.checkpoint("effective_stop_price_updated")
+        return effective
+
+    def stop_price_for_record(self, record: dict[str, Any]) -> Decimal:
+        """Use the persisted actual-entry stop; fixed floor is fail-safe only."""
+
+        calculated = self.update_effective_stop_price(record)
+        if calculated is not None:
+            return calculated
+        persisted = record.get("effective_stop_price")
+        if persisted not in (None, ""):
+            return Decimal(str(persisted))
+        return Decimal(str(record.get("stop_floor_price") or self.config["stop_price"]))
+
+    def note_stop_monitor_quote(
+        self, record: dict[str, Any], executable_bid: Decimal | None, effective_stop: Decimal,
+    ) -> None:
+        """Keep durable aggregate evidence for every post-entry stop check."""
+
+        monitor = record.setdefault("post_entry_stop_monitor", {
+            "quote_count": 0, "unavailable_quote_count": 0, "minimum_executable_bid": None,
+            "minimum_bid_observed_at": None, "last_executable_bid": None,
+        })
+        if executable_bid is None:
+            monitor["unavailable_quote_count"] = int(monitor.get("unavailable_quote_count", 0)) + 1
+            return
+        monitor["quote_count"] = int(monitor.get("quote_count", 0)) + 1
+        monitor["last_executable_bid"] = format(executable_bid, "f")
+        monitor["last_effective_stop_price"] = format(effective_stop, "f")
+        minimum = monitor.get("minimum_executable_bid")
+        if minimum in (None, "") or executable_bid < Decimal(str(minimum)):
+            monitor["minimum_executable_bid"] = format(executable_bid, "f")
+            monitor["minimum_bid_observed_at"] = utc_now()
 
     def capture_opening_quote(self, feed: KalshiLiveFeed, record: dict[str, Any], now: float) -> None:
         """Persist every available fresh complete top-of-book during maker time.
@@ -822,6 +924,7 @@ class LiveEngine:
                 return False
             record["actual_quantity"] = format(abs(raw), "f")
             self.state["current_position"] = record["actual_quantity"]
+            self.update_effective_stop_price(record)
             if record.get("status") in {"ENTRY_PENDING", "ENTRY_PARTIAL", "SIGNAL_PENDING"}:
                 self.transition(record, "POSITION_OPEN", "startup_authoritative_position")
         # Settlement/current-market discovery is independently retried during
@@ -871,6 +974,7 @@ class LiveEngine:
                 for item in filled_orders
             )
             self.state["average_entry"] = format(total_cost / total, "f") if total else None
+            self.update_effective_stop_price(record)
         return total
 
     def refresh_shadow_entry(self, feed: KalshiLiveFeed, record: dict[str, Any]) -> Decimal:
@@ -922,6 +1026,8 @@ class LiveEngine:
         record["actual_quantity"] = format(fill, "f")
         self.state["current_position"] = record["actual_quantity"]
         self.state["average_entry"] = format(limit, "f") if fill else None
+        if fill > 0:
+            self.update_effective_stop_price(record)
         return fill
 
     def entry_deadline(self, record: dict[str, Any]) -> float:
@@ -934,6 +1040,7 @@ class LiveEngine:
         """Close an exhausted entry attempt without ever changing recovery on a zero fill."""
 
         if filled > 0:
+            self.update_effective_stop_price(record)
             self.transition(record, "POSITION_OPEN", reason)
             return
         self.transition(record, "ZERO_FILL", reason)
@@ -1194,6 +1301,7 @@ class LiveEngine:
 
     async def close_at_stop(self, rest: KalshiREST, record: dict[str, Any], executable_bid: Decimal) -> None:
         side = str(record["signal_side"])
+        stop_price = self.stop_price_for_record(record)
         for order in record.get("entry_orders", []):
             await rest.cancel_order(order, self.dry_run)
         if self.dry_run:
@@ -1205,8 +1313,11 @@ class LiveEngine:
                 "average_fill_price": format(executable_bid, "f"), "fees_paid": "0",
                 "shadow_execution": "fresh_executable_bid",
             })
-            record["stop_trigger"] = {"at": utc_now(), "best_executable_bid": format(executable_bid, "f"), "requested_quantity": format(quantity, "f"), "shadow": True}
-            self.transition(record, "STOP_PENDING", "shadow_40c_executable_bid")
+            record["stop_trigger"] = {
+                "at": utc_now(), "best_executable_bid": format(executable_bid, "f"),
+                "effective_stop_price": format(stop_price, "f"), "requested_quantity": format(quantity, "f"), "shadow": True,
+            }
+            self.transition(record, "STOP_PENDING", "shadow_effective_stop_executable_bid")
             await self.finalize_stop(record)
             return
         exchange_position = await rest.position_for_ticker(record["ticker"])
@@ -1229,9 +1340,16 @@ class LiveEngine:
             client_order_id_override=deterministic_client_order_id(record["ticker"], side, f"stop-{len(prior)}", self.config),
         )
         record.setdefault("exit_orders", []).append(order)
-        record["stop_trigger"] = {"at": utc_now(), "best_executable_bid": format(executable_bid, "f"), "requested_quantity": format(quantity, "f")}
-        self.transition(record, "STOP_PENDING", "40c_executable_bid")
-        self.audit("stop_triggered", ticker=record["ticker"], side=side, executable_bid=format(executable_bid, "f"), quantity=format(quantity, "f"), exchange_order_id=order.get("order_id"))
+        record["stop_trigger"] = {
+            "at": utc_now(), "best_executable_bid": format(executable_bid, "f"),
+            "effective_stop_price": format(stop_price, "f"), "requested_quantity": format(quantity, "f"),
+        }
+        self.transition(record, "STOP_PENDING", "effective_stop_executable_bid")
+        self.audit(
+            "stop_triggered", ticker=record["ticker"], side=side, executable_bid=format(executable_bid, "f"),
+            effective_stop_price=format(stop_price, "f"), actual_average_entry_price=record.get("actual_average_entry_price"),
+            quantity=format(quantity, "f"), exchange_order_id=order.get("order_id"),
+        )
 
     def exit_proceeds(self, record: dict[str, Any]) -> tuple[Decimal, Decimal]:
         proceeds = fees = Decimal("0")
@@ -1303,10 +1421,46 @@ class LiveEngine:
                     await self.close_at_stop(rest, record, bid)
             return
         bid = self.selected_quote(feed, record["ticker"], str(record["signal_side"]), "bid")
-        if bid is not None and bid <= Decimal(self.config["stop_price"]):
+        effective_stop = self.stop_price_for_record(record)
+        self.note_stop_monitor_quote(record, bid, effective_stop)
+        if bid is not None and bid <= effective_stop:
             await self.close_at_stop(rest, record, bid)
 
+    async def verify_post_stop_settlement(self, rest: KalshiREST, record: dict[str, Any], now: float) -> None:
+        """Record the later official result of a stopped position without P&L changes."""
+
+        if record.get("post_stop_settlement_outcome") in {"yes", "no"}:
+            return
+        # Settlement can lag the market close. Bound REST retries while the
+        # official result is unavailable; this observation never changes an
+        # already-realized stop P&L or the recovery/base state.
+        next_check = float(record.get("post_stop_settlement_next_check_epoch") or 0)
+        if now < next_check:
+            return
+        record["post_stop_settlement_next_check_epoch"] = now + 60.0
+        market = await rest.get_market(record["ticker"])
+        outcome = market_result(market) if market is not None else None
+        if outcome not in {"yes", "no"}:
+            return
+        would_have_won = outcome == record.get("signal_side")
+        record.update({
+            "post_stop_settlement_outcome": outcome,
+            "post_stop_settlement_timestamp": utc_now(),
+            "post_stop_would_have_settled_correctly": would_have_won,
+        })
+        self.audit(
+            "post_stop_settlement_verified", ticker=record["ticker"], outcome=outcome,
+            would_have_settled_correctly=would_have_won,
+            actual_average_entry_price=record.get("actual_average_entry_price"),
+            effective_stop_price=record.get("effective_stop_price"),
+        )
+        self.checkpoint("post_stop_settlement_verified")
+
     async def settle(self, rest: KalshiREST, record: dict[str, Any], now: float) -> None:
+        if record.get("status") == "CLOSED":
+            if record.get("realized_method") == "stop" and now >= float(record["market_close_epoch"]):
+                await self.verify_post_stop_settlement(rest, record, now)
+            return
         if record.get("status") not in {"ENTRY_PARTIAL", "POSITION_OPEN", "SETTLEMENT_PENDING"} or now < float(record["market_close_epoch"]):
             return
         for order in record.get("entry_orders", []):

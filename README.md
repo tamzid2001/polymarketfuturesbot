@@ -21,7 +21,7 @@ All dollar results below are gross unless explicitly marked otherwise. Fees, liv
 
 ## Current live/shadow configuration
 
-[`selected_live_strategy.json`](selected_live_strategy.json) is the only canonical persisted configuration used by the live workflow. It is versioned as `kxbtc15m-hybrid-live-v3` / schema `3`; a legacy configuration is rejected before the worker can run. Optimizer exports use the same schema, so a future action cannot silently reinterpret an old configuration.
+[`selected_live_strategy.json`](selected_live_strategy.json) is the only canonical persisted configuration used by the live workflow. It is versioned as `kxbtc15m-hybrid-live-v4` / schema `4`; a legacy configuration is rejected before the worker can run. Optimizer exports use the same schema, so a future action cannot silently reinterpret an old configuration.
 
 | Setting | Current value | Notes |
 | --- | ---: | --- |
@@ -31,7 +31,8 @@ All dollar results below are gross unless explicitly marked otherwise. Fees, liv
 | Entry | **Opening maximum − 1¢ post-only limit** | For example, a 52¢ maximum posts at 51¢; there is **no 50¢ ceiling** |
 | Maker window / telemetry | **15 seconds / 500 records** | The maker order expires at 15 seconds; complete opening books are retained for calibration |
 | Fallback | One protected IOC | Only at a fresh executable ask **strictly above 40¢**; it is not an unbounded market order |
-| Stop | **40¢ executable bid** | Exits only actual filled exposure |
+| Stop floor | **40¢ executable bid** | Fills at or below 50¢ retain this fixed stop |
+| Stop above 50¢ entry | **Entry-adjusted** | Actual average entry − 10¢: 52¢ entry → 42¢ stop |
 | Recovery multiplier | **1.01×** | The selection favors $1,000-survivability, not maximum modeled P&L |
 | First base threshold | **$350.00** | Realized net P&L only |
 | Threshold growth | **1.01×** | Geometric after each permanent-base step |
@@ -52,7 +53,9 @@ At the configured discovery deadline (currently three seconds after open), the s
 maker_limit = maximum_selected_executable_ask_during_discovery - 0.01
 ```
 
-There is no upper price cap: a maximum of 52¢ produces a 51¢ post-only limit; a maximum of 67¢ produces a 66¢ post-only limit. The limit is never posted if it would cross the then-current book (post-only must remain maker) or if the derived price is at or below the 40¢ stop. In either case the worker waits for the protected fallback or records a zero fill as appropriate. Later observations through second 15 remain immutable calibration telemetry and cannot rewrite an already-derived entry price. At expiry, the worker cancels any unfilled maker remainder and may use one fresh displayed-depth IOC only when its executable ask is strictly above 40¢. The 40¢ stop remains unchanged and exits only actual filled exposure.
+There is no upper price cap: a maximum of 52¢ produces a 51¢ post-only limit; a maximum of 67¢ produces a 66¢ post-only limit. The limit is never posted if it would cross the then-current book (post-only must remain maker) or if the derived price is at or below the 40¢ stop. In either case the worker waits for the protected fallback or records a zero fill as appropriate. Later observations through second 15 remain immutable calibration telemetry and cannot rewrite an already-derived entry price. At expiry, the worker cancels any unfilled maker remainder and may use one fresh displayed-depth IOC only when its executable ask is strictly above 40¢.
+
+The stop uses the **actual weighted average filled entry price**, not the maker limit. Its persistent policy is `max(0.40, actual_average_entry − 0.10)`: a 49¢ or 50¢ fill keeps a 40¢ stop, while a 52¢ fill raises the executable stop to 42¢. Partial fills and a later IOC remainder are weighted together before stop monitoring. Stop prices are rounded up to the exchange cent, making the realized pre-fee stop loss no larger than the intended 10¢ merely because the average fill has fractional cents. Each entry-price and effective-stop update is written to the audit ledger.
 
 ## Reconstructed historical directional results
 
@@ -142,7 +145,7 @@ pW * ((f - rW) * (1 - e) + rW * (s - e))
 | 49¢ entry, 40¢ stop | **+$0.02232** | **+$0.02625** | **+$22.32** |
 | 50¢ entry, 40¢ stop | **+$0.01382** | **+$0.01625** | **+$13.82** |
 
-The 50¢ row changes only payout math while holding the **49¢** base-fill/path scenario fixed. It is a sensitivity calculation, not a calibrated 50¢ maker-fill forecast. Neither fixed-price row is an expected-value claim for the production opening-maximum-minus-1¢ rule, whose entry-price distribution is deliberately collected in shadow before it can be modeled. At either fixed price, one cent of fee per filled share would reduce the per-eligible-signal figure by approximately $0.00850 under the 85% participation assumption, before any slippage. A positive static EV is not a capital guarantee: nonlinear recovery sizing can still create drawdowns, cap hits, and funding failures.
+The 50¢ row changes only payout math while holding the **49¢** base-fill/path scenario fixed. It is a sensitivity calculation, not a calibrated 50¢ maker-fill forecast. Neither fixed-price row is an expected-value claim for the production opening-maximum-minus-1¢ rule or the new entry-adjusted stop: the historical rung model only identifies 40¢/30¢/20¢/10¢ touches, not 41¢–49¢ stop touches. The worker therefore records actual average entries, effective stops, post-entry minimum executable bids, stop exits, and later official outcomes for stopped positions before that adjustment is assigned an EV. At either fixed price, one cent of fee per filled share would reduce the per-eligible-signal figure by approximately $0.00850 under the 85% participation assumption, before any slippage. A positive static EV is not a capital guarantee: nonlinear recovery sizing can still create drawdowns, cap hits, and funding failures.
 
 ## Prior reconstruction comparisons
 
@@ -244,7 +247,7 @@ The optimizer uses common random numbers for competing configurations, keeps eve
 - Startup reconciles Kalshi balance, open managed orders, positions, fills, and settlements before any entry. Unknown or ambiguous ownership fails closed; Kalshi is authoritative.
 - Client order IDs are deterministic, partial fills use actual quantities, exits are reduce-only where supported, and the same market cannot be counted twice after restart.
 - The worker retains fresh complete selected-side books throughout the 15-second opening window. At second 3 it freezes the maximum selected-side executable ask and submits exactly 1¢ below it post-only, with no upper-price ceiling. Later captured quotes cannot change that submitted price.
-- A stale book, a derived maker limit at/below 40¢, or a price that would cross the current book creates no unsafe maker exposure. The protected one-shot IOC fallback is considered only at 15 seconds and only strictly above 40¢; a stop flattens only confirmed filled exposure.
+- The stop is `max(40¢, actual average entry − 10¢)`: an entry below 50¢ never lowers the 40¢ floor, while an entry above 50¢ raises its executable-bid trigger one-for-one. A stale book, a derived maker limit at/below 40¢, or a price that would cross the current book creates no unsafe maker exposure. The protected one-shot IOC fallback is considered only at 15 seconds and only strictly above 40¢; a stop flattens only confirmed filled exposure.
 - State and append-only audit ledgers are separate for `data/kalshi_shadow_strategy_*` and `data/kalshi_live_strategy_*`. The shadow run starts at $1,000 and tracks realized P&L, peak equity, and max drawdown without mutating live strategy state.
 - A five-hour worker checkpoints and queues its successor only in the middle 13 minutes of a market—from one minute after open through one minute before close. The watchdog is serialized and mode-preserving; it cannot convert a shadow worker into a live worker.
 
@@ -269,7 +272,7 @@ KALSHI_API_KEY_ID=... KALSHI_PEM_PATH=kalshi_private_key.pem \
   .venv/bin/python kalshi_live_trader.py --config selected_live_strategy.json --reconcile-only
 ```
 
-The test suite covers fixed outcomes, no loss-skip behavior, Decimal fractional sizing, zero-fill invariants, recovery/base transitions, path nesting, P&L conventions, caps, funding checks, restart reconciliation, order idempotency, provisional-outcome handling, opening quote capture, the no-cap one-cent-below-opening-maximum maker rule, the 15-second maker/IOC sequence, the 40¢ guard, and safe handoff timing.
+The test suite covers fixed outcomes, no loss-skip behavior, Decimal fractional sizing, zero-fill invariants, recovery/base transitions, path nesting, P&L conventions, caps, funding checks, restart reconciliation, order idempotency, provisional-outcome handling, opening quote capture, the no-cap one-cent-below-opening-maximum maker rule, the asymmetric 40¢-floor/above-50¢ stop policy, the 15-second maker/IOC sequence, the 40¢ guard, and safe handoff timing.
 
 ## Remaining risks
 

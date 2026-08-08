@@ -8,10 +8,35 @@ recovery transition implementation.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import ROUND_CEILING, Decimal
 from typing import Any
 
 from recovery_sizing import CENT, DEFAULT_MAX_POSITION, ZERO, RecoverySizingState, decimal, round_shares
+
+
+def effective_stop_price(
+    actual_entry_price: Decimal | str,
+    stop_floor_price: Decimal | str,
+    stop_baseline_entry_price: Decimal | str = Decimal("0.50"),
+) -> Decimal:
+    """Return the asymmetric live stop used by replay-compatible live state.
+
+    Entries at or below the 50-cent baseline retain the fixed 40-cent floor.
+    Above the baseline, the stop rises one-for-one with the actual average
+    entry price: 52 cents -> 42 cents.  Rounding is upward to the exchange
+    cent so the intended gross loss is never larger merely because a partial
+    fill produced a fractional-cent average.
+    """
+
+    entry = decimal(actual_entry_price)
+    floor = decimal(stop_floor_price)
+    baseline = decimal(stop_baseline_entry_price)
+    if not ZERO < floor < baseline < Decimal("1"):
+        raise ValueError("stop floor and baseline must satisfy 0 < floor < baseline < 1")
+    if not floor < entry < Decimal("1"):
+        raise ValueError("actual entry price must be above the fixed stop floor")
+    adjustment = max(ZERO, entry - baseline)
+    return (floor + adjustment).quantize(CENT, rounding=ROUND_CEILING)
 
 
 @dataclass(frozen=True)

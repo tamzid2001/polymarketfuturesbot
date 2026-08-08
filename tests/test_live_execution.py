@@ -293,6 +293,49 @@ class LiveExecutionTests(unittest.TestCase):
             self.assertEqual(engine.state["sizing"].get("recovery_exponent", 0), 0)
         asyncio.run(scenario())
 
+    def test_stop_uses_actual_entry_above_50c_but_never_moves_below_40c(self) -> None:
+        async def scenario() -> None:
+            class SettlementRest(EntryRest):
+                async def get_market(self, _ticker):
+                    return {"result": "yes"}
+
+            engine = self.engine()
+            rest = SettlementRest()
+            high_entry = engine.set_signal(
+                {"ticker": "KXBTC15M-high-entry", "open_epoch": 1_000, "close_epoch": 1_900},
+                {"outcome": "no", "ticker": "KXBTC15M-prior"},
+            )
+            high_entry.update({
+                "status": "POSITION_OPEN", "actual_quantity": "1.00",
+                "entry_orders": [{"fill_count": "1.00", "average_fill_price": "0.52", "fees_paid": "0"}],
+            })
+            engine.state["active_market"] = high_entry["ticker"]
+            await engine.manage_stop(rest, Feed("0.60", "0.41"), high_entry)
+            self.assertEqual(high_entry["actual_average_entry_price"], "0.52")
+            self.assertEqual(high_entry["effective_stop_price"], "0.42")
+            self.assertEqual(high_entry["stop_trigger"]["effective_stop_price"], "0.42")
+            self.assertEqual(high_entry["post_entry_stop_monitor"]["minimum_executable_bid"], "0.41")
+            self.assertEqual(high_entry["status"], "CLOSED")
+            completed = engine.state["sizing"]["completed_trade_count"]
+            await engine.settle(rest, high_entry, 1_901)
+            self.assertEqual(high_entry["post_stop_settlement_outcome"], "yes")
+            self.assertTrue(high_entry["post_stop_would_have_settled_correctly"])
+            self.assertEqual(engine.state["sizing"]["completed_trade_count"], completed)
+
+            low_entry = engine.set_signal(
+                {"ticker": "KXBTC15M-low-entry", "open_epoch": 2_000, "close_epoch": 2_900},
+                {"outcome": "no", "ticker": "KXBTC15M-prior-2"},
+            )
+            low_entry.update({
+                "status": "POSITION_OPEN", "actual_quantity": "1.00",
+                "entry_orders": [{"fill_count": "1.00", "average_fill_price": "0.49", "fees_paid": "0"}],
+            })
+            engine.state["active_market"] = low_entry["ticker"]
+            await engine.manage_stop(rest, Feed("0.60", "0.41"), low_entry)
+            self.assertEqual(low_entry["effective_stop_price"], "0.40")
+            self.assertEqual(low_entry["status"], "POSITION_OPEN")
+        asyncio.run(scenario())
+
     def test_handoff_only_permits_the_middle_thirteen_minutes_without_pending_operations(self) -> None:
         engine = self.engine()
         engine.markets = [{"ticker": "KXBTC15M-current", "open_epoch": 1_000, "close_epoch": 1_900, "status": "active"}]
