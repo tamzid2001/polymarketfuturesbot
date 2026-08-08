@@ -225,6 +225,16 @@ class LiveExecutionTests(unittest.TestCase):
         self.assertEqual(summary["actual_weighted_average_entry_price"], "0.538")
         self.assertEqual(summary["maker_limit_order_ids"], ["maker-1"])
         self.assertEqual(summary["market_ioc_order_ids"], ["ioc-1"])
+        engine.state["markets"][record["ticker"]] = record
+        metrics = engine.refresh_entry_execution_metrics()
+        self.assertEqual(metrics["markets_with_entry_fill"], 1)
+        self.assertEqual(metrics["maker_limit_fill_markets"], 1)
+        self.assertEqual(metrics["market_ioc_fill_markets"], 1)
+        self.assertEqual(metrics["mixed_entry_markets"], 1)
+        self.assertEqual(metrics["maker_limit_filled_quantity"], "0.30")
+        self.assertEqual(metrics["market_ioc_filled_quantity"], "0.70")
+        # A repeated refresh after a runner restart cannot increment totals.
+        self.assertEqual(engine.refresh_entry_execution_metrics(), metrics)
 
     def test_fifteen_second_maker_expiry_uses_one_price_protected_ioc_fallback(self) -> None:
         async def scenario() -> None:
@@ -254,6 +264,8 @@ class LiveExecutionTests(unittest.TestCase):
             self.assertEqual(record["entry_execution_summary"]["maker_limit_filled_quantity"], "0")
             self.assertEqual(record["entry_execution_summary"]["market_ioc_filled_quantity"], "1.00")
             self.assertEqual(record["entry_execution_summary"]["market_ioc_average_fill_price"], "0.6")
+            self.assertEqual(engine.state["entry_execution_metrics"]["maker_limit_fill_markets"], 0)
+            self.assertEqual(engine.state["entry_execution_metrics"]["market_ioc_fill_markets"], 1)
         asyncio.run(scenario())
 
     def test_market_fallback_refuses_a_40c_or_lower_selected_side(self) -> None:

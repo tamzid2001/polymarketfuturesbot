@@ -439,6 +439,11 @@ class LiveEngine:
         metrics.setdefault("completed_trades", 0)
         metrics.setdefault("stop_count", 0)
         metrics.setdefault("settlement_count", 0)
+        metrics.setdefault("maker_limit_fill_markets", 0)
+        metrics.setdefault("market_ioc_fill_markets", 0)
+        metrics.setdefault("mixed_entry_markets", 0)
+        metrics.setdefault("maker_limit_filled_quantity", "0.00")
+        metrics.setdefault("market_ioc_filled_quantity", "0.00")
         return metrics
 
     def shadow_available_cash(self) -> Decimal:
@@ -724,12 +729,84 @@ class LiveEngine:
         record["entry_execution_type"] = execution_type
         return changed
 
+    def refresh_entry_execution_metrics(self) -> dict[str, Any]:
+        """Recompute fill-method totals from durable per-market fill facts.
+
+        This intentionally recomputes rather than incrementing counters.  A
+        maker partial can later become a mixed maker/IOC entry, and a runner
+        may restart between those events.  Recalculation makes the aggregate
+        idempotent and prevents a restart or refresh from counting a market
+        twice.
+        """
+
+        counts = {
+            "markets_with_entry_fill": 0,
+            "maker_limit_only_markets": 0,
+            "market_ioc_only_markets": 0,
+            "mixed_entry_markets": 0,
+            "other_entry_markets": 0,
+            "maker_limit_fill_markets": 0,
+            "market_ioc_fill_markets": 0,
+        }
+        quantities = {
+            "maker_limit_filled_quantity": Decimal("0"),
+            "market_ioc_filled_quantity": Decimal("0"),
+            "other_entry_filled_quantity": Decimal("0"),
+            "total_entry_filled_quantity": Decimal("0"),
+        }
+        for record in self.state.get("markets", {}).values():
+            if not isinstance(record, dict):
+                continue
+            self.update_entry_execution_summary(record)
+            summary = record["entry_execution_summary"]
+            try:
+                maker_quantity = Decimal(str(summary["maker_limit_filled_quantity"]))
+                ioc_quantity = Decimal(str(summary["market_ioc_filled_quantity"]))
+                other_quantity = Decimal(str(summary["other_entry_filled_quantity"]))
+            except (ArithmeticError, KeyError, TypeError, ValueError):
+                continue
+            total = maker_quantity + ioc_quantity + other_quantity
+            if total <= 0:
+                continue
+            counts["markets_with_entry_fill"] += 1
+            execution_type = str(summary["entry_execution_type"])
+            if execution_type == "maker_limit":
+                counts["maker_limit_only_markets"] += 1
+            elif execution_type == "market_ioc":
+                counts["market_ioc_only_markets"] += 1
+            elif execution_type == "mixed":
+                counts["mixed_entry_markets"] += 1
+            else:
+                counts["other_entry_markets"] += 1
+            if maker_quantity > 0:
+                counts["maker_limit_fill_markets"] += 1
+            if ioc_quantity > 0:
+                counts["market_ioc_fill_markets"] += 1
+            quantities["maker_limit_filled_quantity"] += maker_quantity
+            quantities["market_ioc_filled_quantity"] += ioc_quantity
+            quantities["other_entry_filled_quantity"] += other_quantity
+            quantities["total_entry_filled_quantity"] += total
+
+        metrics = {**counts, **{key: format(value, "f") for key, value in quantities.items()}}
+        self.state["entry_execution_metrics"] = metrics
+        if self.dry_run:
+            # Surface the two requested headline counters alongside balance,
+            # drawdown, and other shadow-run metrics for convenient reporting.
+            shadow = self.shadow_metrics()
+            for key in (
+                "maker_limit_fill_markets", "market_ioc_fill_markets", "mixed_entry_markets",
+                "maker_limit_filled_quantity", "market_ioc_filled_quantity",
+            ):
+                shadow[key] = metrics[key]
+        return metrics
+
     def note_entry_execution_summary(self, record: dict[str, Any], reason: str) -> None:
         """Audit and checkpoint an actual maker/IOC fill composition change."""
 
         if not self.update_entry_execution_summary(record):
             return
         summary = record["entry_execution_summary"]
+        aggregate = self.refresh_entry_execution_metrics()
         self.audit(
             "entry_execution_updated", ticker=record["ticker"], reason=reason,
             entry_execution_type=summary["entry_execution_type"],
@@ -738,6 +815,9 @@ class LiveEngine:
             market_ioc_filled_quantity=summary["market_ioc_filled_quantity"],
             market_ioc_average_fill_price=summary["market_ioc_average_fill_price"],
             actual_weighted_average_entry_price=summary["actual_weighted_average_entry_price"],
+            maker_limit_fill_markets=aggregate["maker_limit_fill_markets"],
+            market_ioc_fill_markets=aggregate["market_ioc_fill_markets"],
+            mixed_entry_markets=aggregate["mixed_entry_markets"],
         )
         self.checkpoint("entry_execution_updated")
 
@@ -1049,6 +1129,10 @@ class LiveEngine:
         # the event loop.  Its result is recorded here for startup audit, but
         # a temporary discovery outage cannot make us forget known exposure.
         await self.discover(rest)
+        # Rebuild aggregate maker/IOC metrics from the persisted per-market
+        # fill facts on every startup.  This is safe across Actions handoffs
+        # and does not infer a fill from a merely requested order.
+        self.refresh_entry_execution_metrics()
         fill_count = len(recent_fills.get("fills", [])) if isinstance(recent_fills, dict) and isinstance(recent_fills.get("fills"), list) else 0
         self.state["last_reconciliation"] = {"at": utc_now(), "balance": format(balance, "f"), "managed_open_orders": len(orders), "recent_fill_records": fill_count, "markets_discovered": len(self.markets), "success": True}
         self.state["api_failure_count"] = 0
@@ -1682,7 +1766,8 @@ class LiveEngine:
                 self.last_reconcile = time.monotonic()
             if time.monotonic() - self.last_heartbeat >= 60:
                 sizing = sizing_state(self.current_parameters(), self.state.get("sizing"))
-                LOG.warning("HEARTBEAT | mode=%s ticker=%s state=%s base=%s exponent=%d target=%s deficit=%s threshold=%s active=%s breaker=%s", "DRY_RUN" if self.dry_run else "LIVE", active and active["ticker"], (self.state.get("markets", {}).get(active["ticker"], {}) if active else {}).get("status"), sizing.base_share_count, sizing.recovery_exponent, sizing.prescribed_quantity(), sizing.recovery_cycle_pnl, sizing.next_base_threshold, self.state.get("active_market"), self.state["circuit_breaker"].get("blocked"))
+                execution = self.refresh_entry_execution_metrics()
+                LOG.warning("HEARTBEAT | mode=%s ticker=%s state=%s base=%s exponent=%d target=%s deficit=%s threshold=%s maker_fills=%d ioc_fills=%d mixed=%d active=%s breaker=%s", "DRY_RUN" if self.dry_run else "LIVE", active and active["ticker"], (self.state.get("markets", {}).get(active["ticker"], {}) if active else {}).get("status"), sizing.base_share_count, sizing.recovery_exponent, sizing.prescribed_quantity(), sizing.recovery_cycle_pnl, sizing.next_base_threshold, execution["maker_limit_fill_markets"], execution["market_ioc_fill_markets"], execution["mixed_entry_markets"], self.state.get("active_market"), self.state["circuit_breaker"].get("blocked"))
                 self.last_heartbeat = time.monotonic()
             elapsed = time.monotonic() - start
             if elapsed >= run_seconds:

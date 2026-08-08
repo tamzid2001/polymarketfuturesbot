@@ -39,6 +39,10 @@ def default_state(config: dict[str, Any]) -> dict[str, Any]:
         "provisional_outcomes": {},
         "processed_settlements": [],
         "outcome_verification": {"provisional": 0, "verified": 0, "matches": 0, "mismatches": 0},
+        # Recomputed from durable per-market actual fills.  Keeping this
+        # aggregate separate from order requests makes maker/IOC participation
+        # measurable across runner handoffs without double counting retries.
+        "entry_execution_metrics": {},
         "circuit_breaker": {"blocked": False, "reason": None, "triggered_at": None},
         "daily_realized": {},
         "shadow_metrics": {},
