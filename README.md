@@ -21,14 +21,15 @@ All dollar results below are gross unless explicitly marked otherwise. Fees, liv
 
 ## Current live/shadow configuration
 
-[`selected_live_strategy.json`](selected_live_strategy.json) is the only canonical persisted configuration used by the live workflow. It is versioned as `kxbtc15m-hybrid-live-v2` / schema `2`; a legacy configuration is rejected before the worker can run. Optimizer exports use the same schema, so a future action cannot silently reinterpret an old configuration.
+[`selected_live_strategy.json`](selected_live_strategy.json) is the only canonical persisted configuration used by the live workflow. It is versioned as `kxbtc15m-hybrid-live-v3` / schema `3`; a legacy configuration is rejected before the worker can run. Optimizer exports use the same schema, so a future action cannot silently reinterpret an old configuration.
 
 | Setting | Current value | Notes |
 | --- | ---: | --- |
 | Series | `KXBTC15M` | Discovered from Kalshi market metadata, not ticker arithmetic |
 | Starting permanent base | **1.00 share** | Two-decimal `Decimal`, `ROUND_HALF_UP` |
-| Entry | **50¢ post-only limit** | Submitted at market open on the predicted side |
-| Maker window | **15 seconds** | Unfilled remainder is cancelled |
+| Opening-price discovery | **3 seconds** | Retains fresh complete selected-side quotes and takes their maximum executable ask |
+| Entry | **Opening maximum − 1¢ post-only limit** | For example, a 52¢ maximum posts at 51¢; there is **no 50¢ ceiling** |
+| Maker window / telemetry | **15 seconds / 500 records** | The maker order expires at 15 seconds; complete opening books are retained for calibration |
 | Fallback | One protected IOC | Only at a fresh executable ask **strictly above 40¢**; it is not an unbounded market order |
 | Stop | **40¢ executable bid** | Exits only actual filled exposure |
 | Recovery multiplier | **1.01×** | The selection favors $1,000-survivability, not maximum modeled P&L |
@@ -39,7 +40,19 @@ All dollar results below are gross unless explicitly marked otherwise. Fees, liv
 | Shadow balance | **$1,000.00** | Isolated from the live account state |
 | Real-money mode | **Disabled by default** | Requires both `KALSHI_LIVE_ENABLED=true` and an explicit live workflow input |
 
-The selected configuration’s basis is recorded verbatim in its JSON: highest modeled $1,000 survival followed by lower P99 bankroll under the base **49¢** calibration. Because the production entry is now 50¢, this is a shadow-validation candidate—not a claim that the 49¢ execution calibration proves 50¢ profitability. The live worker records actual 50¢ fill/quote evidence so the model can be recalibrated before any live enablement.
+The selected configuration’s basis is recorded verbatim in its JSON: highest modeled $1,000 survival followed by lower P99 bankroll under the base **49¢** calibration. `entry_price=0.49` is now a historical/replay reference, not a live ceiling or live order price. The opening-maximum-minus-1¢ execution rule is a shadow-validation candidate—not a claim that fixed-price 49¢/50¢ calibration proves its profitability. The worker records actual quote and fill evidence so it can be calibrated before any live enablement.
+
+### Opening quote capture and dynamic maker rule
+
+From market open through the 15-second entry window, the WebSocket worker retains up to 500 **fresh complete top-of-book** observations for the selected signal side. Every retained observation records exchange/receive timestamps, quote ID and age, YES and NO bid/ask/depth, selected-side executable bid/ask/depth, and the implied one-cent-lower price. This is durable per-market audit data, not a claim that a resting order filled.
+
+At the configured discovery deadline (currently three seconds after open), the selected-side maximum executable ask is frozen. The submitted maker price is exactly:
+
+```text
+maker_limit = maximum_selected_executable_ask_during_discovery - 0.01
+```
+
+There is no upper price cap: a maximum of 52¢ produces a 51¢ post-only limit; a maximum of 67¢ produces a 66¢ post-only limit. The limit is never posted if it would cross the then-current book (post-only must remain maker) or if the derived price is at or below the 40¢ stop. In either case the worker waits for the protected fallback or records a zero fill as appropriate. Later observations through second 15 remain immutable calibration telemetry and cannot rewrite an already-derived entry price. At expiry, the worker cancels any unfilled maker remainder and may use one fresh displayed-depth IOC only when its executable ask is strictly above 40¢. The 40¢ stop remains unchanged and exits only actual filled exposure.
 
 ## Reconstructed historical directional results
 
@@ -129,11 +142,11 @@ pW * ((f - rW) * (1 - e) + rW * (s - e))
 | 49¢ entry, 40¢ stop | **+$0.02232** | **+$0.02625** | **+$22.32** |
 | 50¢ entry, 40¢ stop | **+$0.01382** | **+$0.01625** | **+$13.82** |
 
-The 50¢ row changes only payout math while holding the **49¢** base-fill/path scenario fixed. It is a sensitivity calculation, not a calibrated 50¢ maker-fill forecast. At either price, one cent of fee per filled share would reduce the per-eligible-signal figure by approximately $0.00850 under the 85% participation assumption, before any slippage. A positive static EV is not a capital guarantee: nonlinear recovery sizing can still create drawdowns, cap hits, and funding failures.
+The 50¢ row changes only payout math while holding the **49¢** base-fill/path scenario fixed. It is a sensitivity calculation, not a calibrated 50¢ maker-fill forecast. Neither fixed-price row is an expected-value claim for the production opening-maximum-minus-1¢ rule, whose entry-price distribution is deliberately collected in shadow before it can be modeled. At either fixed price, one cent of fee per filled share would reduce the per-eligible-signal figure by approximately $0.00850 under the 85% participation assumption, before any slippage. A positive static EV is not a capital guarantee: nonlinear recovery sizing can still create drawdowns, cap hits, and funding failures.
 
 ## Prior reconstruction comparisons
 
-These are the earlier 50,000-execution-path / 1,500-market reconstruction results preserved for comparison. They used the corrected 1.00-share start and two-decimal sizing, but they are not a substitute for a full current-history run and must not be combined with the 50¢ live candidate. Dollar P&L and bankroll values below are model distributions, not exchange results.
+These are the earlier 50,000-execution-path / 1,500-market reconstruction results preserved for comparison. They used the corrected 1.00-share start and two-decimal sizing, but they are not a substitute for a full current-history run and must not be combined with the dynamic live entry rule. Dollar P&L and bankroll values below are model distributions, not exchange results.
 
 ### 1.11× recovery comparison: 40¢ stop, 49¢ entry
 
@@ -195,8 +208,8 @@ python3.13 -m venv .venv
   --walkforward-simulations 500 --finalists 15 \
   --reconciliation-simulations 50000 --seed 42
 
-# 4. Required 50¢ sensitivity. This reuses the 49¢ path calibration, so it is
-#    not a substitute for live 50¢ fill telemetry.
+# 4. Optional 50¢ fixed-price sensitivity. This reuses the 49¢ path
+#    calibration; it does not model the live opening-maximum-minus-1¢ rule.
 .venv/bin/python optimizer.py \
   --output-dir outputs/kalshi_hybrid_backtest/sensitivity_50c \
   --entry-price .50 --execution-scenario base_case \
@@ -230,7 +243,8 @@ The optimizer uses common random numbers for competing configurations, keeps eve
 - Permanent-base steps use realized net P&L only. No unrealized value, cancelled order, or zero fill can scale the base.
 - Startup reconciles Kalshi balance, open managed orders, positions, fills, and settlements before any entry. Unknown or ambiguous ownership fails closed; Kalshi is authoritative.
 - Client order IDs are deterministic, partial fills use actual quantities, exits are reduce-only where supported, and the same market cannot be counted twice after restart.
-- The 50¢ maker phase lasts exactly 15 seconds. A stale or at/below-40¢ selected-side quote creates no new exposure; a stop flattens only confirmed filled exposure.
+- The worker retains fresh complete selected-side books throughout the 15-second opening window. At second 3 it freezes the maximum selected-side executable ask and submits exactly 1¢ below it post-only, with no upper-price ceiling. Later captured quotes cannot change that submitted price.
+- A stale book, a derived maker limit at/below 40¢, or a price that would cross the current book creates no unsafe maker exposure. The protected one-shot IOC fallback is considered only at 15 seconds and only strictly above 40¢; a stop flattens only confirmed filled exposure.
 - State and append-only audit ledgers are separate for `data/kalshi_shadow_strategy_*` and `data/kalshi_live_strategy_*`. The shadow run starts at $1,000 and tracks realized P&L, peak equity, and max drawdown without mutating live strategy state.
 - A five-hour worker checkpoints and queues its successor only in the middle 13 minutes of a market—from one minute after open through one minute before close. The watchdog is serialized and mode-preserving; it cannot convert a shadow worker into a live worker.
 
@@ -255,8 +269,8 @@ KALSHI_API_KEY_ID=... KALSHI_PEM_PATH=kalshi_private_key.pem \
   .venv/bin/python kalshi_live_trader.py --config selected_live_strategy.json --reconcile-only
 ```
 
-The test suite covers fixed outcomes, no loss-skip behavior, Decimal fractional sizing, zero-fill invariants, recovery/base transitions, path nesting, P&L conventions, caps, funding checks, restart reconciliation, order idempotency, provisional-outcome handling, the 15-second maker/IOC sequence, the 40¢ guard, and safe handoff timing.
+The test suite covers fixed outcomes, no loss-skip behavior, Decimal fractional sizing, zero-fill invariants, recovery/base transitions, path nesting, P&L conventions, caps, funding checks, restart reconciliation, order idempotency, provisional-outcome handling, opening quote capture, the no-cap one-cent-below-opening-maximum maker rule, the 15-second maker/IOC sequence, the 40¢ guard, and safe handoff timing.
 
 ## Remaining risks
 
-The public settlement API cannot prove historical execution paths. The model does not yet have a representative 50¢ maker-fill sample, and the immediate provisional-quote signal must earn its reliability through live shadow verification. Fee schedules, liquidity, queue priority, stale/disconnected data, stop slippage, API behavior, market rules, and a changed directional regime may turn the modeled result negative. Treat the backtest as a reproducible risk study, not an assurance of profitability or capital safety.
+The public settlement API cannot prove historical execution paths. The model does not yet have a representative sample for the dynamic opening-maximum-minus-1¢ maker rule, and the immediate provisional-quote signal must earn its reliability through live shadow verification. A maximum observed ask does not establish a fillable maker queue position, and the uncapped rule can select materially higher entry prices than the fixed-price studies. Fee schedules, liquidity, queue priority, stale/disconnected data, stop slippage, API behavior, market rules, and a changed directional regime may turn the modeled result negative. Treat the backtest as a reproducible risk study, not an assurance of profitability or capital safety.

@@ -83,6 +83,8 @@ class StrategyCoreTests(unittest.TestCase):
         self.assertEqual(config["entry_price"], "0.50")
         self.assertEqual(config["starting_base"], "1.00")
         self.assertEqual(config["base_increment"], "1.00")
+        self.assertEqual(config["opening_price_discovery_seconds"], 3)
+        self.assertEqual(config["maker_price_offset"], "0.01")
         self.assertEqual(config["strategy_version"], ACTIVE_STRATEGY_VERSION)
         self.assertEqual(config["config_schema_version"], ACTIVE_CONFIG_SCHEMA_VERSION)
 
@@ -94,6 +96,11 @@ class StrategyCoreTests(unittest.TestCase):
             load_config_from_value(legacy_version)
         with self.assertRaisesRegex(ValueError, "non-current live configuration schema"):
             load_config_from_value(legacy_schema)
+
+    def test_dynamic_opening_limit_requires_exact_one_cent_offset(self) -> None:
+        config = load_config(ROOT / "selected_live_strategy.json")
+        with self.assertRaisesRegex(ValueError, "maker_price_offset"):
+            load_config_from_value(dict(config, maker_price_offset="0.02"))
 
 
 if __name__ == "__main__":

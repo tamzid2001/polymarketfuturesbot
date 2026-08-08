@@ -33,7 +33,22 @@ on:
         type: boolean
         default: false
       entry_price:
-        description: "Post-only maker entry price, e.g. 0.50. Blank keeps persisted configuration."
+        description: "Historical/replay reference entry price. Live maker price is derived from the opening selected-side maximum. Blank keeps persisted configuration."
+        required: false
+        type: string
+        default: ""
+      maker_price_offset:
+        description: "Required post-only offset below the opening selected-side maximum. Only 0.01 is accepted."
+        required: false
+        type: string
+        default: ""
+      opening_price_discovery_seconds:
+        description: "Seconds after market open used to capture the selected-side maximum before posting the maker limit. Blank keeps persisted configuration."
+        required: false
+        type: string
+        default: ""
+      opening_quote_max_observations:
+        description: "Maximum complete top-of-book quote observations retained for the first 15 seconds. Blank keeps persisted configuration."
         required: false
         type: string
         default: ""
@@ -173,6 +188,9 @@ jobs:
           RECONCILE_ONLY: ${{ inputs.reconcile_only || false }}
           RESET_STATE: ${{ inputs.reset_state || false }}
           ENTRY_PRICE: ${{ inputs.entry_price || '' }}
+          MAKER_PRICE_OFFSET: ${{ inputs.maker_price_offset || '' }}
+          OPENING_PRICE_DISCOVERY_SECONDS: ${{ inputs.opening_price_discovery_seconds || '' }}
+          OPENING_QUOTE_MAX_OBSERVATIONS: ${{ inputs.opening_quote_max_observations || '' }}
           STOP_PRICE: ${{ inputs.stop_price || '' }}
           RECOVERY_MULTIPLIER: ${{ inputs.recovery_multiplier || '' }}
           FIRST_BASE_THRESHOLD: ${{ inputs.first_base_threshold || '' }}
@@ -204,6 +222,9 @@ jobs:
           [ "$RECONCILE_ONLY" = "true" ] && args+=(--reconcile-only)
           [ "$RESET_STATE" = "true" ] && args+=(--reset-state)
           [ -z "$ENTRY_PRICE" ] || args+=(--entry-price "$ENTRY_PRICE")
+          [ -z "$MAKER_PRICE_OFFSET" ] || args+=(--maker-price-offset "$MAKER_PRICE_OFFSET")
+          [ -z "$OPENING_PRICE_DISCOVERY_SECONDS" ] || args+=(--opening-price-discovery-seconds "$OPENING_PRICE_DISCOVERY_SECONDS")
+          [ -z "$OPENING_QUOTE_MAX_OBSERVATIONS" ] || args+=(--opening-quote-max-observations "$OPENING_QUOTE_MAX_OBSERVATIONS")
           [ -z "$STOP_PRICE" ] || args+=(--stop-price "$STOP_PRICE")
           [ -z "$RECOVERY_MULTIPLIER" ] || args+=(--recovery-multiplier "$RECOVERY_MULTIPLIER")
           [ -z "$FIRST_BASE_THRESHOLD" ] || args+=(--first-base-threshold "$FIRST_BASE_THRESHOLD")

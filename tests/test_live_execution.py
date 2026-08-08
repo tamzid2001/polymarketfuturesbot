@@ -31,7 +31,11 @@ class Feed:
     def executable_shadow_quote(self, ticker: str, side: str, _quantity: float, _age: float):
         return {
             "ticker": ticker, "side": side, "economic_price": float(self.ask),
-            "displayed_depth": float(self.depth), "quote_id": "test-book",
+            "displayed_depth": float(self.depth), "quote_id": f"test-book:{self.ask}:{self.bid}",
+            "yes_bid": float(self.bid), "yes_ask": float(self.ask),
+            "yes_bid_size": float(self.depth), "yes_ask_size": float(self.depth),
+            "source_server_timestamp": "test", "source_timestamp_ms": 1,
+            "received_at": "test", "quote_age_seconds": 0.01,
         }, "executable_top_of_book"
 
     def public_trades_after(self, _ticker: str, _created):
@@ -126,13 +130,17 @@ class LiveExecutionTests(unittest.TestCase):
         async def scenario() -> None:
             engine = self.engine()
             record = engine.set_signal({"ticker": "KXBTC15M-current", "open_epoch": 1_000, "close_epoch": 1_900}, {"outcome": "yes", "ticker": "KXBTC15M-prior"})
-            await engine.submit_entry(EntryRest(), Feed("0.40"), record, 1_001)
+            feed = Feed("0.40")
+            await engine.submit_entry(EntryRest(), feed, record, 1_001)
+            await engine.submit_entry(EntryRest(), feed, record, 1_003)
             self.assertEqual(record["status"], "ZERO_FILL")
             self.assertEqual(engine.state["sizing"].get("recovery_exponent", 0), 0)
             engine = self.engine("0.01")
             record = engine.set_signal({"ticker": "KXBTC15M-current2", "open_epoch": 1_000, "close_epoch": 1_900}, {"outcome": "yes", "ticker": "KXBTC15M-prior"})
             rest = EntryRest("0.01")
-            await engine.submit_entry(rest, Feed("0.60"), record, 1_001)
+            feed = Feed("0.60")
+            await engine.submit_entry(rest, feed, record, 1_001)
+            await engine.submit_entry(rest, feed, record, 1_003)
             self.assertEqual(record["status"], "FUNDING_FAILURE")
             self.assertEqual(rest.created, 0)
         asyncio.run(scenario())
@@ -173,19 +181,19 @@ class LiveExecutionTests(unittest.TestCase):
         class TradeFeed:
             def public_trades_after(self, _ticker, _created):
                 return [
-                    {"trade_id": "a", "yes_price": .50, "no_price": .50, "count": .30},
-                    {"trade_id": "b", "yes_price": .51, "no_price": .49, "count": .20},
+                    {"trade_id": "a", "yes_price": .49, "no_price": .51, "count": .30},
+                    {"trade_id": "b", "yes_price": .50, "no_price": .50, "count": .20},
                 ]
         engine = self.engine()
         record = {
             "ticker": "KXBTC15M-current", "signal_side": "yes", "intended_quantity": "1.00",
-            "entry_orders": [{"quantity": "1.00", "submitted_at": datetime.now(timezone.utc).isoformat(), "fill_count": "0"}],
+            "entry_orders": [{"quantity": "1.00", "position_price": "0.49", "submitted_at": datetime.now(timezone.utc).isoformat(), "fill_count": "0"}],
         }
         filled = engine.refresh_shadow_entry(TradeFeed(), record)
         self.assertEqual(filled, Decimal("0.30"))
         self.assertEqual(record["entry_orders"][0]["shadow_fill_evidence"]["model"], "conservative_trade_through")
         self.assertEqual(record["actual_quantity"], "0.30")
-        self.assertEqual(engine.shadow_metrics()["reserved_cash"], "0.1500")
+        self.assertEqual(engine.shadow_metrics()["reserved_cash"], "0.1470")
 
     def test_fifteen_second_maker_expiry_uses_one_price_protected_ioc_fallback(self) -> None:
         async def scenario() -> None:
@@ -199,6 +207,7 @@ class LiveExecutionTests(unittest.TestCase):
                 {"outcome": "yes", "ticker": "KXBTC15M-prior"},
             )
             await engine.submit_entry(rest, feed, record, 1_000)
+            await engine.submit_entry(rest, feed, record, 1_003)
             self.assertEqual(record["entry_deadline_epoch"], 1_015)
             self.assertTrue(rest.calls[0]["post_only"])
             self.assertEqual(rest.calls[0]["tif"], "good_till_canceled")
@@ -222,10 +231,65 @@ class LiveExecutionTests(unittest.TestCase):
                 {"outcome": "yes", "ticker": "KXBTC15M-prior"},
             )
             await engine.submit_entry(rest, feed, record, 1_000)
+            await engine.submit_entry(rest, feed, record, 1_003)
             feed.ask = "0.40"
             await engine.manage_entry(rest, feed, record, 1_015)
             self.assertEqual(record["status"], "ZERO_FILL")
             self.assertEqual(record["market_fallback"]["reason"], "best_available_price_at_or_below_stop")
+            self.assertEqual(engine.state["sizing"].get("recovery_exponent", 0), 0)
+        asyncio.run(scenario())
+
+    def test_opening_maximum_derives_one_cent_lower_dynamic_maker_and_records_window(self) -> None:
+        async def scenario() -> None:
+            directory = Path(tempfile.mkdtemp())
+            engine = LiveEngine(dict(self.config), default_state(self.config), directory / "state", directory / "ledger", dry_run=False)
+            rest = LiveFallbackRest()
+            feed = Feed("0.52", "0.47")
+            record = engine.set_signal(
+                {"ticker": "KXBTC15M-opening-max", "open_epoch": 1_000, "close_epoch": 1_900},
+                {"outcome": "no", "ticker": "KXBTC15M-prior"},
+            )
+            await engine.submit_entry(rest, feed, record, 1_000.2)
+            self.assertEqual(rest.calls, [])
+            feed.ask = "0.54"
+            await engine.submit_entry(rest, feed, record, 1_001.7)
+            await engine.submit_entry(rest, feed, record, 1_003.1)
+            self.assertEqual(record["opening_price_discovery"]["maximum_selected_best_ask"], "0.54")
+            self.assertEqual(record["maker_entry_price"], "0.53")
+            self.assertEqual(rest.calls[0]["position_price"], 0.53)
+            samples = record["opening_quote_observations"]
+            self.assertEqual(len(samples), 2)
+            self.assertEqual(samples[0]["yes_bid"], "0.47")
+            self.assertEqual(samples[0]["yes_ask"], "0.52")
+            self.assertEqual(samples[0]["no_bid"], "0.48")
+            self.assertEqual(samples[0]["no_ask"], "0.53")
+            # Later opening observations are retained for calibration, but
+            # cannot rewrite the immutable price derived from the first three
+            # seconds once the maker order has been submitted.
+            feed.ask = "0.70"
+            engine.capture_opening_quote(feed, record, 1_004)
+            self.assertEqual(record["maker_entry_price"], "0.53")
+            self.assertEqual(Decimal(record["opening_quote_observations"][-1]["selected_best_ask"]), Decimal("0.70"))
+            self.assertEqual(Decimal(record["opening_quote_capture"]["max_selected_best_ask"]), Decimal("0.70"))
+            engine.capture_opening_quote(feed, record, 1_015)
+            self.assertIsNotNone(record["opening_quote_capture"]["completed_at"])
+        asyncio.run(scenario())
+
+    def test_opening_maximum_one_cent_below_at_stop_is_a_zero_fill(self) -> None:
+        async def scenario() -> None:
+            engine = self.engine()
+            rest = EntryRest()
+            feed = Feed("0.41")
+            record = engine.set_signal(
+                {"ticker": "KXBTC15M-opening-at-stop", "open_epoch": 1_000, "close_epoch": 1_900},
+                {"outcome": "no", "ticker": "KXBTC15M-prior"},
+            )
+            await engine.submit_entry(rest, feed, record, 1_000.1)
+            await engine.submit_entry(rest, feed, record, 1_003)
+            self.assertEqual(record["opening_price_discovery"]["maximum_selected_best_ask"], "0.41")
+            self.assertEqual(record["opening_price_discovery"]["derived_maker_entry_price"], "0.40")
+            self.assertEqual(record["status"], "ZERO_FILL")
+            self.assertEqual(rest.created, 0)
             self.assertEqual(engine.state["sizing"].get("recovery_exponent", 0), 0)
         asyncio.run(scenario())
 
