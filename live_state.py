@@ -37,6 +37,17 @@ def default_state(config: dict[str, Any]) -> dict[str, Any]:
         "average_entry": None,
         "markets": {},
         "provisional_outcomes": {},
+        # Directional side is intentionally independent of execution.  The
+        # v8 shadow experiment holds a losing side until that side eventually
+        # settles correctly, then flips for the following market.
+        "directional_signal_state": {
+            "mode": config.get("signal_mode", "sticky_until_directional_win"),
+            "active_side": None,
+            "last_source_market": None,
+            "last_source_outcome": None,
+            "last_transition": None,
+            "updated_at": None,
+        },
         "processed_settlements": [],
         "outcome_verification": {"provisional": 0, "verified": 0, "matches": 0, "mismatches": 0},
         # Recomputed from durable per-market actual fills.  Keeping this

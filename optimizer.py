@@ -117,12 +117,19 @@ def export_selected_live_strategy(path: Path, row: dict[str, Any], *, selection_
     stop = row.get("stop_price")
     if stop in {None, "no_stop"}:
         raise ValueError("a live strategy export requires an explicit fixed stop")
+    profile_by_stop = {0.40: "sticky_stop_40", 0.30: "sticky_stop_30", 0.20: "sticky_stop_20", 0.10: "sticky_stop_10"}
+    try:
+        shadow_profile = profile_by_stop[round(float(stop), 2)]
+    except KeyError as exc:
+        raise ValueError("a live strategy export requires a 40c, 30c, 20c, or 10c stop profile") from exc
     config = {
-        "config_schema_version": 7,
-        "strategy_version": "kxbtc15m-hybrid-live-v7",
+        "config_schema_version": 8,
+        "strategy_version": "kxbtc15m-hybrid-live-v8",
         "selection_basis": selection_basis,
         "series": "KXBTC15M",
         "signal_delay_seconds": 0,
+        "signal_mode": "sticky_until_directional_win",
+        "shadow_profile": shadow_profile,
         "entry_price": f"{float(row['entry_price']):.2f}",
         "stop_price": f"{float(stop):.2f}",
         "stop_policy": "floor_with_entry_above_baseline",
@@ -715,10 +722,11 @@ def run_optimization(
     walkforward_simulations: int = 500, finalists: int = 15, seed: int = 42,
     calibration_uncertainty_draws: int = 0, execution_scenario: str = "base_case",
     reconciliation_simulations: int = 0, entry_price: float = 0.49,
+    signal_mode: str = "sticky_until_directional_win",
 ) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
     markets = KalshiSettlementLoader().load()
-    signals, metadata = reconstruct_signals(markets)
+    signals, metadata = reconstruct_signals(markets, signal_mode=signal_mode)
     history = signal_summary(signals, metadata)
     outcomes = np.asarray([signal.directional_win for signal in signals], dtype=np.int8)
     calibration = calibration_for_scenario(execution_scenario)
@@ -768,7 +776,7 @@ def run_optimization(
     _write_csv(output_dir / "walkforward_results.csv", walk_rows, ("segment", "selection_role", *OUTPUT_COLUMNS))
     reconciliation_rows = reconciliation_comparison(
         signals, history, output_dir / "reconciliation_comparison.csv", reconciliation_simulations, seed,
-    )
+    ) if signal_mode == "inverse_latest_settlement" else []
     # The user-designated current candidate is a 40c stop.  Stress that
     # configured finalist rather than making stop-slippage/depth tests on an
     # unconstrained no-stop winner where those perturbations are inert.
@@ -817,7 +825,9 @@ def run_optimization(
         f"- Settled markets: {history['total_settled_markets']:,}; eligible signals: {history['eligible_predictions']:,}",
         f"- Actual directional W/L: {history['directional_wins']:,}/{history['directional_losses']:,} ({history['directional_win_rate']:.4%})",
         f"- Range: {history['first_market_timestamp']} to {history['last_market_timestamp']}",
-        "- The earlier 20,778 / 10,751 / 10,027 result is reproduced exactly by the first 20,778 currently available eligible signals; the full API now exposes a later 1,620-signal extension.",
+        ("- The earlier 20,778 / 10,751 / 10,027 contrarian result is reproduced exactly by the first 20,778 currently available eligible signals; the full API now exposes a later 1,620-signal extension."
+         if signal_mode == "inverse_latest_settlement" else
+         "- Sticky-direction results use the immediate prior actual settlement as a labelled proxy for the live realtime provisional outcome; they are not interchangeable with the prior 20,778-signal contrarian result."),
         "",
         "## Rankings",
         "",
@@ -855,8 +865,12 @@ def main() -> int:
     parser.add_argument("--execution-scenario", choices=tuple(EXECUTION_SCENARIOS), default="base_case", help="49c participation scenario; reconstruction_compatible is an explicit full-participation comparison")
     parser.add_argument("--reconciliation-simulations", type=int, default=0, help="also run the six 1.11x prior-style configurations on a fixed 1,500-settlement prefix")
     parser.add_argument("--entry-price", type=float, default=.49, choices=(.49, .50), help="maker-price assumption used consistently by the grid and live export")
+    parser.add_argument(
+        "--signal-mode", choices=("inverse_latest_settlement", "sticky_until_directional_win"),
+        default="sticky_until_directional_win", help="fixed-settlement signal-state rule to optimize",
+    )
     args = parser.parse_args()
-    result = run_optimization(args.output_dir, args.coarse_simulations, args.final_simulations, args.walkforward_simulations, args.finalists, args.seed, args.calibration_uncertainty_draws, args.execution_scenario, args.reconciliation_simulations, args.entry_price)
+    result = run_optimization(args.output_dir, args.coarse_simulations, args.final_simulations, args.walkforward_simulations, args.finalists, args.seed, args.calibration_uncertainty_draws, args.execution_scenario, args.reconciliation_simulations, args.entry_price, args.signal_mode)
     print(json.dumps({"history": result["history"], "best": result["best"]}, indent=2, default=str))
     return 0
 

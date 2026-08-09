@@ -20,6 +20,8 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
+from strategy_core import sticky_directional_prediction
+
 
 LOG = logging.getLogger(__name__)
 SERIES_TICKER = "KXBTC15M"
@@ -112,6 +114,8 @@ class HistoricalSignal:
     decision_time: datetime
     predicted_side: str
     directional_win: bool
+    signal_mode: str = "inverse_latest_settlement"
+    source_outcome_mode: str = "official_settlement"
 
     def to_row(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -214,13 +218,24 @@ class KalshiSettlementLoader:
 
 def reconstruct_signals(
     markets: Iterable[SettlementMarket], decision_delay_seconds: int = 45,
-) -> tuple[list[HistoricalSignal], dict[str, int]]:
-    """Build causal contrarian signals from actual, timestamped settlements.
+    signal_mode: str = "inverse_latest_settlement",
+) -> tuple[list[HistoricalSignal], dict[str, Any]]:
+    """Build fixed-settlement directional signals without redrawing results.
 
-    The target outcome is *never* sampled.  At each target's `open + 45s`,
-    the source is the most recently settled market that both closed before the
-    target opened and was published by that frozen decision time.
+    ``inverse_latest_settlement`` preserves the original audit: at each
+    target's ``open + 45s`` it uses the most recently officially settled
+    prior market.  ``sticky_until_directional_win`` is the v8 shadow rule:
+    it treats the immediately preceding market's *actual final settlement* as
+    the proxy for the realtime >=99c provisional outcome available at the
+    boundary.  That proxy is clearly labelled, rather than pretending the
+    delayed historical settlement timestamp was available at market open.
+
+    In both modes the target settlement is immutable historical data.  It is
+    never sampled, simulated, or modified by execution results.
     """
+
+    if signal_mode not in {"inverse_latest_settlement", "sticky_until_directional_win"}:
+        raise ValueError("signal_mode must be inverse_latest_settlement or sticky_until_directional_win")
 
     ordered = sorted(markets, key=lambda item: (item.open_time, item.ticker))
     settled = sorted(ordered, key=lambda item: (item.settlement_time, item.ticker))
@@ -230,7 +245,33 @@ def reconstruct_signals(
     missing_source = 0
     invalid_order = 0
 
-    for target in ordered:
+    active_side: str | None = None
+    for target_index, target in enumerate(ordered):
+        if signal_mode == "sticky_until_directional_win":
+            # At a live boundary the prior window's final quote determines
+            # direction before the official endpoint responds.  Historical
+            # settlement data cannot prove that quote, so this uses the
+            # eventually confirmed result only as a transparent proxy.
+            if target_index == 0:
+                missing_source += 1
+                continue
+            source = ordered[target_index - 1]
+            if source.close_time > target.open_time:
+                invalid_order += 1
+                continue
+            decision_time = target.open_time
+            predicted, _transition = sticky_directional_prediction(active_side, source.result)
+            active_side = predicted
+            signals.append(HistoricalSignal(
+                market_index=len(signals), ticker=target.ticker, open_time=target.open_time,
+                close_time=target.close_time, settlement_time=target.settlement_time,
+                actual_result=target.result, source_ticker=source.ticker,
+                source_close_time=source.close_time, source_settlement_time=source.settlement_time,
+                source_result=source.result, decision_time=decision_time, predicted_side=predicted,
+                directional_win=(target.result == predicted), signal_mode=signal_mode,
+                source_outcome_mode="immediate_previous_actual_settlement_proxy",
+            ))
+            continue
         decision_time = target.open_time + timedelta(seconds=decision_delay_seconds)
         while next_settlement < len(settled) and settled[next_settlement].settlement_time <= decision_time:
             source = settled[next_settlement]
@@ -253,13 +294,19 @@ def reconstruct_signals(
             actual_result=target.result, source_ticker=source.ticker,
             source_close_time=source.close_time, source_settlement_time=source.settlement_time,
             source_result=source.result, decision_time=decision_time, predicted_side=predicted,
-            directional_win=(target.result == predicted),
+            directional_win=(target.result == predicted), signal_mode=signal_mode,
+            source_outcome_mode="official_settlement",
         ))
     return signals, {
         "total_settled_markets": len(ordered),
         "eligible_predictions": len(signals),
         "missing_causal_source": missing_source,
         "invalid_source_order": invalid_order,
+        "signal_mode": signal_mode,
+        "source_outcome_mode": (
+            "immediate_previous_actual_settlement_proxy"
+            if signal_mode == "sticky_until_directional_win" else "official_settlement"
+        ),
         "first_settled_market_timestamp": timestamp_text(ordered[0].open_time) if ordered else None,
         "last_settled_market_timestamp": timestamp_text(ordered[-1].open_time) if ordered else None,
     }
@@ -299,10 +346,14 @@ def main() -> int:
     parser.add_argument("--signals", type=Path, default=DEFAULT_SIGNALS)
     parser.add_argument("--refresh", action="store_true", help="redownload instead of using the local cache")
     parser.add_argument("--decision-delay-seconds", type=int, default=45)
+    parser.add_argument(
+        "--signal-mode", choices=("inverse_latest_settlement", "sticky_until_directional_win"),
+        default="inverse_latest_settlement",
+    )
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     markets = KalshiSettlementLoader(args.cache).load(refresh=args.refresh)
-    signals, metadata = reconstruct_signals(markets, args.decision_delay_seconds)
+    signals, metadata = reconstruct_signals(markets, args.decision_delay_seconds, args.signal_mode)
     write_signals_parquet(signals, args.signals)
     print(json.dumps(signal_summary(signals, metadata), indent=2, sort_keys=True))
     return 0

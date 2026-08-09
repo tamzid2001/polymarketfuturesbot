@@ -13,6 +13,7 @@ from strategy_core import (
     effective_stop_price,
     prescribed_quantity,
     sizing_state,
+    sticky_directional_prediction,
     zero_fill_snapshot,
 )
 from kalshi_live_trader import (
@@ -97,6 +98,17 @@ class StrategyCoreTests(unittest.TestCase):
         self.assertEqual(config["strategy_version"], ACTIVE_STRATEGY_VERSION)
         self.assertEqual(config["config_schema_version"], ACTIVE_CONFIG_SCHEMA_VERSION)
 
+    def test_optimizer_export_preserves_the_selected_stop_profile(self) -> None:
+        row = {
+            "entry_price": .49, "stop_price": .20, "recovery_multiplier": 1.01,
+            "first_base_threshold": 350, "threshold_growth_multiplier": 1.01, "base_increment": .50,
+        }
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "selected_live_strategy.json"
+            config = export_selected_live_strategy(path, row, selection_basis="test")
+            self.assertEqual(load_config(path)["shadow_profile"], "sticky_stop_20")
+        self.assertEqual(config["stop_price"], "0.20")
+
     def test_legacy_live_configuration_fails_closed(self) -> None:
         config = load_config(ROOT / "selected_live_strategy.json")
         legacy_version = dict(config, strategy_version="kxbtc15m-hybrid-live-v1")
@@ -121,6 +133,23 @@ class StrategyCoreTests(unittest.TestCase):
         self.assertEqual(effective_stop_price(Decimal("0.50"), floor, baseline), floor)
         self.assertEqual(effective_stop_price(Decimal("0.52"), floor, baseline), Decimal("0.42"))
         self.assertEqual(effective_stop_price(Decimal("0.54"), floor, baseline), Decimal("0.44"))
+
+    def test_sticky_direction_holds_after_loss_and_flips_after_win(self) -> None:
+        # Fresh state is contrarian to the just-completed market.  Thereafter
+        # the side is a state machine, independent of fills, stops, or P&L.
+        self.assertEqual(sticky_directional_prediction(None, "yes"), ("no", "seed_inverse_settlement"))
+        self.assertEqual(sticky_directional_prediction("no", "yes"), ("no", "hold_after_directional_loss"))
+        self.assertEqual(sticky_directional_prediction("no", "no"), ("yes", "flip_after_directional_win"))
+        self.assertEqual(sticky_directional_prediction("yes", "no"), ("yes", "hold_after_directional_loss"))
+        self.assertEqual(sticky_directional_prediction("yes", "yes"), ("no", "flip_after_directional_win"))
+
+    def test_shadow_stop_profiles_cannot_silently_reinterpret_a_stop(self) -> None:
+        config = load_config(ROOT / "selected_live_strategy.json")
+        tested = load_config_from_value(dict(config, shadow_profile="sticky_stop_30", stop_price="0.30"))
+        self.assertEqual(tested["shadow_profile"], "sticky_stop_30")
+        self.assertEqual(tested["stop_price"], "0.30")
+        with self.assertRaisesRegex(ValueError, "requires stop_price"):
+            load_config_from_value(dict(config, shadow_profile="sticky_stop_30"))
 
 
 if __name__ == "__main__":

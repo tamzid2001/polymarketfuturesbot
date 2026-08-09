@@ -6,6 +6,7 @@ from decimal import Decimal
 import kalshi_btc15m_average_down as live_trader
 from execution_path_model import ExecutionCalibration, ExecutionPathModel
 from historical_replay import ReplayConfiguration, replay_one, trade_pnl_per_share
+from kalshi_settlement_loader import SettlementMarket, reconstruct_signals
 
 
 class HistoricalReplayTests(unittest.TestCase):
@@ -56,6 +57,24 @@ class HistoricalReplayTests(unittest.TestCase):
         )
         self.assertIsNotNone(result.funding_failure)
         self.assertEqual(result.funding_failure.required_cash, Decimal(".49"))
+
+    def test_sticky_historical_signal_replay_holds_a_losing_side_until_it_wins(self) -> None:
+        from datetime import datetime, timedelta, timezone
+
+        origin = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        results = ("yes", "yes", "no", "yes")
+        markets = []
+        for index, result in enumerate(results):
+            opened = origin + timedelta(minutes=15 * index)
+            closed = opened + timedelta(minutes=15)
+            markets.append(SettlementMarket(
+                ticker=f"KXBTC15M-test-{index}", open_time=opened, close_time=closed,
+                settlement_time=closed + timedelta(seconds=20), result=result, source="test",
+            ))
+        signals, metadata = reconstruct_signals(markets, signal_mode="sticky_until_directional_win")
+        self.assertEqual([signal.predicted_side for signal in signals], ["no", "no", "yes"])
+        self.assertEqual([signal.directional_win for signal in signals], [False, True, True])
+        self.assertEqual(metadata["source_outcome_mode"], "immediate_previous_actual_settlement_proxy")
 
 
 if __name__ == "__main__":

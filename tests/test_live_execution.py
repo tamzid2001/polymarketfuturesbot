@@ -12,7 +12,7 @@ from unittest.mock import patch
 from audit_ledger import append_audit
 from live_checkpoint import MaterialCheckpointPublisher
 from kalshi_live_trader import (
-    LiveEngine, ProvisionalOutcomeTracker, QuoteObservation, deterministic_client_order_id, load_config,
+    LiveEngine, ProvisionalOutcomeTracker, QuoteObservation, deterministic_client_order_id, live_mode_allowed, load_config,
 )
 from live_state import default_state
 
@@ -140,6 +140,12 @@ class LiveExecutionTests(unittest.TestCase):
         config["starting_shadow_balance"] = shadow_balance
         return LiveEngine(config, default_state(config), temporary / "state.json", temporary / "audit.jsonl", dry_run=True)
 
+    def test_persistent_shadow_only_lock_blocks_live_mode(self) -> None:
+        self.assertFalse(live_mode_allowed(True, True, True, False))
+        self.assertFalse(live_mode_allowed(True, True, False, True))
+        self.assertFalse(live_mode_allowed(True, False, False, False))
+        self.assertTrue(live_mode_allowed(True, True, False, False))
+
     def test_provisional_yes_and_no_and_inverse_signal(self) -> None:
         tracker = ProvisionalOutcomeTracker(Decimal("0.99"), 5, 2)
         boundary = 10_000.0
@@ -152,6 +158,33 @@ class LiveExecutionTests(unittest.TestCase):
         engine = self.engine()
         record = engine.set_signal({"ticker": "KXBTC15M-current", "open_epoch": boundary, "close_epoch": boundary + 900}, yes)
         self.assertEqual(record["signal_side"], "no")
+
+    def test_live_signal_holds_after_directional_loss_then_flips_after_win(self) -> None:
+        engine = self.engine()
+        first = engine.set_signal(
+            {"ticker": "KXBTC15M-1", "open_epoch": 1_000, "close_epoch": 1_900},
+            {"outcome": "yes", "ticker": "KXBTC15M-0"},
+        )
+        self.assertEqual(first["signal_side"], "no")
+        self.assertEqual(first["directional_transition"], "seed_inverse_settlement")
+        # The NO prediction was wrong because market 1 settled YES.  The
+        # following market must remain NO even if the first order was a zero
+        # fill; execution has no bearing on directional state.
+        second = engine.set_signal(
+            {"ticker": "KXBTC15M-2", "open_epoch": 1_900, "close_epoch": 2_800},
+            {"outcome": "yes", "ticker": "KXBTC15M-1"},
+        )
+        self.assertEqual(second["prior_signal_side"], "no")
+        self.assertEqual(second["signal_side"], "no")
+        self.assertEqual(second["directional_transition"], "hold_after_directional_loss")
+        # Market 2 then settles NO, so the carried NO side finally wins and
+        # the next prediction flips to YES.
+        third = engine.set_signal(
+            {"ticker": "KXBTC15M-3", "open_epoch": 2_800, "close_epoch": 3_700},
+            {"outcome": "no", "ticker": "KXBTC15M-2"},
+        )
+        self.assertEqual(third["signal_side"], "yes")
+        self.assertEqual(third["directional_transition"], "flip_after_directional_win")
 
     def test_provisional_rejects_stale_missing_and_conflicting_quotes(self) -> None:
         tracker = ProvisionalOutcomeTracker(Decimal(".99"), 5, 2)
