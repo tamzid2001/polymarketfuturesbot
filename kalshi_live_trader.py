@@ -57,10 +57,21 @@ ORDER_PREFIX = "kxbtc15m-hybrid-v1-"
 # silently reinterpret an older selected configuration after a restart or a
 # watchdog handoff.  Bump both values deliberately with a reviewed migration
 # whenever the shared live/backtest strategy semantics change.
-ACTIVE_STRATEGY_VERSION = "kxbtc15m-hybrid-live-v4"
-ACTIVE_CONFIG_SCHEMA_VERSION = 4
+# v5 is a hard compatibility boundary for the cancellation/reconciliation
+# safety model.  An older worker cannot silently load this configuration; it
+# fails closed before it can submit an order.
+ACTIVE_STRATEGY_VERSION = "kxbtc15m-hybrid-live-v5"
+ACTIVE_CONFIG_SCHEMA_VERSION = 5
 TERMINAL_STATES = {"CLOSED", "ZERO_FILL", "FUNDING_FAILURE", "MISSED_SIGNAL", "ERROR_RECONCILIATION"}
-ACTIVE_STATES = {"SIGNAL_PENDING", "ENTRY_PENDING", "ENTRY_PARTIAL", "POSITION_OPEN", "STOP_PENDING", "SETTLEMENT_PENDING"}
+# A cancellation acknowledgement or an order-submission response can be
+# uncertain.  These are deliberately active, risk-managed states: they block
+# every new entry, are retried through exchange reconciliation, and must not
+# be treated like a terminal bookkeeping error while an exchange position may
+# still exist.
+ACTIVE_STATES = {
+    "SIGNAL_PENDING", "ENTRY_PENDING", "ENTRY_PARTIAL", "POSITION_OPEN", "STOP_PENDING", "SETTLEMENT_PENDING",
+    "ENTRY_CANCEL_UNCONFIRMED", "RECONCILIATION_PENDING", "ACCOUNTING_RECONCILIATION_PENDING",
+}
 
 
 def configure_logging() -> None:
@@ -1070,11 +1081,132 @@ class LiveEngine:
             }
             if not record["order_id"]:
                 continue
-            await rest.cancel_order(record, dry_run=False)
+            confirmed = await rest.cancel_order(record, dry_run=False)
+            if not confirmed:
+                self.trip("emergency_entry_cancellation_unconfirmed")
+                self.audit("emergency_managed_order_cancel_unconfirmed", order_id=record["order_id"])
+                continue
             cancelled += 1
             self.audit("emergency_managed_order_cancel", order_id=record["order_id"])
-        LOG.warning("EMERGENCY CANCEL COMPLETE | managed_resting_orders=%d", cancelled)
+        LOG.warning("EMERGENCY CANCEL COMPLETE | confirmed_managed_resting_orders=%d", cancelled)
         return cancelled
+
+    @staticmethod
+    def _portfolio_fill_quantity(fill: Any) -> Decimal:
+        raw = field(fill, "count_fp", "count", "quantity", "fill_count_fp")
+        return Decimal(str(raw)) if raw is not None else Decimal("0")
+
+    @staticmethod
+    def _portfolio_fill_fee(fill: Any) -> Decimal:
+        raw = field(fill, "fee_cost", "fee_cost_dollars", "fees_paid_dollars", "fee")
+        return Decimal(str(raw)) if raw is not None else Decimal("0")
+
+    @staticmethod
+    def _portfolio_fill_price(fill: Any, side: str) -> Decimal | None:
+        """Decode a portfolio-fill price on the strategy's economic side."""
+
+        side_value = field(fill, f"{side}_price_dollars", f"{side}_price")
+        explicit_dollar_value = field(fill, f"{side}_price_dollars")
+        if side_value is None:
+            yes_value = field(fill, "yes_price_dollars", "yes_price")
+            if yes_value is None:
+                side_value = field(fill, "price_dollars", "price")
+                explicit_dollar_value = field(fill, "price_dollars")
+            elif side == "no":
+                yes_price = Decimal(str(yes_value))
+                if field(fill, "yes_price_dollars") is None and yes_price > 1:
+                    yes_price /= Decimal("100")
+                return Decimal("1") - yes_price
+            else:
+                side_value = yes_value
+                explicit_dollar_value = field(fill, "yes_price_dollars")
+        if side_value is None:
+            return None
+        price = Decimal(str(side_value))
+        if explicit_dollar_value is None and price > 1:
+            price /= Decimal("100")
+        return price if Decimal("0") <= price <= Decimal("1") else None
+
+    def reconstruct_entry_accounting_from_fills(
+        self, record: dict[str, Any], fills: Iterable[Any], authoritative_quantity: Decimal,
+    ) -> bool:
+        """Restore known entry fill cost/fees from exact exchange identifiers.
+
+        Ticker matching alone is intentionally insufficient: a manual trade
+        can exist in the same 15-minute market.  Only persisted order IDs or
+        this strategy's deterministic entry client IDs may supply accounting
+        facts.  If the exchange position cannot be fully explained, stop
+        management continues but realized P&L/recovery transitions are blocked.
+        """
+
+        side = str(record.get("signal_side") or "")
+        if side not in {"yes", "no"}:
+            return authoritative_quantity == 0
+        entry_ids = {
+            str(value) for order in record.get("entry_orders", []) if isinstance(order, dict)
+            for value in (order.get("order_id"), order.get("client_order_id")) if value
+        }
+        entry_ids.update({
+            deterministic_client_order_id(record["ticker"], side, "entry", self.config),
+            deterministic_client_order_id(record["ticker"], side, "market-fallback", self.config),
+        })
+        groups: dict[str, dict[str, Any]] = {}
+        seen: set[str] = set()
+        for fill in fills:
+            if str(field(fill, "ticker", "market_ticker") or "") != record.get("ticker"):
+                continue
+            order_id = str(field(fill, "order_id") or "")
+            client_id = str(field(fill, "client_order_id") or "")
+            if not ({order_id, client_id} - {""}) & entry_ids:
+                continue
+            quantity = self._portfolio_fill_quantity(fill)
+            price = self._portfolio_fill_price(fill, side)
+            if quantity <= 0 or price is None:
+                continue
+            fill_id = str(field(fill, "fill_id", "id", "trade_id") or f"{order_id}:{client_id}:{quantity}:{price}")
+            if fill_id in seen:
+                continue
+            seen.add(fill_id)
+            key = order_id or client_id
+            group = groups.setdefault(key, {
+                "order_id": order_id or None, "client_order_id": client_id or None,
+                "quantity": Decimal("0"), "cost": Decimal("0"), "fees": Decimal("0"), "fill_ids": [],
+            })
+            group["quantity"] += quantity
+            group["cost"] += quantity * price
+            group["fees"] += self._portfolio_fill_fee(fill)
+            group["fill_ids"].append(fill_id)
+
+        if groups:
+            known_orders = [order for order in record.setdefault("entry_orders", []) if isinstance(order, dict)]
+            for group in groups.values():
+                target = next((order for order in known_orders if group["order_id"] and order.get("order_id") == group["order_id"]), None)
+                if target is None:
+                    target = next((order for order in known_orders if group["client_order_id"] and order.get("client_order_id") == group["client_order_id"]), None)
+                if target is None:
+                    phase = "market_fallback" if group["client_order_id"] == deterministic_client_order_id(record["ticker"], side, "market-fallback", self.config) else "maker"
+                    target = {"order_id": group["order_id"], "client_order_id": group["client_order_id"], "entry_phase": phase, "remaining_count": "0"}
+                    known_orders.append(target)
+                    record["entry_orders"].append(target)
+                target.update({
+                    "fill_count": format(group["quantity"], "f"),
+                    "remaining_count": "0", "average_fill_price": format(group["cost"] / group["quantity"], "f"),
+                    "fees_paid": format(group["fees"], "f"), "reconciled_from_portfolio_fills": True,
+                    "reconciled_fill_ids": group["fill_ids"],
+                })
+
+        accounted = sum(
+            Decimal(str(order.get("fill_count") or "0"))
+            for order in record.get("entry_orders", []) if isinstance(order, dict)
+        )
+        reconciled = authoritative_quantity <= 0 or accounted + Decimal("0.004") >= authoritative_quantity
+        record["entry_accounting_reconciled"] = reconciled
+        record["entry_accounting_reconciliation"] = {
+            "at": utc_now(), "authoritative_quantity": format(authoritative_quantity, "f"),
+            "accounted_entry_quantity": format(accounted, "f"), "matched_fill_count": len(seen), "reconciled": reconciled,
+        }
+        self.note_entry_execution_summary(record, "portfolio_fill_reconciliation")
+        return reconciled
 
     async def reconcile_startup(self, rest: KalshiREST) -> bool:
         """Reconcile exchange first; uncertainty blocks entries, never closes manual risk."""
@@ -1091,6 +1223,7 @@ class LiveEngine:
             self.trip("invalid_authenticated_balance")
             return False
         known = self.state["markets"]
+        fill_rows = recent_fills.get("fills", []) if isinstance(recent_fills, dict) and isinstance(recent_fills.get("fills"), list) else []
         for order in orders:
             ticker = str(field(order, "ticker") or "")
             client_id = str(field(order, "client_order_id") or "")
@@ -1100,6 +1233,35 @@ class LiveEngine:
                 self.trip("unknown_managed_open_order")
                 self.audit("reconciliation_discrepancy", ticker=ticker, client_order_id=client_id, reason="unknown_managed_open_order")
                 return False
+            record = known[ticker]
+            side = str(record.get("signal_side") or "")
+            maker_client_id = deterministic_client_order_id(ticker, side, "entry", self.config) if side in {"yes", "no"} else ""
+            fallback_client_id = deterministic_client_order_id(ticker, side, "market-fallback", self.config) if side in {"yes", "no"} else ""
+            entry_client_ids = {maker_client_id, fallback_client_id} - {""}
+            if client_id in entry_client_ids:
+                # A timed-out POST can still have created a resting maker.
+                # Recover its exchange ID before any entry/stop management so
+                # future cancellation is not attempted against a missing ID.
+                exchange_order_id = str(field(order, "order_id") or "") or None
+                local = next((item for item in record.setdefault("entry_orders", []) if isinstance(item, dict) and (
+                    (exchange_order_id and item.get("order_id") == exchange_order_id)
+                    or item.get("client_order_id") == client_id
+                )), None)
+                if local is None:
+                    local = {"order_id": exchange_order_id, "client_order_id": client_id}
+                    record["entry_orders"].append(local)
+                local.update({
+                    "order_id": exchange_order_id, "client_order_id": client_id,
+                    "entry_phase": "market_fallback" if client_id == fallback_client_id else "maker",
+                    "fill_count": format(Decimal(str(order_fill_count(order))), "f"),
+                    "remaining_count": format(Decimal(str(order_remaining_count(order) or "0")), "f"),
+                    "average_fill_price": format(Decimal(str(order_average_position_price(order, side, float(self.config["entry_price"])))), "f"),
+                    "fees_paid": format(Decimal(str(order_fee_total(order))), "f"),
+                    "reconciled_from_open_order": True,
+                })
+                self.trip("unconfirmed_managed_entry_recovered")
+                if record.get("status") in {"ERROR_RECONCILIATION", "RECONCILIATION_PENDING"}:
+                    self.transition(record, "ENTRY_PENDING", "startup_recovered_unconfirmed_resting_entry")
         for position in field(positions, "market_positions", "positions") or []:
             ticker = str(field(position, "ticker") or "")
             # This strategy never assumes ownership of a different series.
@@ -1122,8 +1284,20 @@ class LiveEngine:
                 return False
             record["actual_quantity"] = format(abs(raw), "f")
             self.state["current_position"] = record["actual_quantity"]
+            accounting_reconciled = self.reconstruct_entry_accounting_from_fills(record, fill_rows, abs(raw))
+            if not accounting_reconciled:
+                # Keep stop management alive for the actual exposure, but do
+                # not manufacture a cost basis or advance recovery from it.
+                self.trip("entry_fill_accounting_unreconciled")
+                self.audit(
+                    "reconciliation_discrepancy", ticker=ticker, reason="entry_fill_accounting_unreconciled",
+                    reconciliation=record["entry_accounting_reconciliation"],
+                )
             self.update_effective_stop_price(record)
-            if record.get("status") in {"ENTRY_PENDING", "ENTRY_PARTIAL", "SIGNAL_PENDING"}:
+            if record.get("status") not in {"STOP_PENDING", "POSITION_OPEN"}:
+                # This includes historical ERROR_RECONCILIATION records.  An
+                # exchange-confirmed position is never allowed to remain in a
+                # terminal local status where stop management would ignore it.
                 self.transition(record, "POSITION_OPEN", "startup_authoritative_position")
         # Settlement/current-market discovery is independently retried during
         # the event loop.  Its result is recorded here for startup audit, but
@@ -1133,7 +1307,7 @@ class LiveEngine:
         # fill facts on every startup.  This is safe across Actions handoffs
         # and does not infer a fill from a merely requested order.
         self.refresh_entry_execution_metrics()
-        fill_count = len(recent_fills.get("fills", [])) if isinstance(recent_fills, dict) and isinstance(recent_fills.get("fills"), list) else 0
+        fill_count = len(fill_rows)
         self.state["last_reconciliation"] = {"at": utc_now(), "balance": format(balance, "f"), "managed_open_orders": len(orders), "recent_fill_records": fill_count, "markets_discovered": len(self.markets), "success": True}
         self.state["api_failure_count"] = 0
         self.audit("startup_reconciliation", balance=format(balance, "f"), managed_open_orders=len(orders), recent_fill_records=fill_count, markets_discovered=len(self.markets))
@@ -1179,6 +1353,93 @@ class LiveEngine:
             self.update_effective_stop_price(record)
         self.note_entry_execution_summary(record, "exchange_order_refresh")
         return total
+
+    async def cancel_entry_orders_and_confirm(
+        self, rest: KalshiREST, record: dict[str, Any], *, next_action: str, executable_bid: Decimal | None = None,
+    ) -> bool:
+        """Cancel every potentially resting entry and refuse to proceed on doubt.
+
+        A replacement IOC or reduce-only exit is safe only after every earlier
+        entry is known to be gone.  ``cancel_order`` returns an exchange
+        acknowledgement; test doubles written before that contract are also
+        accepted when they explicitly set the remaining quantity to zero.
+        """
+
+        unconfirmed: list[dict[str, Any]] = []
+        for order in record.get("entry_orders", []):
+            # The protected replacement is IOC and therefore cannot remain a
+            # future source of exposure after its response.  Only the GTC
+            # maker (or a legacy order without a recorded phase) must be
+            # canceled before an exit/replacement may proceed.
+            if order.get("entry_phase", "maker") != "maker":
+                continue
+            remaining = Decimal(str(order.get("remaining_count") or "0"))
+            if remaining <= 0:
+                continue
+            try:
+                acknowledged = await rest.cancel_order(order, self.dry_run)
+            except Exception as exc:  # Defensive: adapters must never turn an exception into permission to replace.
+                order["cancel_error"] = type(exc).__name__
+                acknowledged = False
+            confirmed = bool(acknowledged) or Decimal(str(order.get("remaining_count") or "0")) <= 0
+            if not confirmed:
+                unconfirmed.append({
+                    "order_id": order.get("order_id"), "client_order_id": order.get("client_order_id"),
+                    "remaining_count": str(order.get("remaining_count") or "0"),
+                    "cancel_error": order.get("cancel_error"),
+                })
+        if not unconfirmed:
+            record.pop("entry_cancel_pending", None)
+            record["entry_cancellation_confirmed_at"] = utc_now()
+            return True
+
+        record["entry_cancel_pending"] = {
+            "at": utc_now(), "next_action": next_action, "orders": unconfirmed,
+            "executable_bid": None if executable_bid is None else format(executable_bid, "f"),
+        }
+        self.trip("entry_cancellation_unconfirmed")
+        self.transition(record, "ENTRY_CANCEL_UNCONFIRMED", "entry_cancellation_unconfirmed")
+        self.audit(
+            "entry_cancellation_unconfirmed", ticker=record["ticker"], next_action=next_action, orders=unconfirmed,
+        )
+        return False
+
+    async def resume_unconfirmed_entry_cancellation(
+        self, rest: KalshiREST, feed: KalshiLiveFeed, record: dict[str, Any],
+    ) -> bool:
+        """Retry cancellation reconciliation without creating new exposure."""
+
+        pending = record.get("entry_cancel_pending")
+        if record.get("status") != "ENTRY_CANCEL_UNCONFIRMED" or not isinstance(pending, dict):
+            return False
+        action = str(pending.get("next_action") or "finish_entry")
+        bid_text = pending.get("executable_bid")
+        bid = Decimal(str(bid_text)) if bid_text is not None else None
+        if not await self.cancel_entry_orders_and_confirm(rest, record, next_action=action, executable_bid=bid):
+            return True
+
+        filled = self.refresh_shadow_entry(feed, record) if self.dry_run else await self.refresh_entry(rest, record)
+        if not self.dry_run:
+            exchange_position = await rest.position_for_ticker(record["ticker"])
+            if exchange_position is None:
+                self.trip("entry_cancellation_position_reconciliation_failed")
+                self.transition(record, "RECONCILIATION_PENDING", "position_unknown_after_entry_cancellation")
+                return True
+            filled = max(filled, abs(Decimal(str(exchange_position))))
+            record["actual_quantity"] = format(filled, "f")
+            self.state["current_position"] = record["actual_quantity"]
+        if action == "stop":
+            if filled > 0:
+                await self.close_at_stop(rest, record, bid or Decimal(self.config["stop_price"]), entries_confirmed=True)
+            else:
+                self.finish_entry_attempt(record, filled, "entry_cancel_confirmed_before_stop")
+            return True
+
+        # An uncertain cancellation is never followed by an IOC replacement.
+        # Once it is resolved we either manage the confirmed position or count
+        # a strict zero fill, preserving the recovery state in the latter case.
+        self.finish_entry_attempt(record, filled, "entry_cancel_confirmed_without_replacement")
+        return True
 
     def refresh_shadow_entry(self, feed: KalshiLiveFeed, record: dict[str, Any]) -> Decimal:
         """Conservative public-trade-through evidence for a shadow maker fill.
@@ -1280,6 +1541,10 @@ class LiveEngine:
 
         if record.get("market_fallback_attempted"):
             return
+        # Do not trust a caller's prior cancellation attempt.  The maker must
+        # be confirmed gone immediately before a replacement IOC is eligible.
+        if not await self.cancel_entry_orders_and_confirm(rest, record, next_action="finish_entry"):
+            return
         record["market_fallback_attempted"] = True
         side = str(record["signal_side"])
         intended = Decimal(str(record["intended_quantity"]))
@@ -1368,8 +1633,13 @@ class LiveEngine:
             order["entry_phase"] = "market_fallback"
             order["fallback_quote"] = quote
             if order.get("status") in {"submit_failed", "paused", "direction_mismatch"}:
+                # Preserve the deterministic client ID even when the HTTP
+                # response is unknown.  Startup can then tie a late exchange
+                # fill back to this record instead of inventing P&L.
+                record.setdefault("entry_orders", []).append(order)
                 record["market_fallback"] = {"attempted_at": utc_now(), "status": "submission_unknown_or_rejected", "quote": quote}
-                self.transition(record, "ERROR_RECONCILIATION", "market_fallback_not_accepted")
+                self.trip("market_fallback_submission_unknown")
+                self.transition(record, "RECONCILIATION_PENDING", "market_fallback_submission_unknown")
                 return
         record.setdefault("entry_orders", []).append(order)
         record["market_fallback"] = {
@@ -1461,12 +1731,17 @@ class LiveEngine:
             quantity=float(quantity), tif="good_till_canceled", expiration_time=expiry, dry_run=self.dry_run,
             order_key="hybrid-entry", post_only=True, client_order_id_override=client_id,
         )
+        order["entry_phase"] = "maker"
         # A type/API incompatibility cannot degrade to a non-post-only entry.
         if order.get("status") in {"submit_failed", "paused"}:
-            self.transition(record, "ERROR_RECONCILIATION", "post_only_entry_not_accepted")
+            # A failed response is not evidence that the exchange rejected
+            # the request.  Persist its deterministic client ID and hold all
+            # new exposure until authoritative reconciliation says otherwise.
+            record["entry_orders"].append(order)
+            self.trip("maker_entry_submission_unknown")
+            self.transition(record, "RECONCILIATION_PENDING", "post_only_entry_submission_unknown")
             return
         record["entry_orders"].append(order)
-        order["entry_phase"] = "maker"
         self.note_entry_execution_summary(record, "maker_limit_submitted")
         self.state["current_order_id"] = order.get("order_id")
         record["entry_deadline_epoch"] = expiry
@@ -1487,6 +1762,11 @@ class LiveEngine:
         return cost
 
     async def manage_entry(self, rest: KalshiREST, feed: KalshiLiveFeed, record: dict[str, Any], now: float) -> None:
+        if record.get("status") == "ENTRY_CANCEL_UNCONFIRMED":
+            pending = record.get("entry_cancel_pending")
+            if isinstance(pending, dict) and pending.get("next_action") != "stop":
+                await self.resume_unconfirmed_entry_cancellation(rest, feed, record)
+            return
         if record.get("status") not in {"ENTRY_PENDING", "ENTRY_PARTIAL"}:
             return
         filled = self.refresh_shadow_entry(feed, record) if self.dry_run else await self.refresh_entry(rest, record)
@@ -1496,9 +1776,8 @@ class LiveEngine:
         ask = self.selected_quote(feed, record["ticker"], side, "ask")
         deadline = float(record.get("entry_deadline_epoch") or 0)
         if now >= deadline:
-            for order in record.get("entry_orders", []):
-                if order.get("entry_phase", "maker") == "maker":
-                    await rest.cancel_order(order, self.dry_run)
+            if not await self.cancel_entry_orders_and_confirm(rest, record, next_action="finish_entry"):
+                return
             # For shadow mode, preserve only the trade-through evidence that
             # existed before cancellation; later public trades cannot fill a
             # cancelled simulated maker order.
@@ -1506,17 +1785,20 @@ class LiveEngine:
             await self.submit_market_fallback(rest, feed, record, filled)
             return
         if (ask is not None and ask <= Decimal(self.config["stop_price"])) or now >= float(record["market_close_epoch"]):
-            for order in record.get("entry_orders", []):
-                if order.get("entry_phase", "maker") == "maker":
-                    await rest.cancel_order(order, self.dry_run)
+            if not await self.cancel_entry_orders_and_confirm(rest, record, next_action="finish_entry"):
+                return
             filled = filled if self.dry_run else await self.refresh_entry(rest, record)
             self.finish_entry_attempt(record, filled, "selected_side_at_or_below_stop_before_fallback")
 
-    async def close_at_stop(self, rest: KalshiREST, record: dict[str, Any], executable_bid: Decimal) -> None:
+    async def close_at_stop(
+        self, rest: KalshiREST, record: dict[str, Any], executable_bid: Decimal, *, entries_confirmed: bool = False,
+    ) -> None:
         side = str(record["signal_side"])
         stop_price = self.stop_price_for_record(record)
-        for order in record.get("entry_orders", []):
-            await rest.cancel_order(order, self.dry_run)
+        if not entries_confirmed and not await self.cancel_entry_orders_and_confirm(
+            rest, record, next_action="stop", executable_bid=executable_bid,
+        ):
+            return
         if self.dry_run:
             quantity = Decimal(str(record.get("actual_quantity") or "0"))
             if quantity == 0:
@@ -1545,8 +1827,10 @@ class LiveEngine:
             self.trip("stop_position_direction_mismatch")
             return
         prior = record.get("exit_orders", [])
-        if prior and Decimal(str(prior[-1].get("remaining_count") or "0")) > 0:
-            return
+        # An IOC can be rejected or partially filled and still retain its
+        # requested remaining quantity in the local record.  It is not a
+        # resting order.  The just-read exchange position is authoritative,
+        # so retry with only that residual instead of permanently returning.
         order = await rest.create_reduce_only_exit(
             ticker=record["ticker"], held_side=side, economic_exit_price=float(executable_bid), quantity=float(quantity),
             dry_run=self.dry_run, order_key=f"hybrid-stop-{len(prior)}",
@@ -1574,6 +1858,19 @@ class LiveEngine:
 
     def record_realized(self, record: dict[str, Any], net: Decimal, method: str, settlement_id: str) -> None:
         if settlement_id in self.state["processed_settlements"]:
+            return
+        if record.get("entry_accounting_reconciled") is False:
+            # Exchange exposure may already be flat, but a made-up entry cost
+            # would corrupt both realized P&L and the shared recovery state.
+            # Keep the durable exception for a later fill-history reconcile and
+            # prevent all new entries through the circuit breaker.
+            self.trip("realized_pnl_requires_entry_fill_reconciliation")
+            record["realized_pnl_blocked"] = {
+                "at": utc_now(), "method": method, "settlement_id": settlement_id,
+                "reason": "entry_fill_accounting_unreconciled",
+            }
+            self.transition(record, "ACCOUNTING_RECONCILIATION_PENDING", "realized_pnl_blocked_missing_entry_fills")
+            self.audit("realized_pnl_blocked", ticker=record["ticker"], method=method, settlement_id=settlement_id)
             return
         self.note_entry_execution_summary(record, "realized_trade_finalization")
         parameters = self.record_parameters(record)
@@ -1624,6 +1921,11 @@ class LiveEngine:
         self.record_realized(record, net, "stop", f"{record['ticker']}:stop")
 
     async def manage_stop(self, rest: KalshiREST, feed: KalshiLiveFeed, record: dict[str, Any]) -> None:
+        if record.get("status") == "ENTRY_CANCEL_UNCONFIRMED":
+            pending = record.get("entry_cancel_pending")
+            if isinstance(pending, dict) and pending.get("next_action") == "stop":
+                await self.resume_unconfirmed_entry_cancellation(rest, feed, record)
+            return
         if record.get("status") not in {"ENTRY_PARTIAL", "POSITION_OPEN", "STOP_PENDING"}:
             return
         if record.get("status") == "STOP_PENDING":
@@ -1682,8 +1984,8 @@ class LiveEngine:
             return
         if record.get("status") not in {"ENTRY_PARTIAL", "POSITION_OPEN", "SETTLEMENT_PENDING"} or now < float(record["market_close_epoch"]):
             return
-        for order in record.get("entry_orders", []):
-            await rest.cancel_order(order, self.dry_run)
+        if not await self.cancel_entry_orders_and_confirm(rest, record, next_action="finish_entry"):
+            return
         market = await rest.get_market(record["ticker"])
         outcome = market_result(market) if market is not None else None
         if outcome not in {"yes", "no"}:
@@ -1695,11 +1997,49 @@ class LiveEngine:
         record["settlement_outcome"] = outcome
         self.record_realized(record, net, "settlement", f"{record['ticker']}:settlement:{outcome}")
 
+    async def reconcile_uncertain_record(self, rest: KalshiREST, record: dict[str, Any]) -> bool:
+        """Restore protection if an earlier create/cancel response was unknown."""
+
+        if record.get("status") not in {"ERROR_RECONCILIATION", "RECONCILIATION_PENDING"}:
+            return False
+        position = await rest.position_for_ticker(record["ticker"])
+        if position is None:
+            self.trip("uncertain_order_position_lookup_failed")
+            return True
+        signed = Decimal(str(position))
+        if signed == 0:
+            # Do not infer rejection from a zero position: the uncertain order
+            # may still be resting.  New entry remains disabled until a full
+            # startup reconciliation can account for open orders/fills.
+            return True
+        side = str(record.get("signal_side") or "")
+        if (side == "yes" and signed < 0) or (side == "no" and signed > 0) or side not in {"yes", "no"}:
+            self.trip("uncertain_order_position_direction_mismatch")
+            return True
+        record["actual_quantity"] = format(abs(signed), "f")
+        self.state["current_position"] = record["actual_quantity"]
+        try:
+            payload = await rest.get_raw_json("/portfolio/fills", {"limit": 1000})
+            rows = payload.get("fills", []) if isinstance(payload, dict) and isinstance(payload.get("fills"), list) else []
+            accounting_reconciled = self.reconstruct_entry_accounting_from_fills(record, rows, abs(signed))
+        except Exception:
+            accounting_reconciled = False
+        if not accounting_reconciled:
+            self.trip("uncertain_order_entry_accounting_unreconciled")
+        self.update_effective_stop_price(record)
+        self.transition(record, "POSITION_OPEN", "uncertain_submission_authoritative_position")
+        self.audit(
+            "uncertain_submission_reconciled", ticker=record["ticker"], quantity=record["actual_quantity"],
+            entry_accounting_reconciled=accounting_reconciled,
+        )
+        return True
+
     async def reconcile_active(self, rest: KalshiREST, feed: KalshiLiveFeed, now: float) -> None:
         for record in list(self.state["markets"].values()):
             if not isinstance(record, dict):
                 continue
             await self.verify_previous_outcome(rest, record)
+            await self.reconcile_uncertain_record(rest, record)
             await self.manage_entry(rest, feed, record, now)
             await self.manage_stop(rest, feed, record)
             await self.settle(rest, record, now)

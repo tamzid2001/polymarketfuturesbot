@@ -2082,25 +2082,36 @@ class KalshiREST:
                 return
             LOG.warning("Exit order lookup failed for %s: %s", order_id, exc)
 
-    async def cancel_order(self, record: dict[str, Any], dry_run: bool) -> None:
+    async def cancel_order(self, record: dict[str, Any], dry_run: bool) -> bool:
+        """Cancel an order and report whether its disappearance is confirmed.
+
+        Callers that may replace an entry or flatten a position must treat a
+        ``False`` return as a hard stop.  In particular, merely logging a
+        cancellation exception and continuing can leave a resting maker order
+        able to fill after an IOC replacement or a reduce-only exit.
+        """
         order_id = record.get("order_id")
         if not order_id or float(record.get("remaining_count") or 0.0) <= 0.004:
-            return
+            return float(record.get("remaining_count") or 0.0) <= 0.004
         if dry_run:
             record["status"] = "dry_run_canceled"
             record["remaining_count"] = 0.0
-            return
+            return True
         try:
             await self.orders.cancel_order_v2(order_id)
             record["status"] = "canceled"
             record["canceled_at"] = now_iso()
             record["remaining_count"] = 0.0
             LOG.info("CANCELED | %s", order_id)
+            return True
         except Exception as exc:  # noqa: BLE001
             # Closed markets reject cancellation after the exchange has already
-            # canceled resting orders.  Keep the failure audit trail.
+            # canceled resting orders.  Keep the failure audit trail and make
+            # the uncertainty explicit to the caller; it must reconcile before
+            # it may place a replacement or an exit.
             record["cancel_error"] = str(exc)
             LOG.warning("Cancel failed for %s: %s", order_id, exc)
+            return False
 
 
 def expiration_epoch(market: Any) -> int | None:
