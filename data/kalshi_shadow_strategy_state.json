@@ -45,8 +45,8 @@
     "other_entry_filled_quantity": "0",
     "other_entry_markets": 0,
     "total_entry_filled_quantity": "15.45",
-    "tracked_markets": 31,
-    "zero_fill_markets": 15
+    "tracked_markets": 32,
+    "zero_fill_markets": 16
   },
   "execution_timing_metrics": {
     "entry_first_fill_from_market_open": {
@@ -23316,6 +23316,7 @@
       },
       "created_at": "2026-08-09T06:45:12.643243+00:00",
       "effective_stop_price": null,
+      "entry_cancellation_confirmed_at": "2026-08-09T06:46:02.178565+00:00",
       "entry_deadline_epoch": 1786257960.0,
       "entry_discovery_wait_logged_epoch": 1786257912.619273,
       "entry_execution_summary": {
@@ -23323,29 +23324,33 @@
         "entry_execution_type": "none",
         "maker_limit_average_fill_price": null,
         "maker_limit_filled": false,
-        "maker_limit_filled_quantity": "0.00",
+        "maker_limit_filled_quantity": "0",
         "maker_limit_order_ids": [],
         "market_ioc_average_fill_price": null,
         "market_ioc_filled": false,
-        "market_ioc_filled_quantity": "0.00",
+        "market_ioc_filled_quantity": "0",
         "market_ioc_order_ids": [],
-        "other_entry_filled_quantity": "0.00",
-        "total_filled_quantity": "0.00"
+        "other_entry_filled_quantity": "0",
+        "total_filled_quantity": "0"
       },
       "entry_execution_type": "none",
       "entry_orders": [],
       "entry_timing": {
-        "entry_attempt_completed_at": null,
-        "entry_attempt_completed_epoch": null,
+        "entry_attempt_completed_at": "2026-08-09T06:46:02.233624+00:00",
+        "entry_attempt_completed_epoch": 1786257962.233621,
+        "entry_attempt_final_filled_quantity": "0",
+        "entry_attempt_reason": "market_fallback_quote_unavailable",
         "entry_window_seconds": 60,
         "first_fill_observed_at": null,
         "first_fill_observed_epoch": null,
         "first_fill_source": null,
         "first_submission_at": null,
         "first_submission_epoch": null,
+        "first_submission_to_entry_attempt_completion_seconds": null,
         "last_fill_observed_at": null,
         "last_filled_quantity": "0.00",
         "market_open_epoch": 1786257900.0,
+        "market_open_to_entry_attempt_completion_seconds": 62.233621,
         "submission_events": []
       },
       "exit_orders": [],
@@ -23359,6 +23364,12 @@
         "selected_ask": "0.49"
       },
       "market_close_epoch": 1786258800.0,
+      "market_fallback": {
+        "attempted_at": "2026-08-09T06:46:02.178583+00:00",
+        "reason": "stale_top_of_book",
+        "status": "not_submitted"
+      },
+      "market_fallback_attempted": true,
       "market_open_epoch": 1786257900.0,
       "official_outcome": "yes",
       "official_settlement_timestamp": "2026-08-09T06:45:15.396282+00:00",
@@ -24697,8 +24708,8 @@
       "signal_side": "no",
       "signal_timestamp": "2026-08-09T06:45:12.643147+00:00",
       "source_market_ticker": "KXBTC15M-26AUG090245-45",
-      "status": "ENTRY_PENDING",
-      "status_reason": "waiting_for_market_fallback_after_post_only_cross",
+      "status": "ZERO_FILL",
+      "status_reason": "market_fallback_quote_unavailable",
       "stop_baseline_entry_price": "0.50",
       "stop_floor_price": "0.40",
       "stop_policy": "floor_with_entry_above_baseline",
@@ -24712,7 +24723,7 @@
       },
       "strategy_version": "kxbtc15m-hybrid-live-v7",
       "ticker": "KXBTC15M-26AUG090300-00",
-      "updated_at": "2026-08-09T06:45:15.808346+00:00"
+      "updated_at": "2026-08-09T06:46:02.261344+00:00"
     }
   },
   "outcome_verification": {
@@ -24759,8 +24770,8 @@
     "settlement_count": 3,
     "starting_balance": "1000.00",
     "stop_count": 12,
-    "zero_fill_markets": 15,
-    "zero_fills": 15
+    "zero_fill_markets": 16,
+    "zero_fills": 16
   },
   "sizing": {
     "base_scale_count": 0,
@@ -24777,5 +24788,5 @@
   },
   "state_version": 1,
   "strategy_version": "kxbtc15m-hybrid-live-v7",
-  "updated_at": "2026-08-09T06:46:00.749980+00:00"
+  "updated_at": "2026-08-09T06:46:05.820421+00:00"
 }
