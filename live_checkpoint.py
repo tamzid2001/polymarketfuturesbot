@@ -26,6 +26,10 @@ class MaterialCheckpointPublisher:
         self.minimum_interval_seconds = minimum_interval_seconds
         self.last_attempt = float("-inf")
         self.last_fingerprint = ""
+        # A material write which arrives within the throttle interval must not
+        # wait for a different market event before it is published.  The live
+        # loop calls ``publish_if_due`` while maintaining local checkpoints.
+        self.pending_reason: str | None = None
 
     def fingerprint(self) -> str:
         digest = hashlib.sha256()
@@ -40,12 +44,15 @@ class MaterialCheckpointPublisher:
     def publish_if_changed(self, reason: str) -> bool:
         fingerprint = self.fingerprint()
         if fingerprint == self.last_fingerprint:
+            self.pending_reason = None
             return False
         if not self.enabled:
             self.last_fingerprint = fingerprint
+            self.pending_reason = None
             return False
         now = time.monotonic()
         if now - self.last_attempt < self.minimum_interval_seconds:
+            self.pending_reason = reason
             return False
         self.last_attempt = now
         try:
@@ -79,6 +86,18 @@ class MaterialCheckpointPublisher:
             if push.returncode:
                 raise RuntimeError("git push failed")
         except Exception:
+            # Keep the reason queued for the next regular worker checkpoint.
+            # The local state/ledger is already fsynced; this is only the
+            # best-effort remote handoff copy.
+            self.pending_reason = reason
             return False
         self.last_fingerprint = fingerprint
+        self.pending_reason = None
         return True
+
+    def publish_if_due(self) -> bool:
+        """Flush a coalesced material checkpoint once its throttle expires."""
+
+        if self.pending_reason is None:
+            return False
+        return self.publish_if_changed(self.pending_reason)
