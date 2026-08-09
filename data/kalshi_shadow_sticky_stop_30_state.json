@@ -3,9 +3,9 @@
   "api_failure_count": 0,
   "average_entry": null,
   "circuit_breaker": {
-    "blocked": false,
-    "reason": null,
-    "triggered_at": null
+    "blocked": true,
+    "reason": "entry_cancellation_unconfirmed",
+    "triggered_at": "2026-08-09T14:31:02.910454+00:00"
   },
   "config_hash": "3ac8c87aa739b94c3239fba6d120d898cecfb8f668547f9b8992abc0ed140e94",
   "created_at": "2026-08-09T13:43:42.814362+00:00",
@@ -5756,6 +5756,19 @@
       "created_at": "2026-08-09T14:30:11.946106+00:00",
       "directional_transition": "flip_after_directional_win",
       "effective_stop_price": null,
+      "entry_cancel_pending": {
+        "at": "2026-08-09T14:31:02.910442+00:00",
+        "executable_bid": null,
+        "next_action": "finish_entry",
+        "orders": [
+          {
+            "cancel_error": null,
+            "client_order_id": "kxbtc15m-hybrid-v1-ef45d8824705550ba552dd0421e2b8f9",
+            "order_id": null,
+            "remaining_count": "1.01"
+          }
+        ]
+      },
       "entry_deadline_epoch": 1786285860,
       "entry_discovery_wait_logged_epoch": 1786285811.8922062,
       "entry_execution_summary": {
@@ -7057,8 +7070,8 @@
       "signal_side": "yes",
       "signal_timestamp": "2026-08-09T14:30:11.946009+00:00",
       "source_market_ticker": "KXBTC15M-26AUG091030-30",
-      "status": "ENTRY_PENDING",
-      "status_reason": "post_only_limit_submitted",
+      "status": "ENTRY_CANCEL_UNCONFIRMED",
+      "status_reason": "entry_cancellation_unconfirmed",
       "stop_baseline_entry_price": "0.50",
       "stop_floor_price": "0.30",
       "stop_policy": "floor_with_entry_above_baseline",
@@ -7072,7 +7085,7 @@
       },
       "strategy_version": "kxbtc15m-hybrid-live-v8",
       "ticker": "KXBTC15M-26AUG091045-45",
-      "updated_at": "2026-08-09T14:30:16.972823+00:00"
+      "updated_at": "2026-08-09T14:31:02.929112+00:00"
     }
   },
   "outcome_verification": {
@@ -7125,5 +7138,5 @@
   },
   "state_version": 1,
   "strategy_version": "kxbtc15m-hybrid-live-v8",
-  "updated_at": "2026-08-09T14:31:01.055147+00:00"
+  "updated_at": "2026-08-09T14:31:06.206135+00:00"
 }
