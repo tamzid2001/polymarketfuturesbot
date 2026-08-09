@@ -57,11 +57,11 @@ ORDER_PREFIX = "kxbtc15m-hybrid-v1-"
 # silently reinterpret an older selected configuration after a restart or a
 # watchdog handoff.  Bump both values deliberately with a reviewed migration
 # whenever the shared live/backtest strategy semantics change.
-# v6 is a hard compatibility boundary for durable audit/checkpoint and
-# execution-timing telemetry.  An older worker cannot silently load this
-# configuration; it fails closed before it can submit an order.
-ACTIVE_STRATEGY_VERSION = "kxbtc15m-hybrid-live-v6"
-ACTIVE_CONFIG_SCHEMA_VERSION = 6
+# v7 is a hard compatibility boundary for the one-minute entry deadline and
+# first-fresh-quote discovery model.  An older worker cannot silently load
+# this configuration; it fails closed before it can submit an order.
+ACTIVE_STRATEGY_VERSION = "kxbtc15m-hybrid-live-v7"
+ACTIVE_CONFIG_SCHEMA_VERSION = 7
 TERMINAL_STATES = {"CLOSED", "ZERO_FILL", "FUNDING_FAILURE", "MISSED_SIGNAL", "ERROR_RECONCILIATION"}
 # A cancellation acknowledgement or an order-submission response can be
 # uncertain.  These are deliberately active, risk-managed states: they block
@@ -175,8 +175,9 @@ def validate_entry_price_contract(value: dict[str, Any]) -> None:
     if int(value["opening_quote_max_observations"]) < 1:
         raise ValueError("opening_quote_max_observations must be at least one")
     discovery_seconds = int(value["opening_price_discovery_seconds"])
-    if not 0 < discovery_seconds < int(value["entry_timeout_seconds"]):
-        raise ValueError("opening_price_discovery_seconds must be inside the 15-second maker window")
+    entry_window = int(value["entry_timeout_seconds"])
+    if not 0 < discovery_seconds < entry_window:
+        raise ValueError("opening_price_discovery_seconds must be inside the maker window")
 
 
 def load_config(path: Path) -> dict[str, Any]:
@@ -213,10 +214,12 @@ def load_config(path: Path) -> dict[str, Any]:
     value.setdefault("stop_policy", "floor_with_entry_above_baseline")
     value.setdefault("stop_baseline_entry_price", "0.50")
     value.setdefault("signal_delay_seconds", 0)
-    # A maker entry has exactly this much time from market open.  At expiry,
-    # the separate IOC fallback below is evaluated once using a fresh book.
-    value.setdefault("entry_timeout_seconds", 15)
-    value.setdefault("entry_lateness_seconds", 30)
+    # The fresh-book discovery window begins with the first usable quote.  A
+    # post-only entry therefore remains possible despite exchange/WebSocket
+    # warm-up at market open, while a protected IOC fallback is still reached
+    # before the first minute ends.
+    value.setdefault("entry_timeout_seconds", 60)
+    value.setdefault("entry_lateness_seconds", 60)
     value.setdefault("stop_poll_interval", 1.0)
     value.setdefault("reconciliation_interval", 5.0)
     value.setdefault("outcome_observation_seconds", 5)
@@ -239,8 +242,8 @@ def load_config(path: Path) -> dict[str, Any]:
     validate_entry_price_contract(value)
     if decimal(value["starting_base"]) != Decimal("1.00"):
         raise ValueError("the hybrid strategy must start at exactly 1.00 share")
-    if int(value["entry_timeout_seconds"]) != 15:
-        raise ValueError("the hybrid strategy uses an exact 15-second maker-entry window")
+    if not 15 <= int(value["entry_timeout_seconds"]) <= 60:
+        raise ValueError("entry_timeout_seconds must be between 15 and 60")
     if int(value["handoff_guard_seconds"]) < 60:
         raise ValueError("handoff_guard_seconds must keep at least one minute clear at each market boundary")
     if not 1.0 <= float(value["durable_checkpoint_interval_seconds"]) <= 60.0:
@@ -286,7 +289,8 @@ def load_config_from_value(value: dict[str, Any]) -> dict[str, Any]:
     temporary.setdefault("maker_price_offset", "0.01")
     temporary.setdefault("stop_policy", "floor_with_entry_above_baseline")
     temporary.setdefault("stop_baseline_entry_price", "0.50")
-    temporary.setdefault("entry_timeout_seconds", 15)
+    temporary.setdefault("entry_timeout_seconds", 60)
+    temporary.setdefault("entry_lateness_seconds", 60)
     temporary.setdefault("handoff_guard_seconds", 60)
     temporary.setdefault("opening_quote_max_observations", 500)
     temporary.setdefault("opening_price_discovery_seconds", 3)
@@ -294,8 +298,8 @@ def load_config_from_value(value: dict[str, Any]) -> dict[str, Any]:
     validate_entry_price_contract(temporary)
     if temporary["shadow_fill_model"] != "conservative_trade_through":
         raise ValueError("only conservative_trade_through is supported for shadow maker-fill evidence")
-    if int(temporary["entry_timeout_seconds"]) != 15:
-        raise ValueError("the hybrid strategy uses an exact 15-second maker-entry window")
+    if not 15 <= int(temporary["entry_timeout_seconds"]) <= 60:
+        raise ValueError("entry_timeout_seconds must be between 15 and 60")
     if int(temporary["handoff_guard_seconds"]) < 60:
         raise ValueError("handoff_guard_seconds must keep at least one minute clear at each market boundary")
     if not 1.0 <= float(temporary["durable_checkpoint_interval_seconds"]) <= 60.0:
@@ -651,6 +655,8 @@ class LiveEngine:
                 "window_seconds": int(self.config["entry_timeout_seconds"]),
                 "max_observations": int(self.config["opening_quote_max_observations"]),
                 "started_at": None,
+                "discovery_anchor_at": None,
+                "discovery_anchor_epoch": None,
                 "completed_at": None,
                 "observation_count": 0,
                 "dropped_observation_count": 0,
@@ -658,6 +664,9 @@ class LiveEngine:
             },
             "opening_price_discovery": {
                 "window_seconds": int(self.config["opening_price_discovery_seconds"]),
+                "anchor_at": None,
+                "anchor_epoch": None,
+                "anchor_lag_after_open_seconds": None,
                 "completed_at": None,
                 "maximum_selected_best_ask": None,
                 "derived_maker_entry_price": None,
@@ -826,7 +835,12 @@ class LiveEngine:
         """
 
         counts = {
+            "tracked_markets": 0,
             "markets_with_entry_fill": 0,
+            "zero_fill_markets": 0,
+            "funding_failure_markets": 0,
+            "missed_signal_markets": 0,
+            "entry_pending_markets": 0,
             "maker_limit_only_markets": 0,
             "market_ioc_only_markets": 0,
             "mixed_entry_markets": 0,
@@ -843,6 +857,16 @@ class LiveEngine:
         for record in self.state.get("markets", {}).values():
             if not isinstance(record, dict):
                 continue
+            counts["tracked_markets"] += 1
+            status = str(record.get("status") or "")
+            if status == "ZERO_FILL":
+                counts["zero_fill_markets"] += 1
+            elif status == "FUNDING_FAILURE":
+                counts["funding_failure_markets"] += 1
+            elif status == "MISSED_SIGNAL":
+                counts["missed_signal_markets"] += 1
+            elif status in {"SIGNAL_PENDING", "ENTRY_PENDING", "ENTRY_PARTIAL"}:
+                counts["entry_pending_markets"] += 1
             self.update_entry_execution_summary(record)
             summary = record["entry_execution_summary"]
             try:
@@ -882,6 +906,7 @@ class LiveEngine:
             for key in (
                 "maker_limit_fill_markets", "market_ioc_fill_markets", "mixed_entry_markets",
                 "maker_limit_filled_quantity", "market_ioc_filled_quantity",
+                "zero_fill_markets", "funding_failure_markets", "missed_signal_markets",
             ):
                 shadow[key] = metrics[key]
         return metrics
@@ -1276,7 +1301,8 @@ class LiveEngine:
         selected_bid_size = yes_bid_size if side == "yes" else yes_ask_size
         selected_ask_size = yes_ask_size if side == "yes" else yes_bid_size
         observation = {
-            "captured_at": utc_now(), "elapsed_after_open_seconds": round(max(0.0, now - start), 6),
+            "captured_at": utc_now(), "captured_epoch": now,
+            "elapsed_after_open_seconds": round(max(0.0, now - start), 6),
             "quote_id": quote_id or None, "source": "kalshi_websocket_complete_top_of_book",
             "source_server_timestamp": quote.get("source_server_timestamp"),
             "source_timestamp_ms": quote.get("source_timestamp_ms"), "received_at": quote.get("received_at"),
@@ -1296,6 +1322,10 @@ class LiveEngine:
         observations.append(observation)
         capture.update({
             "started_at": capture.get("started_at") or utc_now(), "first_capture_lag_seconds": capture.get("first_capture_lag_seconds", observation["elapsed_after_open_seconds"]),
+            # The first usable book, not a wall-clock moment before the feed
+            # was ready, anchors the short maximum-price discovery sample.
+            "discovery_anchor_at": capture.get("discovery_anchor_at") or observation["captured_at"],
+            "discovery_anchor_epoch": capture.get("discovery_anchor_epoch") or now,
             "last_capture_at": observation["captured_at"], "last_quote_id": observation["quote_id"],
             "observation_count": len(observations), "last_selected_best_ask": observation["selected_best_ask"],
             "min_selected_best_ask": format(min(Decimal(str(capture.get("min_selected_best_ask") or selected_ask)), selected_ask), "f"),
@@ -1310,27 +1340,36 @@ class LiveEngine:
             self.checkpoint("opening_quote_capture_started")
 
     def derive_opening_maker_price(self, record: dict[str, Any], now: float) -> Decimal | None:
-        """Choose a one-cent-below-max quote only after the discovery window.
+        """Choose a one-cent-below-max after a sample from the first fresh book.
 
-        The maximum is taken from selected-side *executable asks* observed
-        through the opening discovery interval. This is an order-placement
-        rule, not an assertion that the derived order filled.
+        A feed can legitimately become usable a few seconds after market
+        open.  The discovery sample starts at that first fresh, complete
+        selected-side book instead of treating transport warm-up as a signal
+        to abandon the market.
         """
 
         existing = record.get("maker_entry_price")
         if existing not in (None, ""):
             return Decimal(str(existing))
-        start = float(record["market_open_epoch"])
         discovery = int(self.config["opening_price_discovery_seconds"])
-        if now < start + discovery:
+        capture = record.setdefault("opening_quote_capture", {})
+        anchor_value = capture.get("discovery_anchor_epoch")
+        if anchor_value is None:
+            return None
+        anchor = float(anchor_value)
+        if now < anchor + discovery:
             return None
         observed = [
             Decimal(str(item["selected_best_ask"]))
             for item in record.get("opening_quote_observations", [])
-            if isinstance(item, dict) and float(item.get("elapsed_after_open_seconds") or 0) <= discovery
+            if isinstance(item, dict)
+            and anchor <= float(item.get("captured_epoch") or float("-inf")) <= anchor + discovery
         ]
         details = record.setdefault("opening_price_discovery", {})
         details["completed_at"] = details.get("completed_at") or utc_now()
+        details["anchor_at"] = capture.get("discovery_anchor_at")
+        details["anchor_epoch"] = anchor
+        details["anchor_lag_after_open_seconds"] = round(max(0.0, anchor - float(record["market_open_epoch"])), 6)
         if not observed:
             details["reason"] = "no_fresh_complete_top_of_book_in_discovery_window"
             return None
@@ -1341,6 +1380,7 @@ class LiveEngine:
             "maximum_selected_best_ask": format(observed_max, "f"),
             "maker_price_offset": format(offset, "f"),
             "derived_maker_entry_price": format(maker, "f"),
+            "discovery_seconds": discovery,
         })
         if maker <= Decimal(self.config["stop_price"]):
             details["reason"] = "one_cent_below_opening_max_at_or_below_stop"
@@ -1350,6 +1390,12 @@ class LiveEngine:
             "opening_maker_price_derived", ticker=record["ticker"], side=record["signal_side"],
             maximum_selected_best_ask=format(observed_max, "f"), maker_entry_price=format(maker, "f"),
             maker_price_offset=format(offset, "f"),
+        )
+        LOG.warning(
+            "ENTRY MAKER READY | ticker=%s side=%s max_ask=%s maker_limit=%s "
+            "first_quote_lag=%ss discovery_seconds=%s",
+            record["ticker"], record["signal_side"], format(observed_max, "f"), format(maker, "f"),
+            details["anchor_lag_after_open_seconds"], discovery,
         )
         return maker
 
@@ -1831,7 +1877,7 @@ class LiveEngine:
         return fill
 
     def entry_deadline(self, record: dict[str, Any]) -> float:
-        """The dynamic-maker phase always ends 15 seconds after market open."""
+        """The dynamic-maker phase ends no later than the first minute."""
 
         configured = float(record["market_open_epoch"]) + int(self.config["entry_timeout_seconds"])
         return min(float(record["market_close_epoch"]) - 1.0, configured)
@@ -2016,17 +2062,33 @@ class LiveEngine:
         side = str(record["signal_side"])
         deadline = float(record.setdefault("entry_deadline_epoch", self.entry_deadline(record)))
         self.capture_opening_quote(feed, record, now)
-        discovery_deadline = float(record["market_open_epoch"]) + int(self.config["opening_price_discovery_seconds"])
-        if now < discovery_deadline:
-            # Do not submit before the configured data collection has had a
-            # chance to observe the selected side's opening maximum.
+        # At the deadline, use the fresh price-protected IOC fallback rather
+        # than declaring a false zero fill because the WebSocket warmed up
+        # after the first three wall-clock seconds.
+        if now >= deadline:
+            await self.submit_market_fallback(rest, feed, record, Decimal(str(record.get("actual_quantity") or "0")))
             return
         maker_price = self.derive_opening_maker_price(record, now)
         if maker_price is None:
-            self.finish_entry_attempt(record, Decimal("0"), "opening_price_discovery_unavailable_or_at_stop")
-            return
-        if now >= deadline:
-            await self.submit_market_fallback(rest, feed, record, Decimal(str(record.get("actual_quantity") or "0")))
+            if record.get("opening_price_discovery", {}).get("reason") == "one_cent_below_opening_max_at_or_below_stop":
+                # This is a completed, safety-preserving decision, not a
+                # temporary lack of market data.  The strategy may not enter
+                # at 40c or lower because that would already be at its stop.
+                self.finish_entry_attempt(record, Decimal("0"), "opening_price_discovery_at_or_below_stop")
+                return
+            # A valid discovery sample starts only once the first fresh book
+            # has been observed. Keep the market eligible through the one
+            # minute deadline instead of converting startup latency to a
+            # zero-fill trading decision.
+            last_log = float(record.get("entry_discovery_wait_logged_epoch") or 0.0)
+            if now - last_log >= 10.0:
+                capture = record.get("opening_quote_capture", {})
+                record["entry_discovery_wait_logged_epoch"] = now
+                LOG.warning(
+                    "ENTRY DISCOVERY WAIT | ticker=%s elapsed=%.3fs quotes=%s first_quote_lag=%s deadline_in=%.3fs",
+                    record["ticker"], now - float(record["market_open_epoch"]),
+                    capture.get("observation_count", 0), capture.get("first_capture_lag_seconds"), max(0.0, deadline - now),
+                )
             return
         ask = self.selected_quote(feed, record["ticker"], side, "ask")
         if ask is None:
@@ -2042,7 +2104,7 @@ class LiveEngine:
             return
         if ask <= maker_price:
             # The dynamically derived limit cannot cross. Wait out the rest
-            # of the 15-second maker phase, then evaluate the IOC fallback.
+            # of the one-minute maker phase, then evaluate the IOC fallback.
             record["maker_submission_skipped"] = {
                 "at": utc_now(), "reason": "post_only_would_cross_current_book",
                 "selected_ask": format(ask, "f"), "maker_entry_price": format(maker_price, "f"),
@@ -2446,7 +2508,7 @@ class LiveEngine:
                         record = self.set_signal(active, provisional)
                         # Keep collecting complete top-of-book observations
                         # even after the dynamic maker order exists, through
-                        # the whole 15-second opening window.
+                        # the whole one-minute opening window.
                         self.capture_opening_quote(feed, record, now)
                         await self.submit_entry(rest, feed, record, now)
             if time.monotonic() - self.last_reconcile >= float(self.config["reconciliation_interval"]):
@@ -2455,7 +2517,36 @@ class LiveEngine:
             if time.monotonic() - self.last_heartbeat >= 60:
                 sizing = sizing_state(self.current_parameters(), self.state.get("sizing"))
                 execution = self.refresh_entry_execution_metrics()
-                LOG.warning("HEARTBEAT | mode=%s ticker=%s state=%s base=%s exponent=%d target=%s deficit=%s threshold=%s maker_fills=%d ioc_fills=%d mixed=%d active=%s breaker=%s", "DRY_RUN" if self.dry_run else "LIVE", active and active["ticker"], (self.state.get("markets", {}).get(active["ticker"], {}) if active else {}).get("status"), sizing.base_share_count, sizing.recovery_exponent, sizing.prescribed_quantity(), sizing.recovery_cycle_pnl, sizing.next_base_threshold, execution["maker_limit_fill_markets"], execution["market_ioc_fill_markets"], execution["mixed_entry_markets"], self.state.get("active_market"), self.state["circuit_breaker"].get("blocked"))
+                timing = self.refresh_execution_timing_metrics()
+                record = self.state.get("markets", {}).get(active["ticker"], {}) if active else {}
+                capture = record.get("opening_quote_capture", {}) if isinstance(record, dict) else {}
+                deadline = record.get("entry_deadline_epoch") if isinstance(record, dict) else None
+                deadline_in = (
+                    round(max(0.0, float(deadline) - now), 3)
+                    if deadline not in (None, "") else None
+                )
+                entry_latency = timing["entry_first_fill_from_market_open"]
+                stop_latency = timing["stop_trigger_from_first_fill"]
+                LOG.warning(
+                    "HEARTBEAT | mode=%s ticker=%s state=%s base=%s exponent=%d target=%s "
+                    "deficit=%s threshold=%s tracked=%d filled=%d zero=%d funding_failures=%d "
+                    "missed=%d maker_fills=%d ioc_fills=%d mixed=%d opening_quotes=%s "
+                    "first_quote_lag=%s maker_limit=%s deadline_in=%s entry_fill_p50=%s "
+                    "stop_from_fill_p50=%s active=%s breaker=%s",
+                    "DRY_RUN" if self.dry_run else "LIVE",
+                    active and active["ticker"],
+                    record.get("status") if isinstance(record, dict) else None,
+                    sizing.base_share_count, sizing.recovery_exponent, sizing.prescribed_quantity(),
+                    sizing.recovery_cycle_pnl, sizing.next_base_threshold,
+                    execution["tracked_markets"], execution["markets_with_entry_fill"],
+                    execution["zero_fill_markets"], execution["funding_failure_markets"],
+                    execution["missed_signal_markets"], execution["maker_limit_fill_markets"],
+                    execution["market_ioc_fill_markets"], execution["mixed_entry_markets"],
+                    capture.get("observation_count"), capture.get("first_capture_lag_seconds"),
+                    record.get("maker_entry_price") if isinstance(record, dict) else None,
+                    deadline_in, entry_latency.get("median_seconds"), stop_latency.get("median_seconds"),
+                    self.state.get("active_market"), self.state["circuit_breaker"].get("blocked"),
+                )
                 self.last_heartbeat = time.monotonic()
             elapsed = time.monotonic() - start
             if elapsed >= run_seconds:

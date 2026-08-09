@@ -118,8 +118,8 @@ def export_selected_live_strategy(path: Path, row: dict[str, Any], *, selection_
     if stop in {None, "no_stop"}:
         raise ValueError("a live strategy export requires an explicit fixed stop")
     config = {
-        "config_schema_version": 6,
-        "strategy_version": "kxbtc15m-hybrid-live-v6",
+        "config_schema_version": 7,
+        "strategy_version": "kxbtc15m-hybrid-live-v7",
         "selection_basis": selection_basis,
         "series": "KXBTC15M",
         "signal_delay_seconds": 0,
@@ -136,11 +136,11 @@ def export_selected_live_strategy(path: Path, row: dict[str, Any], *, selection_
         "starting_shadow_balance": "1000.00",
         "live_enabled": False,
         "dry_run": True,
-        "entry_timeout_seconds": 15,
+        "entry_timeout_seconds": 60,
         "opening_price_discovery_seconds": 3,
         "opening_quote_max_observations": 500,
         "maker_price_offset": "0.01",
-        "entry_lateness_seconds": 30,
+        "entry_lateness_seconds": 60,
         "handoff_guard_seconds": 60,
         "stop_poll_interval": 1.0,
         "reconciliation_interval": 5.0,

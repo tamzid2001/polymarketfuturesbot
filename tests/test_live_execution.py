@@ -46,6 +46,20 @@ class Feed:
         return []
 
 
+class DelayedFreshBookFeed(Feed):
+    """Simulate a WebSocket that becomes usable after the market opens."""
+
+    def __init__(self, ask: str = "0.60", bid: str = "0.45", depth: str = "10.00") -> None:
+        super().__init__(ask, bid, depth)
+        self.available = False
+
+    def executable_asks(self, ticker: str):
+        return super().executable_asks(ticker) if self.available else None
+
+    def executable_shadow_quote(self, ticker: str, side: str, quantity: float, age: float):
+        return super().executable_shadow_quote(ticker, side, quantity, age) if self.available else (None, "missing_or_stale_book")
+
+
 class EntryRest:
     def __init__(self, balance: str = "100.00") -> None:
         self.balance = Decimal(balance)
@@ -168,7 +182,7 @@ class LiveExecutionTests(unittest.TestCase):
             record = engine.set_signal({"ticker": "KXBTC15M-current", "open_epoch": 1_000, "close_epoch": 1_900}, {"outcome": "yes", "ticker": "KXBTC15M-prior"})
             feed = Feed("0.40")
             await engine.submit_entry(EntryRest(), feed, record, 1_001)
-            await engine.submit_entry(EntryRest(), feed, record, 1_003)
+            await engine.submit_entry(EntryRest(), feed, record, 1_004.1)
             self.assertEqual(record["status"], "ZERO_FILL")
             self.assertEqual(engine.state["sizing"].get("recovery_exponent", 0), 0)
             engine = self.engine("0.01")
@@ -176,7 +190,7 @@ class LiveExecutionTests(unittest.TestCase):
             rest = EntryRest("0.01")
             feed = Feed("0.60")
             await engine.submit_entry(rest, feed, record, 1_001)
-            await engine.submit_entry(rest, feed, record, 1_003)
+            await engine.submit_entry(rest, feed, record, 1_004.1)
             self.assertEqual(record["status"], "FUNDING_FAILURE")
             self.assertEqual(rest.created, 0)
         asyncio.run(scenario())
@@ -272,7 +286,7 @@ class LiveExecutionTests(unittest.TestCase):
         # A repeated refresh after a runner restart cannot increment totals.
         self.assertEqual(engine.refresh_entry_execution_metrics(), metrics)
 
-    def test_fifteen_second_maker_expiry_uses_one_price_protected_ioc_fallback(self) -> None:
+    def test_one_minute_maker_expiry_uses_one_price_protected_ioc_fallback(self) -> None:
         async def scenario() -> None:
             config = dict(self.config)
             directory = Path(tempfile.mkdtemp())
@@ -285,10 +299,10 @@ class LiveExecutionTests(unittest.TestCase):
             )
             await engine.submit_entry(rest, feed, record, 1_000)
             await engine.submit_entry(rest, feed, record, 1_003)
-            self.assertEqual(record["entry_deadline_epoch"], 1_015)
+            self.assertEqual(record["entry_deadline_epoch"], 1_060)
             self.assertTrue(rest.calls[0]["post_only"])
             self.assertEqual(rest.calls[0]["tif"], "good_till_canceled")
-            await engine.manage_entry(rest, feed, record, 1_015)
+            await engine.manage_entry(rest, feed, record, 1_060)
             self.assertEqual(len(rest.calls), 2)
             self.assertFalse(rest.calls[1]["post_only"])
             self.assertEqual(rest.calls[1]["tif"], "immediate_or_cancel")
@@ -317,7 +331,7 @@ class LiveExecutionTests(unittest.TestCase):
             )
             await engine.submit_entry(rest, feed, record, 1_000)
             await engine.submit_entry(rest, feed, record, 1_003)
-            await engine.manage_entry(rest, feed, record, 1_015)
+            await engine.manage_entry(rest, feed, record, 1_060)
             self.assertEqual(len(rest.calls), 1, "a cancellation failure must not submit the IOC replacement")
             self.assertEqual(record["status"], "ENTRY_CANCEL_UNCONFIRMED")
             self.assertTrue(engine.state["circuit_breaker"]["blocked"])
@@ -359,7 +373,7 @@ class LiveExecutionTests(unittest.TestCase):
             await engine.submit_entry(rest, feed, record, 1_000)
             await engine.submit_entry(rest, feed, record, 1_003)
             feed.ask = "0.40"
-            await engine.manage_entry(rest, feed, record, 1_015)
+            await engine.manage_entry(rest, feed, record, 1_060)
             self.assertEqual(record["status"], "ZERO_FILL")
             self.assertEqual(record["market_fallback"]["reason"], "best_available_price_at_or_below_stop")
             self.assertEqual(engine.state["sizing"].get("recovery_exponent", 0), 0)
@@ -379,7 +393,7 @@ class LiveExecutionTests(unittest.TestCase):
             self.assertEqual(rest.calls, [])
             feed.ask = "0.54"
             await engine.submit_entry(rest, feed, record, 1_001.7)
-            await engine.submit_entry(rest, feed, record, 1_003.1)
+            await engine.submit_entry(rest, feed, record, 1_003.3)
             self.assertEqual(record["opening_price_discovery"]["maximum_selected_best_ask"], "0.54")
             self.assertEqual(record["maker_entry_price"], "0.53")
             self.assertEqual(rest.calls[0]["position_price"], 0.53)
@@ -397,8 +411,37 @@ class LiveExecutionTests(unittest.TestCase):
             self.assertEqual(record["maker_entry_price"], "0.53")
             self.assertEqual(Decimal(record["opening_quote_observations"][-1]["selected_best_ask"]), Decimal("0.70"))
             self.assertEqual(Decimal(record["opening_quote_capture"]["max_selected_best_ask"]), Decimal("0.70"))
-            engine.capture_opening_quote(feed, record, 1_015)
+            engine.capture_opening_quote(feed, record, 1_060)
             self.assertIsNotNone(record["opening_quote_capture"]["completed_at"])
+        asyncio.run(scenario())
+
+    def test_delayed_first_fresh_book_still_posts_before_one_minute_deadline(self) -> None:
+        async def scenario() -> None:
+            config = dict(self.config)
+            directory = Path(tempfile.mkdtemp())
+            engine = LiveEngine(config, default_state(config), directory / "state", directory / "ledger", dry_run=False)
+            rest = EntryRest()
+            feed = DelayedFreshBookFeed("0.54")
+            record = engine.set_signal(
+                {"ticker": "KXBTC15M-delayed-book", "open_epoch": 1_000, "close_epoch": 1_900},
+                {"outcome": "yes", "ticker": "KXBTC15M-prior"},
+            )
+
+            await engine.submit_entry(rest, feed, record, 1_003)
+            self.assertEqual(record["status"], "SIGNAL_PENDING")
+            self.assertEqual(rest.created, 0)
+
+            feed.available = True
+            await engine.submit_entry(rest, feed, record, 1_010)
+            self.assertEqual(rest.created, 0, "the fresh-book sample must complete before posting")
+            feed.ask = "0.55"
+            await engine.submit_entry(rest, feed, record, 1_013.1)
+
+            self.assertEqual(record["status"], "ENTRY_PENDING")
+            self.assertEqual(rest.created, 1)
+            self.assertEqual(record["maker_entry_price"], "0.54")
+            self.assertEqual(record["opening_price_discovery"]["anchor_lag_after_open_seconds"], 10.0)
+            self.assertEqual(record["entry_deadline_epoch"], 1_060)
         asyncio.run(scenario())
 
     def test_opening_maximum_one_cent_below_at_stop_is_a_zero_fill(self) -> None:
@@ -411,7 +454,7 @@ class LiveExecutionTests(unittest.TestCase):
                 {"outcome": "no", "ticker": "KXBTC15M-prior"},
             )
             await engine.submit_entry(rest, feed, record, 1_000.1)
-            await engine.submit_entry(rest, feed, record, 1_003)
+            await engine.submit_entry(rest, feed, record, 1_003.2)
             self.assertEqual(record["opening_price_discovery"]["maximum_selected_best_ask"], "0.41")
             self.assertEqual(record["opening_price_discovery"]["derived_maker_entry_price"], "0.40")
             self.assertEqual(record["status"], "ZERO_FILL")
