@@ -101,10 +101,13 @@ class StrategyCoreTests(unittest.TestCase):
         config = load_config(ROOT / "selected_live_strategy.json")
         legacy_version = dict(config, strategy_version="kxbtc15m-hybrid-live-v1")
         legacy_schema = dict(config, config_schema_version=1)
+        pre_reconciliation_safety_schema = dict(config, config_schema_version=4)
         with self.assertRaisesRegex(ValueError, "non-current live strategy"):
             load_config_from_value(legacy_version)
         with self.assertRaisesRegex(ValueError, "non-current live configuration schema"):
             load_config_from_value(legacy_schema)
+        with self.assertRaisesRegex(ValueError, "non-current live configuration schema"):
+            load_config_from_value(pre_reconciliation_safety_schema)
 
     def test_dynamic_opening_limit_requires_exact_one_cent_offset(self) -> None:
         config = load_config(ROOT / "selected_live_strategy.json")

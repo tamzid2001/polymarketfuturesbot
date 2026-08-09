@@ -21,7 +21,7 @@ All dollar results below are gross unless explicitly marked otherwise. Fees, liv
 
 ## Current live/shadow configuration
 
-[`selected_live_strategy.json`](selected_live_strategy.json) is the only canonical persisted configuration used by the live workflow. It is versioned as `kxbtc15m-hybrid-live-v4` / schema `4`; a legacy configuration is rejected before the worker can run. Optimizer exports use the same schema, so a future action cannot silently reinterpret an old configuration.
+[`selected_live_strategy.json`](selected_live_strategy.json) is the only canonical persisted configuration used by the live workflow. It is versioned as `kxbtc15m-hybrid-live-v5` / schema `5`; this is a hard compatibility boundary for cancellation and reconciliation safety. An older worker rejects it before it can submit an order. Optimizer exports use the same schema, so a future action cannot silently reinterpret an old configuration.
 
 | Setting | Current value | Notes |
 | --- | ---: | --- |

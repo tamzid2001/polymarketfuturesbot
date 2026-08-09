@@ -57,8 +57,11 @@ ORDER_PREFIX = "kxbtc15m-hybrid-v1-"
 # silently reinterpret an older selected configuration after a restart or a
 # watchdog handoff.  Bump both values deliberately with a reviewed migration
 # whenever the shared live/backtest strategy semantics change.
-ACTIVE_STRATEGY_VERSION = "kxbtc15m-hybrid-live-v4"
-ACTIVE_CONFIG_SCHEMA_VERSION = 4
+# v5 is a hard compatibility boundary for the cancellation/reconciliation
+# safety model.  An older worker cannot silently load this configuration; it
+# fails closed before it can submit an order.
+ACTIVE_STRATEGY_VERSION = "kxbtc15m-hybrid-live-v5"
+ACTIVE_CONFIG_SCHEMA_VERSION = 5
 TERMINAL_STATES = {"CLOSED", "ZERO_FILL", "FUNDING_FAILURE", "MISSED_SIGNAL", "ERROR_RECONCILIATION"}
 # A cancellation acknowledgement or an order-submission response can be
 # uncertain.  These are deliberately active, risk-managed states: they block
