@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import tempfile
 import unittest
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
+from unittest.mock import patch
 
+from audit_ledger import append_audit
+from live_checkpoint import MaterialCheckpointPublisher
 from kalshi_live_trader import (
     LiveEngine, ProvisionalOutcomeTracker, QuoteObservation, deterministic_client_order_id, load_config,
 )
@@ -467,6 +471,79 @@ class LiveExecutionTests(unittest.TestCase):
         self.assertFalse(engine.handoff_ready(1_841)[0])
         engine.state["markets"]["KXBTC15M-current"]["status"] = "ENTRY_PENDING"
         self.assertFalse(engine.handoff_ready(1_300)[0])
+
+    def test_audit_and_state_are_checkpointed_for_each_material_event(self) -> None:
+        temporary = Path(tempfile.mkdtemp())
+        engine = LiveEngine(
+            dict(self.config), default_state(self.config), temporary / "state.json", temporary / "audit.jsonl", dry_run=True,
+        )
+        engine.audit("checkpoint_contract_test", ticker="KXBTC15M-audit")
+        self.assertTrue(engine.state_path.exists())
+        records = [json.loads(line) for line in engine.ledger_path.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(records[-1]["event"], "checkpoint_contract_test")
+        persisted = json.loads(engine.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(persisted["strategy_version"], self.config["strategy_version"])
+
+    def test_ledger_append_fsyncs_a_jsonl_record(self) -> None:
+        path = Path(tempfile.mkdtemp()) / "audit.jsonl"
+        with patch("audit_ledger.os.fsync") as fsync:
+            append_audit(path, {"event": "durability_test"})
+        self.assertGreaterEqual(fsync.call_count, 1)
+        self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["event"], "durability_test")
+
+    def test_coalesced_remote_checkpoint_is_retried_by_normal_worker_checkpoint(self) -> None:
+        path = Path(tempfile.mkdtemp()) / "state.json"
+        path.write_text("{}\n", encoding="utf-8")
+        publisher = MaterialCheckpointPublisher(path, minimum_interval_seconds=5.0)
+        publisher.enabled = True
+        publisher.last_attempt = 100.0
+        with patch("live_checkpoint.time.monotonic", return_value=102.0):
+            self.assertFalse(publisher.publish_if_changed("entry_fill_observed"))
+        self.assertEqual(publisher.pending_reason, "entry_fill_observed")
+        with patch.object(publisher, "publish_if_changed", return_value=True) as retry:
+            self.assertTrue(publisher.publish_if_due())
+        retry.assert_called_once_with("entry_fill_observed")
+
+    def test_entry_and_stop_latency_is_durable_and_observational(self) -> None:
+        engine = self.engine()
+        record = engine.set_signal(
+            {"ticker": "KXBTC15M-timing", "open_epoch": 1_000, "close_epoch": 1_900},
+            {"outcome": "yes", "ticker": "KXBTC15M-prior"},
+        )
+        maker = {
+            "order_id": "maker-timing", "client_order_id": "maker-client", "entry_phase": "maker",
+            "quantity": "1.00", "position_price": "0.51", "fill_count": "0.00",
+            "submitted_at": datetime.fromtimestamp(1_002, timezone.utc).isoformat(),
+        }
+        record["entry_orders"].append(maker)
+        engine.note_entry_order_submitted(record, maker, "maker")
+        with patch("kalshi_live_trader.time.time", return_value=1_005.0):
+            engine.note_entry_fill_observed(record, Decimal("0"), Decimal("1.00"), "exchange_order_refresh")
+        entry = record["entry_timing"]
+        self.assertEqual(entry["market_open_to_first_submission_seconds"], 2.0)
+        self.assertEqual(entry["market_open_to_first_fill_seconds"], 5.0)
+        self.assertEqual(entry["first_submission_to_first_fill_seconds"], 3.0)
+        self.assertEqual(entry["first_fill_source"], "exchange_order_refresh")
+
+        with patch("kalshi_live_trader.time.time", return_value=1_012.0):
+            engine.note_stop_trigger(record, Decimal("0.40"), Decimal("0.40"), Decimal("1.00"), shadow=True)
+        exit_order = {
+            "order_id": "stop-timing", "client_order_id": "stop-client",
+            "submitted_at": datetime.fromtimestamp(1_012.25, timezone.utc).isoformat(),
+        }
+        engine.note_stop_exit_submitted(record, exit_order)
+        with patch("kalshi_live_trader.time.time", return_value=1_013.0):
+            engine.note_stop_position_closed(record)
+        stop = record["stop_timing"]
+        self.assertEqual(stop["first_fill_to_stop_trigger_seconds"], 7.0)
+        self.assertEqual(stop["market_open_to_stop_trigger_seconds"], 12.0)
+        self.assertEqual(stop["stop_trigger_to_first_exit_submission_seconds"], 0.25)
+        self.assertEqual(stop["stop_trigger_to_position_closed_seconds"], 1.0)
+        self.assertEqual(engine.state["execution_timing_metrics"]["entry_first_fill_from_market_open"]["count"], 1)
+        events = [json.loads(line)["event"] for line in engine.ledger_path.read_text(encoding="utf-8").splitlines()]
+        self.assertIn("entry_fill_observed", events)
+        self.assertIn("stop_trigger_timing", events)
+        self.assertIn("stop_position_closed_timing", events)
 
 
 if __name__ == "__main__":

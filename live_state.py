@@ -43,6 +43,9 @@ def default_state(config: dict[str, Any]) -> dict[str, Any]:
         # aggregate separate from order requests makes maker/IOC participation
         # measurable across runner handoffs without double counting retries.
         "entry_execution_metrics": {},
+        # Rebuilt from individual market timing records; telemetry only, not
+        # an input to sizing, funding, or realized P&L.
+        "execution_timing_metrics": {},
         "circuit_breaker": {"blocked": False, "reason": None, "triggered_at": None},
         "daily_realized": {},
         "shadow_metrics": {},
@@ -80,6 +83,19 @@ def save_state(path: Path, state: dict[str, Any]) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
+        # ``replace`` is atomic, but the parent directory owns the rename
+        # metadata.  Sync it as well so an acknowledged strategy checkpoint
+        # survives a host crash, not merely a graceful worker shutdown.
+        try:
+            directory = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        except OSError:
+            # The state file itself is already fsynced.  Directory fsync is
+            # unavailable on a few development filesystems.
+            pass
     except Exception:
         try:
             os.unlink(temporary)

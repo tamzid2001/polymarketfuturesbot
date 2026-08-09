@@ -57,11 +57,11 @@ ORDER_PREFIX = "kxbtc15m-hybrid-v1-"
 # silently reinterpret an older selected configuration after a restart or a
 # watchdog handoff.  Bump both values deliberately with a reviewed migration
 # whenever the shared live/backtest strategy semantics change.
-# v5 is a hard compatibility boundary for the cancellation/reconciliation
-# safety model.  An older worker cannot silently load this configuration; it
-# fails closed before it can submit an order.
-ACTIVE_STRATEGY_VERSION = "kxbtc15m-hybrid-live-v5"
-ACTIVE_CONFIG_SCHEMA_VERSION = 5
+# v6 is a hard compatibility boundary for durable audit/checkpoint and
+# execution-timing telemetry.  An older worker cannot silently load this
+# configuration; it fails closed before it can submit an order.
+ACTIVE_STRATEGY_VERSION = "kxbtc15m-hybrid-live-v6"
+ACTIVE_CONFIG_SCHEMA_VERSION = 6
 TERMINAL_STATES = {"CLOSED", "ZERO_FILL", "FUNDING_FAILURE", "MISSED_SIGNAL", "ERROR_RECONCILIATION"}
 # A cancellation acknowledgement or an order-submission response can be
 # uncertain.  These are deliberately active, risk-managed states: they block
@@ -86,6 +86,28 @@ def _bool(value: Any) -> bool:
     return str(value).lower() in {"1", "true", "yes", "on"}
 
 
+def _iso_epoch(value: Any) -> float | None:
+    """Parse a persisted UTC timestamp for non-accounting telemetry only."""
+
+    if value in (None, ""):
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def _seconds_since(start: float | None, end: float) -> float | None:
+    """Return a non-negative telemetry duration, never a clock artefact."""
+
+    if start is None:
+        return None
+    return round(max(0.0, end - start), 6)
+
+
 def _decimal_string(value: Any, name: str) -> str:
     amount = decimal(value)
     if amount <= Decimal("0"):
@@ -104,7 +126,10 @@ INTEGER_CONFIG_FIELDS = {
     "max_recovery_exponent", "max_api_failures", "handoff_guard_seconds", "opening_quote_max_observations",
     "opening_price_discovery_seconds",
 }
-FLOAT_CONFIG_FIELDS = {"stop_poll_interval", "reconciliation_interval", "max_outcome_quote_age_seconds", "max_stale_quote_seconds"}
+FLOAT_CONFIG_FIELDS = {
+    "stop_poll_interval", "reconciliation_interval", "max_outcome_quote_age_seconds", "max_stale_quote_seconds",
+    "durable_checkpoint_interval_seconds",
+}
 
 
 def assert_active_strategy_contract(value: dict[str, Any]) -> None:
@@ -205,6 +230,10 @@ def load_config(path: Path) -> dict[str, Any]:
     value.setdefault("handoff_guard_seconds", 60)
     value.setdefault("opening_quote_max_observations", 500)
     value.setdefault("opening_price_discovery_seconds", 3)
+    # State and audit writes are fsynced locally for every material event.
+    # This only bounds GitHub checkpoint publication, avoiding a Git push for
+    # every market-data update while preserving a short handoff-loss window.
+    value.setdefault("durable_checkpoint_interval_seconds", 5.0)
     if value["shadow_fill_model"] != "conservative_trade_through":
         raise ValueError("only conservative_trade_through is supported for shadow maker-fill evidence")
     validate_entry_price_contract(value)
@@ -214,6 +243,8 @@ def load_config(path: Path) -> dict[str, Any]:
         raise ValueError("the hybrid strategy uses an exact 15-second maker-entry window")
     if int(value["handoff_guard_seconds"]) < 60:
         raise ValueError("handoff_guard_seconds must keep at least one minute clear at each market boundary")
+    if not 1.0 <= float(value["durable_checkpoint_interval_seconds"]) <= 60.0:
+        raise ValueError("durable_checkpoint_interval_seconds must be between 1 and 60")
     return value
 
 
@@ -259,6 +290,7 @@ def load_config_from_value(value: dict[str, Any]) -> dict[str, Any]:
     temporary.setdefault("handoff_guard_seconds", 60)
     temporary.setdefault("opening_quote_max_observations", 500)
     temporary.setdefault("opening_price_discovery_seconds", 3)
+    temporary.setdefault("durable_checkpoint_interval_seconds", 5.0)
     validate_entry_price_contract(temporary)
     if temporary["shadow_fill_model"] != "conservative_trade_through":
         raise ValueError("only conservative_trade_through is supported for shadow maker-fill evidence")
@@ -266,6 +298,8 @@ def load_config_from_value(value: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("the hybrid strategy uses an exact 15-second maker-entry window")
     if int(temporary["handoff_guard_seconds"]) < 60:
         raise ValueError("handoff_guard_seconds must keep at least one minute clear at each market boundary")
+    if not 1.0 <= float(temporary["durable_checkpoint_interval_seconds"]) <= 60.0:
+        raise ValueError("durable_checkpoint_interval_seconds must be between 1 and 60")
     return temporary
 
 
@@ -426,12 +460,21 @@ class LiveEngine:
         checkpoint_paths = [state_path, ledger_path]
         if config_path is not None:
             checkpoint_paths.insert(0, config_path)
-        self.publisher = MaterialCheckpointPublisher(*checkpoint_paths)
+        self.publisher = MaterialCheckpointPublisher(
+            *checkpoint_paths,
+            minimum_interval_seconds=float(config["durable_checkpoint_interval_seconds"]),
+        )
 
     def checkpoint(self, reason: str | None = None) -> None:
         save_state(self.state_path, self.state)
         if reason:
             self.publisher.publish_if_changed(reason)
+        else:
+            # A material audit which was coalesced inside the remote-publish
+            # interval is flushed by the ordinary live-loop checkpoints.  Do
+            # not publish every quote/state timestamp when nothing material
+            # is pending.
+            self.publisher.publish_if_due()
 
     def shadow_metrics(self) -> dict[str, Any]:
         """The isolated, simulated-account metrics ledger used only in dry mode."""
@@ -471,6 +514,12 @@ class LiveEngine:
             "event": event, "strategy_version": self.config["strategy_version"],
             "config_hash": config_hash(self.config), **details,
         })
+        # An append is fsynced by ``append_audit``.  Immediately pair it with
+        # the atomic state file so a crash cannot leave a fresh ledger event
+        # behind only an old local strategy snapshot.  The publisher itself
+        # coalesces GitHub commits at the configured interval; local safety
+        # never waits on that network operation.
+        self.checkpoint(f"audit:{event}")
 
     def transition(self, record: dict[str, Any], status: str, reason: str | None = None) -> None:
         prior = record.get("status")
@@ -612,6 +661,32 @@ class LiveEngine:
                 "completed_at": None,
                 "maximum_selected_best_ask": None,
                 "derived_maker_entry_price": None,
+            },
+            # All timestamps in this object describe when the worker observed
+            # an event.  Kalshi does not expose a guaranteed matching-engine
+            # fill timestamp in every order response, so the ledger must not
+            # overstate these as exact exchange-fill instants.
+            "entry_timing": {
+                "market_open_epoch": market["open_epoch"],
+                "entry_window_seconds": int(self.config["entry_timeout_seconds"]),
+                "submission_events": [],
+                "first_submission_at": None,
+                "first_submission_epoch": None,
+                "first_fill_observed_at": None,
+                "first_fill_observed_epoch": None,
+                "first_fill_source": None,
+                "last_fill_observed_at": None,
+                "last_filled_quantity": "0.00",
+                "entry_attempt_completed_at": None,
+                "entry_attempt_completed_epoch": None,
+            },
+            "stop_timing": {
+                "stop_trigger_observed_at": None,
+                "stop_trigger_observed_epoch": None,
+                "first_exit_submission_at": None,
+                "first_exit_submission_epoch": None,
+                "position_closed_observed_at": None,
+                "position_closed_observed_epoch": None,
             },
         }
         self.state["markets"][ticker] = record
@@ -831,6 +906,262 @@ class LiveEngine:
             mixed_entry_markets=aggregate["mixed_entry_markets"],
         )
         self.checkpoint("entry_execution_updated")
+
+    @staticmethod
+    def _timing_summary(values: list[float]) -> dict[str, float | int | None]:
+        """Compact, deterministic latency statistics for the durable state."""
+
+        if not values:
+            return {"count": 0, "mean_seconds": None, "median_seconds": None, "p95_seconds": None, "maximum_seconds": None}
+        ordered = sorted(values)
+
+        def percentile(probability: float) -> float:
+            position = (len(ordered) - 1) * probability
+            lower = int(position)
+            upper = min(len(ordered) - 1, lower + 1)
+            fraction = position - lower
+            return round(ordered[lower] + (ordered[upper] - ordered[lower]) * fraction, 6)
+
+        return {
+            "count": len(ordered),
+            "mean_seconds": round(sum(ordered) / len(ordered), 6),
+            "median_seconds": percentile(0.5),
+            "p95_seconds": percentile(0.95),
+            "maximum_seconds": round(ordered[-1], 6),
+        }
+
+    def refresh_execution_timing_metrics(self) -> dict[str, Any]:
+        """Rebuild latency telemetry from per-market facts idempotently.
+
+        This is intentionally observational telemetry only: recovery sizing
+        and P&L never depend on it.  Rebuilding instead of incrementing keeps
+        it accurate through restarts and reconciliation.
+        """
+
+        entry_from_open: list[float] = []
+        entry_from_submit: list[float] = []
+        stop_from_entry: list[float] = []
+        stop_from_open: list[float] = []
+        stop_exit_submission: list[float] = []
+        stop_exit_close: list[float] = []
+        for record in self.state.get("markets", {}).values():
+            if not isinstance(record, dict):
+                continue
+            entry = record.get("entry_timing")
+            if isinstance(entry, dict):
+                for value, bucket in (
+                    (entry.get("market_open_to_first_fill_seconds"), entry_from_open),
+                    (entry.get("first_submission_to_first_fill_seconds"), entry_from_submit),
+                ):
+                    try:
+                        if value is not None:
+                            bucket.append(float(value))
+                    except (TypeError, ValueError):
+                        pass
+            stop = record.get("stop_timing")
+            if isinstance(stop, dict):
+                for value, bucket in (
+                    (stop.get("first_fill_to_stop_trigger_seconds"), stop_from_entry),
+                    (stop.get("market_open_to_stop_trigger_seconds"), stop_from_open),
+                    (stop.get("stop_trigger_to_first_exit_submission_seconds"), stop_exit_submission),
+                    (stop.get("stop_trigger_to_position_closed_seconds"), stop_exit_close),
+                ):
+                    try:
+                        if value is not None:
+                            bucket.append(float(value))
+                    except (TypeError, ValueError):
+                        pass
+        metrics = {
+            "entry_first_fill_from_market_open": self._timing_summary(entry_from_open),
+            "entry_first_fill_from_submission": self._timing_summary(entry_from_submit),
+            "stop_trigger_from_first_fill": self._timing_summary(stop_from_entry),
+            "stop_trigger_from_market_open": self._timing_summary(stop_from_open),
+            "stop_first_exit_submission": self._timing_summary(stop_exit_submission),
+            "stop_position_closed": self._timing_summary(stop_exit_close),
+        }
+        self.state["execution_timing_metrics"] = metrics
+        return metrics
+
+    def note_entry_order_submitted(self, record: dict[str, Any], order: dict[str, Any], phase: str) -> None:
+        """Persist an entry submission and its latency from the market open."""
+
+        observed_epoch = time.time()
+        submitted_at = str(order.get("submitted_at") or utc_now())
+        order.setdefault("submitted_at", submitted_at)
+        submitted_epoch = _iso_epoch(submitted_at) or observed_epoch
+        timing = record.setdefault("entry_timing", {"market_open_epoch": record.get("market_open_epoch"), "submission_events": []})
+        submissions = timing.setdefault("submission_events", [])
+        identity = str(order.get("order_id") or order.get("client_order_id") or f"{phase}:{len(submissions)}")
+        if any(str(item.get("identity")) == identity for item in submissions if isinstance(item, dict)):
+            return
+        market_open = float(record.get("market_open_epoch") or submitted_epoch)
+        event = {
+            "identity": identity,
+            "phase": phase,
+            "submitted_at": submitted_at,
+            "submitted_epoch": submitted_epoch,
+            "market_open_to_submission_seconds": _seconds_since(market_open, submitted_epoch),
+            "requested_quantity": str(order.get("quantity") or "0"),
+            "requested_price": str(order.get("position_price") or ""),
+        }
+        submissions.append(event)
+        if timing.get("first_submission_epoch") is None:
+            timing.update({
+                "first_submission_at": submitted_at,
+                "first_submission_epoch": submitted_epoch,
+                "market_open_to_first_submission_seconds": event["market_open_to_submission_seconds"],
+            })
+        self.audit(
+            "entry_submission_timing", ticker=record["ticker"], phase=phase,
+            order_id=order.get("order_id"), client_order_id=order.get("client_order_id"),
+            market_open_to_submission_seconds=event["market_open_to_submission_seconds"],
+        )
+
+    def note_entry_fill_observed(
+        self, record: dict[str, Any], previous_quantity: Decimal, filled_quantity: Decimal, source: str,
+    ) -> None:
+        """Record the first/last observed entry fill without inventing fill time."""
+
+        if filled_quantity <= previous_quantity:
+            return
+        observed_epoch = time.time()
+        observed_at = utc_now()
+        timing = record.setdefault("entry_timing", {"market_open_epoch": record.get("market_open_epoch"), "submission_events": []})
+        market_open = float(record.get("market_open_epoch") or observed_epoch)
+        timing.update({
+            "last_fill_observed_at": observed_at,
+            "last_fill_observed_epoch": observed_epoch,
+            "last_filled_quantity": format(filled_quantity, "f"),
+        })
+        if timing.get("first_fill_observed_epoch") is None:
+            first_submission = timing.get("first_submission_epoch")
+            timing.update({
+                "first_fill_observed_at": observed_at,
+                "first_fill_observed_epoch": observed_epoch,
+                "first_fill_source": source,
+                "market_open_to_first_fill_seconds": _seconds_since(market_open, observed_epoch),
+                "first_submission_to_first_fill_seconds": _seconds_since(
+                    float(first_submission) if first_submission is not None else None, observed_epoch,
+                ),
+            })
+        metrics = self.refresh_execution_timing_metrics()
+        self.audit(
+            "entry_fill_observed", ticker=record["ticker"], source=source,
+            previous_quantity=format(previous_quantity, "f"), filled_quantity=format(filled_quantity, "f"),
+            market_open_to_first_fill_seconds=timing.get("market_open_to_first_fill_seconds"),
+            first_submission_to_first_fill_seconds=timing.get("first_submission_to_first_fill_seconds"),
+            timing_metrics=metrics,
+        )
+
+    def note_entry_attempt_completed(self, record: dict[str, Any], filled_quantity: Decimal, reason: str) -> None:
+        """Freeze the measurable result of the maker/IOC entry window."""
+
+        timing = record.setdefault("entry_timing", {"market_open_epoch": record.get("market_open_epoch")})
+        if timing.get("entry_attempt_completed_epoch") is not None:
+            return
+        observed_epoch = time.time()
+        market_open = float(record.get("market_open_epoch") or observed_epoch)
+        first_submission = timing.get("first_submission_epoch")
+        timing.update({
+            "entry_attempt_completed_at": utc_now(),
+            "entry_attempt_completed_epoch": observed_epoch,
+            "entry_attempt_reason": reason,
+            "entry_attempt_final_filled_quantity": format(filled_quantity, "f"),
+            "market_open_to_entry_attempt_completion_seconds": _seconds_since(market_open, observed_epoch),
+            "first_submission_to_entry_attempt_completion_seconds": _seconds_since(
+                float(first_submission) if first_submission is not None else None, observed_epoch,
+            ),
+        })
+        self.audit(
+            "entry_attempt_completed", ticker=record["ticker"], reason=reason,
+            final_filled_quantity=format(filled_quantity, "f"),
+            market_open_to_entry_attempt_completion_seconds=timing["market_open_to_entry_attempt_completion_seconds"],
+        )
+
+    def note_stop_trigger(
+        self, record: dict[str, Any], executable_bid: Decimal, stop_price: Decimal, quantity: Decimal, *, shadow: bool,
+    ) -> None:
+        """Preserve first stop detection time across IOC retries and restarts."""
+
+        observed_epoch = time.time()
+        trigger = record.setdefault("stop_trigger", {})
+        trigger.setdefault("at", utc_now())
+        trigger.setdefault("observed_epoch", observed_epoch)
+        trigger.update({
+            "best_executable_bid": format(executable_bid, "f"),
+            "effective_stop_price": format(stop_price, "f"),
+            "requested_quantity": format(quantity, "f"),
+            "shadow": shadow,
+        })
+        timing = record.setdefault("stop_timing", {})
+        if timing.get("stop_trigger_observed_epoch") is not None:
+            return
+        trigger_epoch = float(trigger.get("observed_epoch") or observed_epoch)
+        entry = record.get("entry_timing") if isinstance(record.get("entry_timing"), dict) else {}
+        first_fill = entry.get("first_fill_observed_epoch") if isinstance(entry, dict) else None
+        market_open = float(record.get("market_open_epoch") or trigger_epoch)
+        timing.update({
+            "stop_trigger_observed_at": trigger["at"],
+            "stop_trigger_observed_epoch": trigger_epoch,
+            "first_fill_to_stop_trigger_seconds": _seconds_since(
+                float(first_fill) if first_fill is not None else None, trigger_epoch,
+            ),
+            "market_open_to_stop_trigger_seconds": _seconds_since(market_open, trigger_epoch),
+        })
+        metrics = self.refresh_execution_timing_metrics()
+        self.audit(
+            "stop_trigger_timing", ticker=record["ticker"], executable_bid=format(executable_bid, "f"),
+            effective_stop_price=format(stop_price, "f"),
+            first_fill_to_stop_trigger_seconds=timing["first_fill_to_stop_trigger_seconds"],
+            market_open_to_stop_trigger_seconds=timing["market_open_to_stop_trigger_seconds"], timing_metrics=metrics,
+        )
+
+    def note_stop_exit_submitted(self, record: dict[str, Any], order: dict[str, Any]) -> None:
+        """Capture time from a stop trigger to the first flattening request."""
+
+        timing = record.setdefault("stop_timing", {})
+        if timing.get("first_exit_submission_epoch") is not None:
+            return
+        observed_epoch = time.time()
+        submitted_at = str(order.get("submitted_at") or utc_now())
+        order.setdefault("submitted_at", submitted_at)
+        submitted_epoch = _iso_epoch(submitted_at) or observed_epoch
+        trigger_epoch = timing.get("stop_trigger_observed_epoch")
+        timing.update({
+            "first_exit_submission_at": submitted_at,
+            "first_exit_submission_epoch": submitted_epoch,
+            "stop_trigger_to_first_exit_submission_seconds": _seconds_since(
+                float(trigger_epoch) if trigger_epoch is not None else None, submitted_epoch,
+            ),
+            "first_exit_order_id": order.get("order_id"),
+            "first_exit_client_order_id": order.get("client_order_id"),
+        })
+        self.audit(
+            "stop_exit_submitted_timing", ticker=record["ticker"], exchange_order_id=order.get("order_id"),
+            stop_trigger_to_first_exit_submission_seconds=timing["stop_trigger_to_first_exit_submission_seconds"],
+        )
+
+    def note_stop_position_closed(self, record: dict[str, Any]) -> None:
+        """Record observed time to flatten; live fills remain exchange-authoritative."""
+
+        timing = record.setdefault("stop_timing", {})
+        if timing.get("position_closed_observed_epoch") is not None:
+            return
+        observed_epoch = time.time()
+        trigger_epoch = timing.get("stop_trigger_observed_epoch")
+        timing.update({
+            "position_closed_observed_at": utc_now(),
+            "position_closed_observed_epoch": observed_epoch,
+            "stop_trigger_to_position_closed_seconds": _seconds_since(
+                float(trigger_epoch) if trigger_epoch is not None else None, observed_epoch,
+            ),
+        })
+        metrics = self.refresh_execution_timing_metrics()
+        self.audit(
+            "stop_position_closed_timing", ticker=record["ticker"],
+            stop_trigger_to_position_closed_seconds=timing["stop_trigger_to_position_closed_seconds"],
+            timing_metrics=metrics,
+        )
 
     def update_effective_stop_price(self, record: dict[str, Any]) -> Decimal | None:
         """Persist the actual-entry-derived stop used for active monitoring."""
@@ -1337,6 +1668,7 @@ class LiveEngine:
     async def refresh_entry(self, rest: KalshiREST, record: dict[str, Any]) -> Decimal:
         if self.dry_run:
             raise RuntimeError("shadow entry refresh requires the market-data feed")
+        previous_total = Decimal(str(record.get("actual_quantity") or "0"))
         total = Decimal("0")
         for order in record.get("entry_orders", []):
             await rest.refresh_order(order)
@@ -1351,6 +1683,7 @@ class LiveEngine:
             )
             self.state["average_entry"] = format(total_cost / total, "f") if total else None
             self.update_effective_stop_price(record)
+        self.note_entry_fill_observed(record, previous_total, total, "exchange_order_refresh")
         self.note_entry_execution_summary(record, "exchange_order_refresh")
         return total
 
@@ -1474,6 +1807,7 @@ class LiveEngine:
         requested = Decimal(str(order.get("quantity") or record.get("intended_quantity") or "0"))
         fill = round_shares(min(requested, evidence_count))
         previous_fill = Decimal(str(order.get("fill_count") or "0"))
+        previous_total = Decimal(str(record.get("actual_quantity") or "0"))
         if self.dry_run and fill > previous_fill:
             affordable_delta = (self.shadow_available_cash() / limit).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
             fill = min(fill, previous_fill + affordable_delta)
@@ -1492,6 +1826,7 @@ class LiveEngine:
         self.state["average_entry"] = format(limit, "f") if fill else None
         if fill > 0:
             self.update_effective_stop_price(record)
+        self.note_entry_fill_observed(record, previous_total, fill, "shadow_trade_through")
         self.note_entry_execution_summary(record, "shadow_trade_through_refresh")
         return fill
 
@@ -1505,6 +1840,7 @@ class LiveEngine:
         """Close an exhausted entry attempt without ever changing recovery on a zero fill."""
 
         self.note_entry_execution_summary(record, reason)
+        self.note_entry_attempt_completed(record, filled, reason)
         if filled > 0:
             self.update_effective_stop_price(record)
             self.transition(record, "POSITION_OPEN", reason)
@@ -1597,9 +1933,11 @@ class LiveEngine:
             if self.dry_run:
                 self.shadow_metrics()["funding_failures"] = int(self.shadow_metrics()["funding_failures"]) + 1
             if filled > 0:
+                self.note_entry_attempt_completed(record, filled, "market_fallback_insufficient_cash_partial_maker_fill")
                 self.transition(record, "POSITION_OPEN", "market_fallback_insufficient_cash_partial_maker_fill")
             else:
                 record["funding_failure"] = details
+                self.note_entry_attempt_completed(record, Decimal("0"), "market_fallback_insufficient_cash")
                 self.transition(record, "FUNDING_FAILURE", "market_fallback_insufficient_cash")
             self.audit("funding_failure", ticker=record["ticker"], **details)
             return
@@ -1637,22 +1975,27 @@ class LiveEngine:
                 # response is unknown.  Startup can then tie a late exchange
                 # fill back to this record instead of inventing P&L.
                 record.setdefault("entry_orders", []).append(order)
+                self.note_entry_order_submitted(record, order, "market_fallback")
                 record["market_fallback"] = {"attempted_at": utc_now(), "status": "submission_unknown_or_rejected", "quote": quote}
                 self.trip("market_fallback_submission_unknown")
                 self.transition(record, "RECONCILIATION_PENDING", "market_fallback_submission_unknown")
                 return
         record.setdefault("entry_orders", []).append(order)
+        self.note_entry_order_submitted(record, order, "market_fallback")
         record["market_fallback"] = {
             "attempted_at": utc_now(), "status": "submitted", "requested_quantity": format(remaining, "f"),
             "best_available_price": format(price, "f"), "client_order_id": client_id,
             "exchange_order_id": order.get("order_id"), "quote": quote,
         }
+        previous_total = Decimal(str(record.get("actual_quantity") or "0"))
         final_filled = (
             filled + Decimal(str(order.get("fill_count") or "0"))
             if self.dry_run else await self.refresh_entry(rest, record)
         )
         record["actual_quantity"] = format(final_filled, "f")
         self.state["current_position"] = record["actual_quantity"]
+        if self.dry_run:
+            self.note_entry_fill_observed(record, previous_total, final_filled, "shadow_market_ioc")
         if self.dry_run and final_filled > 0:
             self.state["average_entry"] = format(self.entry_cost(record) / final_filled, "f")
         self.finish_entry_attempt(record, final_filled, "market_fallback_ioc_completed")
@@ -1690,10 +2033,12 @@ class LiveEngine:
             return
         if ask <= Decimal(self.config["stop_price"]):
             # Do not create an order that would enter at/under the stop.
-            self.transition(record, "ZERO_FILL", "selected_side_started_at_or_below_stop")
-            self.state["sizing"] = zero_fill_snapshot(self.current_parameters(), self.state.get("sizing"))
-            self.note_zero_fill()
-            self.audit("zero_fill", ticker=record["ticker"], reason="selected_side_started_at_or_below_stop", selected_ask=format(ask, "f"))
+            record["entry_rejection_quote"] = {
+                "at": utc_now(), "reason": "selected_side_started_at_or_below_stop",
+                "selected_ask": format(ask, "f"),
+            }
+            self.audit("entry_rejected_at_or_below_stop", ticker=record["ticker"], **record["entry_rejection_quote"])
+            self.finish_entry_attempt(record, Decimal("0"), "selected_side_started_at_or_below_stop")
             return
         if ask <= maker_price:
             # The dynamically derived limit cannot cross. Wait out the rest
@@ -1712,6 +2057,7 @@ class LiveEngine:
             metrics["max_required_cash"] = format(max(Decimal(str(metrics["max_required_cash"])), required), "f")
         if balance is None or balance < required:
             record["funding_failure"] = {"at": utc_now(), "available_balance": None if balance is None else format(balance, "f"), "required_cash": format(required, "f"), "quantity": format(quantity, "f")}
+            self.note_entry_attempt_completed(record, Decimal("0"), "insufficient_authenticated_cash")
             self.transition(record, "FUNDING_FAILURE", "insufficient_authenticated_cash")
             if self.dry_run:
                 self.shadow_metrics()["funding_failures"] = int(self.shadow_metrics()["funding_failures"]) + 1
@@ -1738,10 +2084,12 @@ class LiveEngine:
             # the request.  Persist its deterministic client ID and hold all
             # new exposure until authoritative reconciliation says otherwise.
             record["entry_orders"].append(order)
+            self.note_entry_order_submitted(record, order, "maker")
             self.trip("maker_entry_submission_unknown")
             self.transition(record, "RECONCILIATION_PENDING", "post_only_entry_submission_unknown")
             return
         record["entry_orders"].append(order)
+        self.note_entry_order_submitted(record, order, "maker")
         self.note_entry_execution_summary(record, "maker_limit_submitted")
         self.state["current_order_id"] = order.get("order_id")
         record["entry_deadline_epoch"] = expiry
@@ -1803,15 +2151,14 @@ class LiveEngine:
             quantity = Decimal(str(record.get("actual_quantity") or "0"))
             if quantity == 0:
                 return
-            record.setdefault("exit_orders", []).append({
+            self.note_stop_trigger(record, executable_bid, stop_price, quantity, shadow=True)
+            exit_order = {
                 "order_id": None, "fill_count": format(quantity, "f"), "remaining_count": "0",
                 "average_fill_price": format(executable_bid, "f"), "fees_paid": "0",
-                "shadow_execution": "fresh_executable_bid",
-            })
-            record["stop_trigger"] = {
-                "at": utc_now(), "best_executable_bid": format(executable_bid, "f"),
-                "effective_stop_price": format(stop_price, "f"), "requested_quantity": format(quantity, "f"), "shadow": True,
+                "shadow_execution": "fresh_executable_bid", "submitted_at": utc_now(),
             }
+            record.setdefault("exit_orders", []).append(exit_order)
+            self.note_stop_exit_submitted(record, exit_order)
             self.transition(record, "STOP_PENDING", "shadow_effective_stop_executable_bid")
             await self.finalize_stop(record)
             return
@@ -1826,6 +2173,7 @@ class LiveEngine:
         if (side == "yes" and exchange_position < 0) or (side == "no" and exchange_position > 0):
             self.trip("stop_position_direction_mismatch")
             return
+        self.note_stop_trigger(record, executable_bid, stop_price, quantity, shadow=False)
         prior = record.get("exit_orders", [])
         # An IOC can be rejected or partially filled and still retain its
         # requested remaining quantity in the local record.  It is not a
@@ -1837,15 +2185,14 @@ class LiveEngine:
             client_order_id_override=deterministic_client_order_id(record["ticker"], side, f"stop-{len(prior)}", self.config),
         )
         record.setdefault("exit_orders", []).append(order)
-        record["stop_trigger"] = {
-            "at": utc_now(), "best_executable_bid": format(executable_bid, "f"),
-            "effective_stop_price": format(stop_price, "f"), "requested_quantity": format(quantity, "f"),
-        }
+        self.note_stop_exit_submitted(record, order)
         self.transition(record, "STOP_PENDING", "effective_stop_executable_bid")
         self.audit(
             "stop_triggered", ticker=record["ticker"], side=side, executable_bid=format(executable_bid, "f"),
             effective_stop_price=format(stop_price, "f"), actual_average_entry_price=record.get("actual_average_entry_price"),
             quantity=format(quantity, "f"), exchange_order_id=order.get("order_id"),
+            first_fill_to_stop_trigger_seconds=record.get("stop_timing", {}).get("first_fill_to_stop_trigger_seconds"),
+            stop_trigger_to_first_exit_submission_seconds=record.get("stop_timing", {}).get("stop_trigger_to_first_exit_submission_seconds"),
         )
 
     def exit_proceeds(self, record: dict[str, Any]) -> tuple[Decimal, Decimal]:
@@ -1916,6 +2263,7 @@ class LiveEngine:
         )
 
     async def finalize_stop(self, record: dict[str, Any]) -> None:
+        self.note_stop_position_closed(record)
         proceeds, exit_fees = self.exit_proceeds(record)
         net = proceeds - exit_fees - self.entry_cost(record)
         self.record_realized(record, net, "stop", f"{record['ticker']}:stop")
