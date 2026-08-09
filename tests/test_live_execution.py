@@ -80,6 +80,38 @@ class LiveFallbackRest(EntryRest):
         return None
 
 
+class CancellationFailureRest(LiveFallbackRest):
+    async def cancel_order(self, order, _dry_run):
+        order["cancel_error"] = "simulated_transport_failure"
+        return False
+
+
+class StopRetryRest(EntryRest):
+    def __init__(self) -> None:
+        super().__init__()
+        self.position = Decimal("1.00")
+        self.exit_calls = 0
+
+    async def position_for_ticker(self, _ticker: str):
+        return self.position
+
+    async def create_reduce_only_exit(self, **kwargs):
+        self.exit_calls += 1
+        if self.exit_calls == 1:
+            return {
+                "order_id": "rejected-stop", "status": "submit_failed", "fill_count": "0.00",
+                "remaining_count": str(kwargs["quantity"]), "fees_paid": "0",
+            }
+        self.position = Decimal("0")
+        return {
+            "order_id": "retry-stop", "status": "filled", "fill_count": str(kwargs["quantity"]),
+            "remaining_count": "0.00", "average_fill_price": kwargs["economic_exit_price"], "fees_paid": "0",
+        }
+
+    async def refresh_exit_order(self, _order):
+        return None
+
+
 class LiveExecutionTests(unittest.TestCase):
     def setUp(self) -> None:
         self.config = load_config(ROOT / "live_strategy_config.json")
@@ -266,6 +298,49 @@ class LiveExecutionTests(unittest.TestCase):
             self.assertEqual(record["entry_execution_summary"]["market_ioc_average_fill_price"], "0.6")
             self.assertEqual(engine.state["entry_execution_metrics"]["maker_limit_fill_markets"], 0)
             self.assertEqual(engine.state["entry_execution_metrics"]["market_ioc_fill_markets"], 1)
+        asyncio.run(scenario())
+
+    def test_unconfirmed_maker_cancellation_blocks_ioc_fallback(self) -> None:
+        async def scenario() -> None:
+            config = dict(self.config)
+            directory = Path(tempfile.mkdtemp())
+            engine = LiveEngine(config, default_state(config), directory / "state", directory / "ledger", dry_run=False)
+            rest = CancellationFailureRest()
+            feed = Feed("0.60")
+            record = engine.set_signal(
+                {"ticker": "KXBTC15M-cancel-uncertain", "open_epoch": 1_000, "close_epoch": 1_900},
+                {"outcome": "yes", "ticker": "KXBTC15M-prior"},
+            )
+            await engine.submit_entry(rest, feed, record, 1_000)
+            await engine.submit_entry(rest, feed, record, 1_003)
+            await engine.manage_entry(rest, feed, record, 1_015)
+            self.assertEqual(len(rest.calls), 1, "a cancellation failure must not submit the IOC replacement")
+            self.assertEqual(record["status"], "ENTRY_CANCEL_UNCONFIRMED")
+            self.assertTrue(engine.state["circuit_breaker"]["blocked"])
+            self.assertEqual(record["entry_cancel_pending"]["next_action"], "finish_entry")
+        asyncio.run(scenario())
+
+    def test_rejected_stop_ioc_retries_using_authoritative_residual_position(self) -> None:
+        async def scenario() -> None:
+            config = dict(self.config)
+            directory = Path(tempfile.mkdtemp())
+            engine = LiveEngine(config, default_state(config), directory / "state", directory / "ledger", dry_run=False)
+            rest = StopRetryRest()
+            record = {
+                "ticker": "KXBTC15M-stop-retry", "signal_side": "yes", "status": "POSITION_OPEN",
+                "actual_quantity": "1.00", "entry_orders": [
+                    {"entry_phase": "maker", "fill_count": "1.00", "remaining_count": "0", "average_fill_price": "0.50", "fees_paid": "0"},
+                ], "exit_orders": [],
+            }
+            engine.state["markets"][record["ticker"]] = record
+            engine.state["active_market"] = record["ticker"]
+            await engine.close_at_stop(rest, record, Decimal("0.40"))
+            self.assertEqual(rest.exit_calls, 1)
+            self.assertEqual(record["status"], "STOP_PENDING")
+            await engine.close_at_stop(rest, record, Decimal("0.40"))
+            self.assertEqual(rest.exit_calls, 2, "a rejected IOC must not suppress the next flattening attempt")
+            await engine.manage_stop(rest, Feed("0.60", "0.40"), record)
+            self.assertEqual(record["status"], "CLOSED")
         asyncio.run(scenario())
 
     def test_market_fallback_refuses_a_40c_or_lower_selected_side(self) -> None:
