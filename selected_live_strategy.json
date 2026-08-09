@@ -1,7 +1,7 @@
 {
   "allow_capital_downsize": false,
   "base_increment": "0.50",
-  "config_schema_version": 7,
+  "config_schema_version": 8,
   "dry_run": true,
   "durable_checkpoint_interval_seconds": 5.0,
   "entry_lateness_seconds": 60,
@@ -26,6 +26,8 @@
   "recovery_multiplier": "1.01",
   "selection_basis": "highest_1000usd_survival_then_lowest_p99_bankroll_from_base_case_49c_calibration;_opening_max_minus_1c_and_entry_adjusted_stop_shadow_recalibration_required_before_live",
   "series": "KXBTC15M",
+  "shadow_profile": "sticky_stop_40",
+  "signal_mode": "sticky_until_directional_win",
   "shadow_fill_model": "conservative_trade_through",
   "signal_delay_seconds": 0,
   "starting_base": "1.00",
@@ -34,6 +36,6 @@
   "stop_policy": "floor_with_entry_above_baseline",
   "stop_poll_interval": 1.0,
   "stop_price": "0.40",
-  "strategy_version": "kxbtc15m-hybrid-live-v7",
+  "strategy_version": "kxbtc15m-hybrid-live-v8",
   "threshold_growth_multiplier": "1.01"
 }

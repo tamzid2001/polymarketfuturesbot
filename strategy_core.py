@@ -14,6 +14,31 @@ from typing import Any
 from recovery_sizing import CENT, DEFAULT_MAX_POSITION, ZERO, RecoverySizingState, decimal, round_shares
 
 
+def sticky_directional_prediction(
+    prior_prediction_side: str | None,
+    settled_outcome: str,
+) -> tuple[str, str]:
+    """Advance the shadow-only sticky directional state deterministically.
+
+    A fresh sequence is seeded contrarian to the just-settled market.  Once a
+    side is active, a settlement *against* that side keeps it for the next
+    market; a settlement *on* that side flips it.  This is directional-state
+    logic only: fills, stops, zero fills, and P&L never affect the side.
+    """
+
+    outcome = str(settled_outcome).lower()
+    if outcome not in {"yes", "no"}:
+        raise ValueError("settled_outcome must be yes or no")
+    prior = None if prior_prediction_side is None else str(prior_prediction_side).lower()
+    if prior is None:
+        return ("no" if outcome == "yes" else "yes"), "seed_inverse_settlement"
+    if prior not in {"yes", "no"}:
+        raise ValueError("prior_prediction_side must be yes, no, or None")
+    if outcome == prior:
+        return ("no" if prior == "yes" else "yes"), "flip_after_directional_win"
+    return prior, "hold_after_directional_loss"
+
+
 def effective_stop_price(
     actual_entry_price: Decimal | str,
     stop_floor_price: Decimal | str,

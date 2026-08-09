@@ -5,7 +5,7 @@ name: Kalshi KXBTC15M Hybrid Live
 # not assume a cron invocation occurred at exactly a 15-minute open.
 run-name: >-
   Kalshi KXBTC15M Hybrid —
-  ${{ ((github.event_name == 'schedule' && vars.KALSHI_LIVE_ENABLED == 'true') || (github.event_name == 'workflow_dispatch' && inputs.live_enabled && !inputs.dry_run && vars.KALSHI_LIVE_ENABLED == 'true')) && 'LIVE' || 'DRY_RUN' }}
+  ${{ ((github.event_name == 'schedule' && vars.KALSHI_LIVE_ENABLED == 'true' && vars.KALSHI_SHADOW_ONLY != 'true') || (github.event_name == 'workflow_dispatch' && inputs.live_enabled && !inputs.dry_run && vars.KALSHI_LIVE_ENABLED == 'true' && vars.KALSHI_SHADOW_ONLY != 'true')) && 'LIVE' || format('DRY_RUN {0}', inputs.shadow_profile || 'sticky_stop_40') }}
 
 on:
   schedule:
@@ -22,6 +22,16 @@ on:
         required: true
         type: boolean
         default: true
+      shadow_profile:
+        description: "Isolated sticky-direction shadow stop profile. Each profile has its own state, audit ledger, drawdown, and recovery cycle."
+        required: true
+        type: choice
+        default: sticky_stop_40
+        options:
+          - sticky_stop_40
+          - sticky_stop_30
+          - sticky_stop_20
+          - sticky_stop_10
       reconcile_only:
         description: "Authenticate and reconcile orders/positions only; never create an entry."
         required: true
@@ -53,7 +63,7 @@ on:
         type: string
         default: ""
       stop_price:
-        description: "Fixed executable stop floor, e.g. 0.40. Blank keeps persisted configuration."
+        description: "Fixed executable stop floor. For shadow tests it must match the selected profile (40/30/20/10); blank selects that profile's fixed stop."
         required: false
         type: string
         default: ""
@@ -127,7 +137,7 @@ on:
 # worker must never kill another worker mid-order; the next scheduled wakeup
 # waits and begins by exchange reconciliation.
 concurrency:
-  group: kalshi-kxbtc15m-live
+  group: kalshi-kxbtc15m-${{ inputs.shadow_profile || 'sticky_stop_40' }}
   cancel-in-progress: false
 
 permissions:
@@ -187,11 +197,13 @@ jobs:
           KALSHI_PEM_PATH: kalshi_private_key.pem
           KALSHI_DEMO: "false"
           KALSHI_LIVE_ENABLED: ${{ vars.KALSHI_LIVE_ENABLED || 'false' }}
+          KALSHI_SHADOW_ONLY: ${{ vars.KALSHI_SHADOW_ONLY || 'true' }}
           KALSHI_CHECKPOINT_PUBLISH: "true"
           RUN_SECONDS: ${{ inputs.run_seconds || '18000' }}
-          REQUESTED_LIVE: ${{ github.event_name == 'schedule' && vars.KALSHI_LIVE_ENABLED == 'true' || github.event_name == 'workflow_dispatch' && inputs.live_enabled && !inputs.dry_run && vars.KALSHI_LIVE_ENABLED == 'true' }}
+          REQUESTED_LIVE: ${{ github.event_name == 'schedule' && vars.KALSHI_LIVE_ENABLED == 'true' && vars.KALSHI_SHADOW_ONLY != 'true' || github.event_name == 'workflow_dispatch' && inputs.live_enabled && !inputs.dry_run && vars.KALSHI_LIVE_ENABLED == 'true' && vars.KALSHI_SHADOW_ONLY != 'true' }}
           RECONCILE_ONLY: ${{ inputs.reconcile_only || false }}
           RESET_STATE: ${{ inputs.reset_state || false }}
+          SHADOW_PROFILE: ${{ inputs.shadow_profile || 'sticky_stop_40' }}
           ENTRY_PRICE: ${{ inputs.entry_price || '' }}
           MAKER_PRICE_OFFSET: ${{ inputs.maker_price_offset || '' }}
           OPENING_PRICE_DISCOVERY_SECONDS: ${{ inputs.opening_price_discovery_seconds || '' }}
@@ -217,14 +229,31 @@ jobs:
           if [ "$REQUESTED_LIVE" = "true" ] || [ "$RECONCILE_ONLY" = "true" ]; then
             state_file=data/kalshi_live_strategy_state.json
             audit_file=data/kalshi_live_strategy_audit.jsonl
+            profile_stop=""
           else
-            state_file=data/kalshi_shadow_strategy_state.json
-            audit_file=data/kalshi_shadow_strategy_audit.jsonl
+            case "$SHADOW_PROFILE" in
+              sticky_stop_40) profile_stop=0.40 ;;
+              sticky_stop_30) profile_stop=0.30 ;;
+              sticky_stop_20) profile_stop=0.20 ;;
+              sticky_stop_10) profile_stop=0.10 ;;
+              *) echo "::error::Unknown shadow profile: $SHADOW_PROFILE"; exit 2 ;;
+            esac
+            if [ -n "$STOP_PRICE" ] && [ "$STOP_PRICE" != "$profile_stop" ]; then
+              echo "::error::stop_price must equal the selected shadow profile stop ($profile_stop)."
+              exit 2
+            fi
+            state_file="data/kalshi_shadow_${SHADOW_PROFILE}_state.json"
+            audit_file="data/kalshi_shadow_${SHADOW_PROFILE}_audit.jsonl"
           fi
           args=(--config selected_live_strategy.json
                 --state-file "$state_file"
                 --audit-ledger "$audit_file"
-                --persist-config --run-seconds "$RUN_SECONDS")
+                --run-seconds "$RUN_SECONDS")
+          if [ "$REQUESTED_LIVE" = "true" ] || [ "$RECONCILE_ONLY" = "true" ]; then
+            args+=(--persist-config)
+          else
+            args+=(--shadow-profile "$SHADOW_PROFILE" --stop-price "$profile_stop")
+          fi
           [ "$RECONCILE_ONLY" = "true" ] && args+=(--reconcile-only)
           [ "$RESET_STATE" = "true" ] && args+=(--reset-state)
           [ -z "$ENTRY_PRICE" ] || args+=(--entry-price "$ENTRY_PRICE")
@@ -256,7 +285,8 @@ jobs:
           set -euo pipefail
           git add selected_live_strategy.json \
             data/kalshi_live_strategy_state.json data/kalshi_live_strategy_audit.jsonl \
-            data/kalshi_shadow_strategy_state.json data/kalshi_shadow_strategy_audit.jsonl 2>/dev/null || true
+            data/kalshi_shadow_strategy_state.json data/kalshi_shadow_strategy_audit.jsonl \
+            data/kalshi_shadow_*_state.json data/kalshi_shadow_*_audit.jsonl 2>/dev/null || true
           if git diff --cached --quiet; then
             exit 0
           fi
@@ -276,15 +306,16 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
-          REQUESTED_LIVE: ${{ github.event_name == 'schedule' && vars.KALSHI_LIVE_ENABLED == 'true' || github.event_name == 'workflow_dispatch' && inputs.live_enabled && !inputs.dry_run && vars.KALSHI_LIVE_ENABLED == 'true' }}
+          REQUESTED_LIVE: ${{ github.event_name == 'schedule' && vars.KALSHI_LIVE_ENABLED == 'true' && vars.KALSHI_SHADOW_ONLY != 'true' || github.event_name == 'workflow_dispatch' && inputs.live_enabled && !inputs.dry_run && vars.KALSHI_LIVE_ENABLED == 'true' && vars.KALSHI_SHADOW_ONLY != 'true' }}
           RECONCILE_ONLY: ${{ inputs.reconcile_only || false }}
+          SHADOW_PROFILE: ${{ inputs.shadow_profile || 'sticky_stop_40' }}
         run: |
           set -euo pipefail
           [ "$RECONCILE_ONLY" = "true" ] && exit 0
           if [ "$REQUESTED_LIVE" = "true" ]; then
             state_file=data/kalshi_live_strategy_state.json
           else
-            state_file=data/kalshi_shadow_strategy_state.json
+            state_file="data/kalshi_shadow_${SHADOW_PROFILE}_state.json"
           fi
           ready="$(python -c 'import json, pathlib; p=pathlib.Path("'"$state_file"'"); print(str(bool(json.loads(p.read_text()).get("handoff", {}).get("ready"))).lower() if p.exists() else "false")')"
           if [ "$ready" != "true" ]; then
@@ -296,7 +327,7 @@ jobs:
               -f live_enabled=true -f dry_run=false -f reconcile_only=false -f reset_state=false -f run_seconds=18000
           else
             gh workflow run kalshi_btc15m_average_down.yml --repo "$REPOSITORY" --ref main \
-              -f live_enabled=false -f dry_run=true -f reconcile_only=false -f reset_state=false -f run_seconds=18000
+              -f live_enabled=false -f dry_run=true -f shadow_profile="$SHADOW_PROFILE" -f reconcile_only=false -f reset_state=false -f run_seconds=18000
           fi
           echo "SAFE HANDOFF QUEUED | next serialized five-hour worker requested."
 
@@ -316,5 +347,7 @@ jobs:
             data/kalshi_live_strategy_audit.jsonl
             data/kalshi_shadow_strategy_state.json
             data/kalshi_shadow_strategy_audit.jsonl
+            data/kalshi_shadow_*_state.json
+            data/kalshi_shadow_*_audit.jsonl
           if-no-files-found: warn
           retention-days: 30

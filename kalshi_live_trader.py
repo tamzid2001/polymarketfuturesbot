@@ -46,6 +46,7 @@ from strategy_core import (
     prescribed_quantity,
     round_shares,
     sizing_state,
+    sticky_directional_prediction,
     zero_fill_snapshot,
 )
 
@@ -57,11 +58,11 @@ ORDER_PREFIX = "kxbtc15m-hybrid-v1-"
 # silently reinterpret an older selected configuration after a restart or a
 # watchdog handoff.  Bump both values deliberately with a reviewed migration
 # whenever the shared live/backtest strategy semantics change.
-# v7 is a hard compatibility boundary for the one-minute entry deadline and
-# first-fresh-quote discovery model.  An older worker cannot silently load
-# this configuration; it fails closed before it can submit an order.
-ACTIVE_STRATEGY_VERSION = "kxbtc15m-hybrid-live-v7"
-ACTIVE_CONFIG_SCHEMA_VERSION = 7
+# v8 is a hard compatibility boundary for the sticky directional sequence.
+# An older worker cannot silently load this configuration; it fails closed
+# before it can submit an order.
+ACTIVE_STRATEGY_VERSION = "kxbtc15m-hybrid-live-v8"
+ACTIVE_CONFIG_SCHEMA_VERSION = 8
 TERMINAL_STATES = {"CLOSED", "ZERO_FILL", "FUNDING_FAILURE", "MISSED_SIGNAL", "ERROR_RECONCILIATION"}
 # A cancellation acknowledgement or an order-submission response can be
 # uncertain.  These are deliberately active, risk-managed states: they block
@@ -84,6 +85,18 @@ def configure_logging() -> None:
 
 def _bool(value: Any) -> bool:
     return str(value).lower() in {"1", "true", "yes", "on"}
+
+
+def live_mode_allowed(
+    requested_live: bool, environment_live: bool, shadow_only_lock: bool, dry_run_requested: bool,
+) -> bool:
+    """Return true only for the deliberately enabled real-money path.
+
+    Keeping this gate pure gives the repository a regression test that a
+    future workflow/config change cannot turn a shadow run live accidentally.
+    """
+
+    return requested_live and environment_live and not shadow_only_lock and not dry_run_requested
 
 
 def _iso_epoch(value: Any) -> float | None:
@@ -131,6 +144,16 @@ FLOAT_CONFIG_FIELDS = {
     "durable_checkpoint_interval_seconds",
 }
 
+# These profile names are deliberately part of the durable configuration hash.
+# A 30c replay must never inherit recovery/base state from a 40c replay merely
+# because both happen to observe the same Kalshi account in dry-run mode.
+SHADOW_STOP_PROFILE_PRICES = {
+    "sticky_stop_40": Decimal("0.40"),
+    "sticky_stop_30": Decimal("0.30"),
+    "sticky_stop_20": Decimal("0.20"),
+    "sticky_stop_10": Decimal("0.10"),
+}
+
 
 def assert_active_strategy_contract(value: dict[str, Any]) -> None:
     """Fail closed rather than load a legacy or underspecified live config."""
@@ -168,6 +191,16 @@ def validate_entry_price_contract(value: dict[str, Any]) -> None:
         raise ValueError("the hybrid strategy requires stop_policy=floor_with_entry_above_baseline")
     if stop_baseline != Decimal("0.50"):
         raise ValueError("the hybrid strategy requires stop_baseline_entry_price to equal exactly 0.50")
+    profile = str(value.get("shadow_profile") or "sticky_stop_40")
+    expected_profile_stop = SHADOW_STOP_PROFILE_PRICES.get(profile)
+    if expected_profile_stop is None:
+        raise ValueError(
+            "shadow_profile must be one of " + ", ".join(sorted(SHADOW_STOP_PROFILE_PRICES))
+        )
+    if stop != expected_profile_stop:
+        raise ValueError(
+            f"shadow_profile={profile} requires stop_price={format(expected_profile_stop, 'f')}"
+        )
     # Exercise the shared Decimal implementation at the fixed baseline so a
     # malformed floor/baseline contract cannot reach live monitoring.
     if effective_stop_price(stop_baseline, stop, stop_baseline) != stop:
@@ -214,6 +247,8 @@ def load_config(path: Path) -> dict[str, Any]:
     value.setdefault("stop_policy", "floor_with_entry_above_baseline")
     value.setdefault("stop_baseline_entry_price", "0.50")
     value.setdefault("signal_delay_seconds", 0)
+    value.setdefault("signal_mode", "sticky_until_directional_win")
+    value.setdefault("shadow_profile", "sticky_stop_40")
     # The fresh-book discovery window begins with the first usable quote.  A
     # post-only entry therefore remains possible despite exchange/WebSocket
     # warm-up at market open, while a protected IOC fallback is still reached
@@ -239,6 +274,8 @@ def load_config(path: Path) -> dict[str, Any]:
     value.setdefault("durable_checkpoint_interval_seconds", 5.0)
     if value["shadow_fill_model"] != "conservative_trade_through":
         raise ValueError("only conservative_trade_through is supported for shadow maker-fill evidence")
+    if value["signal_mode"] != "sticky_until_directional_win":
+        raise ValueError("the active shadow strategy requires signal_mode=sticky_until_directional_win")
     validate_entry_price_contract(value)
     if decimal(value["starting_base"]) != Decimal("1.00"):
         raise ValueError("the hybrid strategy must start at exactly 1.00 share")
@@ -265,6 +302,9 @@ def apply_overrides(config: dict[str, Any], args: argparse.Namespace) -> dict[st
         value = getattr(args, name, None)
         if value is not None:
             updated[name] = value
+    shadow_profile = getattr(args, "shadow_profile", None)
+    if shadow_profile not in (None, ""):
+        updated["shadow_profile"] = str(shadow_profile)
     return load_config_from_value(updated)
 
 
@@ -289,6 +329,8 @@ def load_config_from_value(value: dict[str, Any]) -> dict[str, Any]:
     temporary.setdefault("maker_price_offset", "0.01")
     temporary.setdefault("stop_policy", "floor_with_entry_above_baseline")
     temporary.setdefault("stop_baseline_entry_price", "0.50")
+    temporary.setdefault("signal_mode", "sticky_until_directional_win")
+    temporary.setdefault("shadow_profile", "sticky_stop_40")
     temporary.setdefault("entry_timeout_seconds", 60)
     temporary.setdefault("entry_lateness_seconds", 60)
     temporary.setdefault("handoff_guard_seconds", 60)
@@ -298,6 +340,8 @@ def load_config_from_value(value: dict[str, Any]) -> dict[str, Any]:
     validate_entry_price_contract(temporary)
     if temporary["shadow_fill_model"] != "conservative_trade_through":
         raise ValueError("only conservative_trade_through is supported for shadow maker-fill evidence")
+    if temporary["signal_mode"] != "sticky_until_directional_win":
+        raise ValueError("the active shadow strategy requires signal_mode=sticky_until_directional_win")
     if not 15 <= int(temporary["entry_timeout_seconds"]) <= 60:
         raise ValueError("entry_timeout_seconds must be between 15 and 60")
     if int(temporary["handoff_guard_seconds"]) < 60:
@@ -603,7 +647,28 @@ class LiveEngine:
         if isinstance(record, dict):
             return record
         source = str(provisional["outcome"])
-        side = "no" if source == "yes" else "yes"
+        signal_state = self.state.setdefault("directional_signal_state", {
+            "mode": self.config["signal_mode"], "active_side": None,
+            "last_source_market": None, "last_source_outcome": None,
+            "last_transition": None, "updated_at": None,
+        })
+        source_record = self.state["markets"].get(provisional["ticker"])
+        source_record_side = (
+            str(source_record.get("signal_side"))
+            if isinstance(source_record, dict) and source_record.get("signal_side") in {"yes", "no"}
+            else None
+        )
+        prior_side = source_record_side or (
+            str(signal_state.get("active_side"))
+            if signal_state.get("active_side") in {"yes", "no"}
+            else None
+        )
+        side, directional_transition = sticky_directional_prediction(prior_side, source)
+        signal_state.update({
+            "mode": self.config["signal_mode"], "active_side": side,
+            "last_source_market": provisional["ticker"], "last_source_outcome": source,
+            "last_transition": directional_transition, "updated_at": utc_now(),
+        })
         parameters = self.current_parameters()
         quantity, capped = prescribed_quantity(parameters, self.state.get("sizing"))
         record = {
@@ -611,6 +676,8 @@ class LiveEngine:
             "market_open_epoch": market["open_epoch"], "market_close_epoch": market["close_epoch"],
             "source_market_ticker": provisional["ticker"], "provisional_outcome": source,
             "provisional_outcome_details": provisional, "signal_side": side,
+            "signal_mode": self.config["signal_mode"], "prior_signal_side": prior_side,
+            "directional_transition": directional_transition,
             "signal_timestamp": utc_now(), "intended_quantity": format(quantity, "f"),
             "quantity_capped": capped, "base_before": format(sizing_state(parameters, self.state.get("sizing")).base_share_count, "f"),
             "recovery_exponent_before": sizing_state(parameters, self.state.get("sizing")).recovery_exponent,
@@ -700,10 +767,15 @@ class LiveEngine:
         }
         self.state["markets"][ticker] = record
         self.state["active_market"] = ticker
-        self.audit("signal_created", ticker=ticker, source_ticker=provisional["ticker"], provisional_outcome=source, prediction=side, intended_quantity=format(quantity, "f"))
+        self.audit(
+            "signal_created", ticker=ticker, source_ticker=provisional["ticker"], provisional_outcome=source,
+            prior_signal_side=prior_side, directional_transition=directional_transition,
+            prediction=side, intended_quantity=format(quantity, "f"),
+        )
         LOG.warning(
-            "NEW MARKET SIGNAL | ticker=%s source=%s provisional=%s prediction=%s qty=%s maker=$%s max=$%s",
-            ticker, provisional["ticker"], source.upper(), side.upper(), quantity,
+            "NEW MARKET SIGNAL | ticker=%s source=%s provisional=%s prior_side=%s transition=%s prediction=%s qty=%s maker=$%s max=$%s",
+            ticker, provisional["ticker"], source.upper(), prior_side and prior_side.upper(), directional_transition,
+            side.upper(), quantity,
             self.config["entry_price"], "dynamic",
         )
         self.checkpoint("signal_created")
@@ -2580,6 +2652,10 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--reset-state", action="store_true")
     result.add_argument("--live-enabled", action="store_true")
     result.add_argument("--dry-run", action="store_true")
+    result.add_argument(
+        "--shadow-profile", choices=sorted(SHADOW_STOP_PROFILE_PRICES),
+        help="isolated dry-run stop/profile identity; must agree with --stop-price",
+    )
     for name in sorted(DECIMAL_CONFIG_FIELDS | INTEGER_CONFIG_FIELDS | FLOAT_CONFIG_FIELDS):
         result.add_argument("--" + name.replace("_", "-"), dest=name)
     result.add_argument("--allow-capital-downsize", action=argparse.BooleanOptionalAction, default=None)
@@ -2592,8 +2668,11 @@ async def async_main(args: argparse.Namespace) -> int:
         save_config(args.config, config)
     requested_live = bool(args.live_enabled)
     environment_live = _bool(os.getenv("KALSHI_LIVE_ENABLED", "false"))
-    live = requested_live and environment_live and not args.dry_run
+    shadow_only_lock = _bool(os.getenv("KALSHI_SHADOW_ONLY", "false"))
+    live = live_mode_allowed(requested_live, environment_live, shadow_only_lock, bool(args.dry_run))
     dry_run = not live
+    if requested_live and shadow_only_lock:
+        LOG.warning("LIVE REQUEST BLOCKED | KALSHI_SHADOW_ONLY=true; forcing MODE=DRY_RUN")
     LOG.warning("MODE=%s | strategy=%s config_hash=%s", "LIVE" if live else "DRY_RUN", config["strategy_version"], config_hash(config)[:12])
     api_key = os.getenv("KALSHI_API_KEY_ID", "")
     pem_path = Path(os.getenv("KALSHI_PEM_PATH", "kalshi_private_key.pem"))
