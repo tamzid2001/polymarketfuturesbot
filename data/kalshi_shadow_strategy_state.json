@@ -14029,6 +14029,7 @@
       },
       "created_at": "2026-08-09T05:15:09.751571+00:00",
       "effective_stop_price": null,
+      "entry_cancellation_confirmed_at": "2026-08-09T05:16:04.360906+00:00",
       "entry_deadline_epoch": 1786252560.0,
       "entry_discovery_wait_logged_epoch": 1786252509.7247477,
       "entry_execution_summary": {
@@ -14048,17 +14049,21 @@
       "entry_execution_type": "none",
       "entry_orders": [],
       "entry_timing": {
-        "entry_attempt_completed_at": null,
-        "entry_attempt_completed_epoch": null,
+        "entry_attempt_completed_at": "2026-08-09T05:16:04.360948+00:00",
+        "entry_attempt_completed_epoch": 1786252564.3609474,
+        "entry_attempt_final_filled_quantity": "0",
+        "entry_attempt_reason": "market_fallback_quote_unavailable",
         "entry_window_seconds": 60,
         "first_fill_observed_at": null,
         "first_fill_observed_epoch": null,
         "first_fill_source": null,
         "first_submission_at": null,
         "first_submission_epoch": null,
+        "first_submission_to_entry_attempt_completion_seconds": null,
         "last_fill_observed_at": null,
         "last_filled_quantity": "0.00",
         "market_open_epoch": 1786252500.0,
+        "market_open_to_entry_attempt_completion_seconds": 64.360947,
         "submission_events": []
       },
       "exit_orders": [],
@@ -14072,6 +14077,12 @@
         "selected_ask": "0.51"
       },
       "market_close_epoch": 1786253400.0,
+      "market_fallback": {
+        "attempted_at": "2026-08-09T05:16:04.360922+00:00",
+        "reason": "stale_top_of_book",
+        "status": "not_submitted"
+      },
+      "market_fallback_attempted": true,
       "market_open_epoch": 1786252500.0,
       "official_outcome": "no",
       "official_settlement_timestamp": "2026-08-09T05:15:11.806150+00:00",
@@ -15467,8 +15478,8 @@
       "signal_side": "yes",
       "signal_timestamp": "2026-08-09T05:15:09.751412+00:00",
       "source_market_ticker": "KXBTC15M-26AUG090115-15",
-      "status": "ENTRY_PENDING",
-      "status_reason": "waiting_for_market_fallback_after_post_only_cross",
+      "status": "ZERO_FILL",
+      "status_reason": "market_fallback_quote_unavailable",
       "stop_baseline_entry_price": "0.50",
       "stop_floor_price": "0.40",
       "stop_policy": "floor_with_entry_above_baseline",
@@ -15482,7 +15493,7 @@
       },
       "strategy_version": "kxbtc15m-hybrid-live-v7",
       "ticker": "KXBTC15M-26AUG090130-30",
-      "updated_at": "2026-08-09T05:15:14.661706+00:00"
+      "updated_at": "2026-08-09T05:16:04.379132+00:00"
     }
   },
   "outcome_verification": {
@@ -15525,7 +15536,7 @@
     "starting_balance": "1000.00",
     "stop_count": 8,
     "zero_fill_markets": 14,
-    "zero_fills": 14
+    "zero_fills": 15
   },
   "sizing": {
     "base_scale_count": 0,
@@ -15542,5 +15553,5 @@
   },
   "state_version": 1,
   "strategy_version": "kxbtc15m-hybrid-live-v7",
-  "updated_at": "2026-08-09T05:16:02.746846+00:00"
+  "updated_at": "2026-08-09T05:16:07.847195+00:00"
 }
