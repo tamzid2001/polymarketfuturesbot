@@ -43,12 +43,12 @@ on:
         type: string
         default: ""
       opening_price_discovery_seconds:
-        description: "Seconds after market open used to capture the selected-side maximum before posting the maker limit. Blank keeps persisted configuration."
+        description: "Fresh-book discovery sample length before posting the maker limit. The sample starts at the first usable selected-side book. Blank keeps persisted configuration."
         required: false
         type: string
         default: ""
       opening_quote_max_observations:
-        description: "Maximum complete top-of-book quote observations retained for the first 15 seconds. Blank keeps persisted configuration."
+        description: "Maximum complete top-of-book quote observations retained during the one-minute entry window. Blank keeps persisted configuration."
         required: false
         type: string
         default: ""
@@ -88,7 +88,7 @@ on:
         type: string
         default: ""
       entry_timeout_seconds:
-        description: "Exact 15-second post-only maker window before the single protected IOC fallback. Only 15 is accepted."
+        description: "Post-only maker window (15–60 seconds) before one price-protected IOC fallback. Default strategy value: 60."
         required: false
         type: string
         default: ""
