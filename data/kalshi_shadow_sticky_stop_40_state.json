@@ -32,7 +32,7 @@
     "updated_at": "2026-08-15T18:00:13.217803+00:00"
   },
   "entry_execution_metrics": {
-    "entry_pending_markets": 213,
+    "entry_pending_markets": 214,
     "funding_failure_markets": 0,
     "maker_limit_fill_markets": 1,
     "maker_limit_filled_quantity": "1.00",
@@ -46,7 +46,7 @@
     "other_entry_filled_quantity": "0",
     "other_entry_markets": 0,
     "total_entry_filled_quantity": "2.00",
-    "tracked_markets": 216,
+    "tracked_markets": 217,
     "zero_fill_markets": 0
   },
   "execution_timing_metrics": {
@@ -130853,14 +130853,14 @@
         "entry_execution_type": "none",
         "maker_limit_average_fill_price": null,
         "maker_limit_filled": false,
-        "maker_limit_filled_quantity": "0.00",
+        "maker_limit_filled_quantity": "0",
         "maker_limit_order_ids": [],
         "market_ioc_average_fill_price": null,
         "market_ioc_filled": false,
-        "market_ioc_filled_quantity": "0.00",
+        "market_ioc_filled_quantity": "0",
         "market_ioc_order_ids": [],
-        "other_entry_filled_quantity": "0.00",
-        "total_filled_quantity": "0.00"
+        "other_entry_filled_quantity": "0",
+        "total_filled_quantity": "0"
       },
       "entry_execution_type": "none",
       "entry_orders": [],
@@ -130884,6 +130884,8 @@
       "maker_price_offset": "0.01",
       "market_close_epoch": 1786817700.0,
       "market_open_epoch": 1786816800.0,
+      "official_outcome": "yes",
+      "official_settlement_timestamp": "2026-08-15T18:00:23.112674+00:00",
       "opening_price_discovery": {
         "anchor_at": null,
         "anchor_epoch": null,
@@ -130895,18 +130897,55 @@
       },
       "opening_quote_capture": {
         "completed_at": null,
-        "discovery_anchor_at": null,
-        "discovery_anchor_epoch": null,
+        "discovery_anchor_at": "2026-08-15T18:00:23.485142+00:00",
+        "discovery_anchor_epoch": 1786816823.4000232,
         "dropped_observation_count": 0,
+        "first_capture_lag_seconds": 23.400023,
+        "last_capture_at": "2026-08-15T18:00:23.485142+00:00",
+        "last_quote_id": "KXBTC15M-26AUG151415-15:23:2026-08-15T18:00:23.086130+00:00",
+        "last_selected_best_ask": "0.45",
         "last_unavailable_reason": "stale_top_of_book",
         "max_observations": 500,
-        "observation_count": 0,
-        "started_at": null,
+        "max_selected_best_ask": "0.45",
+        "max_selected_best_bid": "0.44",
+        "min_selected_best_ask": "0.45",
+        "observation_count": 1,
+        "started_at": "2026-08-15T18:00:23.485166+00:00",
         "unavailable_quote_count": 1,
         "window_seconds": 60
       },
-      "opening_quote_observations": [],
+      "opening_quote_observations": [
+        {
+          "captured_at": "2026-08-15T18:00:23.485142+00:00",
+          "captured_epoch": 1786816823.4000232,
+          "elapsed_after_open_seconds": 23.400023,
+          "maker_price_offset": "0.01",
+          "no_ask": "0.45",
+          "no_ask_size": "2949.84",
+          "no_bid": "0.44",
+          "no_bid_size": "2109.0",
+          "post_only_would_cross": null,
+          "proposed_limit_from_this_ask": "0.44",
+          "quote_age_seconds": 0.398981,
+          "quote_id": "KXBTC15M-26AUG151415-15:23:2026-08-15T18:00:23.086130+00:00",
+          "received_at": "2026-08-15T18:00:23.086130+00:00",
+          "reference_maker_entry_price": "0.49",
+          "selected_ask_size": "2949.84",
+          "selected_best_ask": "0.45",
+          "selected_best_bid": "0.44",
+          "selected_bid_size": "2109.0",
+          "selected_side": "no",
+          "source": "kalshi_websocket_complete_top_of_book",
+          "source_server_timestamp": "2026-08-15T18:00:22.891901Z",
+          "source_timestamp_ms": 1786816822891,
+          "yes_ask": "0.56",
+          "yes_ask_size": "2109.0",
+          "yes_bid": "0.55",
+          "yes_bid_size": "2949.84"
+        }
+      ],
       "prior_signal_side": "yes",
+      "provisional_matches_official": true,
       "provisional_outcome": "yes",
       "provisional_outcome_details": {
         "method": "official_rest_fallback",
@@ -130940,10 +130979,10 @@
     }
   },
   "outcome_verification": {
-    "matches": 216,
+    "matches": 217,
     "mismatches": 0,
-    "provisional": 216,
-    "verified": 216
+    "provisional": 217,
+    "verified": 217
   },
   "peak_equity": "0.4900",
   "processed_settlements": [
@@ -130988,5 +131027,5 @@
   },
   "state_version": 1,
   "strategy_version": "kxbtc15m-hybrid-live-v8",
-  "updated_at": "2026-08-15T18:00:18.274860+00:00"
+  "updated_at": "2026-08-15T18:00:23.486139+00:00"
 }
