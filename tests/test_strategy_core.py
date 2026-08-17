@@ -92,8 +92,8 @@ class StrategyCoreTests(unittest.TestCase):
         self.assertEqual(config["starting_base"], "1.00")
         self.assertEqual(config["base_increment"], "1.00")
         self.assertEqual(config["opening_price_discovery_seconds"], 3)
-        self.assertEqual(config["maker_price_offset"], "0.01")
-        self.assertEqual(config["stop_policy"], "floor_with_entry_above_baseline")
+        self.assertEqual(config["entry_execution_mode"], "immediate_market_ioc")
+        self.assertEqual(config["stop_policy"], "fixed_profile_floor")
         self.assertEqual(config["stop_baseline_entry_price"], "0.50")
         self.assertEqual(config["strategy_version"], ACTIVE_STRATEGY_VERSION)
         self.assertEqual(config["config_schema_version"], ACTIVE_CONFIG_SCHEMA_VERSION)
@@ -121,16 +121,18 @@ class StrategyCoreTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "non-current live configuration schema"):
             load_config_from_value(pre_reconciliation_safety_schema)
 
-    def test_dynamic_opening_limit_requires_exact_one_cent_offset(self) -> None:
+    def test_active_config_rejects_legacy_maker_execution_mode(self) -> None:
         config = load_config(ROOT / "selected_live_strategy.json")
-        with self.assertRaisesRegex(ValueError, "maker_price_offset"):
-            load_config_from_value(dict(config, maker_price_offset="0.02"))
+        with self.assertRaisesRegex(ValueError, "entry_execution_mode"):
+            load_config_from_value(dict(config, entry_execution_mode="maker_then_ioc"))
 
-    def test_entry_adjusted_stop_never_moves_below_the_40c_floor(self) -> None:
+    def test_v9_fixed_stop_is_not_adjusted_by_actual_entry_price(self) -> None:
         floor = Decimal("0.40")
         baseline = Decimal("0.50")
         self.assertEqual(effective_stop_price(Decimal("0.49"), floor, baseline), floor)
         self.assertEqual(effective_stop_price(Decimal("0.50"), floor, baseline), floor)
+        # This helper remains for archived research, but the v9 live contract
+        # does not invoke it for an active position.
         self.assertEqual(effective_stop_price(Decimal("0.52"), floor, baseline), Decimal("0.42"))
         self.assertEqual(effective_stop_price(Decimal("0.54"), floor, baseline), Decimal("0.44"))
 
