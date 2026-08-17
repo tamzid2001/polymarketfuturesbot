@@ -64,6 +64,8 @@ ORDER_PREFIX = "kxbtc15m-hybrid-v1-"
 # configuration; it fails closed before it can submit an order.
 ACTIVE_STRATEGY_VERSION = "kxbtc15m-hybrid-live-v10"
 ACTIVE_CONFIG_SCHEMA_VERSION = 10
+MARKET_DISCOVERY_LOOKBACK_SECONDS = 3_600
+MARKET_DISCOVERY_LOOKAHEAD_SECONDS = 3_600
 TERMINAL_STATES = {"CLOSED", "ZERO_FILL", "FUNDING_FAILURE", "MISSED_SIGNAL", "ERROR_RECONCILIATION"}
 # A cancellation acknowledgement or an order-submission response can be
 # uncertain.  These are deliberately active, risk-managed states: they block
@@ -372,12 +374,39 @@ def deterministic_client_order_id(ticker: str, side: str, purpose: str, config: 
 
 
 def epoch(value: Any) -> float | None:
+    """Parse exchange timestamps without mistaking milliseconds for seconds.
+
+    Kalshi ticker messages normally expose ``ts_ms`` as a 13-digit integer.
+    The legacy helper accepts numeric values as seconds, so normalize numeric
+    inputs before asking it to parse ISO-8601 strings.  Otherwise every final
+    quote appears thousands of years in the future and provisional outcome
+    inference always fails closed.
+    """
+
+    if value in (None, ""):
+        return None
+    if isinstance(value, (int, float, Decimal)):
+        numeric = float(value)
+        return numeric / 1000.0 if abs(numeric) > 10_000_000_000 else numeric
+    if isinstance(value, str):
+        try:
+            numeric = float(value)
+        except ValueError:
+            pass
+        else:
+            return numeric / 1000.0 if abs(numeric) > 10_000_000_000 else numeric
     converted = timestamp_epoch(value)
-    if converted is not None:
-        return float(converted)
-    if isinstance(value, (int, float)):
-        return float(value) / 1000.0 if value > 10_000_000_000 else float(value)
-    return None
+    return None if converted is None else float(converted)
+
+
+def executable_quote_epoch(quote: dict[str, Any]) -> float | None:
+    """Return the best auditable exchange/receive time for one book quote."""
+
+    return (
+        epoch(quote.get("source_timestamp_ms"))
+        or epoch(quote.get("source_server_timestamp"))
+        or _iso_epoch(quote.get("received_at"))
+    )
 
 
 def market_metadata(market: Any) -> dict[str, Any] | None:
@@ -400,6 +429,8 @@ class QuoteObservation:
     yes_bid: Decimal
     no_bid: Decimal
     source: str = "kalshi_websocket_ticker"
+    yes_bid_epoch: float | None = None
+    no_bid_epoch: float | None = None
 
 
 class ProvisionalOutcomeTracker:
@@ -414,7 +445,14 @@ class ProvisionalOutcomeTracker:
 
     def observe_feed(self, feed: KalshiLiveFeed, ticker: str) -> None:
         quote = feed.quotes.get(ticker)
-        book = quote.get("complete_book") if isinstance(quote, dict) else None
+        # Direction inference only requires executable bids.  Prefer the
+        # ticker-level reconstructed quote, whose bid/ask component times are
+        # tracked independently, rather than requiring one message to carry
+        # both prices and both sizes.  Entry execution remains stricter and
+        # still requires ``complete_book`` with displayed depth.
+        book = quote.get("ticker_book") if isinstance(quote, dict) else None
+        if not isinstance(book, dict) and isinstance(quote, dict):
+            book = quote.get("complete_book")
         if not isinstance(book, dict):
             return
         book_id = str(book.get("quote_id") or "")
@@ -430,12 +468,25 @@ class ProvisionalOutcomeTracker:
         if not (Decimal("0") <= yes_bid_d <= Decimal("1") and Decimal("0") <= no_bid_d <= Decimal("1")):
             return
         self._last_book_id[ticker] = book_id
+        received_epoch = float(book.get("received_epoch") or time.time())
+        common_exchange_epoch = epoch(
+            book.get("source_timestamp_ms") or book.get("source_server_timestamp")
+        )
+        yes_bid_epoch = epoch(book.get("yes_bid_source_timestamp"))
+        no_bid_epoch = epoch(book.get("yes_ask_source_timestamp"))
+        try:
+            yes_bid_epoch = yes_bid_epoch or float(book.get("yes_bid_received_epoch") or received_epoch)
+            no_bid_epoch = no_bid_epoch or float(book.get("yes_ask_received_epoch") or received_epoch)
+        except (TypeError, ValueError):
+            return
         observation = QuoteObservation(
             ticker=ticker,
-            received_epoch=time.time(),
-            exchange_epoch=epoch(book.get("source_timestamp_ms") or book.get("source_server_timestamp")),
+            received_epoch=received_epoch,
+            exchange_epoch=common_exchange_epoch,
             yes_bid=yes_bid_d,
             no_bid=no_bid_d,
+            yes_bid_epoch=yes_bid_epoch,
+            no_bid_epoch=no_bid_epoch,
         )
         records = self.observations.setdefault(ticker, [])
         records.append(observation)
@@ -453,17 +504,28 @@ class ProvisionalOutcomeTracker:
         if not candidates:
             return None
         latest = max(candidates, key=lambda item: item.received_epoch)
-        quote_age = boundary_epoch - (latest.exchange_epoch or latest.received_epoch)
-        if quote_age < -1.0 or quote_age > self.max_quote_age_seconds:
-            return None
-        yes_qualifying = [item for item in candidates if item.yes_bid >= self.threshold]
-        no_qualifying = [item for item in candidates if item.no_bid >= self.threshold]
-        latest_yes = latest.yes_bid >= self.threshold
-        latest_no = latest.no_bid >= self.threshold
+
+        def side_age(item: QuoteObservation, side: str) -> float:
+            component_epoch = item.yes_bid_epoch if side == "yes" else item.no_bid_epoch
+            return boundary_epoch - (component_epoch or item.exchange_epoch or item.received_epoch)
+
+        def is_fresh(item: QuoteObservation, side: str) -> bool:
+            age = side_age(item, side)
+            return -1.0 <= age <= self.max_quote_age_seconds
+
+        yes_qualifying = [
+            item for item in candidates if item.yes_bid >= self.threshold and is_fresh(item, "yes")
+        ]
+        no_qualifying = [
+            item for item in candidates if item.no_bid >= self.threshold and is_fresh(item, "no")
+        ]
+        latest_yes = latest.yes_bid >= self.threshold and is_fresh(latest, "yes")
+        latest_no = latest.no_bid >= self.threshold and is_fresh(latest, "no")
         if latest_yes == latest_no:  # both true is conflict; both false is unavailable.
             return None
         side = "yes" if latest_yes else "no"
         selected = yes_qualifying if side == "yes" else no_qualifying
+        quote_age = side_age(latest, side)
         return {
             "outcome": side,
             "ticker": ticker,
@@ -621,38 +683,44 @@ class LiveEngine:
         return not self.state["circuit_breaker"].get("blocked")
 
     async def discover(self, rest: KalshiREST) -> None:
-        """Discover the exchange's active market without scanning future pages.
+        """Discover the previous, current, and upcoming exchange markets.
 
-        The unfiltered endpoint is ordered through a large initialized-future
-        inventory.  A ``limit=1000`` scan can therefore omit the market that
-        is trading now, leaving the worker idle even with a healthy API.  The
-        exchange-supported ``status=open`` filter is the authoritative
-        current-market discovery mechanism.  Recently settled markets are
-        merged as an API-provided startup fallback; markets seen while active
-        remain in the rolling cache to preserve the just-ended quote source at
-        the next boundary.
+        A status-only ``open`` query cannot preload the successor, while an
+        unbounded query may return a page composed entirely of far-future
+        initialized markets.  Kalshi supports close-time filters without a
+        status filter, so use a narrow window around exchange time.  That
+        provides the real unopened successor ticker before the boundary and
+        still avoids deriving tickers or scanning fragile future pages.
         """
         try:
-            active_payload = await rest.get_raw_json(
-                "/markets", {"series_ticker": self.config["series"], "status": "open", "limit": 10},
-            )
-            settled_payload = await rest.get_raw_json(
-                "/markets", {"series_ticker": self.config["series"], "status": "settled", "limit": 10},
+            now = time.time()
+            window_payload = await rest.get_raw_json(
+                "/markets",
+                {
+                    "series_ticker": self.config["series"],
+                    "min_close_ts": int(now) - MARKET_DISCOVERY_LOOKBACK_SECONDS,
+                    "max_close_ts": int(now) + MARKET_DISCOVERY_LOOKAHEAD_SECONDS,
+                    "limit": 100,
+                },
             )
             candidates = [
                 market_metadata(value)
-                for payload in (active_payload, settled_payload)
-                for value in payload.get("markets", []) if isinstance(value, dict)
+                for value in window_payload.get("markets", []) if isinstance(value, dict)
             ]
-            now = time.time()
-            # Keep a narrow rolling window: the immediate predecessor is
-            # enough for signal causality, and bounded retention prevents an
-            # old API page from becoming a substitute predecessor.
+            # Keep a narrow rolling window: one predecessor and the nearby
+            # initialized successors are enough for signal causality and
+            # pre-subscription.  Bounded retention prevents an old API page
+            # from becoming a substitute predecessor.
             retained = {
                 item["ticker"]: item for item in self.markets
                 if item["close_epoch"] >= now - 3_600
             }
-            retained.update({item["ticker"]: item for item in candidates if item is not None})
+            retained.update({
+                item["ticker"]: item for item in candidates
+                if item is not None
+                and item["close_epoch"] >= now - MARKET_DISCOVERY_LOOKBACK_SECONDS
+                and item["open_epoch"] <= now + MARKET_DISCOVERY_LOOKAHEAD_SECONDS
+            })
             self.markets = sorted(retained.values(), key=lambda item: item["open_epoch"])
         except Exception as exc:  # read failure: no new entry, but active risk remains managed
             self.state["api_failure_count"] = int(self.state.get("api_failure_count", 0)) + 1
@@ -737,12 +805,12 @@ class LiveEngine:
             "strategy_version": self.config["strategy_version"], "config_hash": config_hash(self.config),
             "config_snapshot": self.current_parameters().as_dict(), "created_at": utc_now(),
             "entry_execution_mode": self.config["entry_execution_mode"],
-            # ``entry_price`` is the historical-reference price. v9 records
+            # ``entry_price`` is the historical-reference price. v10 records
             # the actual selected-side IOC ask in ``market_entry``/orders.
             "maker_entry_price": None,
             "reference_maker_entry_price": self.config["entry_price"],
             "maker_price_offset": self.config["maker_price_offset"],
-            # These values are per-market immutable policy inputs.  v9 uses
+            # These values are per-market immutable policy inputs.  v10 uses
             # the floor exactly; an actual entry above 50c never raises it.
             "stop_policy": self.config["stop_policy"],
             "stop_floor_price": self.config["stop_price"],
@@ -801,8 +869,15 @@ class LiveEngine:
         self.state["active_market"] = ticker
         self.audit(
             "signal_created", ticker=ticker, source_ticker=provisional["ticker"], provisional_outcome=source,
+            provisional_method=provisional.get("method"), provisional_quote_age=provisional.get("quote_age_seconds"),
             prior_signal_side=prior_side, directional_transition=directional_transition,
             prediction=side, intended_quantity=format(quantity, "f"),
+        )
+        LOG.warning(
+            "SIGNAL SOURCE | source=%s method=%s provisional=%s final_yes_bid=%s final_no_bid=%s quote_age=%s",
+            provisional["ticker"], provisional.get("method"), source.upper(),
+            provisional.get("final_yes_bid"), provisional.get("final_no_bid"),
+            provisional.get("quote_age_seconds"),
         )
         LOG.warning(
             "NEW MARKET SIGNAL | ticker=%s source=%s provisional=%s prior_side=%s transition=%s prediction=%s qty=%s entry_mode=%s fixed_stop=$%s",
@@ -1395,6 +1470,14 @@ class LiveEngine:
         if quote is None:
             capture["unavailable_quote_count"] = int(capture.get("unavailable_quote_count", 0)) + 1
             capture["last_unavailable_reason"] = quote_state
+            return
+        quote_epoch = executable_quote_epoch(quote)
+        if quote_epoch is None or quote_epoch < start:
+            # A book observed while the successor was unopened is useful only
+            # for transport warm-up.  It is never entry evidence and cannot
+            # be used to simulate or submit a post-open IOC.
+            capture["unavailable_quote_count"] = int(capture.get("unavailable_quote_count", 0)) + 1
+            capture["last_unavailable_reason"] = "preopen_or_unstamped_top_of_book"
             return
         quote_id = str(quote.get("quote_id") or "")
         if observations and quote_id and observations[-1].get("quote_id") == quote_id:
@@ -2192,7 +2275,7 @@ class LiveEngine:
     async def submit_immediate_market_entry(
         self, rest: KalshiREST, feed: KalshiLiveFeed, record: dict[str, Any], now: float,
     ) -> None:
-        """Submit the one v9 entry attempt as a protected IOC at the fresh ask.
+        """Submit the one v10 entry attempt as a protected IOC at the fresh ask.
 
         Kalshi does not need an unbounded buy instruction here: an IOC limit at
         the current executable selected-side ask is the safe market-order
@@ -2221,6 +2304,22 @@ class LiveEngine:
             LOG.warning(
                 "MARKET IOC WAIT | ticker=%s side=%s reason=%s age_after_open=%.3fs",
                 record["ticker"], side.upper(), quote_state, now - float(record["market_open_epoch"]),
+            )
+            return
+        quote_epoch = executable_quote_epoch(quote)
+        if quote_epoch is None or quote_epoch < float(record["market_open_epoch"]):
+            # Pre-subscription is intentional, but a pre-open quote is not
+            # evidence that the new contract is trading.  Wait for the first
+            # fresh exchange/receive timestamp at or after the actual open.
+            record["market_entry_attempted"] = False
+            record["market_entry"] = {
+                "attempted_at": utc_now(), "status": "waiting_for_post_open_executable_book",
+                "reason": "preopen_or_unstamped_top_of_book",
+                "quote_timestamp": quote_epoch,
+            }
+            LOG.warning(
+                "MARKET IOC WAIT | ticker=%s side=%s reason=preopen_or_unstamped_top_of_book age_after_open=%.3fs",
+                record["ticker"], side.upper(), now - float(record["market_open_epoch"]),
             )
             return
         price = Decimal(str(quote["economic_price"]))
@@ -2775,6 +2874,20 @@ class LiveEngine:
                 # race at the exchange boundary.
                 subscribed = [active["ticker"]] + ([previous["ticker"]] if previous else []) + ([upcoming["ticker"]] if upcoming else [])
                 feed.set_tickers(subscribed)
+                if upcoming:
+                    preloaded = self.state.setdefault("preloaded_markets", [])
+                    if upcoming["ticker"] not in preloaded:
+                        append_unique(preloaded, upcoming["ticker"], maximum=200)
+                        LOG.warning(
+                            "UPCOMING MARKET PRELOADED | current=%s upcoming=%s opens_in=%.3fs status=%s",
+                            active["ticker"], upcoming["ticker"], upcoming["open_epoch"] - now,
+                            upcoming.get("status"),
+                        )
+                        self.audit(
+                            "upcoming_market_preloaded", ticker=upcoming["ticker"],
+                            current_ticker=active["ticker"], open_epoch=upcoming["open_epoch"],
+                            status=upcoming.get("status"),
+                        )
                 for ticker in subscribed:
                     self.tracker.observe_feed(feed, ticker)
                 # Persist a final-quote provisional result as soon as it is

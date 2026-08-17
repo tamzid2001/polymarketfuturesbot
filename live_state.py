@@ -37,6 +37,7 @@ def default_state(config: dict[str, Any]) -> dict[str, Any]:
         "average_entry": None,
         "markets": {},
         "provisional_outcomes": {},
+        "preloaded_markets": [],
         # Directional side is intentionally independent of execution.  The
         # v8 shadow experiment holds a losing side until that side eventually
         # settles correctly, then flips for the following market.
