@@ -123,8 +123,8 @@ def export_selected_live_strategy(path: Path, row: dict[str, Any], *, selection_
     except KeyError as exc:
         raise ValueError("a live strategy export requires a 40c, 30c, 20c, or 10c stop profile") from exc
     config = {
-        "config_schema_version": 9,
-        "strategy_version": "kxbtc15m-hybrid-live-v9",
+        "config_schema_version": 10,
+        "strategy_version": "kxbtc15m-hybrid-live-v10",
         "selection_basis": selection_basis,
         "series": "KXBTC15M",
         "signal_delay_seconds": 0,
@@ -152,6 +152,7 @@ def export_selected_live_strategy(path: Path, row: dict[str, Any], *, selection_
         "handoff_guard_seconds": 60,
         "stop_poll_interval": 1.0,
         "reconciliation_interval": 5.0,
+        "market_discovery_interval_seconds": 1.0,
         "outcome_observation_seconds": 5,
         "provisional_outcome_threshold": "0.99",
         "max_outcome_quote_age_seconds": 2.0,

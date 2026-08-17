@@ -58,11 +58,12 @@ ORDER_PREFIX = "kxbtc15m-hybrid-v1-"
 # silently reinterpret an older selected configuration after a restart or a
 # watchdog handoff.  Bump both values deliberately with a reviewed migration
 # whenever the shared live/backtest strategy semantics change.
-# v9 is a hard compatibility boundary for the immediate protected-IOC entry
-# and fixed-floor stop contract.  An older worker cannot silently load this
+# v10 is a hard compatibility boundary for status-filtered active-market
+# discovery, immediate protected-IOC entry, and fixed-floor stop contract.
+# An older worker cannot silently load this
 # configuration; it fails closed before it can submit an order.
-ACTIVE_STRATEGY_VERSION = "kxbtc15m-hybrid-live-v9"
-ACTIVE_CONFIG_SCHEMA_VERSION = 9
+ACTIVE_STRATEGY_VERSION = "kxbtc15m-hybrid-live-v10"
+ACTIVE_CONFIG_SCHEMA_VERSION = 10
 TERMINAL_STATES = {"CLOSED", "ZERO_FILL", "FUNDING_FAILURE", "MISSED_SIGNAL", "ERROR_RECONCILIATION"}
 # A cancellation acknowledgement or an order-submission response can be
 # uncertain.  These are deliberately active, risk-managed states: they block
@@ -141,7 +142,7 @@ INTEGER_CONFIG_FIELDS = {
 }
 FLOAT_CONFIG_FIELDS = {
     "stop_poll_interval", "reconciliation_interval", "max_outcome_quote_age_seconds", "max_stale_quote_seconds",
-    "durable_checkpoint_interval_seconds",
+    "durable_checkpoint_interval_seconds", "market_discovery_interval_seconds",
 }
 
 # These profile names are deliberately part of the durable configuration hash.
@@ -253,6 +254,7 @@ def load_config(path: Path) -> dict[str, Any]:
     value.setdefault("entry_lateness_seconds", 60)
     value.setdefault("stop_poll_interval", 1.0)
     value.setdefault("reconciliation_interval", 5.0)
+    value.setdefault("market_discovery_interval_seconds", 1.0)
     value.setdefault("outcome_observation_seconds", 5)
     value.setdefault("provisional_outcome_threshold", "0.99")
     value.setdefault("max_outcome_quote_age_seconds", 2.0)
@@ -281,6 +283,8 @@ def load_config(path: Path) -> dict[str, Any]:
         raise ValueError("handoff_guard_seconds must keep at least one minute clear at each market boundary")
     if not 1.0 <= float(value["durable_checkpoint_interval_seconds"]) <= 60.0:
         raise ValueError("durable_checkpoint_interval_seconds must be between 1 and 60")
+    if not 0.25 <= float(value["market_discovery_interval_seconds"]) <= 10.0:
+        raise ValueError("market_discovery_interval_seconds must be between 0.25 and 10")
     return value
 
 
@@ -334,6 +338,7 @@ def load_config_from_value(value: dict[str, Any]) -> dict[str, Any]:
     temporary.setdefault("opening_quote_max_observations", 500)
     temporary.setdefault("opening_price_discovery_seconds", 3)
     temporary.setdefault("durable_checkpoint_interval_seconds", 5.0)
+    temporary.setdefault("market_discovery_interval_seconds", 1.0)
     validate_entry_price_contract(temporary)
     if temporary["shadow_fill_model"] != "fresh_displayed_top_of_book_ioc":
         raise ValueError("v9 shadow mode requires fresh_displayed_top_of_book_ioc")
@@ -345,6 +350,8 @@ def load_config_from_value(value: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("handoff_guard_seconds must keep at least one minute clear at each market boundary")
     if not 1.0 <= float(temporary["durable_checkpoint_interval_seconds"]) <= 60.0:
         raise ValueError("durable_checkpoint_interval_seconds must be between 1 and 60")
+    if not 0.25 <= float(temporary["market_discovery_interval_seconds"]) <= 10.0:
+        raise ValueError("market_discovery_interval_seconds must be between 0.25 and 10")
     return temporary
 
 
@@ -614,10 +621,39 @@ class LiveEngine:
         return not self.state["circuit_breaker"].get("blocked")
 
     async def discover(self, rest: KalshiREST) -> None:
+        """Discover the exchange's active market without scanning future pages.
+
+        The unfiltered endpoint is ordered through a large initialized-future
+        inventory.  A ``limit=1000`` scan can therefore omit the market that
+        is trading now, leaving the worker idle even with a healthy API.  The
+        exchange-supported ``status=open`` filter is the authoritative
+        current-market discovery mechanism.  Recently settled markets are
+        merged as an API-provided startup fallback; markets seen while active
+        remain in the rolling cache to preserve the just-ended quote source at
+        the next boundary.
+        """
         try:
-            payload = await rest.get_raw_json("/markets", {"series_ticker": self.config["series"], "limit": 1000})
-            candidates = [market_metadata(value) for value in payload.get("markets", []) if isinstance(value, dict)]
-            self.markets = sorted([item for item in candidates if item is not None], key=lambda item: item["open_epoch"])
+            active_payload = await rest.get_raw_json(
+                "/markets", {"series_ticker": self.config["series"], "status": "open", "limit": 10},
+            )
+            settled_payload = await rest.get_raw_json(
+                "/markets", {"series_ticker": self.config["series"], "status": "settled", "limit": 10},
+            )
+            candidates = [
+                market_metadata(value)
+                for payload in (active_payload, settled_payload)
+                for value in payload.get("markets", []) if isinstance(value, dict)
+            ]
+            now = time.time()
+            # Keep a narrow rolling window: the immediate predecessor is
+            # enough for signal causality, and bounded retention prevents an
+            # old API page from becoming a substitute predecessor.
+            retained = {
+                item["ticker"]: item for item in self.markets
+                if item["close_epoch"] >= now - 3_600
+            }
+            retained.update({item["ticker"]: item for item in candidates if item is not None})
+            self.markets = sorted(retained.values(), key=lambda item: item["open_epoch"])
         except Exception as exc:  # read failure: no new entry, but active risk remains managed
             self.state["api_failure_count"] = int(self.state.get("api_failure_count", 0)) + 1
             LOG.warning("MARKET DISCOVERY FAILED | %s", type(exc).__name__)
@@ -2726,7 +2762,7 @@ class LiveEngine:
         handoff_wait_logged_at = 0.0
         while True:
             now = time.time()
-            if time.monotonic() - self.last_market_discovery >= 10.0:
+            if time.monotonic() - self.last_market_discovery >= float(self.config["market_discovery_interval_seconds"]):
                 await self.discover(rest)
                 self.last_market_discovery = time.monotonic()
             active = self.active_market(now)
@@ -2765,8 +2801,8 @@ class LiveEngine:
                     if provisional is not None:
                         record = self.set_signal(active, provisional)
                         # Keep collecting complete top-of-book observations
-                        # even after the dynamic maker order exists, through
-                        # the whole one-minute opening window.
+                        # after the v10 IOC attempt as durable calibration
+                        # evidence; they cannot rewrite an executed order.
                         self.capture_opening_quote(feed, record, now)
                         await self.submit_entry(rest, feed, record, now)
             if time.monotonic() - self.last_reconcile >= float(self.config["reconciliation_interval"]):
