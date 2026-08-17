@@ -494,48 +494,63 @@ class ProvisionalOutcomeTracker:
         self.observations[ticker] = [item for item in records if item.received_epoch >= cutoff]
 
     def infer(self, ticker: str, boundary_epoch: float) -> dict[str, Any] | None:
+        window_start = boundary_epoch - self.observation_seconds
         candidates = [
             item for item in self.observations.get(ticker, [])
-            # The directional fact must have been observable *before* the
-            # old market closed.  Do not let a post-boundary websocket update
-            # rewrite the fact used to enter the new market.
-            if boundary_epoch - self.observation_seconds <= item.received_epoch <= boundary_epoch
+            # Only the configured final 5/15-second window may determine the
+            # next direction. Do not use an earlier intramarket quote or let a
+            # post-boundary update rewrite the decision-time fact.
+            if window_start <= item.received_epoch <= boundary_epoch
         ]
         if not candidates:
             return None
         latest = max(candidates, key=lambda item: item.received_epoch)
 
-        def side_age(item: QuoteObservation, side: str) -> float:
+        def side_epoch(item: QuoteObservation, side: str) -> float:
             component_epoch = item.yes_bid_epoch if side == "yes" else item.no_bid_epoch
-            return boundary_epoch - (component_epoch or item.exchange_epoch or item.received_epoch)
+            return component_epoch or item.exchange_epoch or item.received_epoch
 
-        def is_fresh(item: QuoteObservation, side: str) -> bool:
-            age = side_age(item, side)
-            return -1.0 <= age <= self.max_quote_age_seconds
+        def is_valid_window_quote(item: QuoteObservation, side: str) -> bool:
+            observed_epoch = side_epoch(item, side)
+            # The final-window bounds define signal recency. The independent
+            # staleness guard checks transport/source lag at observation time,
+            # rather than shrinking a configured 5/15-second window to two
+            # seconds at the boundary.
+            transport_age = item.received_epoch - observed_epoch
+            return (
+                window_start <= observed_epoch <= boundary_epoch
+                and -1.0 <= transport_age <= self.max_quote_age_seconds
+            )
 
         yes_qualifying = [
-            item for item in candidates if item.yes_bid >= self.threshold and is_fresh(item, "yes")
+            item for item in candidates
+            if item.yes_bid >= self.threshold and is_valid_window_quote(item, "yes")
         ]
         no_qualifying = [
-            item for item in candidates if item.no_bid >= self.threshold and is_fresh(item, "no")
+            item for item in candidates
+            if item.no_bid >= self.threshold and is_valid_window_quote(item, "no")
         ]
-        latest_yes = latest.yes_bid >= self.threshold and is_fresh(latest, "yes")
-        latest_no = latest.no_bid >= self.threshold and is_fresh(latest, "no")
-        if latest_yes == latest_no:  # both true is conflict; both false is unavailable.
+        if bool(yes_qualifying) == bool(no_qualifying):
+            # Both sides qualifying anywhere in the final window is a data
+            # conflict; neither side qualifying is an unavailable signal.
             return None
-        side = "yes" if latest_yes else "no"
+        side = "yes" if yes_qualifying else "no"
         selected = yes_qualifying if side == "yes" else no_qualifying
-        quote_age = side_age(latest, side)
+        qualifying = max(selected, key=lambda item: side_epoch(item, side))
+        qualifying_epoch = side_epoch(qualifying, side)
+        quote_age = boundary_epoch - qualifying_epoch
         return {
             "outcome": side,
             "ticker": ticker,
-            "timestamp": datetime.fromtimestamp(latest.received_epoch, timezone.utc).isoformat(),
-            "exchange_timestamp": latest.exchange_epoch,
+            "timestamp": datetime.fromtimestamp(qualifying.received_epoch, timezone.utc).isoformat(),
+            "exchange_timestamp": qualifying_epoch,
             "quote_age_seconds": round(max(0.0, quote_age), 6),
-            "method": "final_executable_bid_threshold",
+            "method": "final_window_executable_bid_threshold",
             "threshold": format(self.threshold, "f"),
             "final_yes_bid": format(latest.yes_bid, "f"),
             "final_no_bid": format(latest.no_bid, "f"),
+            "qualifying_bid": format(qualifying.yes_bid if side == "yes" else qualifying.no_bid, "f"),
+            "observation_window_seconds": self.observation_seconds,
             "max_yes_bid": format(max(item.yes_bid for item in candidates), "f"),
             "max_no_bid": format(max(item.no_bid for item in candidates), "f"),
             "qualifying_observations": len(selected),
@@ -870,12 +885,18 @@ class LiveEngine:
         self.audit(
             "signal_created", ticker=ticker, source_ticker=provisional["ticker"], provisional_outcome=source,
             provisional_method=provisional.get("method"), provisional_quote_age=provisional.get("quote_age_seconds"),
+            provisional_observation_window=provisional.get("observation_window_seconds"),
+            provisional_qualifying_bid=provisional.get("qualifying_bid"),
             prior_signal_side=prior_side, directional_transition=directional_transition,
             prediction=side, intended_quantity=format(quantity, "f"),
         )
+        observation_window = provisional.get("observation_window_seconds")
+        observation_window_label = f"{observation_window}s" if observation_window is not None else "n/a"
         LOG.warning(
-            "SIGNAL SOURCE | source=%s method=%s provisional=%s final_yes_bid=%s final_no_bid=%s quote_age=%s",
-            provisional["ticker"], provisional.get("method"), source.upper(),
+            "SIGNAL SOURCE | source=%s method=%s window=%s provisional=%s qualifying_bid=%s "
+            "final_yes_bid=%s final_no_bid=%s quote_age=%s",
+            provisional["ticker"], provisional.get("method"), observation_window_label, source.upper(),
+            provisional.get("qualifying_bid"),
             provisional.get("final_yes_bid"), provisional.get("final_no_bid"),
             provisional.get("quote_age_seconds"),
         )
@@ -2888,8 +2909,12 @@ class LiveEngine:
                             current_ticker=active["ticker"], open_epoch=upcoming["open_epoch"],
                             status=upcoming.get("status"),
                         )
-                for ticker in subscribed:
-                    self.tracker.observe_feed(feed, ticker)
+                observation_window = int(self.config["outcome_observation_seconds"])
+                if active["close_epoch"] - observation_window <= now <= active["close_epoch"]:
+                    # The quote stream remains pre-subscribed, but only the
+                    # ending market's configured final 5/15-second window is
+                    # admitted to the next-market direction tracker.
+                    self.tracker.observe_feed(feed, active["ticker"])
                 # Persist a final-quote provisional result as soon as it is
                 # available in the last second before close.  This makes a
                 # restart between the old close and new entry auditable rather
@@ -2898,7 +2923,15 @@ class LiveEngine:
                     closing = self.tracker.infer(active["ticker"], active["close_epoch"])
                     if closing is not None:
                         self.state.setdefault("provisional_outcomes", {})[active["ticker"]] = closing
-                        self.audit("provisional_outcome_frozen", ticker=active["ticker"], outcome=closing["outcome"], method=closing["method"], quote_age=closing["quote_age_seconds"])
+                        self.audit(
+                            "provisional_outcome_frozen", ticker=active["ticker"],
+                            outcome=closing["outcome"], method=closing["method"],
+                            quote_age=closing["quote_age_seconds"],
+                            observation_window_seconds=closing["observation_window_seconds"],
+                            qualifying_bid=closing["qualifying_bid"],
+                            final_yes_bid=closing["final_yes_bid"],
+                            final_no_bid=closing["final_no_bid"],
+                        )
                         self.checkpoint("provisional_outcome")
                 if previous and now >= active["open_epoch"]:
                     provisional = self.state.get("provisional_outcomes", {}).get(previous["ticker"])

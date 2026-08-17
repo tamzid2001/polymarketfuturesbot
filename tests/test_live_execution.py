@@ -219,8 +219,32 @@ class LiveExecutionTests(unittest.TestCase):
         tracker.observe_feed(feed, "prior")
         inferred = tracker.infer("prior", boundary)
         self.assertEqual(inferred and inferred["outcome"], "yes")
-        self.assertEqual(inferred and inferred["method"], "final_executable_bid_threshold")
+        self.assertEqual(inferred and inferred["method"], "final_window_executable_bid_threshold")
         self.assertAlmostEqual(inferred and inferred["quote_age_seconds"], .2, places=6)
+
+    def test_provisional_uses_only_threshold_hits_inside_configured_final_window(self) -> None:
+        boundary = 10_000.0
+        tracker = ProvisionalOutcomeTracker(Decimal(".99"), 5, 2)
+        tracker.observations["prior"] = [
+            QuoteObservation("prior", boundary - 5.01, boundary - 5.01, Decimal(".99"), Decimal(".01")),
+            QuoteObservation("prior", boundary - 4.9, boundary - 4.9, Decimal(".99"), Decimal(".01")),
+            # The final raw quote need not itself remain at 99c; the observed
+            # threshold hit anywhere in the declared final window is the fact.
+            QuoteObservation("prior", boundary - .1, boundary - .1, Decimal(".98"), Decimal(".02")),
+        ]
+        inferred = tracker.infer("prior", boundary)
+        self.assertEqual(inferred and inferred["outcome"], "yes")
+        self.assertEqual(inferred and inferred["observation_window_seconds"], 5)
+        self.assertEqual(inferred and inferred["qualifying_bid"], "0.99")
+        self.assertAlmostEqual(inferred and inferred["quote_age_seconds"], 4.9, places=6)
+
+        fifteen_seconds = ProvisionalOutcomeTracker(Decimal(".99"), 15, 2)
+        fifteen_seconds.observations["prior"] = [
+            QuoteObservation("prior", boundary - 14.9, boundary - 14.9, Decimal(".01"), Decimal(".99")),
+        ]
+        inferred_15 = fifteen_seconds.infer("prior", boundary)
+        self.assertEqual(inferred_15 and inferred_15["outcome"], "no")
+        self.assertEqual(inferred_15 and inferred_15["observation_window_seconds"], 15)
 
     def test_provisional_yes_and_no_and_inverse_signal(self) -> None:
         tracker = ProvisionalOutcomeTracker(Decimal("0.99"), 5, 2)
@@ -265,7 +289,11 @@ class LiveExecutionTests(unittest.TestCase):
     def test_provisional_rejects_stale_missing_and_conflicting_quotes(self) -> None:
         tracker = ProvisionalOutcomeTracker(Decimal(".99"), 5, 2)
         boundary = 1_000.0
-        tracker.observations["prior"] = [QuoteObservation("prior", boundary - 3, boundary - 3, Decimal(".99"), Decimal(".01"))]
+        # Inside the five-second decision window but delivered from a source
+        # timestamp more than two seconds old: reject as stale transport.
+        tracker.observations["prior"] = [QuoteObservation("prior", boundary - .2, boundary - 3, Decimal(".99"), Decimal(".01"))]
+        self.assertIsNone(tracker.infer("prior", boundary))
+        tracker.observations["prior"] = [QuoteObservation("prior", boundary - 5.01, boundary - 5.01, Decimal(".99"), Decimal(".01"))]
         self.assertIsNone(tracker.infer("prior", boundary))
         tracker.observations["prior"] = [QuoteObservation("prior", boundary - .2, boundary - .2, Decimal(".98"), Decimal(".02"))]
         self.assertIsNone(tracker.infer("prior", boundary))
