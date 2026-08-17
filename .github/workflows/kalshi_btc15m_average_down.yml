@@ -233,8 +233,8 @@ jobs:
           # intentionally reads the live state but still cannot submit an
           # entry because the Python worker receives --reconcile-only.
           if [ "$REQUESTED_LIVE" = "true" ] || [ "$RECONCILE_ONLY" = "true" ]; then
-            state_file=data/kalshi_live_market_ioc_state.json
-            audit_file=data/kalshi_live_market_ioc_audit.jsonl
+            state_file=data/kalshi_live_market_ioc_v10_state.json
+            audit_file=data/kalshi_live_market_ioc_v10_audit.jsonl
             profile_stop=""
           else
             case "$SHADOW_PROFILE" in
@@ -248,11 +248,11 @@ jobs:
               echo "::error::stop_price must equal the selected shadow profile stop ($profile_stop)."
               exit 2
             fi
-            # v9 deliberately starts a separate namespace: it may not load
-            # v8 maker/entry-adjusted-stop state or resurrect its stale
-            # synthetic cancellation records.
-            state_file="data/kalshi_shadow_market_ioc_${SHADOW_PROFILE}_state.json"
-            audit_file="data/kalshi_shadow_market_ioc_${SHADOW_PROFILE}_audit.jsonl"
+            # v10 deliberately starts a separate namespace: it may not load
+            # v8/v9 maker/entry-adjusted-stop state or resurrect a stale
+            # synthetic cancellation record.
+            state_file="data/kalshi_shadow_market_ioc_v10_${SHADOW_PROFILE}_state.json"
+            audit_file="data/kalshi_shadow_market_ioc_v10_${SHADOW_PROFILE}_audit.jsonl"
           fi
           args=(--config selected_live_strategy.json
                 --state-file "$state_file"
@@ -294,9 +294,9 @@ jobs:
         run: |
           set -euo pipefail
           git add selected_live_strategy.json \
-            data/kalshi_live_market_ioc_state.json data/kalshi_live_market_ioc_audit.jsonl \
+            data/kalshi_live_market_ioc_v10_state.json data/kalshi_live_market_ioc_v10_audit.jsonl \
             data/kalshi_shadow_strategy_state.json data/kalshi_shadow_strategy_audit.jsonl \
-            data/kalshi_shadow_market_ioc_*_state.json data/kalshi_shadow_market_ioc_*_audit.jsonl 2>/dev/null || true
+            data/kalshi_shadow_market_ioc_v10_*_state.json data/kalshi_shadow_market_ioc_v10_*_audit.jsonl 2>/dev/null || true
           if git diff --cached --quiet; then
             exit 0
           fi
@@ -323,9 +323,9 @@ jobs:
           set -euo pipefail
           [ "$RECONCILE_ONLY" = "true" ] && exit 0
           if [ "$REQUESTED_LIVE" = "true" ]; then
-            state_file=data/kalshi_live_market_ioc_state.json
+            state_file=data/kalshi_live_market_ioc_v10_state.json
           else
-            state_file="data/kalshi_shadow_market_ioc_${SHADOW_PROFILE}_state.json"
+            state_file="data/kalshi_shadow_market_ioc_v10_${SHADOW_PROFILE}_state.json"
           fi
           ready="$(python -c 'import json, pathlib; p=pathlib.Path("'"$state_file"'"); print(str(bool(json.loads(p.read_text()).get("handoff", {}).get("ready"))).lower() if p.exists() else "false")')"
           if [ "$ready" != "true" ]; then
@@ -353,11 +353,11 @@ jobs:
           name: kalshi-kxbtc15m-hybrid-${{ github.run_id }}
           path: |
             selected_live_strategy.json
-            data/kalshi_live_market_ioc_state.json
-            data/kalshi_live_market_ioc_audit.jsonl
+            data/kalshi_live_market_ioc_v10_state.json
+            data/kalshi_live_market_ioc_v10_audit.jsonl
             data/kalshi_shadow_strategy_state.json
             data/kalshi_shadow_strategy_audit.jsonl
-            data/kalshi_shadow_market_ioc_*_state.json
-            data/kalshi_shadow_market_ioc_*_audit.jsonl
+            data/kalshi_shadow_market_ioc_v10_*_state.json
+            data/kalshi_shadow_market_ioc_v10_*_audit.jsonl
           if-no-files-found: warn
           retention-days: 30

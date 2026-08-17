@@ -76,10 +76,10 @@ Workflow input `shadow_profile` selects one of `sticky_stop_40`, `sticky_stop_30
 
 | Profile | Fixed floor | Durable state | Append-only audit ledger |
 | --- | ---: | --- | --- |
-| `sticky_stop_40` | 40¢ | `data/kalshi_shadow_market_ioc_sticky_stop_40_state.json` | `data/kalshi_shadow_market_ioc_sticky_stop_40_audit.jsonl` |
-| `sticky_stop_30` | 30¢ | `data/kalshi_shadow_market_ioc_sticky_stop_30_state.json` | `data/kalshi_shadow_market_ioc_sticky_stop_30_audit.jsonl` |
-| `sticky_stop_20` | 20¢ | `data/kalshi_shadow_market_ioc_sticky_stop_20_state.json` | `data/kalshi_shadow_market_ioc_sticky_stop_20_audit.jsonl` |
-| `sticky_stop_10` | 10¢ | `data/kalshi_shadow_market_ioc_sticky_stop_10_state.json` | `data/kalshi_shadow_market_ioc_sticky_stop_10_audit.jsonl` |
+| `sticky_stop_40` | 40¢ | `data/kalshi_shadow_market_ioc_v10_sticky_stop_40_state.json` | `data/kalshi_shadow_market_ioc_v10_sticky_stop_40_audit.jsonl` |
+| `sticky_stop_30` | 30¢ | `data/kalshi_shadow_market_ioc_v10_sticky_stop_30_state.json` | `data/kalshi_shadow_market_ioc_v10_sticky_stop_30_audit.jsonl` |
+| `sticky_stop_20` | 20¢ | `data/kalshi_shadow_market_ioc_v10_sticky_stop_20_state.json` | `data/kalshi_shadow_market_ioc_v10_sticky_stop_20_audit.jsonl` |
+| `sticky_stop_10` | 10¢ | `data/kalshi_shadow_market_ioc_v10_sticky_stop_10_state.json` | `data/kalshi_shadow_market_ioc_v10_sticky_stop_10_audit.jsonl` |
 
 The v8/v9 ledgers are preserved as retired diagnostic history. v10 starts in this separate namespace at a $1,000 shadow balance and 1.00 permanent base, so its recovery/P&L metrics cannot be contaminated by the known v8 synthetic-order cancellation defect or v9 unfiltered-discovery defect. The watchdog evaluates each lane independently.
 
@@ -284,7 +284,7 @@ The optimizer uses common random numbers for competing configurations, keeps eve
 - Client order IDs are deterministic, partial fills use actual quantities, exits are reduce-only where supported, and the same market cannot be counted twice after restart.
 - The worker discovers the active market every second with `status=open` and retains only the current/recent API metadata needed for the preceding-market signal. It retains fresh complete selected-side books through the opening minute as evidence, but v10 submits its single price-protected IOC as soon as a fresh executable ask exists. It never posts a maker order, waits for a maximum-opening-price sample, or revives the retired maker fallback.
 - The stop is the fixed selected profile floor: for the reference profile, a fresh executable selected-side bid at **≤40¢** submits a reduce-only IOC only for confirmed filled exposure. An entry above 50¢ does not raise that trigger; an entry at/below the floor is rejected before exposure is created.
-- State and append-only audit ledgers are separate for each `data/kalshi_shadow_market_ioc_*` profile and for `data/kalshi_live_market_ioc_*`. Every v10 shadow profile starts at $1,000 and 1.00 share, tracks realized P&L, peak equity, and max drawdown, and cannot mutate another profile or a live strategy state.
+- State and append-only audit ledgers are separate for each `data/kalshi_shadow_market_ioc_v10_*` profile and for `data/kalshi_live_market_ioc_v10_*`. Every v10 shadow profile starts at $1,000 and 1.00 share, tracks realized P&L, peak equity, and max drawdown, and cannot mutate another profile or a live strategy state.
 - Every audit JSONL record is appended, flushed, and `fsync`ed before the worker resumes order/position management. Its companion strategy state is atomically written and `fsync`ed immediately after every audit event; therefore a state transition, fill observation, stop event, funding failure, settlement, reconciliation result, and handoff is checkpointed while the worker is running—not merely at its end. GitHub state commits are additionally coalesced at the configured `durable_checkpoint_interval_seconds` (default: 5 seconds); a pending material event is retried by the ordinary worker checkpoints once that interval expires, without publishing every quote update.
 - Each market ledger record includes opening quote evidence plus observed execution timing: first-fresh-book lag, market-open-to-IOC submission, market-open-to-first-fill, submission-to-first-fill, entry completion, first-fill-to-stop-trigger, stop-trigger-to-first-exit submission, and stop-trigger-to-observed-flat-position. These are explicitly **worker-observed** timestamps; they do not claim unavailable matching-engine fill times. GitHub Actions heartbeats report active state, balance, cumulative shadow P&L, max drawdown, completed/stop/settlement counts, IOC composition, and entry/stop latency medians. The durable `execution_timing_metrics` state provides count/mean/median/P95/max summaries rebuilt from those per-market records across restarts.
 - A five-hour worker checkpoints and queues its successor only in the middle 13 minutes of a market—from one minute after open through one minute before close. The watchdog is serialized **per profile** and mode-preserving; it cannot convert a shadow worker into a live worker.
@@ -302,8 +302,8 @@ PYTHONPATH=. .venv/bin/python -m unittest -v \
 # Dry-run 30¢ profile (uses its own isolated $1,000 shadow state).
 KALSHI_API_KEY_ID=... KALSHI_PEM_PATH=kalshi_private_key.pem \
   .venv/bin/python kalshi_live_trader.py --config selected_live_strategy.json \
-  --state-file data/kalshi_shadow_market_ioc_sticky_stop_30_state.json \
-  --audit-ledger data/kalshi_shadow_market_ioc_sticky_stop_30_audit.jsonl \
+  --state-file data/kalshi_shadow_market_ioc_v10_sticky_stop_30_state.json \
+  --audit-ledger data/kalshi_shadow_market_ioc_v10_sticky_stop_30_audit.jsonl \
   --shadow-profile sticky_stop_30 --stop-price 0.30 --dry-run --run-seconds 120
 
 # Read-only reconciliation; it never creates an entry.
