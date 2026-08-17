@@ -38,12 +38,13 @@ All dollar results below are gross unless explicitly marked otherwise. Fees, liv
 | Default stop floor | **40¢ executable bid** | `sticky_stop_40` remains the reference profile; the other floors are evidence-gathering shadows |
 | Stop | **Fixed profile floor** | A 54¢ entry in the 40¢ profile still exits only at an executable bid of **≤40¢** |
 | Recovery multiplier | **1.01×** | The selection favors $1,000-survivability, not maximum modeled P&L |
+| Recovery exponent ceiling | **Disabled (`0`)** | The 1.01× sequence continues after every filled trade while cycle P&L is negative in both shadow and live modes |
 | First base threshold | **$350.00** | Realized net P&L only |
 | Threshold growth | **1.01×** | Geometric after each permanent-base step |
 | Base increment | **+0.50 share** | Supports +0.25, +0.50, and +1.00 |
-| Position cap | **100.00 shares** | Cap is applied after two-decimal sizing |
+| Position cap | **100.00 shares** | Separate absolute exposure safety limit, applied after otherwise-unbounded two-decimal 1.01× sizing |
 | Shadow balance | **$1,000.00** | Isolated from the live account state |
-| Real-money mode | **Hard-disabled** | `KALSHI_SHADOW_ONLY=true` forces dry run even if a workflow requests live mode |
+| Real-money mode | **Currently gated off** | It requires `KALSHI_SHADOW_ONLY=false`, `KALSHI_LIVE_ENABLED=true`, and an explicit workflow `live_enabled=true` / `dry_run=false` request |
 
 The selected configuration’s basis is recorded verbatim in its JSON: highest modeled $1,000 survival followed by lower P99 bankroll under the earlier base **49¢ contrarian** calibration. That ranking is not an expected-value claim for v10: sticky-direction signals, immediate market-equivalent execution, and fixed-floor stops require their own settlement replay and shadow evidence. `entry_price=0.49` remains a historical/replay reference, not a live ceiling or live order price.
 
@@ -280,6 +281,7 @@ The optimizer uses common random numbers for competing configurations, keeps eve
 
 - The live engine and historical replay share the recovery/base-sizing transitions. A filled trade updates realized net P&L; a zero fill is exactly $0 and changes neither the recovery exponent nor permanent base.
 - Recovery exponent increases after **every filled closed trade** while cumulative recovery-cycle P&L remains negative. It resets only when that cumulative amount reaches at least $0.
+- `max_recovery_exponent=0` is the explicit disabled sentinel. The shared shadow/live engine does not stop the 1.01× sequence at exponent 12; the independent 100-share position limit, funding check, recovery-loss breaker, and daily-loss breaker remain active.
 - Permanent-base steps use realized net P&L only. No unrealized value, cancelled order, or zero fill can scale the base.
 - Startup reconciles Kalshi balance, open managed orders, positions, fills, and settlements before any entry. Unknown or ambiguous ownership fails closed; Kalshi is authoritative.
 - Client order IDs are deterministic, partial fills use actual quantities, exits are reduce-only where supported, and the same market cannot be counted twice after restart.
@@ -290,7 +292,7 @@ The optimizer uses common random numbers for competing configurations, keeps eve
 - Each market ledger record includes opening quote evidence plus observed execution timing: first-fresh-book lag, market-open-to-IOC submission, market-open-to-first-fill, submission-to-first-fill, entry completion, first-fill-to-stop-trigger, stop-trigger-to-first-exit submission, and stop-trigger-to-observed-flat-position. These are explicitly **worker-observed** timestamps; they do not claim unavailable matching-engine fill times. GitHub Actions heartbeats report active state, balance, cumulative shadow P&L, max drawdown, completed/stop/settlement counts, IOC composition, and entry/stop latency medians. The durable `execution_timing_metrics` state provides count/mean/median/P95/max summaries rebuilt from those per-market records across restarts.
 - A five-hour worker checkpoints and queues its successor only in the middle 13 minutes of a market—from one minute after open through one minute before close. The watchdog is serialized **per profile** and mode-preserving; it cannot convert a shadow worker into a live worker.
 
-`KALSHI_SHADOW_ONLY=true` is the persistent current repository variable and hard-forces `MODE=DRY_RUN` in both workflow and Python code. Even setting `KALSHI_LIVE_ENABLED=true` and supplying live inputs cannot place a real order until that hard lock is deliberately removed. Credentials are referenced only by the names `KALSHI_PROD_API_KEY` and `KALSHI_PRIVATE_KEY`; they are never written to state, logs, artifacts, source, or README.
+`KALSHI_SHADOW_ONLY=true` is the current repository setting and hard-forces `MODE=DRY_RUN` in both workflow and Python code. To switch deliberately, set `KALSHI_SHADOW_ONLY=false` and `KALSHI_LIVE_ENABLED=true`, then run the controlled-restart workflow with `target_live=true` while the named source lane is flat. The handoff refuses boundary timing or persisted exposure, dispatches the current `main`, preserves state, and the replacement reconciles before creating risk. Reversing either repository gate disables live placement again. Credentials are referenced only by the names `KALSHI_PROD_API_KEY` and `KALSHI_PRIVATE_KEY`; they are never written to state, logs, artifacts, source, or README.
 
 ## Tests and operational commands
 

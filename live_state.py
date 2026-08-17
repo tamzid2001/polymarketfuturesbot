@@ -12,6 +12,8 @@ from typing import Any
 
 
 STATE_VERSION = 1
+UNCAPPED_RECOVERY_EXPONENT = 0
+LEGACY_RECOVERY_EXPONENT_LIMIT = 12
 
 
 def utc_now() -> str:
@@ -28,6 +30,7 @@ def default_state(config: dict[str, Any]) -> dict[str, Any]:
         "state_version": STATE_VERSION,
         "strategy_version": config["strategy_version"],
         "config_hash": config_hash(config),
+        "config_migrations": [],
         "created_at": utc_now(),
         "updated_at": utc_now(),
         "sizing": {},
@@ -85,8 +88,34 @@ def load_state(path: Path, config: dict[str, Any]) -> dict[str, Any]:
     # workflow gives v9 its own durable state/ledger namespace.
     if value.get("strategy_version") != config.get("strategy_version"):
         raise RuntimeError("live state strategy version differs from active configuration; fail closed")
-    if value.get("config_hash") != config_hash(config):
-        raise RuntimeError("live state configuration hash differs from active configuration; fail closed")
+    expected_hash = config_hash(config)
+    if value.get("config_hash") != expected_hash:
+        # One narrowly-scoped operational migration is supported: v10 changed
+        # the recovery-exponent circuit breaker from 12 to the explicit zero
+        # sentinel (disabled). This does not reinterpret quantity, P&L, base,
+        # thresholds, fills, positions, or any open record. Verify the exact
+        # prior hash before preserving the cycle; every other change still
+        # fails closed.
+        legacy_config = dict(config)
+        legacy_config["max_recovery_exponent"] = LEGACY_RECOVERY_EXPONENT_LIMIT
+        is_uncapped_migration = (
+            int(config.get("max_recovery_exponent", LEGACY_RECOVERY_EXPONENT_LIMIT))
+            == UNCAPPED_RECOVERY_EXPONENT
+            and value.get("config_hash") == config_hash(legacy_config)
+        )
+        if not is_uncapped_migration:
+            raise RuntimeError("live state configuration hash differs from active configuration; fail closed")
+        migrations = value.setdefault("config_migrations", [])
+        migrations.append({
+            "at": utc_now(),
+            "kind": "disable_recovery_exponent_breaker",
+            "previous_max_recovery_exponent": LEGACY_RECOVERY_EXPONENT_LIMIT,
+            "max_recovery_exponent": UNCAPPED_RECOVERY_EXPONENT,
+            "previous_config_hash": value.get("config_hash"),
+            "config_hash": expected_hash,
+            "policy": "preserve_existing_recovery_cycle_without_reinterpretation",
+        })
+        value["config_hash"] = expected_hash
     for key, default in default_state(config).items():
         value.setdefault(key, default)
     return value

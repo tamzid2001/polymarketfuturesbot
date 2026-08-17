@@ -18,6 +18,7 @@ from kalshi_live_trader import (
     live_mode_allowed, load_config,
 )
 from live_state import default_state, load_state, save_state
+from strategy_core import sizing_state
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -158,6 +159,37 @@ class LiveExecutionTests(unittest.TestCase):
         save_state(temporary, state)
         with self.assertRaisesRegex(RuntimeError, "strategy version differs"):
             load_state(temporary, self.config)
+
+    def test_uncapped_recovery_exponent_migrates_without_reset_and_keeps_position_cap(self) -> None:
+        temporary = Path(tempfile.mkdtemp()) / "state.json"
+        legacy_config = dict(self.config, max_recovery_exponent=12)
+        state = default_state(legacy_config)
+        state["sizing"] = {
+            "base_share_count": "1.00", "recovery_exponent": 500,
+            "recovery_cycle_pnl": "-1.1494", "next_base_threshold": "350.00",
+        }
+        save_state(temporary, state)
+
+        migrated = load_state(temporary, self.config)
+        self.assertEqual(migrated["sizing"]["recovery_exponent"], 500)
+        self.assertEqual(migrated["sizing"]["recovery_cycle_pnl"], "-1.1494")
+        self.assertEqual(migrated["config_migrations"][-1]["kind"], "disable_recovery_exponent_breaker")
+
+        engine = LiveEngine(
+            self.config, migrated, temporary, temporary.with_suffix(".jsonl"), dry_run=True,
+        )
+        self.assertTrue(engine.circuit_allows_entry())
+        self.assertFalse(engine.state["circuit_breaker"]["blocked"])
+        self.assertEqual(
+            sizing_state(engine.current_parameters(), engine.state["sizing"]).prescribed_quantity(),
+            Decimal("100.00"),
+        )
+
+    def test_unrelated_configuration_change_still_fails_closed(self) -> None:
+        temporary = Path(tempfile.mkdtemp()) / "state.json"
+        save_state(temporary, default_state(self.config))
+        with self.assertRaisesRegex(RuntimeError, "configuration hash differs"):
+            load_state(temporary, dict(self.config, max_position="99.00"))
 
     def test_discovery_preloads_api_successor_from_bounded_close_window(self) -> None:
         async def scenario() -> None:
@@ -514,6 +546,30 @@ class LiveExecutionTests(unittest.TestCase):
             await engine.close_at_stop(rest, record, Decimal("0.40"))
             self.assertEqual(rest.exit_calls, 2, "a rejected IOC must not suppress the next flattening attempt")
             await engine.manage_stop(rest, Feed("0.60", "0.40"), record)
+            self.assertEqual(record["status"], "CLOSED")
+        asyncio.run(scenario())
+
+    def test_shadow_stop_is_recorded_as_non_resting_reduce_only_ioc(self) -> None:
+        async def scenario() -> None:
+            engine = self.engine()
+            record = {
+                "ticker": "KXBTC15M-shadow-taker-stop", "signal_side": "yes", "status": "POSITION_OPEN",
+                "actual_quantity": "1.00", "entry_orders": [
+                    {
+                        "entry_phase": "market_entry", "fill_count": "1.00", "remaining_count": "0",
+                        "average_fill_price": "0.50", "fees_paid": "0",
+                        "time_in_force": "immediate_or_cancel", "post_only": False,
+                    },
+                ], "exit_orders": [],
+            }
+            engine.state["markets"][record["ticker"]] = record
+            engine.state["active_market"] = record["ticker"]
+            await engine.close_at_stop(EntryRest(), record, Decimal("0.40"), entries_confirmed=True)
+            stop = record["exit_orders"][0]
+            self.assertEqual(stop["order_type"], "reduce_only_exit_ioc")
+            self.assertEqual(stop["time_in_force"], "immediate_or_cancel")
+            self.assertFalse(stop["post_only"])
+            self.assertTrue(stop["reduce_only"])
             self.assertEqual(record["status"], "CLOSED")
         asyncio.run(scenario())
 

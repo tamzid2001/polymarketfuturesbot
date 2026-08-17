@@ -1,17 +1,36 @@
 name: Controlled Restart — Kalshi KXBTC15M Hybrid
 
-# This workflow is intentionally manual.  It provides a safe live-code
-# handoff: stop one known older runner, retain its resting deterministic ladder
-# for exchange recovery, then queue the current settlement-only runner.
-# Filled contracts and manual orders are never modified.
+# Manual, serialized handoff onto the current main branch. The source lane
+# must be flat and inside the same middle-13-minute safety window used by the
+# worker's automatic handoff. The replacement always starts with authoritative
+# reconciliation and never resets state.
 on:
   workflow_dispatch:
     inputs:
       source_run_id:
-        description: "The running Kalshi average-down Actions run to stop before handoff."
+        description: "Running KXBTC15M hybrid Actions run to replace."
         required: true
         type: string
-        default: "29766662134"
+      target_live:
+        description: "Request live mode; both repository live gates must already permit it."
+        required: true
+        type: boolean
+        default: false
+      shadow_profile:
+        description: "Shadow lane to restart; live mode always uses the single sticky_stop_40 live lane."
+        required: true
+        type: choice
+        default: sticky_stop_40
+        options:
+          - sticky_stop_40
+          - sticky_stop_30
+          - sticky_stop_20
+          - sticky_stop_10
+      run_seconds:
+        description: "Replacement worker duration before its next safe handoff."
+        required: true
+        type: string
+        default: "18000"
 
 permissions:
   contents: read
@@ -24,55 +43,143 @@ concurrency:
 jobs:
   handoff:
     runs-on: ubuntu-latest
-    environment: "Kalshi"
+    environment: Kalshi
     timeout-minutes: 12
     steps:
-      - name: Checkout current settlement-trader code
-        uses: actions/checkout@v6
+      - name: Checkout current main code and durable state
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 1
 
-      - name: Stop the specified older runner
+      - name: Validate source, live gates, state, and safe handoff window
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          TARGET_LIVE: ${{ inputs.target_live }}
+          SHADOW_PROFILE: ${{ inputs.shadow_profile }}
+          LIVE_GATE: ${{ vars.KALSHI_LIVE_ENABLED || 'false' }}
+          SHADOW_ONLY_LOCK: ${{ vars.KALSHI_SHADOW_ONLY || 'true' }}
+        run: |
+          set -euo pipefail
+          git pull --ff-only origin main
+          source_json="$(gh run view "$SOURCE_RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            --json workflowName,status,displayTitle,headSha)"
+          workflow="$(jq -r '.workflowName' <<<"$source_json")"
+          source_status="$(jq -r '.status' <<<"$source_json")"
+          title="$(jq -r '.displayTitle' <<<"$source_json")"
+          [ "$workflow" = "Kalshi KXBTC15M Hybrid Live" ] || {
+            echo "::error::source_run_id is not a KXBTC15M hybrid worker"; exit 2;
+          }
+          [ "$source_status" = "in_progress" ] || {
+            echo "::error::source worker must be in_progress, got $source_status"; exit 2;
+          }
+
+          if [ "$TARGET_LIVE" = "true" ]; then
+            [ "$LIVE_GATE" = "true" ] && [ "$SHADOW_ONLY_LOCK" != "true" ] || {
+              echo "::error::Live handoff requires KALSHI_LIVE_ENABLED=true and KALSHI_SHADOW_ONLY=false"; exit 2;
+            }
+          fi
+          if [[ "$title" == *"LIVE" ]]; then
+            state_file=data/kalshi_live_market_ioc_v10_state.json
+          else
+            expected_title="DRY_RUN $SHADOW_PROFILE"
+            [[ "$title" == *"$expected_title"* ]] || {
+              echo "::error::source title does not match requested shadow profile"; exit 2;
+            }
+            state_file="data/kalshi_shadow_market_ioc_v10_${SHADOW_PROFILE}_state.json"
+          fi
+          [ -f "$state_file" ] || { echo "::error::Missing durable state: $state_file"; exit 2; }
+
+          # Never stop a manager at a boundary or while its persisted state
+          # reports exposure/order work. A replacement can then reconcile from
+          # a flat, fsynced checkpoint without an unmanaged-risk interval.
+          phase=$(( $(date -u +%s) % 900 ))
+          [ "$phase" -ge 60 ] && [ "$phase" -le 840 ] || {
+            echo "::error::Controlled restart is allowed only 1–14 minutes into the current market"; exit 2;
+          }
+          python - "$state_file" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          state = json.loads(pathlib.Path(sys.argv[1]).read_text())
+          active_statuses = {
+              "SIGNAL_PENDING", "ENTRY_PENDING", "ENTRY_PARTIAL", "POSITION_OPEN",
+              "STOP_PENDING", "SETTLEMENT_PENDING", "RECONCILIATION_PENDING",
+              "ACCOUNTING_RECONCILIATION_PENDING", "ENTRY_CANCEL_UNCONFIRMED",
+          }
+          active = [
+              ticker for ticker, record in state.get("markets", {}).items()
+              if isinstance(record, dict) and record.get("status") in active_statuses
+          ]
+          if str(state.get("current_position", "0")) not in {"0", "0.0", "0.00"}:
+              raise SystemExit("persisted position is not flat; refusing controlled restart")
+          if state.get("current_order_id") or active:
+              raise SystemExit(f"persisted order/active state exists; refusing controlled restart: {active}")
+          print("CONTROLLED_RESTART_PREFLIGHT=FLAT")
+          PY
+
+      - name: Remove queued replacement for the source lane
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          TARGET_LIVE: ${{ inputs.target_live }}
+          SHADOW_PROFILE: ${{ inputs.shadow_profile }}
+        run: |
+          set -euo pipefail
+          source_title="$(gh run view "$SOURCE_RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            --json displayTitle --jq '.displayTitle')"
+          if [ "$TARGET_LIVE" = "true" ]; then
+            target_title="LIVE"
+          else
+            target_title="DRY_RUN $SHADOW_PROFILE"
+          fi
+          runs="$(gh run list --repo "$GITHUB_REPOSITORY" \
+            --workflow kalshi_btc15m_average_down.yml --limit 100 \
+            --json databaseId,status,displayTitle)"
+          jq -r --arg source "$SOURCE_RUN_ID" --arg source_title "$source_title" --arg target_title "$target_title" '
+            .[]
+            | select((.databaseId|tostring) != $source)
+            | select(.status == "queued" or .status == "pending" or .status == "waiting")
+            | select(((.displayTitle // "") | contains($source_title)) or ((.displayTitle // "") | contains($target_title)))
+            | .databaseId
+          ' <<<"$runs" | while read -r run_id; do
+            [ -z "$run_id" ] || gh run cancel "$run_id" --repo "$GITHUB_REPOSITORY"
+          done
+
+      - name: Stop only the validated source worker
         env:
           GH_TOKEN: ${{ github.token }}
           SOURCE_RUN_ID: ${{ inputs.source_run_id }}
         run: |
           set -euo pipefail
-          gh run cancel "$SOURCE_RUN_ID" --repo "$GITHUB_REPOSITORY" || true
+          gh run cancel "$SOURCE_RUN_ID" --repo "$GITHUB_REPOSITORY"
           for attempt in $(seq 1 12); do
-            status="$(gh run view "$SOURCE_RUN_ID" --repo "$GITHUB_REPOSITORY" --json status --jq '.status')"
-            echo "SOURCE RUN STATUS | attempt=$attempt status=$status"
-            [ "$status" = "completed" ] && exit 0
+            run_state="$(gh run view "$SOURCE_RUN_ID" --repo "$GITHUB_REPOSITORY" --json status --jq '.status')"
+            echo "SOURCE RUN STATUS | attempt=$attempt status=$run_state"
+            [ "$run_state" = "completed" ] && exit 0
             sleep 5
           done
-          echo "The old runner did not stop within 60 seconds; refusing to overlap a live bot." >&2
+          echo "::error::Source worker did not stop within 60 seconds; refusing overlap"
           exit 1
 
-      - name: Set up Python
-        uses: actions/setup-python@v6
-        with:
-          # Match the live runner's supported Kalshi async SDK interpreter.
-          python-version: "3.13"
-
-      - name: Install controlled-handoff dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements_kalshi_settlement_trader.txt
-
-      - name: Write Kalshi RSA private key
-        env:
-          KALSHI_PRIVATE_KEY: ${{ secrets.KALSHI_PRIVATE_KEY }}
-        run: |
-          printf '%s\n' "$KALSHI_PRIVATE_KEY" > kalshi_private_key.pem
-          chmod 600 kalshi_private_key.pem
-
-      - name: Start a non-live reconciliation runner
+      - name: Dispatch current main with preserved state
         env:
           GH_TOKEN: ${{ github.token }}
+          TARGET_LIVE: ${{ inputs.target_live }}
+          SHADOW_PROFILE: ${{ inputs.shadow_profile }}
+          RUN_SECONDS: ${{ inputs.run_seconds }}
         run: |
           set -euo pipefail
-          gh workflow run kalshi_btc15m_average_down.yml \
-            --repo "$GITHUB_REPOSITORY" --ref main \
-            -f live_enabled=false \
-            -f dry_run=true \
-            -f reconcile_only=true \
-            -f reset_state=false
-          echo "NON-LIVE RECONCILIATION RUNNER QUEUED | it cannot submit orders while balance reconciliation is pending."
+          if [ "$TARGET_LIVE" = "true" ]; then
+            gh workflow run kalshi_btc15m_average_down.yml --repo "$GITHUB_REPOSITORY" --ref main \
+              -f live_enabled=true -f dry_run=false -f shadow_profile=sticky_stop_40 \
+              -f reconcile_only=false -f reset_state=false -f run_seconds="$RUN_SECONDS"
+            echo "CONTROLLED HANDOFF QUEUED | target=LIVE ref=main reconciliation_required=true"
+          else
+            gh workflow run kalshi_btc15m_average_down.yml --repo "$GITHUB_REPOSITORY" --ref main \
+              -f live_enabled=false -f dry_run=true -f shadow_profile="$SHADOW_PROFILE" \
+              -f reconcile_only=false -f reset_state=false -f run_seconds="$RUN_SECONDS"
+            echo "CONTROLLED HANDOFF QUEUED | target=DRY_RUN profile=$SHADOW_PROFILE ref=main"
+          fi
