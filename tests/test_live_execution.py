@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import tempfile
+import time
 import unittest
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -153,6 +154,39 @@ class LiveExecutionTests(unittest.TestCase):
         save_state(temporary, state)
         with self.assertRaisesRegex(RuntimeError, "strategy version differs"):
             load_state(temporary, self.config)
+
+    def test_discovery_uses_status_open_and_preserves_api_predecessor(self) -> None:
+        async def scenario() -> None:
+            now = time.time()
+
+            def market(ticker: str, opened: float, closed: float, status: str, result: str = "") -> dict:
+                return {
+                    "ticker": ticker, "open_time": datetime.fromtimestamp(opened, timezone.utc).isoformat(),
+                    "close_time": datetime.fromtimestamp(closed, timezone.utc).isoformat(),
+                    "status": status, "result": result,
+                }
+
+            class DiscoveryRest:
+                def __init__(self) -> None:
+                    self.calls = []
+
+                async def get_raw_json(self, path, params):
+                    self.calls.append((path, params))
+                    if params["status"] == "open":
+                        return {"markets": [market("KXBTC15M-active", now - 30, now + 870, "active")]}
+                    if params["status"] == "settled":
+                        return {"markets": [market("KXBTC15M-prior", now - 930, now - 30, "finalized", "yes")]}
+                    raise AssertionError(params)
+
+            engine = self.engine()
+            rest = DiscoveryRest()
+            await engine.discover(rest)
+            active = engine.active_market(now)
+            self.assertEqual(active and active["ticker"], "KXBTC15M-active")
+            self.assertEqual(engine.predecessor(active or {}) and engine.predecessor(active or {})["ticker"], "KXBTC15M-prior")
+            self.assertEqual([params["status"] for _, params in rest.calls], ["open", "settled"])
+            self.assertEqual([params["limit"] for _, params in rest.calls], [10, 10])
+        asyncio.run(scenario())
 
     def test_provisional_yes_and_no_and_inverse_signal(self) -> None:
         tracker = ProvisionalOutcomeTracker(Decimal("0.99"), 5, 2)

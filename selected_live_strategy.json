@@ -1,7 +1,7 @@
 {
   "allow_capital_downsize": false,
   "base_increment": "0.50",
-  "config_schema_version": 9,
+  "config_schema_version": 10,
   "dry_run": true,
   "durable_checkpoint_interval_seconds": 5.0,
   "entry_lateness_seconds": 60,
@@ -19,13 +19,14 @@
   "max_recovery_cycle_loss": "50.00",
   "max_recovery_exponent": 12,
   "max_stale_quote_seconds": 2.0,
+  "market_discovery_interval_seconds": 1.0,
   "opening_price_discovery_seconds": 3,
   "opening_quote_max_observations": 500,
   "outcome_observation_seconds": 5,
   "provisional_outcome_threshold": "0.99",
   "reconciliation_interval": 5.0,
   "recovery_multiplier": "1.01",
-  "selection_basis": "highest_1000usd_survival_then_lowest_p99_bankroll_from_base_case_49c_calibration;_v9_shadow_only_fresh_top_of_book_market_ioc_requires_separate_recalibration_before_live",
+  "selection_basis": "highest_1000usd_survival_then_lowest_p99_bankroll_from_base_case_49c_calibration;_v10_shadow_only_status_filtered_market_discovery_and_fresh_top_of_book_market_ioc_require_separate_recalibration_before_live",
   "series": "KXBTC15M",
   "shadow_profile": "sticky_stop_40",
   "signal_mode": "sticky_until_directional_win",
@@ -37,6 +38,6 @@
   "stop_policy": "fixed_profile_floor",
   "stop_poll_interval": 1.0,
   "stop_price": "0.40",
-  "strategy_version": "kxbtc15m-hybrid-live-v9",
+  "strategy_version": "kxbtc15m-hybrid-live-v10",
   "threshold_growth_multiplier": "1.01"
 }

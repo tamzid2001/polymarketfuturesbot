@@ -107,6 +107,11 @@ on:
         required: false
         type: string
         default: ""
+      market_discovery_interval_seconds:
+        description: "Poll interval for Kalshi status=open current-market discovery (0.25–10 seconds; default 1)."
+        required: false
+        type: string
+        default: ""
       outcome_observation_seconds:
         description: "Final-quote buffer duration for the provisional previous outcome."
         required: false
@@ -217,6 +222,7 @@ jobs:
           MAX_POSITION: ${{ inputs.max_position || '' }}
           ENTRY_TIMEOUT_SECONDS: ${{ inputs.entry_timeout_seconds || '' }}
           ENTRY_LATENESS_SECONDS: ${{ inputs.entry_lateness_seconds || '' }}
+          MARKET_DISCOVERY_INTERVAL_SECONDS: ${{ inputs.market_discovery_interval_seconds || '' }}
           OUTCOME_OBSERVATION_SECONDS: ${{ inputs.outcome_observation_seconds || '' }}
           PROVISIONAL_OUTCOME_THRESHOLD: ${{ inputs.provisional_outcome_threshold || '' }}
           STARTING_SHADOW_BALANCE: ${{ inputs.starting_shadow_balance || '' }}
@@ -272,6 +278,7 @@ jobs:
           [ -z "$MAX_POSITION" ] || args+=(--max-position "$MAX_POSITION")
           [ -z "$ENTRY_TIMEOUT_SECONDS" ] || args+=(--entry-timeout-seconds "$ENTRY_TIMEOUT_SECONDS")
           [ -z "$ENTRY_LATENESS_SECONDS" ] || args+=(--entry-lateness-seconds "$ENTRY_LATENESS_SECONDS")
+          [ -z "$MARKET_DISCOVERY_INTERVAL_SECONDS" ] || args+=(--market-discovery-interval-seconds "$MARKET_DISCOVERY_INTERVAL_SECONDS")
           [ -z "$OUTCOME_OBSERVATION_SECONDS" ] || args+=(--outcome-observation-seconds "$OUTCOME_OBSERVATION_SECONDS")
           [ -z "$PROVISIONAL_OUTCOME_THRESHOLD" ] || args+=(--provisional-outcome-threshold "$PROVISIONAL_OUTCOME_THRESHOLD")
           [ -z "$STARTING_SHADOW_BALANCE" ] || args+=(--starting-shadow-balance "$STARTING_SHADOW_BALANCE")

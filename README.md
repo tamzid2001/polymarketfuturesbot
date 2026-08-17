@@ -21,16 +21,17 @@ All dollar results below are gross unless explicitly marked otherwise. Fees, liv
 
 ## Current live/shadow configuration
 
-[`selected_live_strategy.json`](selected_live_strategy.json) is the canonical base configuration used by the worker. It is versioned as `kxbtc15m-hybrid-live-v9` / schema `9`; this is a hard compatibility boundary for sticky directional state, immediate protected-IOC entry, fixed-profile stops, and durable audit telemetry. A v8 configuration or checkpoint is rejected before the worker can submit an order. Optimizer exports use the same schema, so a future action cannot silently reinterpret the retired maker strategy.
+[`selected_live_strategy.json`](selected_live_strategy.json) is the canonical base configuration used by the worker. It is versioned as `kxbtc15m-hybrid-live-v10` / schema `10`; this is a hard compatibility boundary for status-filtered active-market discovery, sticky directional state, immediate protected-IOC entry, fixed-profile stops, and durable audit telemetry. A v8/v9 configuration or checkpoint is rejected before the worker can submit an order. Optimizer exports use the same schema, so a future action cannot silently reinterpret the retired maker strategy.
 
 | Setting | Current value | Notes |
 | --- | ---: | --- |
 | Series | `KXBTC15M` | Discovered from Kalshi market metadata, not ticker arithmetic |
+| Active-market discovery | **`status=open`, 1-second poll** | Avoids the unfiltered endpoint’s far-future initialized-market page; retains only the current/recent API markets |
 | Direction rule | **Sticky until directional win** | Seed inverse to the first prior result; hold the same side after a wrong prediction; flip only after that side settles correctly |
 | Starting permanent base | **1.00 share** | Two-decimal `Decimal`, `ROUND_HALF_UP` |
 | Entry | **Immediate protected IOC** | Submitted on the selected side at the fresh executable ask; this is Kalshi’s bounded market-order equivalent, never a resting maker order |
 | Fresh-book wait | **Up to 60 seconds** | Wait only for a current executable book; a stale/missing book becomes a missed signal rather than an invented fill |
-| Opening telemetry | **500 records** | Complete opening books remain audit/calibration evidence; they do not determine v9 order price |
+| Opening telemetry | **500 records** | Complete opening books remain audit/calibration evidence; they do not determine v10 order price |
 | Price guard | **Strictly above the profile floor** | At/below 40¢ (or the selected 30/20/10¢ test floor) records no entry; it does not enter into an immediate stop |
 | Shadow stop profiles | **40¢ / 30¢ / 20¢ / 10¢** | Each profile has separate state, recovery cycle, drawdown, ledger, configuration hash, workflow lane, and watchdog recovery |
 | Default stop floor | **40¢ executable bid** | `sticky_stop_40` remains the reference profile; the other floors are evidence-gathering shadows |
@@ -43,21 +44,21 @@ All dollar results below are gross unless explicitly marked otherwise. Fees, liv
 | Shadow balance | **$1,000.00** | Isolated from the live account state |
 | Real-money mode | **Hard-disabled** | `KALSHI_SHADOW_ONLY=true` forces dry run even if a workflow requests live mode |
 
-The selected configuration’s basis is recorded verbatim in its JSON: highest modeled $1,000 survival followed by lower P99 bankroll under the earlier base **49¢ contrarian** calibration. That ranking is not an expected-value claim for v9: sticky-direction signals, immediate market-equivalent execution, and fixed-floor stops require their own settlement replay and shadow evidence. `entry_price=0.49` remains a historical/replay reference, not a live ceiling or live order price.
+The selected configuration’s basis is recorded verbatim in its JSON: highest modeled $1,000 survival followed by lower P99 bankroll under the earlier base **49¢ contrarian** calibration. That ranking is not an expected-value claim for v10: sticky-direction signals, immediate market-equivalent execution, and fixed-floor stops require their own settlement replay and shadow evidence. `entry_price=0.49` remains a historical/replay reference, not a live ceiling or live order price.
 
 ### Immediate market-IOC entry and fixed-floor stop
 
-At market open, the WebSocket worker uses the first **fresh complete top-of-book** observation for the selected side and submits exactly one immediate-or-cancel order at that selected-side executable ask. This is the safe exchange equivalent of a market buy: it either fills immediately at no worse than the observed ask or leaves no resting order. There is no post-only/GTC maker order, no three-second price-discovery gate, and no maker-cancellation/fallback path in the active v9 configuration.
+The worker discovers the active KXBTC15M market with Kalshi’s `status=open` API filter every second, then retains that real API market as the just-ended predecessor at the boundary. This avoids a broken unfiltered 1,000-market scan that can be populated entirely by far-future initialized markets. At market open, the WebSocket worker uses the first **fresh complete top-of-book** observation for the selected side and submits exactly one immediate-or-cancel order at that selected-side executable ask. This is the safe exchange equivalent of a market buy: it either fills immediately at no worse than the observed ask or leaves no resting order. There is no post-only/GTC maker order, no three-second price-discovery gate, and no maker-cancellation/fallback path in the active v10 configuration.
 
 The worker retains up to 500 opening quote observations for evidence. Each includes exchange/receive timestamps, quote ID/age, YES/NO bid/ask/depth, selected-side executable bid/ask/depth, and the submitted IOC quote. Shadow fills are explicitly labelled `fresh_displayed_top_of_book_ioc` and are limited by displayed depth; they are a hypothetical shadow fill, not a claim that Kalshi filled an exchange order.
 
-An IOC is not submitted if the fresh selected-side ask is at or below the selected fixed stop floor. A 40¢ profile therefore does not create a position at 40¢ or less. The exit trigger uses the fresh selected-side executable **bid**: `bid <= fixed_stop_floor` submits a reduce-only IOC only for confirmed actual exposure. Actual entry price feeds P&L only; it never moves the v9 stop. All submissions, fills, no-entry outcomes, stop triggers, exits, worker-observed fill/stop latency, realized P&L, balance, and max drawdown are append-only audit facts.
+An IOC is not submitted if the fresh selected-side ask is at or below the selected fixed stop floor. A 40¢ profile therefore does not create a position at 40¢ or less. The exit trigger uses the fresh selected-side executable **bid**: `bid <= fixed_stop_floor` submits a reduce-only IOC only for confirmed actual exposure. Actual entry price feeds P&L only; it never moves the v10 stop. All submissions, fills, no-entry outcomes, stop triggers, exits, worker-observed fill/stop latency, realized P&L, balance, and max drawdown are append-only audit facts.
 
-Every market record reports actual entry composition. For v9 the expected nonzero category is `market_ioc`; legacy `maker_limit`/`mixed` categories remain readable only for archived v8 evidence. Cumulative method counters are rebuilt idempotently from per-market fill records across workflow handoffs.
+Every market record reports actual entry composition. For v10 the expected nonzero category is `market_ioc`; legacy `maker_limit`/`mixed` categories remain readable only for archived v8 evidence. Cumulative method counters are rebuilt idempotently from per-market fill records across workflow handoffs.
 
 ### Sticky signal transition
 
-The v9 signal has no loss-skip rule and is independent of execution. For each new market, the worker freezes the immediately preceding market’s realtime provisional outcome, later checks it against official settlement, and records the transition in both state and audit ledger:
+The v10 signal has no loss-skip rule and is independent of execution. For each new market, the worker freezes the immediately preceding market’s realtime provisional outcome, later checks it against official settlement, and records the transition in both state and audit ledger:
 
 ```text
 fresh state + previous YES  -> enter NO
@@ -80,11 +81,11 @@ Workflow input `shadow_profile` selects one of `sticky_stop_40`, `sticky_stop_30
 | `sticky_stop_20` | 20¢ | `data/kalshi_shadow_market_ioc_sticky_stop_20_state.json` | `data/kalshi_shadow_market_ioc_sticky_stop_20_audit.jsonl` |
 | `sticky_stop_10` | 10¢ | `data/kalshi_shadow_market_ioc_sticky_stop_10_state.json` | `data/kalshi_shadow_market_ioc_sticky_stop_10_audit.jsonl` |
 
-The v8 ledgers are preserved as retired diagnostic history. v9 starts in this separate namespace at a $1,000 shadow balance and 1.00 permanent base, so its recovery/P&L metrics cannot be contaminated by the known v8 synthetic-order cancellation defect. The watchdog evaluates each lane independently.
+The v8/v9 ledgers are preserved as retired diagnostic history. v10 starts in this separate namespace at a $1,000 shadow balance and 1.00 permanent base, so its recovery/P&L metrics cannot be contaminated by the known v8 synthetic-order cancellation defect or v9 unfiltered-discovery defect. The watchdog evaluates each lane independently.
 
 ## Reconstructed historical directional results — prior inverse baseline
 
-The following snapshot was regenerated from Kalshi’s public settlement endpoints on **2026-08-08** using the prior `inverse_latest_settlement` rule. The cache is intentionally ignored by Git because it is downloaded source data; the exact retrieval commands are below. It is a reproducibility baseline, **not** the v9 sticky-direction/IOC expected value.
+The following snapshot was regenerated from Kalshi’s public settlement endpoints on **2026-08-08** using the prior `inverse_latest_settlement` rule. The cache is intentionally ignored by Git because it is downloaded source data; the exact retrieval commands are below. It is a reproducibility baseline, **not** the v10 sticky-direction/IOC expected value.
 
 | Metric | Current public-history replay |
 | --- | ---: |
@@ -107,7 +108,7 @@ The original 20,778-signal reference is reproduced exactly as the first 20,778 c
 
 The difference from the earlier headline is therefore additional public history, not a random redraw or a changed directional rule. For this baseline, the source signal is the most recently settled earlier market published by the target market’s `open + 45 seconds`; YES maps to predicted NO and NO maps to predicted YES. No two-loss/two-market skip exists in either strategy version.
 
-Live signal timing is intentionally faster: it freezes a provisional prior outcome from the final fresh executable 99¢ bid before the boundary, produces the v9 sticky transition at the next market’s open, and later verifies it against official settlement. The historical optimizer’s `--signal-mode sticky_until_directional_win` rebuild uses the actual previous settlement as an explicitly labelled **provisional-outcome proxy**; it does not claim that the delayed public endpoint was available at the boundary. The historical API does not contain that final quote stream, so the proxy and the live provisional-quote mechanism are distinct evidence paths; their agreement must be measured in shadow rather than assumed.
+Live signal timing is intentionally faster: it freezes a provisional prior outcome from the final fresh executable 99¢ bid before the boundary, produces the v10 sticky transition at the next market’s open, and later verifies it against official settlement. The historical optimizer’s `--signal-mode sticky_until_directional_win` rebuild uses the actual previous settlement as an explicitly labelled **provisional-outcome proxy**; it does not claim that the delayed public endpoint was available at the boundary. The historical API does not contain that final quote stream, so the proxy and the live provisional-quote mechanism are distinct evidence paths; their agreement must be measured in shadow rather than assumed.
 
 ## Execution calibration
 
@@ -156,7 +157,7 @@ The current base-case calibration check used 100,000 replications with seed `42`
 
 ## Static expected value — prior inverse baseline only
 
-The following is a **one-share, fixed-size, no-fee, 40¢-stop calculation** using the current 22,406 *prior inverse* fixed directional outcomes and the base 49¢ execution scenario. It does not include recovery sizing, permanent-base scaling, the 100-share cap, funding failures, slippage, or calibration uncertainty. It must not be read as v9 sticky-direction/IOC EV.
+The following is a **one-share, fixed-size, no-fee, 40¢-stop calculation** using the current 22,406 *prior inverse* fixed directional outcomes and the base 49¢ execution scenario. It does not include recovery sizing, permanent-base scaling, the 100-share cap, funding failures, slippage, or calibration uncertainty. It must not be read as v10 sticky-direction/IOC EV.
 
 For entry price `e`, stop `s`, win rate `pW`, fill probability `f`, and joint 40¢-region probabilities `rW`/`rL`, the gross EV per eligible signal is:
 
@@ -170,7 +171,7 @@ pW * ((f - rW) * (1 - e) + rW * (s - e))
 | 49¢ entry, 40¢ stop | **+$0.02232** | **+$0.02625** | **+$22.32** |
 | 50¢ entry, 40¢ stop | **+$0.01382** | **+$0.01625** | **+$13.82** |
 
-The 50¢ row changes only payout math while holding the **49¢** base-fill/path scenario fixed. It is a sensitivity calculation, not a calibrated 50¢ maker-fill forecast. Neither fixed-price row is an expected-value claim for the v9 fresh-book IOC rule or its fixed stop floor: the historical rung model only identifies 40¢/30¢/20¢/10¢ touches, not actual IOC fills or stop slippage. The worker therefore records actual average entries, fixed stop floors, post-entry minimum executable bids, stop exits, and later official outcomes for stopped positions before that execution is assigned an EV. At either fixed price, one cent of fee per filled share would reduce the per-eligible-signal figure by approximately $0.00850 under the 85% participation assumption, before any slippage. A positive static EV is not a capital guarantee: nonlinear recovery sizing can still create drawdowns, cap hits, and funding failures.
+The 50¢ row changes only payout math while holding the **49¢** base-fill/path scenario fixed. It is a sensitivity calculation, not a calibrated 50¢ maker-fill forecast. Neither fixed-price row is an expected-value claim for the v10 fresh-book IOC rule or its fixed stop floor: the historical rung model only identifies 40¢/30¢/20¢/10¢ touches, not actual IOC fills or stop slippage. The worker therefore records actual average entries, fixed stop floors, post-entry minimum executable bids, stop exits, and later official outcomes for stopped positions before that execution is assigned an EV. At either fixed price, one cent of fee per filled share would reduce the per-eligible-signal figure by approximately $0.00850 under the 85% participation assumption, before any slippage. A positive static EV is not a capital guarantee: nonlinear recovery sizing can still create drawdowns, cap hits, and funding failures.
 
 ## Prior reconstruction comparisons
 
@@ -207,7 +208,7 @@ The intended reading is a risk trade-off, not a claim that higher recovery is be
 
 ### Earlier inverse-baseline stop comparison
 
-An earlier static inverse reconstruction ranked 40¢ first, followed closely by 10¢, then staged 40/30/20/10, 20¢, and 30¢. Its per-share gross estimates were 2.68¢, 2.64¢, 2.53¢, 2.44¢, and 2.37¢ respectively. This ranking is descriptive only and does not select a v9 sticky profile. The current implementation reruns all fixed stops on the new fixed sticky settlement sequence and reports stop results in `stop_optimization_results.csv`; v9 IOC shadow evidence is collected in the four independent ledgers above.
+An earlier static inverse reconstruction ranked 40¢ first, followed closely by 10¢, then staged 40/30/20/10, 20¢, and 30¢. Its per-share gross estimates were 2.68¢, 2.64¢, 2.53¢, 2.44¢, and 2.37¢ respectively. This ranking is descriptive only and does not select a v10 sticky profile. The current implementation reruns all fixed stops on the new fixed sticky settlement sequence and reports stop results in `stop_optimization_results.csv`; v10 IOC shadow evidence is collected in the four independent ledgers above.
 
 ## Full reproducible backtest
 
@@ -219,7 +220,7 @@ python3.13 -m venv .venv
 
 # 1. Download/cache actual Kalshi settlement outcomes and reconstruct the
 #    prior inverse baseline. Use --signal-mode sticky_until_directional_win
-#    below for the active v9 fixed-settlement proxy replay.
+#    below for the active v10 fixed-settlement proxy replay.
 .venv/bin/python kalshi_settlement_loader.py --refresh \
   --cache data/raw/kalshi_kxbtc15m_settlements.json \
   --signals historical_signals.parquet
@@ -229,7 +230,7 @@ python3.13 -m venv .venv
   --output outputs/kalshi_hybrid_backtest/calibration_report.csv \
   --replications 100000 --seed 42
 
-# 3. Full v9 sticky-direction 49¢ screen, stop finalists, 100,000-rep final
+# 3. Full v10 sticky-direction 49¢ screen, stop finalists, 100,000-rep final
 #    runs, walk-forward, stress tests, and plots. The historical proxy is
 #    labelled in every result; it does not invent intramarket quote history.
 .venv/bin/python optimizer.py \
@@ -281,9 +282,9 @@ The optimizer uses common random numbers for competing configurations, keeps eve
 - Permanent-base steps use realized net P&L only. No unrealized value, cancelled order, or zero fill can scale the base.
 - Startup reconciles Kalshi balance, open managed orders, positions, fills, and settlements before any entry. Unknown or ambiguous ownership fails closed; Kalshi is authoritative.
 - Client order IDs are deterministic, partial fills use actual quantities, exits are reduce-only where supported, and the same market cannot be counted twice after restart.
-- The worker retains fresh complete selected-side books through the opening minute as evidence, but v9 submits its single price-protected IOC as soon as a fresh executable ask exists. It never posts a maker order, waits for a maximum-opening-price sample, or revives the retired maker fallback.
+- The worker discovers the active market every second with `status=open` and retains only the current/recent API metadata needed for the preceding-market signal. It retains fresh complete selected-side books through the opening minute as evidence, but v10 submits its single price-protected IOC as soon as a fresh executable ask exists. It never posts a maker order, waits for a maximum-opening-price sample, or revives the retired maker fallback.
 - The stop is the fixed selected profile floor: for the reference profile, a fresh executable selected-side bid at **≤40¢** submits a reduce-only IOC only for confirmed filled exposure. An entry above 50¢ does not raise that trigger; an entry at/below the floor is rejected before exposure is created.
-- State and append-only audit ledgers are separate for each `data/kalshi_shadow_market_ioc_*` profile and for `data/kalshi_live_market_ioc_*`. Every v9 shadow profile starts at $1,000 and 1.00 share, tracks realized P&L, peak equity, and max drawdown, and cannot mutate another profile or a live strategy state.
+- State and append-only audit ledgers are separate for each `data/kalshi_shadow_market_ioc_*` profile and for `data/kalshi_live_market_ioc_*`. Every v10 shadow profile starts at $1,000 and 1.00 share, tracks realized P&L, peak equity, and max drawdown, and cannot mutate another profile or a live strategy state.
 - Every audit JSONL record is appended, flushed, and `fsync`ed before the worker resumes order/position management. Its companion strategy state is atomically written and `fsync`ed immediately after every audit event; therefore a state transition, fill observation, stop event, funding failure, settlement, reconciliation result, and handoff is checkpointed while the worker is running—not merely at its end. GitHub state commits are additionally coalesced at the configured `durable_checkpoint_interval_seconds` (default: 5 seconds); a pending material event is retried by the ordinary worker checkpoints once that interval expires, without publishing every quote update.
 - Each market ledger record includes opening quote evidence plus observed execution timing: first-fresh-book lag, market-open-to-IOC submission, market-open-to-first-fill, submission-to-first-fill, entry completion, first-fill-to-stop-trigger, stop-trigger-to-first-exit submission, and stop-trigger-to-observed-flat-position. These are explicitly **worker-observed** timestamps; they do not claim unavailable matching-engine fill times. GitHub Actions heartbeats report active state, balance, cumulative shadow P&L, max drawdown, completed/stop/settlement counts, IOC composition, and entry/stop latency medians. The durable `execution_timing_metrics` state provides count/mean/median/P95/max summaries rebuilt from those per-market records across restarts.
 - A five-hour worker checkpoints and queues its successor only in the middle 13 minutes of a market—from one minute after open through one minute before close. The watchdog is serialized **per profile** and mode-preserving; it cannot convert a shadow worker into a live worker.
