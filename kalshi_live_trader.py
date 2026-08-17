@@ -769,10 +769,9 @@ class LiveEngine:
             prediction=side, intended_quantity=format(quantity, "f"),
         )
         LOG.warning(
-            "NEW MARKET SIGNAL | ticker=%s source=%s provisional=%s prior_side=%s transition=%s prediction=%s qty=%s maker=$%s max=$%s",
+            "NEW MARKET SIGNAL | ticker=%s source=%s provisional=%s prior_side=%s transition=%s prediction=%s qty=%s entry_mode=%s fixed_stop=$%s",
             ticker, provisional["ticker"], source.upper(), prior_side and prior_side.upper(), directional_transition,
-            side.upper(), quantity,
-            self.config["entry_price"], "dynamic",
+            side.upper(), quantity, self.config["entry_execution_mode"], self.config["stop_price"],
         )
         self.checkpoint("signal_created")
         return record
@@ -2183,6 +2182,10 @@ class LiveEngine:
             record["market_entry"] = {
                 "attempted_at": utc_now(), "status": "waiting_for_fresh_executable_book", "reason": quote_state,
             }
+            LOG.warning(
+                "MARKET IOC WAIT | ticker=%s side=%s reason=%s age_after_open=%.3fs",
+                record["ticker"], side.upper(), quote_state, now - float(record["market_open_epoch"]),
+            )
             return
         price = Decimal(str(quote["economic_price"]))
         stop = Decimal(str(record.get("stop_floor_price") or self.config["stop_price"]))
@@ -2192,6 +2195,10 @@ class LiveEngine:
                 "reason": "best_available_price_at_or_below_fixed_stop",
                 "best_available_price": format(price, "f"), "quote": quote,
             }
+            LOG.warning(
+                "MARKET IOC NO ENTRY | ticker=%s side=%s ask=$%s fixed_stop=$%s reason=at_or_below_stop",
+                record["ticker"], side.upper(), format(price, "f"), format(stop, "f"),
+            )
             self.finish_entry_attempt(record, Decimal("0"), "market_entry_at_or_below_fixed_stop")
             return
 
@@ -2275,6 +2282,11 @@ class LiveEngine:
             if final_filled > 0:
                 self.state["average_entry"] = format(self.entry_cost(record) / final_filled, "f")
         self.finish_entry_attempt(record, final_filled, "immediate_market_ioc_completed")
+        LOG.warning(
+            "MARKET IOC ENTRY | ticker=%s side=%s requested=%s ask=$%s filled=%s status=%s shadow=%s",
+            record["ticker"], side.upper(), format(intended, "f"), format(price, "f"),
+            format(final_filled, "f"), record.get("status"), self.dry_run,
+        )
         self.audit(
             "market_entry_submitted", ticker=record["ticker"], side=side, requested_quantity=format(intended, "f"),
             best_available_price=format(price, "f"), client_order_id=client_id, exchange_order_id=order.get("order_id"),
