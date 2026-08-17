@@ -1,5 +1,49 @@
 # KXBTC15M hybrid Kalshi strategy
 
+## Polymarket US MLB one-minute history downloader
+
+[`polymarket_us_mlb_pregame_prices.py`](polymarket_us_mlb_pregame_prices.py) downloads the real Polymarket US price history for either team in an MLB full-game moneyline. It discovers markets from exchange data, requests one-minute fidelity, maps the selected team to its stable market-side `item_id`, and writes exactly:
+
+```csv
+item_id,datetime,price
+```
+
+The default is strictly pregame: every timestamp is before first pitch, prices are within `0.01..0.99`, and empty exchange minutes carry the last observed close. No future, guessed, or linearly interpolated odds are generated. `--history-window full` is explicit and retains available in-game and terminal settlement values, including genuine `0` or `1` prices. Each CSV receives a provenance JSON containing the event, team, market slug, scheduled start, raw point count, observed-minute count, carry-forward count, and exact time range.
+
+Install and download all available pregame minutes for the earliest upcoming game:
+
+```bash
+python -m pip install -r requirements.txt
+python polymarket_us_mlb_pregame_prices.py --game-scope upcoming --min-rows 500
+```
+
+Download the latest completed game's pregame history:
+
+```bash
+python polymarket_us_mlb_pregame_prices.py --game-scope previous --history-window pregame --min-rows 500
+```
+
+Download one known prior market and select a team by name:
+
+```bash
+python polymarket_us_mlb_pregame_prices.py \
+  --game-scope previous \
+  --market-slug aec-mlb-nyy-chc-2026-03-24 \
+  --team Yankees \
+  --history-window pregame
+```
+
+Request all available history, including post-start and terminal observations:
+
+```bash
+python polymarket_us_mlb_pregame_prices.py \
+  --game-scope previous \
+  --market-slug aec-mlb-nyy-chc-2026-03-24 \
+  --history-window full
+```
+
+Without `--output`, files use unique names under `data/processed/polymarket_us_mlb/`, so downloading another game does not overwrite an earlier dataset. `--output` and `--metadata-output` provide exact destination control. The checked-in Orioles–Rays sample contains 5,278 one-minute pregame rows in [`data/processed/polymarket_us_mlb_pregame_prices.csv`](data/processed/polymarket_us_mlb_pregame_prices.csv).
+
 This repository’s active Kalshi path is a KXBTC15M **sticky-direction shadow strategy** with a shared historical-replay and live state engine. The research method is:
 
 > **Historical Kalshi settlement replay with empirically calibrated Monte Carlo execution-path simulation.**
