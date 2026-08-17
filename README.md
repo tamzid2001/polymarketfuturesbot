@@ -13,20 +13,20 @@ The default is strictly pregame: every timestamp is before first pitch, prices a
 Install and download all available pregame minutes for the earliest upcoming game:
 
 ```bash
-python -m pip install -r requirements.txt
-python polymarket_us_mlb_pregame_prices.py --game-scope upcoming --min-rows 500
+python3 -m pip install -r requirements.txt
+python3 polymarket_us_mlb_pregame_prices.py --game-scope upcoming --min-rows 500
 ```
 
 Download the latest completed game's pregame history:
 
 ```bash
-python polymarket_us_mlb_pregame_prices.py --game-scope previous --history-window pregame --min-rows 500
+python3 polymarket_us_mlb_pregame_prices.py --game-scope previous --history-window pregame --min-rows 500
 ```
 
 Download one known prior market and select a team by name:
 
 ```bash
-python polymarket_us_mlb_pregame_prices.py \
+python3 polymarket_us_mlb_pregame_prices.py \
   --game-scope previous \
   --market-slug aec-mlb-nyy-chc-2026-03-24 \
   --team Yankees \
@@ -36,7 +36,7 @@ python polymarket_us_mlb_pregame_prices.py \
 Request all available history, including post-start and terminal observations:
 
 ```bash
-python polymarket_us_mlb_pregame_prices.py \
+python3 polymarket_us_mlb_pregame_prices.py \
   --game-scope previous \
   --market-slug aec-mlb-nyy-chc-2026-03-24 \
   --history-window full
