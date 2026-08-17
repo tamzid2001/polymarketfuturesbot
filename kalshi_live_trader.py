@@ -2870,8 +2870,8 @@ class LiveEngine:
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
     result.add_argument("--config", type=Path, default=Path("live_strategy_config.json"))
-    result.add_argument("--state-file", type=Path, default=Path("data/kalshi_live_market_ioc_state.json"))
-    result.add_argument("--audit-ledger", type=Path, default=Path("data/kalshi_live_market_ioc_audit.jsonl"))
+    result.add_argument("--state-file", type=Path, default=Path("data/kalshi_live_market_ioc_v10_state.json"))
+    result.add_argument("--audit-ledger", type=Path, default=Path("data/kalshi_live_market_ioc_v10_audit.jsonl"))
     result.add_argument("--run-seconds", type=float, default=19_200)
     result.add_argument("--persist-config", action="store_true")
     result.add_argument("--reconcile-only", action="store_true")
