@@ -181,7 +181,7 @@ jobs:
       - name: Assert canonical hybrid strategy contract
         run: |
           set -euo pipefail
-          python -c 'from kalshi_live_trader import ACTIVE_CONFIG_SCHEMA_VERSION, ACTIVE_STRATEGY_VERSION, load_config; c = load_config(__import__("pathlib").Path("selected_live_strategy.json")); assert c["strategy_version"] == ACTIVE_STRATEGY_VERSION; assert c["config_schema_version"] == ACTIVE_CONFIG_SCHEMA_VERSION; print("CANONICAL_HYBRID_STRATEGY_CONTRACT=OK")'
+          python -c 'from kalshi_live_trader import ACTIVE_CONFIG_SCHEMA_VERSION, ACTIVE_STRATEGY_VERSION, load_config; c = load_config(__import__("pathlib").Path("selected_live_strategy.json")); assert c["strategy_version"] == ACTIVE_STRATEGY_VERSION; assert c["config_schema_version"] == ACTIVE_CONFIG_SCHEMA_VERSION; assert c["entry_execution_mode"] == "immediate_market_ioc"; assert c["recovery_multiplier"] == "1.01"; assert c["max_recovery_exponent"] == 0; print("CANONICAL_HYBRID_STRATEGY_CONTRACT=OK | entry=market_ioc recovery=1.01 exponent_limit=disabled")'
 
       - name: Write Kalshi RSA private key
         env:

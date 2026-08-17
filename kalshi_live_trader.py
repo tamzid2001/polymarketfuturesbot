@@ -261,7 +261,10 @@ def load_config(path: Path) -> dict[str, Any]:
     value.setdefault("provisional_outcome_threshold", "0.99")
     value.setdefault("max_outcome_quote_age_seconds", 2.0)
     value.setdefault("max_stale_quote_seconds", 2.0)
-    value.setdefault("max_recovery_exponent", 12)
+    # Zero disables only the exponent circuit breaker. Recovery sizing still
+    # obeys the shared 100-share position cap and the configured loss/funding
+    # circuit breakers in both shadow and live modes.
+    value.setdefault("max_recovery_exponent", 0)
     value.setdefault("max_recovery_cycle_loss", "50.00")
     value.setdefault("max_daily_realized_loss", "25.00")
     value.setdefault("max_api_failures", 5)
@@ -687,7 +690,8 @@ class LiveEngine:
         if self.state["circuit_breaker"].get("blocked"):
             return False
         sizing = sizing_state(self.current_parameters(), self.state.get("sizing"))
-        if sizing.recovery_exponent >= int(self.config["max_recovery_exponent"]):
+        maximum_exponent = int(self.config["max_recovery_exponent"])
+        if maximum_exponent > 0 and sizing.recovery_exponent >= maximum_exponent:
             self.trip("max_recovery_exponent")
         if -sizing.recovery_cycle_pnl >= Decimal(self.config["max_recovery_cycle_loss"]):
             self.trip("max_recovery_cycle_loss")
@@ -3052,6 +3056,13 @@ async def async_main(args: argparse.Namespace) -> int:
     if not api_key or not pem_path.exists():
         raise SystemExit("Kalshi authentication is required; credentials are never logged")
     state = load_state(args.state_file, config)
+    migrations = state.get("config_migrations", [])
+    if migrations and migrations[-1].get("kind") == "disable_recovery_exponent_breaker":
+        LOG.warning(
+            "CONFIG MIGRATION | recovery exponent breaker disabled; preserved exponent=%s deficit=%s",
+            state.get("sizing", {}).get("recovery_exponent", 0),
+            state.get("sizing", {}).get("recovery_cycle_pnl", "0"),
+        )
     if args.reset_state:
         if state.get("active_market") or any(item.get("status") in ACTIVE_STATES for item in state.get("markets", {}).values() if isinstance(item, dict)):
             raise SystemExit("refusing reset_state with active local strategy exposure; use reconciliation instead")

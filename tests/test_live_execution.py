@@ -18,6 +18,7 @@ from kalshi_live_trader import (
     live_mode_allowed, load_config,
 )
 from live_state import default_state, load_state, save_state
+from strategy_core import sizing_state
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -158,6 +159,37 @@ class LiveExecutionTests(unittest.TestCase):
         save_state(temporary, state)
         with self.assertRaisesRegex(RuntimeError, "strategy version differs"):
             load_state(temporary, self.config)
+
+    def test_uncapped_recovery_exponent_migrates_without_reset_and_keeps_position_cap(self) -> None:
+        temporary = Path(tempfile.mkdtemp()) / "state.json"
+        legacy_config = dict(self.config, max_recovery_exponent=12)
+        state = default_state(legacy_config)
+        state["sizing"] = {
+            "base_share_count": "1.00", "recovery_exponent": 500,
+            "recovery_cycle_pnl": "-1.1494", "next_base_threshold": "350.00",
+        }
+        save_state(temporary, state)
+
+        migrated = load_state(temporary, self.config)
+        self.assertEqual(migrated["sizing"]["recovery_exponent"], 500)
+        self.assertEqual(migrated["sizing"]["recovery_cycle_pnl"], "-1.1494")
+        self.assertEqual(migrated["config_migrations"][-1]["kind"], "disable_recovery_exponent_breaker")
+
+        engine = LiveEngine(
+            self.config, migrated, temporary, temporary.with_suffix(".jsonl"), dry_run=True,
+        )
+        self.assertTrue(engine.circuit_allows_entry())
+        self.assertFalse(engine.state["circuit_breaker"]["blocked"])
+        self.assertEqual(
+            sizing_state(engine.current_parameters(), engine.state["sizing"]).prescribed_quantity(),
+            Decimal("100.00"),
+        )
+
+    def test_unrelated_configuration_change_still_fails_closed(self) -> None:
+        temporary = Path(tempfile.mkdtemp()) / "state.json"
+        save_state(temporary, default_state(self.config))
+        with self.assertRaisesRegex(RuntimeError, "configuration hash differs"):
+            load_state(temporary, dict(self.config, max_position="99.00"))
 
     def test_discovery_preloads_api_successor_from_bounded_close_window(self) -> None:
         async def scenario() -> None:

@@ -93,6 +93,7 @@ class StrategyCoreTests(unittest.TestCase):
         self.assertEqual(config["base_increment"], "1.00")
         self.assertEqual(config["opening_price_discovery_seconds"], 3)
         self.assertEqual(config["entry_execution_mode"], "immediate_market_ioc")
+        self.assertEqual(config["max_recovery_exponent"], 0)
         self.assertEqual(config["stop_policy"], "fixed_profile_floor")
         self.assertEqual(config["stop_baseline_entry_price"], "0.50")
         self.assertEqual(config["strategy_version"], ACTIVE_STRATEGY_VERSION)

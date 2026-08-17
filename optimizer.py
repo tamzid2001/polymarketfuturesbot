@@ -158,7 +158,7 @@ def export_selected_live_strategy(path: Path, row: dict[str, Any], *, selection_
         "max_outcome_quote_age_seconds": 2.0,
         "max_stale_quote_seconds": 2.0,
         "durable_checkpoint_interval_seconds": 5.0,
-        "max_recovery_exponent": 12,
+        "max_recovery_exponent": 0,
         "max_recovery_cycle_loss": "50.00",
         "max_daily_realized_loss": "25.00",
         "max_api_failures": 5,
