@@ -43,17 +43,17 @@ on:
         type: boolean
         default: false
       entry_price:
-        description: "Historical/replay reference price only. v9 enters through a fresh selected-side protected IOC; blank keeps the persisted reference."
+        description: "Historical/replay reference price only. v10 enters through a fresh selected-side protected IOC; blank keeps the persisted reference."
         required: false
         type: string
         default: ""
       maker_price_offset:
-        description: "Archived-maker telemetry compatibility only; it never changes v9 market-IOC execution."
+        description: "Archived-maker telemetry compatibility only; it never changes v10 market-IOC execution."
         required: false
         type: string
         default: ""
       opening_price_discovery_seconds:
-        description: "Archived maker telemetry compatibility only; v9 enters as soon as a fresh executable book is available."
+        description: "Archived maker telemetry compatibility only; v10 enters as soon as a fresh post-open executable book is available."
         required: false
         type: string
         default: ""
@@ -98,7 +98,7 @@ on:
         type: string
         default: ""
       entry_timeout_seconds:
-        description: "Maximum wait (1–60 seconds) for a fresh executable book before the market is marked missed; v9 never posts a maker order."
+        description: "Maximum wait (1–60 seconds) for a fresh post-open executable book before the market is marked missed; v10 never posts a maker order."
         required: false
         type: string
         default: ""
@@ -108,12 +108,12 @@ on:
         type: string
         default: ""
       market_discovery_interval_seconds:
-        description: "Poll interval for Kalshi status=open current-market discovery (0.25–10 seconds; default 1)."
+        description: "Poll interval for bounded Kalshi previous/current/upcoming market discovery (0.25–10 seconds; default 1)."
         required: false
         type: string
         default: ""
       outcome_observation_seconds:
-        description: "Final-quote buffer duration for the provisional previous outcome."
+        description: "Ending-market direction window in seconds (5 default; 15 supported); only a >=99c bid inside this window qualifies."
         required: false
         type: string
         default: ""

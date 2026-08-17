@@ -12,8 +12,10 @@ from unittest.mock import patch
 
 from audit_ledger import append_audit
 from live_checkpoint import MaterialCheckpointPublisher
+from kalshi_btc15m_average_down import KalshiLiveFeed
 from kalshi_live_trader import (
-    LiveEngine, ProvisionalOutcomeTracker, QuoteObservation, deterministic_client_order_id, live_mode_allowed, load_config,
+    LiveEngine, ProvisionalOutcomeTracker, QuoteObservation, deterministic_client_order_id, epoch,
+    live_mode_allowed, load_config,
 )
 from live_state import default_state, load_state, save_state
 
@@ -34,13 +36,15 @@ class Feed:
         return {"economic_price": float(self.bid)}, "test"
 
     def executable_shadow_quote(self, ticker: str, side: str, _quantity: float, _age: float):
+        observed = time.time()
         return {
             "ticker": ticker, "side": side, "economic_price": float(self.ask),
             "displayed_depth": float(self.depth), "quote_id": f"test-book:{self.ask}:{self.bid}",
             "yes_bid": float(self.bid), "yes_ask": float(self.ask),
             "yes_bid_size": float(self.depth), "yes_ask_size": float(self.depth),
-            "source_server_timestamp": "test", "source_timestamp_ms": 1,
-            "received_at": "test", "quote_age_seconds": 0.01,
+            "source_server_timestamp": datetime.fromtimestamp(observed, timezone.utc).isoformat(),
+            "source_timestamp_ms": int(observed * 1000),
+            "received_at": datetime.fromtimestamp(observed, timezone.utc).isoformat(), "quote_age_seconds": 0.01,
         }, "executable_top_of_book"
 
     def public_trades_after(self, _ticker: str, _created):
@@ -155,7 +159,7 @@ class LiveExecutionTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "strategy version differs"):
             load_state(temporary, self.config)
 
-    def test_discovery_uses_status_open_and_preserves_api_predecessor(self) -> None:
+    def test_discovery_preloads_api_successor_from_bounded_close_window(self) -> None:
         async def scenario() -> None:
             now = time.time()
 
@@ -172,11 +176,19 @@ class LiveExecutionTests(unittest.TestCase):
 
                 async def get_raw_json(self, path, params):
                     self.calls.append((path, params))
-                    if params["status"] == "open":
-                        return {"markets": [market("KXBTC15M-active", now - 30, now + 870, "active")]}
-                    if params["status"] == "settled":
-                        return {"markets": [market("KXBTC15M-prior", now - 930, now - 30, "finalized", "yes")]}
-                    raise AssertionError(params)
+                    self.assert_bounded(params)
+                    return {"markets": [
+                        market("KXBTC15M-prior", now - 930, now - 30, "finalized", "yes"),
+                        market("KXBTC15M-active", now - 30, now + 870, "active"),
+                        market("KXBTC15M-upcoming", now + 870, now + 1770, "initialized"),
+                    ]}
+
+                @staticmethod
+                def assert_bounded(params):
+                    assert "status" not in params
+                    assert params["min_close_ts"] <= now - 30
+                    assert params["max_close_ts"] >= now + 1770
+                    assert params["limit"] == 100
 
             engine = self.engine()
             rest = DiscoveryRest()
@@ -184,9 +196,55 @@ class LiveExecutionTests(unittest.TestCase):
             active = engine.active_market(now)
             self.assertEqual(active and active["ticker"], "KXBTC15M-active")
             self.assertEqual(engine.predecessor(active or {}) and engine.predecessor(active or {})["ticker"], "KXBTC15M-prior")
-            self.assertEqual([params["status"] for _, params in rest.calls], ["open", "settled"])
-            self.assertEqual([params["limit"] for _, params in rest.calls], [10, 10])
+            self.assertEqual(engine.successor(active or {}) and engine.successor(active or {})["ticker"], "KXBTC15M-upcoming")
+            self.assertEqual(len(rest.calls), 1)
         asyncio.run(scenario())
+
+    def test_millisecond_exchange_timestamp_and_price_only_quote_enable_provisional_signal(self) -> None:
+        boundary = 1_786_996_800.0
+        self.assertEqual(epoch(int((boundary - .2) * 1000)), boundary - .2)
+        self.assertEqual(epoch(str(int((boundary - .2) * 1000))), boundary - .2)
+        feed = KalshiLiveFeed(auth=None)
+        with patch("kalshi_btc15m_average_down.time.time", return_value=boundary - .2):
+            feed._handle(json.dumps({
+                "type": "ticker",
+                "msg": {
+                    "market_ticker": "prior", "yes_bid_dollars": "0.99",
+                    "yes_ask_dollars": "1.00", "ts_ms": int((boundary - .2) * 1000),
+                },
+            }))
+        self.assertIn("ticker_book", feed.quotes["prior"])
+        self.assertNotIn("complete_book", feed.quotes["prior"])
+        tracker = ProvisionalOutcomeTracker(Decimal(".99"), 5, 2)
+        tracker.observe_feed(feed, "prior")
+        inferred = tracker.infer("prior", boundary)
+        self.assertEqual(inferred and inferred["outcome"], "yes")
+        self.assertEqual(inferred and inferred["method"], "final_window_executable_bid_threshold")
+        self.assertAlmostEqual(inferred and inferred["quote_age_seconds"], .2, places=6)
+
+    def test_provisional_uses_only_threshold_hits_inside_configured_final_window(self) -> None:
+        boundary = 10_000.0
+        tracker = ProvisionalOutcomeTracker(Decimal(".99"), 5, 2)
+        tracker.observations["prior"] = [
+            QuoteObservation("prior", boundary - 5.01, boundary - 5.01, Decimal(".99"), Decimal(".01")),
+            QuoteObservation("prior", boundary - 4.9, boundary - 4.9, Decimal(".99"), Decimal(".01")),
+            # The final raw quote need not itself remain at 99c; the observed
+            # threshold hit anywhere in the declared final window is the fact.
+            QuoteObservation("prior", boundary - .1, boundary - .1, Decimal(".98"), Decimal(".02")),
+        ]
+        inferred = tracker.infer("prior", boundary)
+        self.assertEqual(inferred and inferred["outcome"], "yes")
+        self.assertEqual(inferred and inferred["observation_window_seconds"], 5)
+        self.assertEqual(inferred and inferred["qualifying_bid"], "0.99")
+        self.assertAlmostEqual(inferred and inferred["quote_age_seconds"], 4.9, places=6)
+
+        fifteen_seconds = ProvisionalOutcomeTracker(Decimal(".99"), 15, 2)
+        fifteen_seconds.observations["prior"] = [
+            QuoteObservation("prior", boundary - 14.9, boundary - 14.9, Decimal(".01"), Decimal(".99")),
+        ]
+        inferred_15 = fifteen_seconds.infer("prior", boundary)
+        self.assertEqual(inferred_15 and inferred_15["outcome"], "no")
+        self.assertEqual(inferred_15 and inferred_15["observation_window_seconds"], 15)
 
     def test_provisional_yes_and_no_and_inverse_signal(self) -> None:
         tracker = ProvisionalOutcomeTracker(Decimal("0.99"), 5, 2)
@@ -231,7 +289,11 @@ class LiveExecutionTests(unittest.TestCase):
     def test_provisional_rejects_stale_missing_and_conflicting_quotes(self) -> None:
         tracker = ProvisionalOutcomeTracker(Decimal(".99"), 5, 2)
         boundary = 1_000.0
-        tracker.observations["prior"] = [QuoteObservation("prior", boundary - 3, boundary - 3, Decimal(".99"), Decimal(".01"))]
+        # Inside the five-second decision window but delivered from a source
+        # timestamp more than two seconds old: reject as stale transport.
+        tracker.observations["prior"] = [QuoteObservation("prior", boundary - .2, boundary - 3, Decimal(".99"), Decimal(".01"))]
+        self.assertIsNone(tracker.infer("prior", boundary))
+        tracker.observations["prior"] = [QuoteObservation("prior", boundary - 5.01, boundary - 5.01, Decimal(".99"), Decimal(".01"))]
         self.assertIsNone(tracker.infer("prior", boundary))
         tracker.observations["prior"] = [QuoteObservation("prior", boundary - .2, boundary - .2, Decimal(".98"), Decimal(".02"))]
         self.assertIsNone(tracker.infer("prior", boundary))
@@ -523,6 +585,44 @@ class LiveExecutionTests(unittest.TestCase):
             self.assertEqual(rest.created, 1)
             self.assertEqual(rest.calls[0]["position_price"], 0.54)
             self.assertEqual(record["entry_orders"][0]["entry_phase"], "market_entry")
+        asyncio.run(scenario())
+
+    def test_preloaded_preopen_quote_cannot_be_used_for_market_entry(self) -> None:
+        async def scenario() -> None:
+            market_open = time.time()
+
+            class TimestampedFeed(Feed):
+                def __init__(self) -> None:
+                    super().__init__("0.54")
+                    self.quote_epoch = market_open - .2
+
+                def executable_shadow_quote(self, ticker: str, side: str, quantity: float, age: float):
+                    quote, state = super().executable_shadow_quote(ticker, side, quantity, age)
+                    quote["source_timestamp_ms"] = int(self.quote_epoch * 1000)
+                    quote["source_server_timestamp"] = datetime.fromtimestamp(
+                        self.quote_epoch, timezone.utc,
+                    ).isoformat()
+                    quote["received_at"] = quote["source_server_timestamp"]
+                    return quote, state
+
+            engine = self.engine()
+            feed = TimestampedFeed()
+            rest = EntryRest()
+            record = engine.set_signal(
+                {"ticker": "KXBTC15M-preloaded", "open_epoch": market_open, "close_epoch": market_open + 900},
+                {"outcome": "yes", "ticker": "KXBTC15M-prior"},
+            )
+            await engine.submit_entry(rest, feed, record, market_open + .05)
+            self.assertEqual(record["status"], "SIGNAL_PENDING")
+            self.assertFalse(record["market_entry_attempted"])
+            self.assertEqual(record["market_entry"]["reason"], "preopen_or_unstamped_top_of_book")
+            self.assertEqual(record["opening_quote_observations"], [])
+
+            feed.quote_epoch = market_open + .1
+            await engine.submit_entry(rest, feed, record, market_open + .1)
+            self.assertEqual(record["status"], "POSITION_OPEN")
+            self.assertEqual(record["entry_execution_type"], "market_ioc")
+            self.assertEqual(record["actual_quantity"], "1.00")
         asyncio.run(scenario())
 
     def test_market_entry_at_fixed_stop_is_a_zero_fill(self) -> None:

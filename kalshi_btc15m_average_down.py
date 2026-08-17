@@ -1148,11 +1148,39 @@ class KalshiLiveFeed:
         yes_ask = as_float(message.get("yes_ask_dollars", message.get("yes_ask")))
         yes_bid_size = as_float(field(message, "yes_bid_size_fp", "yes_bid_size"))
         yes_ask_size = as_float(field(message, "yes_ask_size_fp", "yes_ask_size"))
+        received_epoch = time.time()
+        received_at = now_iso()
+        source_server_timestamp = field(message, "time", "timestamp", "created_time")
+        source_timestamp_ms = field(message, "ts_ms", "timestamp_ms")
         if yes_bid is not None:
             quote["yes_bid"] = yes_bid
+            quote["yes_bid_received_epoch"] = received_epoch
+            quote["yes_bid_source_timestamp"] = source_timestamp_ms or source_server_timestamp
         if yes_ask is not None:
             quote["yes_ask"] = yes_ask
+            quote["yes_ask_received_epoch"] = received_epoch
+            quote["yes_ask_source_timestamp"] = source_timestamp_ms or source_server_timestamp
         quote["received_monotonic"] = time.monotonic()
+        # Provisional outcome inference requires only fresh executable bids,
+        # not displayed size.  Reconstruct the latest bid/ask state with
+        # component timestamps so a final price-only ticker update is not
+        # discarded merely because it omitted depth fields.
+        if (yes_bid is not None or yes_ask is not None) and quote.get("yes_bid") is not None and quote.get("yes_ask") is not None:
+            ticker_sequence = int(quote.get("ticker_sequence") or 0) + 1
+            quote["ticker_sequence"] = ticker_sequence
+            quote["ticker_book"] = {
+                "quote_id": f"{ticker}:ticker:{ticker_sequence}:{received_at}",
+                "yes_bid": quote["yes_bid"],
+                "yes_ask": quote["yes_ask"],
+                "yes_bid_received_epoch": quote.get("yes_bid_received_epoch"),
+                "yes_ask_received_epoch": quote.get("yes_ask_received_epoch"),
+                "yes_bid_source_timestamp": quote.get("yes_bid_source_timestamp"),
+                "yes_ask_source_timestamp": quote.get("yes_ask_source_timestamp"),
+                "received_epoch": received_epoch,
+                "received_at": received_at,
+                "source_server_timestamp": source_server_timestamp,
+                "source_timestamp_ms": source_timestamp_ms,
+            }
         # Preserve only a *complete snapshot* for executable-shadow fills.
         # Delta updates and last-trade-only messages are useful operational
         # signals, but cannot establish a displayed, executable quote.
@@ -1161,7 +1189,6 @@ class KalshiLiveFeed:
             assert yes_bid_size is not None and yes_ask_size is not None
             if 0.0 < yes_bid <= yes_ask < 1.0 and yes_bid_size >= 0.0 and yes_ask_size >= 0.0:
                 sequence = int(quote.get("book_sequence") or 0) + 1
-                received_at = now_iso()
                 quote["book_sequence"] = sequence
                 quote["complete_book"] = {
                     "quote_id": f"{ticker}:{sequence}:{received_at}",
@@ -1171,8 +1198,8 @@ class KalshiLiveFeed:
                     "yes_ask_size": yes_ask_size,
                     "received_monotonic": time.monotonic(),
                     "received_at": received_at,
-                    "source_server_timestamp": field(message, "time", "timestamp", "created_time"),
-                    "source_timestamp_ms": field(message, "ts_ms", "timestamp_ms"),
+                    "source_server_timestamp": source_server_timestamp,
+                    "source_timestamp_ms": source_timestamp_ms,
                 }
         self.update_count += 1
         self._wake.set()
