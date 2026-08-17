@@ -2626,6 +2626,8 @@ class LiveEngine:
             exit_order = {
                 "order_id": None, "fill_count": format(quantity, "f"), "remaining_count": "0",
                 "average_fill_price": format(executable_bid, "f"), "fees_paid": "0",
+                "order_type": "reduce_only_exit_ioc", "time_in_force": "immediate_or_cancel",
+                "post_only": False, "reduce_only": True,
                 "shadow_execution": "fresh_executable_bid", "submitted_at": utc_now(),
             }
             record.setdefault("exit_orders", []).append(exit_order)

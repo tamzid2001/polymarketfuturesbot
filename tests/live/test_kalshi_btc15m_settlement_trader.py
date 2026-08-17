@@ -543,6 +543,24 @@ class SettlementTraderTests(unittest.IsolatedAsyncioTestCase):
                 quantity=3.251, dry_run=True, order_key="invalid-exit",
             )
 
+    async def test_reduce_only_stop_exit_is_non_resting_ioc(self) -> None:
+        # Dry-run reaches the same request-construction boundary as live mode
+        # without credentials.  The live branch forwards these exact flags to
+        # create_order_v2, preventing a stop from becoming a resting maker.
+        rest = object.__new__(trader.KalshiREST)
+        # The lightweight unit-test environment intentionally omits Kalshi's
+        # generated SDK, so provide only the enum surface needed to construct
+        # the otherwise credential-free dry-run request.
+        with patch.object(trader, "BookSide", SimpleNamespace(ASK="ask", BID="bid")):
+            stop = await rest.create_reduce_only_exit(
+                ticker="KXBTC15M-taker-stop", held_side="yes", economic_exit_price=0.40,
+                quantity=1.25, dry_run=True, order_key="stop-contract",
+            )
+        self.assertEqual(stop["order_type"], "reduce_only_exit_ioc")
+        self.assertEqual(stop["time_in_force"], "immediate_or_cancel")
+        self.assertFalse(stop["post_only"])
+        self.assertTrue(stop["reduce_only"])
+
     def test_dynamic_scaling_action_overrides_are_persistable_and_explicit_caps_stay_manual(self) -> None:
         parser = trader.build_parser()
         args = parser.parse_args([

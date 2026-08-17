@@ -1983,6 +1983,11 @@ class KalshiREST:
             "book_side": "ask" if held_side == "yes" else "bid",
             "quantity": round(quantity, 2),
             "time_in_force": "immediate_or_cancel",
+            # This is a price-protected taker exit.  Keep the non-resting
+            # contract explicit in both the durable audit record and the API
+            # request so a future refactor cannot silently turn stops into
+            # maker/GTC orders.
+            "post_only": False,
             "reduce_only": True,
             "submitted_at": now_iso(),
             "status": "dry_run" if dry_run else "submitting",
@@ -2008,6 +2013,7 @@ class KalshiREST:
                 client_order_id=record["client_order_id"],
                 self_trade_prevention_type=SelfTradePreventionType.TAKER_AT_CROSS,
                 reduce_only=True,
+                post_only=False,
             )
         except Exception as exc:  # noqa: BLE001
             if pause_error(exc):

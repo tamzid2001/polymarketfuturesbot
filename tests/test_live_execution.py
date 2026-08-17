@@ -549,6 +549,30 @@ class LiveExecutionTests(unittest.TestCase):
             self.assertEqual(record["status"], "CLOSED")
         asyncio.run(scenario())
 
+    def test_shadow_stop_is_recorded_as_non_resting_reduce_only_ioc(self) -> None:
+        async def scenario() -> None:
+            engine = self.engine()
+            record = {
+                "ticker": "KXBTC15M-shadow-taker-stop", "signal_side": "yes", "status": "POSITION_OPEN",
+                "actual_quantity": "1.00", "entry_orders": [
+                    {
+                        "entry_phase": "market_entry", "fill_count": "1.00", "remaining_count": "0",
+                        "average_fill_price": "0.50", "fees_paid": "0",
+                        "time_in_force": "immediate_or_cancel", "post_only": False,
+                    },
+                ], "exit_orders": [],
+            }
+            engine.state["markets"][record["ticker"]] = record
+            engine.state["active_market"] = record["ticker"]
+            await engine.close_at_stop(EntryRest(), record, Decimal("0.40"), entries_confirmed=True)
+            stop = record["exit_orders"][0]
+            self.assertEqual(stop["order_type"], "reduce_only_exit_ioc")
+            self.assertEqual(stop["time_in_force"], "immediate_or_cancel")
+            self.assertFalse(stop["post_only"])
+            self.assertTrue(stop["reduce_only"])
+            self.assertEqual(record["status"], "CLOSED")
+        asyncio.run(scenario())
+
     def test_market_entry_refuses_a_40c_or_lower_selected_side(self) -> None:
         async def scenario() -> None:
             engine = self.engine()
