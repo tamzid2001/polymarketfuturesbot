@@ -1,5 +1,5 @@
 {
-  "strategy_version": "kxbtc15m-hybrid-live-v8",
+  "strategy_version": "kxbtc15m-hybrid-live-v9",
   "series": "KXBTC15M",
   "shadow_profile": "sticky_stop_40",
   "signal_mode": "sticky_until_directional_win",
@@ -7,7 +7,7 @@
   "entry_price": "0.49",
   "stop_price": "0.40",
   "stop_baseline_entry_price": "0.50",
-  "stop_policy": "floor_with_entry_above_baseline",
+  "stop_policy": "fixed_profile_floor",
   "starting_base": "1.00",
   "recovery_multiplier": "1.01",
   "first_base_threshold": "350.00",
@@ -17,6 +17,7 @@
   "starting_shadow_balance": "1000.00",
   "entry_timeout_seconds": 60,
   "entry_lateness_seconds": 60,
+  "entry_execution_mode": "immediate_market_ioc",
   "handoff_guard_seconds": 60,
   "stop_poll_interval": 1.0,
   "reconciliation_interval": 5.0,
@@ -32,9 +33,9 @@
   "max_daily_realized_loss": "25.00",
   "max_api_failures": 5,
   "allow_capital_downsize": false,
-  "shadow_fill_model": "conservative_trade_through",
+  "shadow_fill_model": "fresh_displayed_top_of_book_ioc",
   "live_enabled": false,
   "dry_run": true,
-  "config_schema_version": 8,
+  "config_schema_version": 9,
   "maker_price_offset": "0.01"
 }

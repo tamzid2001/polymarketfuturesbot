@@ -58,11 +58,11 @@ ORDER_PREFIX = "kxbtc15m-hybrid-v1-"
 # silently reinterpret an older selected configuration after a restart or a
 # watchdog handoff.  Bump both values deliberately with a reviewed migration
 # whenever the shared live/backtest strategy semantics change.
-# v8 is a hard compatibility boundary for the sticky directional sequence.
-# An older worker cannot silently load this configuration; it fails closed
-# before it can submit an order.
-ACTIVE_STRATEGY_VERSION = "kxbtc15m-hybrid-live-v8"
-ACTIVE_CONFIG_SCHEMA_VERSION = 8
+# v9 is a hard compatibility boundary for the immediate protected-IOC entry
+# and fixed-floor stop contract.  An older worker cannot silently load this
+# configuration; it fails closed before it can submit an order.
+ACTIVE_STRATEGY_VERSION = "kxbtc15m-hybrid-live-v9"
+ACTIVE_CONFIG_SCHEMA_VERSION = 9
 TERMINAL_STATES = {"CLOSED", "ZERO_FILL", "FUNDING_FAILURE", "MISSED_SIGNAL", "ERROR_RECONCILIATION"}
 # A cancellation acknowledgement or an order-submission response can be
 # uncertain.  These are deliberately active, risk-managed states: they block
@@ -177,18 +177,18 @@ def assert_active_strategy_contract(value: dict[str, Any]) -> None:
 
 
 def validate_entry_price_contract(value: dict[str, Any]) -> None:
-    """Validate the fixed historical reference, entry rule, and stop rule."""
+    """Validate the historical reference and v9 protected-IOC/fixed-stop rule."""
 
     entry = decimal(value["entry_price"])
     offset = decimal(value["maker_price_offset"])
     stop = decimal(value["stop_price"])
     stop_baseline = decimal(value["stop_baseline_entry_price"])
-    if offset != Decimal("0.01"):
-        raise ValueError("the hybrid strategy requires maker_price_offset to equal exactly 0.01")
     if not stop < entry < Decimal("1"):
         raise ValueError("reference entry_price must satisfy stop < entry_price < 1")
-    if value.get("stop_policy") != "floor_with_entry_above_baseline":
-        raise ValueError("the hybrid strategy requires stop_policy=floor_with_entry_above_baseline")
+    if value.get("entry_execution_mode") != "immediate_market_ioc":
+        raise ValueError("the active strategy requires entry_execution_mode=immediate_market_ioc")
+    if value.get("stop_policy") != "fixed_profile_floor":
+        raise ValueError("the active strategy requires stop_policy=fixed_profile_floor")
     if stop_baseline != Decimal("0.50"):
         raise ValueError("the hybrid strategy requires stop_baseline_entry_price to equal exactly 0.50")
     profile = str(value.get("shadow_profile") or "sticky_stop_40")
@@ -201,16 +201,12 @@ def validate_entry_price_contract(value: dict[str, Any]) -> None:
         raise ValueError(
             f"shadow_profile={profile} requires stop_price={format(expected_profile_stop, 'f')}"
         )
-    # Exercise the shared Decimal implementation at the fixed baseline so a
-    # malformed floor/baseline contract cannot reach live monitoring.
-    if effective_stop_price(stop_baseline, stop, stop_baseline) != stop:
-        raise ValueError("stop floor must remain the effective stop at the 50-cent baseline")
+    # The old maker-only controls remain telemetry-only fields so archived
+    # v8 evidence is readable, but they may never alter v9 execution.
+    if offset < Decimal("0"):
+        raise ValueError("maker_price_offset cannot be negative")
     if int(value["opening_quote_max_observations"]) < 1:
         raise ValueError("opening_quote_max_observations must be at least one")
-    discovery_seconds = int(value["opening_price_discovery_seconds"])
-    entry_window = int(value["entry_timeout_seconds"])
-    if not 0 < discovery_seconds < entry_window:
-        raise ValueError("opening_price_discovery_seconds must be inside the maker window")
 
 
 def load_config(path: Path) -> dict[str, Any]:
@@ -220,7 +216,7 @@ def load_config(path: Path) -> dict[str, Any]:
     required = {
         "strategy_version", "series", "entry_price", "stop_price", "starting_base", "recovery_multiplier",
         "first_base_threshold", "threshold_growth_multiplier", "base_increment", "max_position",
-        "stop_policy", "stop_baseline_entry_price",
+        "stop_policy", "stop_baseline_entry_price", "entry_execution_mode",
     }
     missing = required - value.keys()
     if missing:
@@ -241,18 +237,18 @@ def load_config(path: Path) -> dict[str, Any]:
     value.setdefault("live_enabled", False)
     value.setdefault("dry_run", True)
     value.setdefault("allow_capital_downsize", False)
-    value.setdefault("shadow_fill_model", "conservative_trade_through")
+    value.setdefault("shadow_fill_model", "fresh_displayed_top_of_book_ioc")
     value.setdefault("starting_shadow_balance", "1000.00")
     value.setdefault("maker_price_offset", "0.01")
-    value.setdefault("stop_policy", "floor_with_entry_above_baseline")
+    value.setdefault("stop_policy", "fixed_profile_floor")
+    value.setdefault("entry_execution_mode", "immediate_market_ioc")
     value.setdefault("stop_baseline_entry_price", "0.50")
     value.setdefault("signal_delay_seconds", 0)
     value.setdefault("signal_mode", "sticky_until_directional_win")
     value.setdefault("shadow_profile", "sticky_stop_40")
-    # The fresh-book discovery window begins with the first usable quote.  A
-    # post-only entry therefore remains possible despite exchange/WebSocket
-    # warm-up at market open, while a protected IOC fallback is still reached
-    # before the first minute ends.
+    # A fresh executable book is required for the protected IOC.  The runner
+    # may wait through ``entry_lateness_seconds`` for that book, but never
+    # post a resting maker order or substitute an older execution path.
     value.setdefault("entry_timeout_seconds", 60)
     value.setdefault("entry_lateness_seconds", 60)
     value.setdefault("stop_poll_interval", 1.0)
@@ -272,15 +268,15 @@ def load_config(path: Path) -> dict[str, Any]:
     # This only bounds GitHub checkpoint publication, avoiding a Git push for
     # every market-data update while preserving a short handoff-loss window.
     value.setdefault("durable_checkpoint_interval_seconds", 5.0)
-    if value["shadow_fill_model"] != "conservative_trade_through":
-        raise ValueError("only conservative_trade_through is supported for shadow maker-fill evidence")
+    if value["shadow_fill_model"] != "fresh_displayed_top_of_book_ioc":
+        raise ValueError("v9 shadow mode requires fresh_displayed_top_of_book_ioc")
     if value["signal_mode"] != "sticky_until_directional_win":
         raise ValueError("the active shadow strategy requires signal_mode=sticky_until_directional_win")
     validate_entry_price_contract(value)
     if decimal(value["starting_base"]) != Decimal("1.00"):
         raise ValueError("the hybrid strategy must start at exactly 1.00 share")
-    if not 15 <= int(value["entry_timeout_seconds"]) <= 60:
-        raise ValueError("entry_timeout_seconds must be between 15 and 60")
+    if not 1 <= int(value["entry_timeout_seconds"]) <= 60:
+        raise ValueError("entry_timeout_seconds must be between 1 and 60")
     if int(value["handoff_guard_seconds"]) < 60:
         raise ValueError("handoff_guard_seconds must keep at least one minute clear at each market boundary")
     if not 1.0 <= float(value["durable_checkpoint_interval_seconds"]) <= 60.0:
@@ -317,17 +313,18 @@ def load_config_from_value(value: dict[str, Any]) -> dict[str, Any]:
         temporary[name] = int(temporary[name])
     for name in FLOAT_CONFIG_FIELDS & temporary.keys():
         temporary[name] = float(temporary[name])
-    required = {"strategy_version", "series", "entry_price", "stop_price", "starting_base", "recovery_multiplier", "first_base_threshold", "threshold_growth_multiplier", "base_increment", "max_position", "stop_policy", "stop_baseline_entry_price"}
+    required = {"strategy_version", "series", "entry_price", "stop_price", "starting_base", "recovery_multiplier", "first_base_threshold", "threshold_growth_multiplier", "base_increment", "max_position", "stop_policy", "stop_baseline_entry_price", "entry_execution_mode"}
     if required - temporary.keys():
         raise ValueError("invalid overridden live strategy configuration")
     assert_active_strategy_contract(temporary)
     # Reuse the normal rules without doing a file round-trip.
     if temporary["series"] != "KXBTC15M" or decimal(temporary["starting_base"]) != Decimal("1.00"):
         raise ValueError("invalid strategy series or starting base")
-    temporary.setdefault("shadow_fill_model", "conservative_trade_through")
+    temporary.setdefault("shadow_fill_model", "fresh_displayed_top_of_book_ioc")
     temporary.setdefault("starting_shadow_balance", "1000.00")
     temporary.setdefault("maker_price_offset", "0.01")
-    temporary.setdefault("stop_policy", "floor_with_entry_above_baseline")
+    temporary.setdefault("stop_policy", "fixed_profile_floor")
+    temporary.setdefault("entry_execution_mode", "immediate_market_ioc")
     temporary.setdefault("stop_baseline_entry_price", "0.50")
     temporary.setdefault("signal_mode", "sticky_until_directional_win")
     temporary.setdefault("shadow_profile", "sticky_stop_40")
@@ -338,12 +335,12 @@ def load_config_from_value(value: dict[str, Any]) -> dict[str, Any]:
     temporary.setdefault("opening_price_discovery_seconds", 3)
     temporary.setdefault("durable_checkpoint_interval_seconds", 5.0)
     validate_entry_price_contract(temporary)
-    if temporary["shadow_fill_model"] != "conservative_trade_through":
-        raise ValueError("only conservative_trade_through is supported for shadow maker-fill evidence")
+    if temporary["shadow_fill_model"] != "fresh_displayed_top_of_book_ioc":
+        raise ValueError("v9 shadow mode requires fresh_displayed_top_of_book_ioc")
     if temporary["signal_mode"] != "sticky_until_directional_win":
         raise ValueError("the active shadow strategy requires signal_mode=sticky_until_directional_win")
-    if not 15 <= int(temporary["entry_timeout_seconds"]) <= 60:
-        raise ValueError("entry_timeout_seconds must be between 15 and 60")
+    if not 1 <= int(temporary["entry_timeout_seconds"]) <= 60:
+        raise ValueError("entry_timeout_seconds must be between 1 and 60")
     if int(temporary["handoff_guard_seconds"]) < 60:
         raise ValueError("handoff_guard_seconds must keep at least one minute clear at each market boundary")
     if not 1.0 <= float(temporary["durable_checkpoint_interval_seconds"]) <= 60.0:
@@ -684,8 +681,8 @@ class LiveEngine:
             "recovery_cycle_pnl_before": str(self.state.get("sizing", {}).get("recovery_cycle_pnl", "0")),
             "status": "SIGNAL_PENDING", "entry_orders": [], "exit_orders": [], "actual_quantity": "0.00",
             # This is a durable summary of what actually opened exposure.
-            # ``market_ioc`` means the price-protected IOC fallback below,
-            # never an unbounded market order.
+            # ``market_ioc`` means a price-protected IOC at the fresh
+            # executable ask, never an unbounded market order.
             "entry_execution_type": "none",
             "entry_execution_summary": {
                 "entry_execution_type": "none",
@@ -703,15 +700,14 @@ class LiveEngine:
             },
             "strategy_version": self.config["strategy_version"], "config_hash": config_hash(self.config),
             "config_snapshot": self.current_parameters().as_dict(), "created_at": utc_now(),
-            # ``entry_price`` is the historical-reference price. The actual
-            # live maker price is derived from the opening quote maximum.
+            "entry_execution_mode": self.config["entry_execution_mode"],
+            # ``entry_price`` is the historical-reference price. v9 records
+            # the actual selected-side IOC ask in ``market_entry``/orders.
             "maker_entry_price": None,
             "reference_maker_entry_price": self.config["entry_price"],
             "maker_price_offset": self.config["maker_price_offset"],
-            # The fixed 40c floor only rises when the *actual average filled
-            # entry* is above 50c.  These values are per-market immutable
-            # policy inputs, so a later config update cannot reinterpret an
-            # already-open position after a runner restart.
+            # These values are per-market immutable policy inputs.  v9 uses
+            # the floor exactly; an actual entry above 50c never raises it.
             "stop_policy": self.config["stop_policy"],
             "stop_floor_price": self.config["stop_price"],
             "stop_baseline_entry_price": self.config["stop_baseline_entry_price"],
@@ -839,7 +835,11 @@ class LiveEngine:
             if filled <= 0:
                 continue
             phase = str(order.get("entry_phase") or "maker")
-            bucket_name = "maker_limit" if phase == "maker" else "market_ioc" if phase == "market_fallback" else "other"
+            bucket_name = (
+                "maker_limit" if phase == "maker"
+                else "market_ioc" if phase in {"market_fallback", "market_entry"}
+                else "other"
+            )
             bucket = buckets[bucket_name]
             bucket["quantity"] += filled
             order_id = order.get("order_id") or order.get("client_order_id")
@@ -1261,14 +1261,25 @@ class LiveEngine:
         )
 
     def update_effective_stop_price(self, record: dict[str, Any]) -> Decimal | None:
-        """Persist the actual-entry-derived stop used for active monitoring."""
+        """Persist the v9 fixed profile stop used for active monitoring.
+
+        The entry price is a fact for P&L accounting, never a reason to move
+        the stop.  In particular, an IOC fill at 54c still exits only when
+        the selected-side executable bid is at or below the configured 40c
+        floor (or the explicit 30/20/10 shadow comparison floor).
+        """
 
         average = self.average_filled_entry_price(record)
         if average is None:
             return None
         floor = Decimal(str(record.get("stop_floor_price") or self.config["stop_price"]))
         baseline = Decimal(str(record.get("stop_baseline_entry_price") or self.config["stop_baseline_entry_price"]))
-        effective = effective_stop_price(average, floor, baseline)
+        if record.get("stop_policy", self.config["stop_policy"]) == "fixed_profile_floor":
+            effective = floor
+        else:
+            # Retain a defensive reader for archived records, but v9 config
+            # validation makes this branch unreachable for new execution.
+            effective = effective_stop_price(average, floor, baseline)
         prior = record.get("effective_stop_price")
         record.update({
             "actual_average_entry_price": format(average, "f"),
@@ -1285,7 +1296,7 @@ class LiveEngine:
         return effective
 
     def stop_price_for_record(self, record: dict[str, Any]) -> Decimal:
-        """Use the persisted actual-entry stop; fixed floor is fail-safe only."""
+        """Use the persisted fixed executable stop floor."""
 
         calculated = self.update_effective_stop_price(record)
         if calculated is not None:
@@ -1598,6 +1609,7 @@ class LiveEngine:
         entry_ids.update({
             deterministic_client_order_id(record["ticker"], side, "entry", self.config),
             deterministic_client_order_id(record["ticker"], side, "market-fallback", self.config),
+            deterministic_client_order_id(record["ticker"], side, "market-entry", self.config),
         })
         groups: dict[str, dict[str, Any]] = {}
         seen: set[str] = set()
@@ -1633,7 +1645,11 @@ class LiveEngine:
                 if target is None:
                     target = next((order for order in known_orders if group["client_order_id"] and order.get("client_order_id") == group["client_order_id"]), None)
                 if target is None:
-                    phase = "market_fallback" if group["client_order_id"] == deterministic_client_order_id(record["ticker"], side, "market-fallback", self.config) else "maker"
+                    phase = (
+                        "market_entry" if group["client_order_id"] == deterministic_client_order_id(record["ticker"], side, "market-entry", self.config)
+                        else "market_fallback" if group["client_order_id"] == deterministic_client_order_id(record["ticker"], side, "market-fallback", self.config)
+                        else "maker"
+                    )
                     target = {"order_id": group["order_id"], "client_order_id": group["client_order_id"], "entry_phase": phase, "remaining_count": "0"}
                     known_orders.append(target)
                     record["entry_orders"].append(target)
@@ -1686,7 +1702,8 @@ class LiveEngine:
             side = str(record.get("signal_side") or "")
             maker_client_id = deterministic_client_order_id(ticker, side, "entry", self.config) if side in {"yes", "no"} else ""
             fallback_client_id = deterministic_client_order_id(ticker, side, "market-fallback", self.config) if side in {"yes", "no"} else ""
-            entry_client_ids = {maker_client_id, fallback_client_id} - {""}
+            market_entry_client_id = deterministic_client_order_id(ticker, side, "market-entry", self.config) if side in {"yes", "no"} else ""
+            entry_client_ids = {maker_client_id, fallback_client_id, market_entry_client_id} - {""}
             if client_id in entry_client_ids:
                 # A timed-out POST can still have created a resting maker.
                 # Recover its exchange ID before any entry/stop management so
@@ -1701,7 +1718,7 @@ class LiveEngine:
                     record["entry_orders"].append(local)
                 local.update({
                     "order_id": exchange_order_id, "client_order_id": client_id,
-                    "entry_phase": "market_fallback" if client_id == fallback_client_id else "maker",
+                    "entry_phase": "market_entry" if client_id == market_entry_client_id else "market_fallback" if client_id == fallback_client_id else "maker",
                     "fill_count": format(Decimal(str(order_fill_count(order))), "f"),
                     "remaining_count": format(Decimal(str(order_remaining_count(order) or "0")), "f"),
                     "average_fill_price": format(Decimal(str(order_average_position_price(order, side, float(self.config["entry_price"])))), "f"),
@@ -1826,6 +1843,18 @@ class LiveEngine:
                 continue
             remaining = Decimal(str(order.get("remaining_count") or "0"))
             if remaining <= 0:
+                continue
+            # A v8 dry-run maker record has no exchange order ID by design.
+            # It is simulated public-trade evidence, not an order that can
+            # fill after its shadow deadline.  Treating it as an uncertain
+            # exchange cancellation was the source of the stale
+            # ENTRY_CANCEL_UNCONFIRMED loop observed on August 17.  Mark it
+            # conclusively closed locally; real/missing-ID orders still fail
+            # closed below.
+            if self.dry_run and not order.get("order_id") and str(order.get("status") or "").startswith("shadow_"):
+                order["remaining_count"] = "0.00"
+                order["status"] = "shadow_cancelled"
+                order["cancelled_at"] = utc_now()
                 continue
             try:
                 acknowledged = await rest.cancel_order(order, self.dry_run)
@@ -2125,11 +2154,147 @@ class LiveEngine:
             entry_execution_summary=record["entry_execution_summary"],
         )
 
+    async def submit_immediate_market_entry(
+        self, rest: KalshiREST, feed: KalshiLiveFeed, record: dict[str, Any], now: float,
+    ) -> None:
+        """Submit the one v9 entry attempt as a protected IOC at the fresh ask.
+
+        Kalshi does not need an unbounded buy instruction here: an IOC limit at
+        the current executable selected-side ask is the safe market-order
+        equivalent.  It either fills immediately at no worse than the just
+        observed price or leaves no resting order.  Unlike the retired maker
+        path, this method never submits GTC/post-only entry exposure and
+        never performs a maker cancellation before entering.
+        """
+
+        if record.get("market_entry_attempted"):
+            return
+        record["market_entry_attempted"] = True
+        side = str(record["signal_side"])
+        intended = Decimal(str(record["intended_quantity"]))
+        quote, quote_state = feed.executable_shadow_quote(
+            record["ticker"], side, 0.0, float(self.config["max_stale_quote_seconds"]),
+        )
+        if quote is None:
+            # A missing/stale book is not evidence of a zero fill.  Permit the
+            # outer loop to retry the *same*, deterministic IOC attempt while
+            # the configured opening-lateness window remains open.
+            record["market_entry_attempted"] = False
+            record["market_entry"] = {
+                "attempted_at": utc_now(), "status": "waiting_for_fresh_executable_book", "reason": quote_state,
+            }
+            return
+        price = Decimal(str(quote["economic_price"]))
+        stop = Decimal(str(record.get("stop_floor_price") or self.config["stop_price"]))
+        if price <= stop:
+            record["market_entry"] = {
+                "attempted_at": utc_now(), "status": "not_submitted",
+                "reason": "best_available_price_at_or_below_fixed_stop",
+                "best_available_price": format(price, "f"), "quote": quote,
+            }
+            self.finish_entry_attempt(record, Decimal("0"), "market_entry_at_or_below_fixed_stop")
+            return
+
+        if not self.dry_run:
+            exchange_position = await rest.position_for_ticker(record["ticker"])
+            if exchange_position is None:
+                self.trip("market_entry_position_reconciliation_failed")
+                self.transition(record, "RECONCILIATION_PENDING", "market_entry_position_unknown")
+                return
+            if Decimal(str(exchange_position)) != 0:
+                self.trip("existing_position_before_market_entry")
+                return
+        available = self.shadow_available_cash() if self.dry_run else await rest.balance_decimal()
+        required = intended * price
+        if self.dry_run:
+            metrics = self.shadow_metrics()
+            metrics["max_required_cash"] = format(max(Decimal(str(metrics["max_required_cash"])), required), "f")
+        if available is None or available < required:
+            details = {
+                "at": utc_now(), "available_balance": None if available is None else format(available, "f"),
+                "required_cash": format(required, "f"), "quantity": format(intended, "f"),
+                "best_available_price": format(price, "f"),
+            }
+            record["funding_failure"] = details
+            record["market_entry"] = {"attempted_at": utc_now(), "status": "not_submitted", "reason": "insufficient_cash", **details}
+            self.note_entry_attempt_completed(record, Decimal("0"), "market_entry_insufficient_cash")
+            self.transition(record, "FUNDING_FAILURE", "market_entry_insufficient_cash")
+            if self.dry_run:
+                self.shadow_metrics()["funding_failures"] = int(self.shadow_metrics()["funding_failures"]) + 1
+            self.audit("funding_failure", ticker=record["ticker"], **details)
+            return
+
+        client_id = deterministic_client_order_id(record["ticker"], side, "market-entry", self.config)
+        if self.dry_run:
+            # Shadow fills are deliberately bounded by displayed top-of-book
+            # depth.  They are simulated IOC participation, not an assertion
+            # that an exchange order filled.
+            displayed = Decimal(str(quote.get("displayed_depth") or "0"))
+            filled = round_shares(min(intended, displayed))
+            affordable = (self.shadow_available_cash() / price).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+            filled = min(filled, affordable)
+            order = {
+                "order_id": None, "client_order_id": client_id, "ticker": record["ticker"], "side": side,
+                "quantity": format(intended, "f"), "position_price": format(price, "f"),
+                "time_in_force": "immediate_or_cancel", "post_only": False,
+                "fill_count": format(filled, "f"), "remaining_count": format(round_shares(intended - filled), "f"),
+                "average_fill_price": format(price, "f"), "fees_paid": "0", "entry_phase": "market_entry",
+                "status": "shadow_market_ioc_filled" if filled == intended else "shadow_market_ioc_partial_or_unfilled",
+                "shadow_execution": "fresh_displayed_top_of_book_ioc", "shadow_quote": quote, "submitted_at": utc_now(),
+            }
+            self.reserve_shadow_entry_cash(filled, price)
+        else:
+            order = await rest.create_order(
+                ticker=record["ticker"], side=side, position_price=float(price), quantity=float(intended),
+                tif="immediate_or_cancel", expiration_time=None, dry_run=False, order_key="hybrid-market-entry",
+                post_only=False, client_order_id_override=client_id,
+            )
+            order["entry_phase"] = "market_entry"
+            order["market_entry_quote"] = quote
+            if order.get("status") in {"submit_failed", "paused", "direction_mismatch"}:
+                record.setdefault("entry_orders", []).append(order)
+                self.note_entry_order_submitted(record, order, "market_entry")
+                record["market_entry"] = {"attempted_at": utc_now(), "status": "submission_unknown_or_rejected", "quote": quote}
+                self.trip("market_entry_submission_unknown")
+                self.transition(record, "RECONCILIATION_PENDING", "market_entry_submission_unknown")
+                return
+
+        record.setdefault("entry_orders", []).append(order)
+        self.note_entry_order_submitted(record, order, "market_entry")
+        record["market_entry"] = {
+            "attempted_at": utc_now(), "status": "submitted", "requested_quantity": format(intended, "f"),
+            "best_available_price": format(price, "f"), "client_order_id": client_id,
+            "exchange_order_id": order.get("order_id"), "quote": quote,
+        }
+        previous_total = Decimal(str(record.get("actual_quantity") or "0"))
+        final_filled = Decimal(str(order.get("fill_count") or "0")) if self.dry_run else await self.refresh_entry(rest, record)
+        record["actual_quantity"] = format(final_filled, "f")
+        self.state["current_position"] = record["actual_quantity"]
+        if self.dry_run:
+            self.note_entry_fill_observed(record, previous_total, final_filled, "shadow_market_ioc")
+            if final_filled > 0:
+                self.state["average_entry"] = format(self.entry_cost(record) / final_filled, "f")
+        self.finish_entry_attempt(record, final_filled, "immediate_market_ioc_completed")
+        self.audit(
+            "market_entry_submitted", ticker=record["ticker"], side=side, requested_quantity=format(intended, "f"),
+            best_available_price=format(price, "f"), client_order_id=client_id, exchange_order_id=order.get("order_id"),
+            shadow=self.dry_run, entry_execution_type=record["entry_execution_type"],
+            entry_execution_summary=record["entry_execution_summary"],
+        )
+
     async def submit_entry(self, rest: KalshiREST, feed: KalshiLiveFeed, record: dict[str, Any], now: float) -> None:
         if record.get("status") != "SIGNAL_PENDING" or not self.circuit_allows_entry():
             return
         if now > float(record["market_open_epoch"]) + int(self.config["entry_lateness_seconds"]):
             self.transition(record, "MISSED_SIGNAL", "entry_lateness_exceeded")
+            return
+        # v9 has exactly one protected market-equivalent IOC entry attempt.
+        # This hard branch is intentionally above all retained v8 maker code
+        # so a future edit cannot accidentally revive the old post-only/
+        # cancellation/fallback state machine for the active configuration.
+        if self.config["entry_execution_mode"] == "immediate_market_ioc":
+            self.capture_opening_quote(feed, record, now)
+            await self.submit_immediate_market_entry(rest, feed, record, now)
             return
         side = str(record["signal_side"])
         deadline = float(record.setdefault("entry_deadline_epoch", self.entry_deadline(record)))
@@ -2395,6 +2560,15 @@ class LiveEngine:
             base_increased=changes["base_increased"], entry_execution_type=record["entry_execution_type"],
             entry_execution_summary=record["entry_execution_summary"],
         )
+        if self.dry_run:
+            metrics = self.shadow_metrics()
+            LOG.warning(
+                "SHADOW PNL | ticker=%s method=%s net=%s cumulative=%s balance=%s max_drawdown=%s "
+                "completed=%d stops=%d settlements=%d",
+                record["ticker"], method, format(net, "f"), self.state["cumulative_realized_pnl"],
+                metrics["balance"], metrics["max_drawdown"], metrics["completed_trades"],
+                metrics["stop_count"], metrics["settlement_count"],
+            )
 
     async def finalize_stop(self, record: dict[str, Any]) -> None:
         self.note_stop_position_closed(record)
@@ -2599,12 +2773,14 @@ class LiveEngine:
                 )
                 entry_latency = timing["entry_first_fill_from_market_open"]
                 stop_latency = timing["stop_trigger_from_first_fill"]
+                shadow = self.shadow_metrics() if self.dry_run else {}
                 LOG.warning(
                     "HEARTBEAT | mode=%s ticker=%s state=%s base=%s exponent=%d target=%s "
                     "deficit=%s threshold=%s tracked=%d filled=%d zero=%d funding_failures=%d "
                     "missed=%d maker_fills=%d ioc_fills=%d mixed=%d opening_quotes=%s "
                     "first_quote_lag=%s maker_limit=%s deadline_in=%s entry_fill_p50=%s "
-                    "stop_from_fill_p50=%s active=%s breaker=%s",
+                    "stop_from_fill_p50=%s shadow_balance=%s shadow_pnl=%s shadow_dd=%s "
+                    "completed=%s stops=%s settlements=%s entry_mode=%s active=%s breaker=%s",
                     "DRY_RUN" if self.dry_run else "LIVE",
                     active and active["ticker"],
                     record.get("status") if isinstance(record, dict) else None,
@@ -2617,6 +2793,9 @@ class LiveEngine:
                     capture.get("observation_count"), capture.get("first_capture_lag_seconds"),
                     record.get("maker_entry_price") if isinstance(record, dict) else None,
                     deadline_in, entry_latency.get("median_seconds"), stop_latency.get("median_seconds"),
+                    shadow.get("balance"), self.state.get("cumulative_realized_pnl"), shadow.get("max_drawdown"),
+                    shadow.get("completed_trades"), shadow.get("stop_count"), shadow.get("settlement_count"),
+                    self.config["entry_execution_mode"],
                     self.state.get("active_market"), self.state["circuit_breaker"].get("blocked"),
                 )
                 self.last_heartbeat = time.monotonic()
@@ -2643,8 +2822,8 @@ class LiveEngine:
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
     result.add_argument("--config", type=Path, default=Path("live_strategy_config.json"))
-    result.add_argument("--state-file", type=Path, default=Path("data/kalshi_live_strategy_state.json"))
-    result.add_argument("--audit-ledger", type=Path, default=Path("data/kalshi_live_strategy_audit.jsonl"))
+    result.add_argument("--state-file", type=Path, default=Path("data/kalshi_live_market_ioc_state.json"))
+    result.add_argument("--audit-ledger", type=Path, default=Path("data/kalshi_live_market_ioc_audit.jsonl"))
     result.add_argument("--run-seconds", type=float, default=19_200)
     result.add_argument("--persist-config", action="store_true")
     result.add_argument("--reconcile-only", action="store_true")

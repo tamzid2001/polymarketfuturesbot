@@ -14,7 +14,7 @@ from live_checkpoint import MaterialCheckpointPublisher
 from kalshi_live_trader import (
     LiveEngine, ProvisionalOutcomeTracker, QuoteObservation, deterministic_client_order_id, live_mode_allowed, load_config,
 )
-from live_state import default_state
+from live_state import default_state, load_state, save_state
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -145,6 +145,14 @@ class LiveExecutionTests(unittest.TestCase):
         self.assertFalse(live_mode_allowed(True, True, False, True))
         self.assertFalse(live_mode_allowed(True, False, False, False))
         self.assertTrue(live_mode_allowed(True, True, False, False))
+
+    def test_v9_refuses_a_v8_checkpoint_instead_of_reinterpreting_recovery(self) -> None:
+        temporary = Path(tempfile.mkdtemp()) / "state.json"
+        state = default_state(self.config)
+        state["strategy_version"] = "kxbtc15m-hybrid-live-v8"
+        save_state(temporary, state)
+        with self.assertRaisesRegex(RuntimeError, "strategy version differs"):
+            load_state(temporary, self.config)
 
     def test_provisional_yes_and_no_and_inverse_signal(self) -> None:
         tracker = ProvisionalOutcomeTracker(Decimal("0.99"), 5, 2)
@@ -319,7 +327,7 @@ class LiveExecutionTests(unittest.TestCase):
         # A repeated refresh after a runner restart cannot increment totals.
         self.assertEqual(engine.refresh_entry_execution_metrics(), metrics)
 
-    def test_one_minute_maker_expiry_uses_one_price_protected_ioc_fallback(self) -> None:
+    def test_v9_submits_one_immediate_protected_market_ioc(self) -> None:
         async def scenario() -> None:
             config = dict(self.config)
             directory = Path(tempfile.mkdtemp())
@@ -331,18 +339,14 @@ class LiveExecutionTests(unittest.TestCase):
                 {"outcome": "yes", "ticker": "KXBTC15M-prior"},
             )
             await engine.submit_entry(rest, feed, record, 1_000)
-            await engine.submit_entry(rest, feed, record, 1_003)
-            self.assertEqual(record["entry_deadline_epoch"], 1_060)
-            self.assertTrue(rest.calls[0]["post_only"])
-            self.assertEqual(rest.calls[0]["tif"], "good_till_canceled")
-            await engine.manage_entry(rest, feed, record, 1_060)
-            self.assertEqual(len(rest.calls), 2)
-            self.assertFalse(rest.calls[1]["post_only"])
-            self.assertEqual(rest.calls[1]["tif"], "immediate_or_cancel")
-            self.assertEqual(rest.calls[1]["position_price"], 0.60)
+            self.assertEqual(len(rest.calls), 1)
+            self.assertFalse(rest.calls[0]["post_only"])
+            self.assertEqual(rest.calls[0]["tif"], "immediate_or_cancel")
+            self.assertEqual(rest.calls[0]["position_price"], 0.60)
             self.assertEqual(record["status"], "POSITION_OPEN")
             self.assertEqual(record["actual_quantity"], "1.00")
-            self.assertTrue(record["market_fallback_attempted"])
+            self.assertTrue(record["market_entry_attempted"])
+            self.assertEqual(record["entry_orders"][0]["entry_phase"], "market_entry")
             self.assertEqual(record["entry_execution_type"], "market_ioc")
             self.assertEqual(record["entry_execution_summary"]["maker_limit_filled_quantity"], "0")
             self.assertEqual(record["entry_execution_summary"]["market_ioc_filled_quantity"], "1.00")
@@ -351,7 +355,7 @@ class LiveExecutionTests(unittest.TestCase):
             self.assertEqual(engine.state["entry_execution_metrics"]["market_ioc_fill_markets"], 1)
         asyncio.run(scenario())
 
-    def test_unconfirmed_maker_cancellation_blocks_ioc_fallback(self) -> None:
+    def test_v9_market_entry_does_not_attempt_maker_cancellation(self) -> None:
         async def scenario() -> None:
             config = dict(self.config)
             directory = Path(tempfile.mkdtemp())
@@ -363,12 +367,35 @@ class LiveExecutionTests(unittest.TestCase):
                 {"outcome": "yes", "ticker": "KXBTC15M-prior"},
             )
             await engine.submit_entry(rest, feed, record, 1_000)
-            await engine.submit_entry(rest, feed, record, 1_003)
-            await engine.manage_entry(rest, feed, record, 1_060)
-            self.assertEqual(len(rest.calls), 1, "a cancellation failure must not submit the IOC replacement")
-            self.assertEqual(record["status"], "ENTRY_CANCEL_UNCONFIRMED")
-            self.assertTrue(engine.state["circuit_breaker"]["blocked"])
-            self.assertEqual(record["entry_cancel_pending"]["next_action"], "finish_entry")
+            self.assertEqual(len(rest.calls), 1)
+            self.assertEqual(record["status"], "POSITION_OPEN")
+            self.assertFalse(engine.state["circuit_breaker"]["blocked"])
+            self.assertNotIn("entry_cancel_pending", record)
+        asyncio.run(scenario())
+
+    def test_archived_shadow_maker_without_exchange_id_cancels_locally(self) -> None:
+        async def scenario() -> None:
+            class NoCancelRest:
+                def __init__(self) -> None:
+                    self.cancel_calls = 0
+
+                async def cancel_order(self, _order, _dry_run):
+                    self.cancel_calls += 1
+                    return False
+
+            engine = self.engine()
+            record = {
+                "ticker": "KXBTC15M-old-shadow-maker", "status": "ENTRY_PENDING",
+                "entry_orders": [{
+                    "entry_phase": "maker", "order_id": None, "status": "shadow_maker_open",
+                    "remaining_count": "1.00", "fill_count": "0.00",
+                }],
+            }
+            rest = NoCancelRest()
+            self.assertTrue(await engine.cancel_entry_orders_and_confirm(rest, record, next_action="finish_entry"))
+            self.assertEqual(rest.cancel_calls, 0)
+            self.assertEqual(record["entry_orders"][0]["remaining_count"], "0.00")
+            self.assertFalse(engine.state["circuit_breaker"]["blocked"])
         asyncio.run(scenario())
 
     def test_rejected_stop_ioc_retries_using_authoritative_residual_position(self) -> None:
@@ -394,25 +421,22 @@ class LiveExecutionTests(unittest.TestCase):
             self.assertEqual(record["status"], "CLOSED")
         asyncio.run(scenario())
 
-    def test_market_fallback_refuses_a_40c_or_lower_selected_side(self) -> None:
+    def test_market_entry_refuses_a_40c_or_lower_selected_side(self) -> None:
         async def scenario() -> None:
             engine = self.engine()
             rest = EntryRest()
-            feed = Feed("0.60")
+            feed = Feed("0.40")
             record = engine.set_signal(
                 {"ticker": "KXBTC15M-no-fallback", "open_epoch": 1_000, "close_epoch": 1_900},
                 {"outcome": "yes", "ticker": "KXBTC15M-prior"},
             )
             await engine.submit_entry(rest, feed, record, 1_000)
-            await engine.submit_entry(rest, feed, record, 1_003)
-            feed.ask = "0.40"
-            await engine.manage_entry(rest, feed, record, 1_060)
             self.assertEqual(record["status"], "ZERO_FILL")
-            self.assertEqual(record["market_fallback"]["reason"], "best_available_price_at_or_below_stop")
+            self.assertEqual(record["market_entry"]["reason"], "best_available_price_at_or_below_fixed_stop")
             self.assertEqual(engine.state["sizing"].get("recovery_exponent", 0), 0)
         asyncio.run(scenario())
 
-    def test_opening_maximum_derives_one_cent_lower_dynamic_maker_and_records_window(self) -> None:
+    def test_market_ioc_uses_the_fresh_selected_side_ask(self) -> None:
         async def scenario() -> None:
             directory = Path(tempfile.mkdtemp())
             engine = LiveEngine(dict(self.config), default_state(self.config), directory / "state", directory / "ledger", dry_run=False)
@@ -423,37 +447,32 @@ class LiveExecutionTests(unittest.TestCase):
                 {"outcome": "no", "ticker": "KXBTC15M-prior"},
             )
             await engine.submit_entry(rest, feed, record, 1_000.2)
-            self.assertEqual(rest.calls, [])
-            feed.ask = "0.54"
-            await engine.submit_entry(rest, feed, record, 1_001.7)
-            await engine.submit_entry(rest, feed, record, 1_003.3)
-            self.assertEqual(record["opening_price_discovery"]["maximum_selected_best_ask"], "0.54")
-            self.assertEqual(record["maker_entry_price"], "0.53")
-            self.assertEqual(rest.calls[0]["position_price"], 0.53)
+            self.assertEqual(len(rest.calls), 1)
+            self.assertEqual(rest.calls[0]["position_price"], 0.52)
+            self.assertFalse(rest.calls[0]["post_only"])
+            self.assertEqual(record["market_entry"]["best_available_price"], "0.52")
             samples = record["opening_quote_observations"]
-            self.assertEqual(len(samples), 2)
+            self.assertEqual(len(samples), 1)
             self.assertEqual(samples[0]["yes_bid"], "0.47")
             self.assertEqual(samples[0]["yes_ask"], "0.52")
             self.assertEqual(samples[0]["no_bid"], "0.48")
             self.assertEqual(samples[0]["no_ask"], "0.53")
-            # Later opening observations are retained for calibration, but
-            # cannot rewrite the immutable price derived from the first three
-            # seconds once the maker order has been submitted.
+            # Later opening observations are retained for calibration but
+            # cannot rewrite the already-submitted IOC price.
             feed.ask = "0.70"
             engine.capture_opening_quote(feed, record, 1_004)
-            self.assertEqual(record["maker_entry_price"], "0.53")
             self.assertEqual(Decimal(record["opening_quote_observations"][-1]["selected_best_ask"]), Decimal("0.70"))
             self.assertEqual(Decimal(record["opening_quote_capture"]["max_selected_best_ask"]), Decimal("0.70"))
             engine.capture_opening_quote(feed, record, 1_060)
             self.assertIsNotNone(record["opening_quote_capture"]["completed_at"])
         asyncio.run(scenario())
 
-    def test_delayed_first_fresh_book_still_posts_before_one_minute_deadline(self) -> None:
+    def test_delayed_first_fresh_book_enters_immediately_when_available(self) -> None:
         async def scenario() -> None:
             config = dict(self.config)
             directory = Path(tempfile.mkdtemp())
             engine = LiveEngine(config, default_state(config), directory / "state", directory / "ledger", dry_run=False)
-            rest = EntryRest()
+            rest = LiveFallbackRest()
             feed = DelayedFreshBookFeed("0.54")
             record = engine.set_signal(
                 {"ticker": "KXBTC15M-delayed-book", "open_epoch": 1_000, "close_epoch": 1_900},
@@ -466,36 +485,28 @@ class LiveExecutionTests(unittest.TestCase):
 
             feed.available = True
             await engine.submit_entry(rest, feed, record, 1_010)
-            self.assertEqual(rest.created, 0, "the fresh-book sample must complete before posting")
-            feed.ask = "0.55"
-            await engine.submit_entry(rest, feed, record, 1_013.1)
-
-            self.assertEqual(record["status"], "ENTRY_PENDING")
+            self.assertEqual(record["status"], "POSITION_OPEN")
             self.assertEqual(rest.created, 1)
-            self.assertEqual(record["maker_entry_price"], "0.54")
-            self.assertEqual(record["opening_price_discovery"]["anchor_lag_after_open_seconds"], 10.0)
-            self.assertEqual(record["entry_deadline_epoch"], 1_060)
+            self.assertEqual(rest.calls[0]["position_price"], 0.54)
+            self.assertEqual(record["entry_orders"][0]["entry_phase"], "market_entry")
         asyncio.run(scenario())
 
-    def test_opening_maximum_one_cent_below_at_stop_is_a_zero_fill(self) -> None:
+    def test_market_entry_at_fixed_stop_is_a_zero_fill(self) -> None:
         async def scenario() -> None:
             engine = self.engine()
             rest = EntryRest()
-            feed = Feed("0.41")
+            feed = Feed("0.40")
             record = engine.set_signal(
                 {"ticker": "KXBTC15M-opening-at-stop", "open_epoch": 1_000, "close_epoch": 1_900},
                 {"outcome": "no", "ticker": "KXBTC15M-prior"},
             )
             await engine.submit_entry(rest, feed, record, 1_000.1)
-            await engine.submit_entry(rest, feed, record, 1_003.2)
-            self.assertEqual(record["opening_price_discovery"]["maximum_selected_best_ask"], "0.41")
-            self.assertEqual(record["opening_price_discovery"]["derived_maker_entry_price"], "0.40")
             self.assertEqual(record["status"], "ZERO_FILL")
             self.assertEqual(rest.created, 0)
             self.assertEqual(engine.state["sizing"].get("recovery_exponent", 0), 0)
         asyncio.run(scenario())
 
-    def test_stop_uses_actual_entry_above_50c_but_never_moves_below_40c(self) -> None:
+    def test_v9_stop_is_fixed_at_40c_even_when_actual_entry_is_above_50c(self) -> None:
         async def scenario() -> None:
             class SettlementRest(EntryRest):
                 async def get_market(self, _ticker):
@@ -514,9 +525,11 @@ class LiveExecutionTests(unittest.TestCase):
             engine.state["active_market"] = high_entry["ticker"]
             await engine.manage_stop(rest, Feed("0.60", "0.41"), high_entry)
             self.assertEqual(high_entry["actual_average_entry_price"], "0.52")
-            self.assertEqual(high_entry["effective_stop_price"], "0.42")
-            self.assertEqual(high_entry["stop_trigger"]["effective_stop_price"], "0.42")
+            self.assertEqual(high_entry["effective_stop_price"], "0.40")
             self.assertEqual(high_entry["post_entry_stop_monitor"]["minimum_executable_bid"], "0.41")
+            self.assertEqual(high_entry["status"], "POSITION_OPEN")
+            await engine.manage_stop(rest, Feed("0.60", "0.40"), high_entry)
+            self.assertEqual(high_entry["stop_trigger"]["effective_stop_price"], "0.40")
             self.assertEqual(high_entry["status"], "CLOSED")
             completed = engine.state["sizing"]["completed_trade_count"]
             await engine.settle(rest, high_entry, 1_901)

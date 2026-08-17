@@ -78,6 +78,14 @@ def load_state(path: Path, config: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeError(f"cannot load durable live state: {exc}") from exc
     if not isinstance(value, dict) or int(value.get("state_version", 0)) != STATE_VERSION:
         raise RuntimeError("live state has an unsupported schema; fail closed rather than migrate unknown risk")
+    # A recovery cycle is defined by its exact configuration.  Loading a v8
+    # maker/entry-adjusted-stop checkpoint under v9 would silently reinterpret
+    # exposure and P&L, so reject it rather than attempting a migration.  The
+    # workflow gives v9 its own durable state/ledger namespace.
+    if value.get("strategy_version") != config.get("strategy_version"):
+        raise RuntimeError("live state strategy version differs from active configuration; fail closed")
+    if value.get("config_hash") != config_hash(config):
+        raise RuntimeError("live state configuration hash differs from active configuration; fail closed")
     for key, default in default_state(config).items():
         value.setdefault(key, default)
     return value

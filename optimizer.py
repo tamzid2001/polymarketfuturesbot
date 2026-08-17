@@ -123,8 +123,8 @@ def export_selected_live_strategy(path: Path, row: dict[str, Any], *, selection_
     except KeyError as exc:
         raise ValueError("a live strategy export requires a 40c, 30c, 20c, or 10c stop profile") from exc
     config = {
-        "config_schema_version": 8,
-        "strategy_version": "kxbtc15m-hybrid-live-v8",
+        "config_schema_version": 9,
+        "strategy_version": "kxbtc15m-hybrid-live-v9",
         "selection_basis": selection_basis,
         "series": "KXBTC15M",
         "signal_delay_seconds": 0,
@@ -132,8 +132,9 @@ def export_selected_live_strategy(path: Path, row: dict[str, Any], *, selection_
         "shadow_profile": shadow_profile,
         "entry_price": f"{float(row['entry_price']):.2f}",
         "stop_price": f"{float(stop):.2f}",
-        "stop_policy": "floor_with_entry_above_baseline",
+        "stop_policy": "fixed_profile_floor",
         "stop_baseline_entry_price": "0.50",
+        "entry_execution_mode": "immediate_market_ioc",
         "starting_base": "1.00",
         "recovery_multiplier": f"{float(row['recovery_multiplier']):.2f}",
         "first_base_threshold": f"{float(row['first_base_threshold']):.2f}",
@@ -161,7 +162,7 @@ def export_selected_live_strategy(path: Path, row: dict[str, Any], *, selection_
         "max_daily_realized_loss": "25.00",
         "max_api_failures": 5,
         "allow_capital_downsize": False,
-        "shadow_fill_model": "conservative_trade_through",
+        "shadow_fill_model": "fresh_displayed_top_of_book_ioc",
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n", encoding="utf-8")
