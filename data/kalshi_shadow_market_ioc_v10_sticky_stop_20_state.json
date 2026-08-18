@@ -20,7 +20,7 @@
     }
   ],
   "created_at": "2026-08-17T19:25:29.585605+00:00",
-  "cumulative_realized_pnl": "2.8378",
+  "cumulative_realized_pnl": "2.3759",
   "current_order_id": null,
   "current_position": "0.00",
   "cycle_strategy_parameters": {
@@ -33,7 +33,7 @@
   },
   "daily_realized": {
     "2026-08-17": "0.4635",
-    "2026-08-18": "2.3743"
+    "2026-08-18": "1.9124"
   },
   "directional_signal_state": {
     "active_side": "yes",
@@ -77,18 +77,18 @@
       "p95_seconds": 0.157176
     },
     "stop_first_exit_submission": {
-      "count": 52,
+      "count": 53,
       "maximum_seconds": 4.528363,
-      "mean_seconds": 2.767625,
-      "median_seconds": 2.642473,
-      "p95_seconds": 4.373401
+      "mean_seconds": 2.790346,
+      "median_seconds": 2.653592,
+      "p95_seconds": 4.365164
     },
     "stop_position_closed": {
-      "count": 52,
+      "count": 53,
       "maximum_seconds": 4.95435,
-      "mean_seconds": 3.019796,
-      "median_seconds": 2.86454,
-      "p95_seconds": 4.857184
+      "mean_seconds": 3.049684,
+      "median_seconds": 2.871229,
+      "p95_seconds": 4.850179
     },
     "stop_trigger_from_first_fill": {
       "count": 53,
@@ -134698,7 +134698,9 @@
     "KXBTC15M-26AUG181400-00": {
       "actual_average_entry_price": "0.5",
       "actual_quantity": "1.49",
+      "base_after": "1.00",
       "base_before": "1.00",
+      "completed_at": "2026-08-18T17:51:09.696670+00:00",
       "config_hash": "5a5310291dd7ed202053ae3007be4deeb01919a2fa7d4936da6b32e390cf09f9",
       "config_snapshot": {
         "base_increment": "0.50",
@@ -134797,7 +134799,21 @@
           }
         ]
       },
-      "exit_orders": [],
+      "exit_orders": [
+        {
+          "average_fill_price": "0.19",
+          "fees_paid": "0",
+          "fill_count": "1.49",
+          "order_id": null,
+          "order_type": "reduce_only_exit_ioc",
+          "post_only": false,
+          "reduce_only": true,
+          "remaining_count": "0",
+          "shadow_execution": "fresh_executable_bid",
+          "submitted_at": "2026-08-18T17:51:08.787043+00:00",
+          "time_in_force": "immediate_or_cancel"
+        }
+      ],
       "intended_quantity": "1.49",
       "maker_entry_price": null,
       "maker_price_offset": "0.01",
@@ -134827,6 +134843,7 @@
       },
       "market_entry_attempted": true,
       "market_open_epoch": 1787075100.0,
+      "next_base_threshold_after": "350.00",
       "official_outcome": "no",
       "official_settlement_timestamp": "2026-08-18T17:45:13.703446+00:00",
       "opening_price_discovery": {
@@ -136286,28 +136303,36 @@
         "timestamp": "2026-08-18T17:44:58.727072+00:00"
       },
       "quantity_capped": false,
+      "realized_method": "stop",
+      "realized_net_pnl": "-0.4619",
+      "recovery_cycle_pnl_after": "-0.6518",
       "recovery_cycle_pnl_before": "-0.9543",
+      "recovery_exponent_after": 42,
       "recovery_exponent_before": 40,
       "reference_maker_entry_price": "0.49",
       "signal_mode": "sticky_until_directional_win",
       "signal_side": "yes",
       "signal_timestamp": "2026-08-18T17:45:03.115872+00:00",
       "source_market_ticker": "KXBTC15M-26AUG181345-45",
-      "status": "POSITION_OPEN",
-      "status_reason": "immediate_market_ioc_completed",
+      "status": "CLOSED",
+      "status_reason": "stop",
       "stop_adjustment_from_floor": "0.00",
       "stop_baseline_entry_price": "0.50",
       "stop_floor_price": "0.20",
       "stop_policy": "fixed_profile_floor",
       "stop_timing": {
-        "first_exit_submission_at": null,
-        "first_exit_submission_epoch": null,
+        "first_exit_client_order_id": null,
+        "first_exit_order_id": null,
+        "first_exit_submission_at": "2026-08-18T17:51:08.787043+00:00",
+        "first_exit_submission_epoch": 1787075468.787043,
         "first_fill_to_stop_trigger_seconds": 361.012753,
         "market_open_to_stop_trigger_seconds": 364.815223,
-        "position_closed_observed_at": null,
-        "position_closed_observed_epoch": null,
+        "position_closed_observed_at": "2026-08-18T17:51:09.419103+00:00",
+        "position_closed_observed_epoch": 1787075469.4191008,
         "stop_trigger_observed_at": "2026-08-18T17:51:04.815223+00:00",
-        "stop_trigger_observed_epoch": 1787075464.8152227
+        "stop_trigger_observed_epoch": 1787075464.8152227,
+        "stop_trigger_to_first_exit_submission_seconds": 3.97182,
+        "stop_trigger_to_position_closed_seconds": 4.603878
       },
       "stop_trigger": {
         "at": "2026-08-18T17:51:04.815223+00:00",
@@ -136319,7 +136344,7 @@
       },
       "strategy_version": "kxbtc15m-hybrid-live-v10",
       "ticker": "KXBTC15M-26AUG181400-00",
-      "updated_at": "2026-08-18T17:45:07.081209+00:00"
+      "updated_at": "2026-08-18T17:51:09.696679+00:00"
     }
   },
   "outcome_verification": {
@@ -136491,7 +136516,8 @@
     "KXBTC15M-26AUG181300-00:stop",
     "KXBTC15M-26AUG181315-15:settlement:no",
     "KXBTC15M-26AUG181330-30:settlement:yes",
-    "KXBTC15M-26AUG181345-45:settlement:no"
+    "KXBTC15M-26AUG181345-45:settlement:no",
+    "KXBTC15M-26AUG181400-00:stop"
   ],
   "provisional_outcomes": {
     "KXBTC15M-26AUG172030-30": {
@@ -137600,8 +137626,8 @@
     }
   },
   "shadow_metrics": {
-    "balance": "1002.8378",
-    "completed_trades": 89,
+    "balance": "1002.3759",
+    "completed_trades": 90,
     "funding_failure_markets": 0,
     "funding_failures": 0,
     "maker_limit_fill_markets": 0,
@@ -137614,10 +137640,10 @@
     "missed_signal_markets": 0,
     "mixed_entry_markets": 0,
     "peak_balance": "1003.0277",
-    "reserved_cash": "0.7450",
+    "reserved_cash": "0",
     "settlement_count": 37,
     "starting_balance": "1000.00",
-    "stop_count": 52,
+    "stop_count": 53,
     "zero_fill_markets": 0,
     "zero_fills": 0
   },
@@ -137625,16 +137651,16 @@
     "base_scale_count": 0,
     "base_share_count": "1.00",
     "cap_hit_count": 0,
-    "completed_trade_count": 89,
-    "filled_trades_in_current_cycle": 41,
-    "longest_recovery_cycle": 41,
+    "completed_trade_count": 90,
+    "filled_trades_in_current_cycle": 42,
+    "longest_recovery_cycle": 42,
     "max_recovery_quantity": "0",
     "next_base_threshold": "350.00",
-    "profit_since_last_base_scale": "2.8378",
-    "recovery_cycle_pnl": "-0.1899",
-    "recovery_exponent": 41
+    "profit_since_last_base_scale": "2.3759",
+    "recovery_cycle_pnl": "-0.6518",
+    "recovery_exponent": 42
   },
   "state_version": 1,
   "strategy_version": "kxbtc15m-hybrid-live-v10",
-  "updated_at": "2026-08-18T17:51:04.816139+00:00"
+  "updated_at": "2026-08-18T17:51:09.848551+00:00"
 }
