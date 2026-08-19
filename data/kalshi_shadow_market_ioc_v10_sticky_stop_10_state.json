@@ -232340,6 +232340,7 @@
       "created_at": "2026-08-19T10:00:04.283669+00:00",
       "directional_transition": "flip_after_directional_win",
       "effective_stop_price": "0.10",
+      "entry_cancellation_confirmed_at": "2026-08-19T10:15:08.743454+00:00",
       "entry_execution_mode": "immediate_market_ioc",
       "entry_execution_summary": {
         "actual_weighted_average_entry_price": "0.5",
@@ -233445,7 +233446,7 @@
         "minimum_bid_observed_at": "2026-08-19T10:00:35.033510+00:00",
         "minimum_executable_bid": "0.47",
         "quote_count": 160,
-        "unavailable_quote_count": 11
+        "unavailable_quote_count": 12
       },
       "prior_signal_side": "yes",
       "provisional_matches_official": true,
@@ -233474,8 +233475,8 @@
       "signal_side": "no",
       "signal_timestamp": "2026-08-19T10:00:04.283582+00:00",
       "source_market_ticker": "KXBTC15M-26AUG190600-00",
-      "status": "POSITION_OPEN",
-      "status_reason": "immediate_market_ioc_completed",
+      "status": "SETTLEMENT_PENDING",
+      "status_reason": "awaiting_official_settlement",
       "stop_adjustment_from_floor": "0.00",
       "stop_baseline_entry_price": "0.50",
       "stop_floor_price": "0.10",
@@ -233490,7 +233491,7 @@
       },
       "strategy_version": "kxbtc15m-hybrid-live-v10",
       "ticker": "KXBTC15M-26AUG190615-15",
-      "updated_at": "2026-08-19T10:00:18.306210+00:00"
+      "updated_at": "2026-08-19T10:15:08.842399+00:00"
     },
     "KXBTC15M-26AUG190630-30": {
       "actual_average_entry_price": null,
@@ -233544,6 +233545,12 @@
       "maker_entry_price": null,
       "maker_price_offset": "0.01",
       "market_close_epoch": 1787135400.0,
+      "market_entry": {
+        "attempted_at": "2026-08-19T10:15:08.742912+00:00",
+        "reason": "stale_top_of_book",
+        "status": "waiting_for_fresh_executable_book"
+      },
+      "market_entry_attempted": false,
       "market_open_epoch": 1787134500.0,
       "opening_price_discovery": {
         "anchor_at": null,
@@ -233559,10 +233566,11 @@
         "discovery_anchor_at": null,
         "discovery_anchor_epoch": null,
         "dropped_observation_count": 0,
+        "last_unavailable_reason": "stale_top_of_book",
         "max_observations": 500,
         "observation_count": 0,
         "started_at": null,
-        "unavailable_quote_count": 0,
+        "unavailable_quote_count": 2,
         "window_seconds": 60
       },
       "opening_quote_observations": [],
@@ -236093,5 +236101,5 @@
   },
   "state_version": 1,
   "strategy_version": "kxbtc15m-hybrid-live-v10",
-  "updated_at": "2026-08-19T10:15:04.261546+00:00"
+  "updated_at": "2026-08-19T10:15:09.378663+00:00"
 }
