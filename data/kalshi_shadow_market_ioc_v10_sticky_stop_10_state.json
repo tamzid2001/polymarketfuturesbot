@@ -92,18 +92,18 @@
       "p95_seconds": 9.418879
     },
     "stop_trigger_from_first_fill": {
-      "count": 72,
+      "count": 73,
       "maximum_seconds": 881.518296,
-      "mean_seconds": 600.625804,
-      "median_seconds": 626.804736,
-      "p95_seconds": 859.406611
+      "mean_seconds": 600.654967,
+      "median_seconds": 621.913957,
+      "p95_seconds": 859.311073
     },
     "stop_trigger_from_market_open": {
-      "count": 72,
+      "count": 73,
       "maximum_seconds": 883.548222,
-      "mean_seconds": 607.762585,
-      "median_seconds": 629.432483,
-      "p95_seconds": 865.971077
+      "mean_seconds": 607.890336,
+      "median_seconds": 624.907027,
+      "p95_seconds": 865.910462
     }
   },
   "handoff": {
@@ -205622,6 +205622,7 @@
       "created_at": "2026-08-19T04:45:04.047064+00:00",
       "directional_transition": "flip_after_directional_win",
       "effective_stop_price": "0.10",
+      "entry_cancellation_confirmed_at": "2026-08-19T04:55:17.088442+00:00",
       "entry_execution_mode": "immediate_market_ioc",
       "entry_execution_summary": {
         "actual_weighted_average_entry_price": "0.6",
@@ -205798,11 +205799,12 @@
         }
       ],
       "post_entry_stop_monitor": {
-        "last_executable_bid": null,
-        "minimum_bid_observed_at": null,
-        "minimum_executable_bid": null,
-        "quote_count": 0,
-        "unavailable_quote_count": 1
+        "last_effective_stop_price": "0.10",
+        "last_executable_bid": "0.062",
+        "minimum_bid_observed_at": "2026-08-19T04:55:17.088426+00:00",
+        "minimum_executable_bid": "0.062",
+        "quote_count": 85,
+        "unavailable_quote_count": 2
       },
       "prior_signal_side": "no",
       "provisional_matches_official": true,
@@ -205840,10 +205842,20 @@
       "stop_timing": {
         "first_exit_submission_at": null,
         "first_exit_submission_epoch": null,
+        "first_fill_to_stop_trigger_seconds": 602.754707,
+        "market_open_to_stop_trigger_seconds": 617.088447,
         "position_closed_observed_at": null,
         "position_closed_observed_epoch": null,
-        "stop_trigger_observed_at": null,
-        "stop_trigger_observed_epoch": null
+        "stop_trigger_observed_at": "2026-08-19T04:55:17.088447+00:00",
+        "stop_trigger_observed_epoch": 1787115317.0884466
+      },
+      "stop_trigger": {
+        "at": "2026-08-19T04:55:17.088447+00:00",
+        "best_executable_bid": "0.062",
+        "effective_stop_price": "0.10",
+        "observed_epoch": 1787115317.0884466,
+        "requested_quantity": "1.03",
+        "shadow": true
       },
       "strategy_version": "kxbtc15m-hybrid-live-v10",
       "ticker": "KXBTC15M-26AUG190100-00",
@@ -207956,5 +207968,5 @@
   },
   "state_version": 1,
   "strategy_version": "kxbtc15m-hybrid-live-v10",
-  "updated_at": "2026-08-19T04:47:41.509144+00:00"
+  "updated_at": "2026-08-19T04:55:17.089721+00:00"
 }
