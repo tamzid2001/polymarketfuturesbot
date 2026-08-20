@@ -305892,7 +305892,21 @@
           }
         ]
       },
-      "exit_orders": [],
+      "exit_orders": [
+        {
+          "average_fill_price": "0.1",
+          "fees_paid": "0",
+          "fill_count": "2.52",
+          "order_id": null,
+          "order_type": "reduce_only_exit_ioc",
+          "post_only": false,
+          "reduce_only": true,
+          "remaining_count": "0",
+          "shadow_execution": "fresh_executable_bid",
+          "submitted_at": "2026-08-20T03:06:20.434283+00:00",
+          "time_in_force": "immediate_or_cancel"
+        }
+      ],
       "intended_quantity": "2.52",
       "maker_entry_price": null,
       "maker_price_offset": "0.01",
@@ -307221,21 +307235,24 @@
       "signal_side": "yes",
       "signal_timestamp": "2026-08-20T03:00:03.482288+00:00",
       "source_market_ticker": "KXBTC15M-26AUG192300-00",
-      "status": "POSITION_OPEN",
-      "status_reason": "immediate_market_ioc_completed",
+      "status": "STOP_PENDING",
+      "status_reason": "shadow_effective_stop_executable_bid",
       "stop_adjustment_from_floor": "0.00",
       "stop_baseline_entry_price": "0.50",
       "stop_floor_price": "0.10",
       "stop_policy": "fixed_profile_floor",
       "stop_timing": {
-        "first_exit_submission_at": null,
-        "first_exit_submission_epoch": null,
+        "first_exit_client_order_id": null,
+        "first_exit_order_id": null,
+        "first_exit_submission_at": "2026-08-20T03:06:20.434283+00:00",
+        "first_exit_submission_epoch": 1787195180.434283,
         "first_fill_to_stop_trigger_seconds": 366.710303,
         "market_open_to_stop_trigger_seconds": 375.994588,
         "position_closed_observed_at": null,
         "position_closed_observed_epoch": null,
         "stop_trigger_observed_at": "2026-08-20T03:06:15.994588+00:00",
-        "stop_trigger_observed_epoch": 1787195175.9945877
+        "stop_trigger_observed_epoch": 1787195175.9945877,
+        "stop_trigger_to_first_exit_submission_seconds": 4.439695
       },
       "stop_trigger": {
         "at": "2026-08-20T03:06:15.994588+00:00",
@@ -307247,7 +307264,7 @@
       },
       "strategy_version": "kxbtc15m-hybrid-live-v10",
       "ticker": "KXBTC15M-26AUG192315-15",
-      "updated_at": "2026-08-20T03:00:13.923617+00:00"
+      "updated_at": "2026-08-20T03:06:20.734086+00:00"
     }
   },
   "outcome_verification": {
@@ -310922,5 +310939,5 @@
   },
   "state_version": 1,
   "strategy_version": "kxbtc15m-hybrid-live-v10",
-  "updated_at": "2026-08-20T03:06:15.995623+00:00"
+  "updated_at": "2026-08-20T03:06:21.035868+00:00"
 }
