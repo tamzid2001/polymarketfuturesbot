@@ -46,7 +46,7 @@
     "updated_at": "2026-08-20T04:30:10.223368+00:00"
   },
   "entry_execution_metrics": {
-    "entry_pending_markets": 0,
+    "entry_pending_markets": 1,
     "funding_failure_markets": 0,
     "maker_limit_fill_markets": 0,
     "maker_limit_filled_quantity": "0",
@@ -60,7 +60,7 @@
     "other_entry_filled_quantity": "0",
     "other_entry_markets": 0,
     "total_entry_filled_quantity": "296.35",
-    "tracked_markets": 228,
+    "tracked_markets": 229,
     "zero_fill_markets": 16
   },
   "execution_timing_metrics": {
@@ -272535,6 +272535,10 @@
         "quote_count": 27,
         "unavailable_quote_count": 1
       },
+      "post_stop_settlement_next_check_epoch": 1787200269.9154687,
+      "post_stop_settlement_outcome": "no",
+      "post_stop_settlement_timestamp": "2026-08-20T04:30:14.854046+00:00",
+      "post_stop_would_have_settled_correctly": true,
       "prior_signal_side": "no",
       "provisional_matches_official": true,
       "provisional_outcome": "yes",
@@ -272620,14 +272624,14 @@
         "entry_execution_type": "none",
         "maker_limit_average_fill_price": null,
         "maker_limit_filled": false,
-        "maker_limit_filled_quantity": "0.00",
+        "maker_limit_filled_quantity": "0",
         "maker_limit_order_ids": [],
         "market_ioc_average_fill_price": null,
         "market_ioc_filled": false,
-        "market_ioc_filled_quantity": "0.00",
+        "market_ioc_filled_quantity": "0",
         "market_ioc_order_ids": [],
-        "other_entry_filled_quantity": "0.00",
-        "total_filled_quantity": "0.00"
+        "other_entry_filled_quantity": "0",
+        "total_filled_quantity": "0"
       },
       "entry_execution_type": "none",
       "entry_orders": [],
@@ -272650,7 +272654,15 @@
       "maker_entry_price": null,
       "maker_price_offset": "0.01",
       "market_close_epoch": 1787201100.0,
+      "market_entry": {
+        "attempted_at": "2026-08-20T04:30:14.812293+00:00",
+        "reason": "stale_top_of_book",
+        "status": "waiting_for_fresh_executable_book"
+      },
+      "market_entry_attempted": false,
       "market_open_epoch": 1787200200.0,
+      "official_outcome": "no",
+      "official_settlement_timestamp": "2026-08-20T04:30:15.428557+00:00",
       "opening_price_discovery": {
         "anchor_at": null,
         "anchor_epoch": null,
@@ -272665,14 +272677,16 @@
         "discovery_anchor_at": null,
         "discovery_anchor_epoch": null,
         "dropped_observation_count": 0,
+        "last_unavailable_reason": "stale_top_of_book",
         "max_observations": 500,
         "observation_count": 0,
         "started_at": null,
-        "unavailable_quote_count": 0,
+        "unavailable_quote_count": 2,
         "window_seconds": 60
       },
       "opening_quote_observations": [],
       "prior_signal_side": "no",
+      "provisional_matches_official": true,
       "provisional_outcome": "no",
       "provisional_outcome_details": {
         "exchange_timestamp": 1787200199.572,
@@ -272715,10 +272729,10 @@
     }
   },
   "outcome_verification": {
-    "matches": 228,
+    "matches": 229,
     "mismatches": 0,
-    "provisional": 228,
-    "verified": 228
+    "provisional": 229,
+    "verified": 229
   },
   "peak_equity": "2.0559",
   "preloaded_markets": [
@@ -276610,5 +276624,5 @@
   },
   "state_version": 1,
   "strategy_version": "kxbtc15m-hybrid-live-v10",
-  "updated_at": "2026-08-20T04:30:10.490758+00:00"
+  "updated_at": "2026-08-20T04:30:15.704435+00:00"
 }
