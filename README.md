@@ -21,7 +21,7 @@ All dollar results below are gross unless explicitly marked otherwise. Fees, liv
 
 ## Current live/shadow configuration
 
-[`selected_live_strategy.json`](selected_live_strategy.json) is the canonical base configuration. The active contract is `kxbtc15m-hybrid-live-v11` / schema `11`. The Python loader and GitHub Action both assert that exact version, the maker-entry mode, all 40–49¢ analytics levels, and a valid hybrid-stop hierarchy before the worker can submit anything. `sticky_stop_40` remains the only canonical lane that can participate in the separately gated live workflow. The 10¢/20¢/30¢ profiles are accepted only with `trading_mode=shadow` and run through a workflow that contains no live input or `--live-enabled` path. Older IOC/fixed-stop configurations and checkpoints cannot be loaded under the v11 state paths.
+[`selected_live_strategy.json`](selected_live_strategy.json) is the canonical base configuration. The active contract is `kxbtc15m-hybrid-live-v11` / schema `11`. The Python loader and GitHub Action both assert that exact version, the maker-entry mode, all 40–49¢ analytics levels, and a valid hybrid-stop hierarchy before the worker can submit anything. `sticky_stop_40` remains the only canonical lane that can participate in the separately gated live workflow. The 10¢/20¢/25¢/30¢/35¢ profiles are accepted only with `trading_mode=shadow` and run through a workflow that contains no live input or `--live-enabled` path. Older IOC/fixed-stop configurations and checkpoints cannot be loaded under the v11 state paths.
 
 | Setting | Current value | Notes |
 | --- | ---: | --- |
@@ -35,7 +35,7 @@ All dollar results below are gross unless explicitly marked otherwise. Fees, liv
 | Entry lifetime | **Until filled or market close** | No strategy-time expiry; a resting remainder is cancelled only at market close or when confirmed cancellation is required to protect filled exposure |
 | Shadow entry analytics | **40¢ through 49¢, every cent** | Touch, simulated fill, eventual winner capture, and missed winner are distinct facts |
 | Canonical workflow lane | **`sticky_stop_40`** | Sole live-capable lane; still gated off by default |
-| Shadow comparisons | **`sticky_stop_10`, `sticky_stop_20`, `sticky_stop_30`** | Isolated dry-run-only workers; no live control exists in their workflow |
+| Shadow comparisons | **`sticky_stop_10`, `sticky_stop_20`, `sticky_stop_25`, `sticky_stop_30`, `sticky_stop_35`** | Isolated dry-run-only workers; no live control exists in their workflow |
 | Hybrid trigger | **Executable bid ≤45¢ default** | Always one cent above the configured hard-stop input |
 | Hybrid maker exit | **46¢ default** | Always two cents above the configured hard-stop input |
 | Hybrid hard stop | **Executable bid ≤44¢ default** | Confirms maker cancellation/fills, then IOC-exits only authoritative residual exposure |
@@ -78,7 +78,7 @@ Entry fills, zero fills, hybrid exits, recovery P&L, and permanent-base scaling 
 
 ### Canonical lane and isolated stop comparisons
 
-`sticky_stop_40` remains the only profile accepted by the optimizer export, canonical worker, canonical watchdog, and controlled restart. The comparison workflow runs 10¢/20¢/30¢ profiles with the same signal, GTC ask-minus-1¢ entry, sizing engine, analytics, and audit code, but with a shadow-only hybrid hierarchy `hard=H`, `trigger=H+1¢`, `maker exit=H+2¢`:
+`sticky_stop_40` remains the only profile accepted by the optimizer export, canonical worker, canonical watchdog, and controlled restart. The comparison workflow runs 10¢/20¢/25¢/30¢/35¢ profiles with the same signal, GTC ask-minus-1¢ entry, sizing engine, analytics, and audit code, but with a shadow-only hybrid hierarchy `hard=H`, `trigger=H+1¢`, `maker exit=H+2¢`:
 
 | Lane | Durable state | Append-only audit ledger | Runtime ref |
 | --- | --- | --- | --- |
@@ -86,7 +86,9 @@ Entry fills, zero fills, hybrid exits, recovery P&L, and permanent-base scaling 
 | Live | `data/kalshi_live_maker_hybrid_v11_state.json` | `data/kalshi_live_maker_hybrid_v11_audit.jsonl` | `runtime-state` |
 | 10¢ shadow comparison | `data/kalshi_shadow_maker_hybrid_v11_sticky_stop_10_state.json` | `data/kalshi_shadow_maker_hybrid_v11_sticky_stop_10_audit.jsonl` | `runtime-state-stop-10` |
 | 20¢ shadow comparison | `data/kalshi_shadow_maker_hybrid_v11_sticky_stop_20_state.json` | `data/kalshi_shadow_maker_hybrid_v11_sticky_stop_20_audit.jsonl` | `runtime-state-stop-20` |
+| 25¢ shadow comparison | `data/kalshi_shadow_maker_hybrid_v11_sticky_stop_25_state.json` | `data/kalshi_shadow_maker_hybrid_v11_sticky_stop_25_audit.jsonl` | `runtime-state-stop-25` |
 | 30¢ shadow comparison | `data/kalshi_shadow_maker_hybrid_v11_sticky_stop_30_state.json` | `data/kalshi_shadow_maker_hybrid_v11_sticky_stop_30_audit.jsonl` | `runtime-state-stop-30` |
+| 35¢ shadow comparison | `data/kalshi_shadow_maker_hybrid_v11_sticky_stop_35_state.json` | `data/kalshi_shadow_maker_hybrid_v11_sticky_stop_35_audit.jsonl` | `runtime-state-stop-35` |
 
 The v8/v9/v10 files remain archived evidence. Every v11 lane starts in a separate namespace at a $1,000 shadow balance and 1.00 permanent base, so no older IOC, comparison-stop, or synthetic-cancellation state can be reinterpreted as current execution. Each comparison worker has a dedicated concurrency group and bounded parentless runtime branch; concurrent checkpoints cannot overwrite the canonical lane or another stop lane. [`kalshi_btc15m_shadow_stop_watchdog.yml`](.github/workflows/kalshi_btc15m_shadow_stop_watchdog.yml) can recreate only these shadow-only comparison workers.
 

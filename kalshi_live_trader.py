@@ -160,7 +160,9 @@ FLOAT_CONFIG_FIELDS = {
 SHADOW_STOP_PROFILE_PRICES = {
     "sticky_stop_10": Decimal("0.10"),
     "sticky_stop_20": Decimal("0.20"),
+    "sticky_stop_25": Decimal("0.25"),
     "sticky_stop_30": Decimal("0.30"),
+    "sticky_stop_35": Decimal("0.35"),
     "sticky_stop_40": Decimal("0.40"),
 }
 CANONICAL_LIVE_SHADOW_PROFILE = "sticky_stop_40"
@@ -248,7 +250,7 @@ def validate_entry_price_contract(value: dict[str, Any]) -> None:
         )
     trading_mode = str(value.get("trading_mode") or "shadow")
     if profile != CANONICAL_LIVE_SHADOW_PROFILE and trading_mode != "shadow":
-        raise ValueError("10c/20c/30c stop profiles are shadow-only and cannot be loaded in live mode")
+        raise ValueError("comparison stop profiles are shadow-only and cannot be loaded in live mode")
     if int(value["entry_limit_offset_cents"]) < 0:
         raise ValueError("entry_limit_offset_cents cannot be negative")
     level_min = int(value["shadow_entry_level_min_cents"])

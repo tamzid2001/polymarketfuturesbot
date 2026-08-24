@@ -201,7 +201,7 @@ class StrategyCoreTests(unittest.TestCase):
 
     def test_comparison_stop_profiles_are_shadow_only_and_isolated(self) -> None:
         config = load_config(ROOT / "selected_live_strategy.json")
-        for cents in (10, 20, 30):
+        for cents in (10, 20, 25, 30, 35):
             profile = load_config_from_value(dict(
                 config,
                 shadow_profile=f"sticky_stop_{cents}",
@@ -291,7 +291,7 @@ class StrategyCoreTests(unittest.TestCase):
         self.assertIn('runtime-state-stop-${STOP_CENTS}', worker)
         self.assertIn('kalshi_shadow_maker_hybrid_v11_sticky_stop_${STOP_CENTS}_state.json', worker)
         self.assertIn('kalshi-kxbtc15m-shadow-stop-${{ inputs.stop_cents }}', worker)
-        self.assertIn('for stop_cents in 10 20 30', watchdog)
+        self.assertIn('for stop_cents in 10 20 25 30 35', watchdog)
         self.assertNotIn("live_enabled", watchdog)
 
 
