@@ -116,7 +116,28 @@ def load_state(path: Path, config: dict[str, Any]) -> dict[str, Any]:
             config.get("maker_order_time_in_force") == "good_till_canceled"
             and value.get("config_hash") == config_hash(implicit_gtc_config)
         )
-        if not is_uncapped_migration and not is_explicit_gtc_migration:
+        # v11 originally bounded the resting maker entry with a 60-second
+        # strategy timer. The new contract leaves the exchange GTC order
+        # resting until it fills, market close, or a confirmed risk-driven
+        # cancellation. Reverse only these exact declarative changes when
+        # validating the persisted checkpoint hash; all trading/accounting
+        # state remains byte-for-byte meaningful under the new lifetime.
+        bounded_gtc_config = dict(config)
+        bounded_gtc_config["entry_timeout_seconds"] = bounded_gtc_config.pop(
+            "opening_quote_capture_seconds"
+        )
+        bounded_gtc_config.pop("entry_order_lifetime", None)
+        bounded_implicit_gtc_config = dict(bounded_gtc_config)
+        bounded_implicit_gtc_config.pop("maker_order_time_in_force", None)
+        is_persistent_gtc_migration = (
+            int(config.get("entry_timeout_seconds", -1)) == 0
+            and config.get("entry_order_lifetime") == "until_filled_or_market_close"
+            and value.get("config_hash") in {
+                config_hash(bounded_gtc_config),
+                config_hash(bounded_implicit_gtc_config),
+            }
+        )
+        if not is_uncapped_migration and not is_explicit_gtc_migration and not is_persistent_gtc_migration:
             raise RuntimeError("live state configuration hash differs from active configuration; fail closed")
         migrations = value.setdefault("config_migrations", [])
         if is_uncapped_migration:
@@ -137,6 +158,18 @@ def load_state(path: Path, config: dict[str, Any]) -> dict[str, Any]:
                 "previous_config_hash": value.get("config_hash"),
                 "config_hash": expected_hash,
                 "policy": "preserve_all_existing_state_because_order_execution_was_already_gtc",
+            })
+        if is_persistent_gtc_migration:
+            migrations.append({
+                "at": utc_now(),
+                "kind": "remove_gtc_strategy_timeout",
+                "previous_entry_timeout_seconds": bounded_gtc_config["entry_timeout_seconds"],
+                "entry_timeout_seconds": 0,
+                "entry_order_lifetime": "until_filled_or_market_close",
+                "opening_quote_capture_seconds": config["opening_quote_capture_seconds"],
+                "previous_config_hash": value.get("config_hash"),
+                "config_hash": expected_hash,
+                "policy": "preserve_existing_state_and_apply_unbounded_lifetime_to_open_and_future_gtc_entries",
             })
         value["config_hash"] = expected_hash
     for key, default in default_state(config).items():

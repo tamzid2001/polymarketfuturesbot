@@ -75,8 +75,8 @@ on:
         required: false
         type: string
         default: ""
-      entry_timeout_seconds:
-        description: "Maximum life (1–60 seconds) of the single post-only maker entry before its remainder is cancelled."
+      opening_quote_capture_seconds:
+        description: "Opening quote telemetry window (1–300 seconds); does not expire the GTC entry."
         required: false
         type: string
         default: ""
@@ -180,7 +180,7 @@ jobs:
       - name: Assert canonical hybrid strategy contract
         run: |
           set -euo pipefail
-          python -c 'from kalshi_live_trader import ACTIVE_CONFIG_SCHEMA_VERSION, ACTIVE_STRATEGY_VERSION, load_config; c = load_config(__import__("pathlib").Path("selected_live_strategy.json")); assert c["strategy_version"] == ACTIVE_STRATEGY_VERSION; assert c["config_schema_version"] == ACTIVE_CONFIG_SCHEMA_VERSION; assert c["entry_execution_mode"] == "signal_price_minus_offset_maker"; assert c["maker_order_time_in_force"] == "good_till_canceled"; assert c["entry_limit_offset_cents"] == 1; assert c["stop_policy"] == "hybrid_maker_then_hard_stop"; assert (c["hybrid_stop_trigger_cents"], c["hybrid_maker_exit_cents"], c["hybrid_hard_stop_cents"]) == (45,46,44); assert c["shadow_profile"] == "sticky_stop_40"; assert c["recovery_multiplier"] == "1.01"; assert c["max_recovery_exponent"] == 0; print("CANONICAL_HYBRID_STRATEGY_CONTRACT=OK | entry=signal_ask_minus_1c maker_tif=GTC hybrid=45/46/44 profile=40 recovery=1.01")'
+          python -c 'from kalshi_live_trader import ACTIVE_CONFIG_SCHEMA_VERSION, ACTIVE_STRATEGY_VERSION, load_config; c = load_config(__import__("pathlib").Path("selected_live_strategy.json")); assert c["strategy_version"] == ACTIVE_STRATEGY_VERSION; assert c["config_schema_version"] == ACTIVE_CONFIG_SCHEMA_VERSION; assert c["entry_execution_mode"] == "signal_price_minus_offset_maker"; assert c["maker_order_time_in_force"] == "good_till_canceled"; assert c["entry_order_lifetime"] == "until_filled_or_market_close"; assert c["entry_timeout_seconds"] == 0; assert c["opening_quote_capture_seconds"] == 60; assert c["entry_limit_offset_cents"] == 1; assert c["stop_policy"] == "hybrid_maker_then_hard_stop"; assert (c["hybrid_stop_trigger_cents"], c["hybrid_maker_exit_cents"], c["hybrid_hard_stop_cents"]) == (45,46,44); assert c["shadow_profile"] == "sticky_stop_40"; assert c["recovery_multiplier"] == "1.01"; assert c["max_recovery_exponent"] == 0; print("CANONICAL_HYBRID_STRATEGY_CONTRACT=OK | entry=signal_ask_minus_1c maker_tif=GTC lifetime=until_fill_or_market_close hybrid=45/46/44 profile=40 recovery=1.01")'
 
       - name: Write Kalshi RSA private key
         env:
@@ -215,7 +215,7 @@ jobs:
           THRESHOLD_GROWTH_MULTIPLIER: ${{ inputs.threshold_growth_multiplier || '' }}
           BASE_INCREMENT: ${{ inputs.base_increment || '' }}
           MAX_POSITION: ${{ inputs.max_position || '' }}
-          ENTRY_TIMEOUT_SECONDS: ${{ inputs.entry_timeout_seconds || '' }}
+          OPENING_QUOTE_CAPTURE_SECONDS: ${{ inputs.opening_quote_capture_seconds || '' }}
           ENTRY_LATENESS_SECONDS: ${{ inputs.entry_lateness_seconds || '' }}
           MARKET_DISCOVERY_INTERVAL_SECONDS: ${{ inputs.market_discovery_interval_seconds || '' }}
           OUTCOME_OBSERVATION_SECONDS: ${{ inputs.outcome_observation_seconds || '' }}
@@ -268,7 +268,7 @@ jobs:
           [ -z "$THRESHOLD_GROWTH_MULTIPLIER" ] || args+=(--threshold-growth-multiplier "$THRESHOLD_GROWTH_MULTIPLIER")
           [ -z "$BASE_INCREMENT" ] || args+=(--base-increment "$BASE_INCREMENT")
           [ -z "$MAX_POSITION" ] || args+=(--max-position "$MAX_POSITION")
-          [ -z "$ENTRY_TIMEOUT_SECONDS" ] || args+=(--entry-timeout-seconds "$ENTRY_TIMEOUT_SECONDS")
+          [ -z "$OPENING_QUOTE_CAPTURE_SECONDS" ] || args+=(--opening-quote-capture-seconds "$OPENING_QUOTE_CAPTURE_SECONDS")
           [ -z "$ENTRY_LATENESS_SECONDS" ] || args+=(--entry-lateness-seconds "$ENTRY_LATENESS_SECONDS")
           [ -z "$MARKET_DISCOVERY_INTERVAL_SECONDS" ] || args+=(--market-discovery-interval-seconds "$MARKET_DISCOVERY_INTERVAL_SECONDS")
           [ -z "$OUTCOME_OBSERVATION_SECONDS" ] || args+=(--outcome-observation-seconds "$OUTCOME_OBSERVATION_SECONDS")

@@ -218,6 +218,31 @@ class LiveExecutionTests(unittest.TestCase):
         )
         self.assertEqual(migrated["config_hash"], config_hash(self.config))
 
+    def test_gtc_strategy_timeout_removal_migrates_exact_checkpoint_without_reset(self) -> None:
+        temporary = Path(tempfile.mkdtemp()) / "state.json"
+        bounded_config = dict(self.config)
+        bounded_config["entry_timeout_seconds"] = bounded_config.pop("opening_quote_capture_seconds")
+        bounded_config.pop("entry_order_lifetime")
+        state = default_state(bounded_config)
+        state["sizing"] = {
+            "base_share_count": "1.00", "recovery_exponent": 11,
+            "recovery_cycle_pnl": "-0.73", "next_base_threshold": "350.00",
+        }
+        state["markets"] = {
+            "KXBTC15M-resting": {
+                "ticker": "KXBTC15M-resting", "status": "ENTRY_PENDING",
+                "entry_deadline_epoch": 1_060,
+                "entry_orders": [{"remaining_count": "1.00", "time_in_force": "good_till_canceled"}],
+            },
+        }
+        save_state(temporary, state)
+
+        migrated = load_state(temporary, self.config)
+        self.assertEqual(migrated["sizing"], state["sizing"])
+        self.assertEqual(migrated["markets"], state["markets"])
+        self.assertEqual(migrated["config_migrations"][-1]["kind"], "remove_gtc_strategy_timeout")
+        self.assertEqual(migrated["config_hash"], config_hash(self.config))
+
     def test_unrelated_configuration_change_still_fails_closed(self) -> None:
         temporary = Path(tempfile.mkdtemp()) / "state.json"
         save_state(temporary, default_state(self.config))
@@ -503,6 +528,7 @@ class LiveExecutionTests(unittest.TestCase):
             self.assertEqual(len(rest.calls), 1)
             self.assertTrue(rest.calls[0]["post_only"])
             self.assertEqual(rest.calls[0]["tif"], "good_till_canceled")
+            self.assertIsNone(rest.calls[0]["expiration_time"])
             self.assertEqual(rest.calls[0]["position_price"], 0.59)
             self.assertEqual(record["initial_signal_price_cents"], 60)
             self.assertEqual(record["entry_limit_cents"], 59)
@@ -530,7 +556,7 @@ class LiveExecutionTests(unittest.TestCase):
             )
             await engine.submit_entry(rest, feed, record, 1_000)
             self.assertEqual(len(rest.calls), 1)
-            await engine.manage_entry(rest, feed, record, 1_061)
+            await engine.manage_entry(rest, feed, record, 1_901)
             self.assertEqual(record["status"], "ENTRY_CANCEL_UNCONFIRMED")
             self.assertTrue(engine.state["circuit_breaker"]["blocked"])
             self.assertEqual(record["entry_cancel_pending"]["next_action"], "finish_entry")

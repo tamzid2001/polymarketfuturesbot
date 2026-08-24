@@ -146,7 +146,7 @@ INTEGER_CONFIG_FIELDS = {
     "opening_price_discovery_seconds",
     "entry_limit_offset_cents", "shadow_entry_level_min_cents", "shadow_entry_level_max_cents",
     "shadow_entry_level_step_cents", "hybrid_stop_trigger_cents", "hybrid_maker_exit_cents",
-    "hybrid_hard_stop_cents",
+    "hybrid_hard_stop_cents", "opening_quote_capture_seconds",
 }
 FLOAT_CONFIG_FIELDS = {
     "stop_poll_interval", "reconciliation_interval", "max_outcome_quote_age_seconds", "max_stale_quote_seconds",
@@ -215,6 +215,10 @@ def validate_entry_price_contract(value: dict[str, Any]) -> None:
         raise ValueError("the active strategy requires entry_execution_mode=signal_price_minus_offset_maker")
     if value.get("maker_order_time_in_force") != "good_till_canceled":
         raise ValueError("the active strategy requires maker_order_time_in_force=good_till_canceled")
+    if value.get("entry_order_lifetime") != "until_filled_or_market_close":
+        raise ValueError("the active strategy requires entry_order_lifetime=until_filled_or_market_close")
+    if int(value.get("entry_timeout_seconds", -1)) != 0:
+        raise ValueError("entry_timeout_seconds must be 0; strategy-time expiration is disabled")
     if value.get("stop_policy") != "hybrid_maker_then_hard_stop":
         raise ValueError("the active strategy requires stop_policy=hybrid_maker_then_hard_stop")
     if stop_baseline != Decimal("0.50"):
@@ -263,7 +267,8 @@ def load_config(path: Path) -> dict[str, Any]:
         "strategy_version", "series", "entry_price", "stop_price", "starting_base", "recovery_multiplier",
         "first_base_threshold", "threshold_growth_multiplier", "base_increment", "max_position",
         "stop_policy", "stop_baseline_entry_price", "entry_execution_mode", "entry_limit_offset_cents",
-        "maker_order_time_in_force",
+        "maker_order_time_in_force", "entry_order_lifetime", "entry_timeout_seconds",
+        "opening_quote_capture_seconds",
         "shadow_fill_model", "shadow_entry_level_min_cents", "shadow_entry_level_max_cents",
         "shadow_entry_level_step_cents", "hybrid_stop_enabled", "hybrid_stop_trigger_cents",
         "hybrid_maker_exit_cents", "hybrid_hard_stop_cents", "trading_mode", "config_schema_version",
@@ -299,7 +304,9 @@ def load_config(path: Path) -> dict[str, Any]:
     value.setdefault("shadow_profile", "sticky_stop_40")
     # A fresh post-open complete book is required to freeze the one-cent-below
     # maker limit. Missing or stale evidence fails closed.
-    value.setdefault("entry_timeout_seconds", 60)
+    value.setdefault("entry_timeout_seconds", 0)
+    value.setdefault("entry_order_lifetime", "until_filled_or_market_close")
+    value.setdefault("opening_quote_capture_seconds", 60)
     value.setdefault("entry_lateness_seconds", 60)
     value.setdefault("stop_poll_interval", 1.0)
     value.setdefault("reconciliation_interval", 5.0)
@@ -338,8 +345,8 @@ def load_config(path: Path) -> dict[str, Any]:
     validate_entry_price_contract(value)
     if decimal(value["starting_base"]) != Decimal("1.00"):
         raise ValueError("the hybrid strategy must start at exactly 1.00 share")
-    if not 1 <= int(value["entry_timeout_seconds"]) <= 60:
-        raise ValueError("entry_timeout_seconds must be between 1 and 60")
+    if not 1 <= int(value["opening_quote_capture_seconds"]) <= 300:
+        raise ValueError("opening_quote_capture_seconds must be between 1 and 300")
     if int(value["handoff_guard_seconds"]) < 60:
         raise ValueError("handoff_guard_seconds must keep at least one minute clear at each market boundary")
     if not 1.0 <= float(value["durable_checkpoint_interval_seconds"]) <= 60.0:
@@ -385,7 +392,8 @@ def load_config_from_value(value: dict[str, Any]) -> dict[str, Any]:
         "strategy_version", "series", "entry_price", "stop_price", "starting_base", "recovery_multiplier",
         "first_base_threshold", "threshold_growth_multiplier", "base_increment", "max_position", "stop_policy",
         "stop_baseline_entry_price", "entry_execution_mode", "entry_limit_offset_cents", "shadow_fill_model",
-        "maker_order_time_in_force",
+        "maker_order_time_in_force", "entry_order_lifetime", "entry_timeout_seconds",
+        "opening_quote_capture_seconds",
         "shadow_entry_level_min_cents", "shadow_entry_level_max_cents", "shadow_entry_level_step_cents",
         "hybrid_stop_enabled", "hybrid_stop_trigger_cents", "hybrid_maker_exit_cents",
         "hybrid_hard_stop_cents", "trading_mode", "config_schema_version",
@@ -405,7 +413,9 @@ def load_config_from_value(value: dict[str, Any]) -> dict[str, Any]:
     temporary.setdefault("stop_baseline_entry_price", "0.50")
     temporary.setdefault("signal_mode", "sticky_until_directional_win")
     temporary.setdefault("shadow_profile", "sticky_stop_40")
-    temporary.setdefault("entry_timeout_seconds", 60)
+    temporary.setdefault("entry_timeout_seconds", 0)
+    temporary.setdefault("entry_order_lifetime", "until_filled_or_market_close")
+    temporary.setdefault("opening_quote_capture_seconds", 60)
     temporary.setdefault("entry_lateness_seconds", 60)
     temporary.setdefault("handoff_guard_seconds", 60)
     temporary.setdefault("opening_quote_max_observations", 500)
@@ -426,8 +436,8 @@ def load_config_from_value(value: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("trading_mode must be shadow or live")
     if temporary["signal_mode"] != "sticky_until_directional_win":
         raise ValueError("the active shadow strategy requires signal_mode=sticky_until_directional_win")
-    if not 1 <= int(temporary["entry_timeout_seconds"]) <= 60:
-        raise ValueError("entry_timeout_seconds must be between 1 and 60")
+    if not 1 <= int(temporary["opening_quote_capture_seconds"]) <= 300:
+        raise ValueError("opening_quote_capture_seconds must be between 1 and 300")
     if int(temporary["handoff_guard_seconds"]) < 60:
         raise ValueError("handoff_guard_seconds must keep at least one minute clear at each market boundary")
     if not 1.0 <= float(temporary["durable_checkpoint_interval_seconds"]) <= 60.0:
@@ -947,7 +957,7 @@ class LiveEngine:
             "effective_stop_price": None,
             "opening_quote_observations": [],
             "opening_quote_capture": {
-                "window_seconds": int(self.config["entry_timeout_seconds"]),
+                "window_seconds": int(self.config["opening_quote_capture_seconds"]),
                 "max_observations": int(self.config["opening_quote_max_observations"]),
                 "started_at": None,
                 "discovery_anchor_at": None,
@@ -972,7 +982,7 @@ class LiveEngine:
             # overstate these as exact exchange-fill instants.
             "entry_timing": {
                 "market_open_epoch": market["open_epoch"],
-                "entry_window_seconds": int(self.config["entry_timeout_seconds"]),
+                "entry_order_lifetime": self.config["entry_order_lifetime"],
                 "submission_events": [],
                 "first_submission_at": None,
                 "first_submission_epoch": None,
@@ -1078,7 +1088,7 @@ class LiveEngine:
             "initial_signal_quote": quote,
             "entry_limit_cents": limit_cents,
         })
-        record["entry_deadline_epoch"] = self.entry_deadline(record)
+        record["opening_quote_capture_deadline_epoch"] = self.opening_quote_capture_deadline(record)
         if 1 <= limit_cents <= 99:
             record["maker_entry_price"] = format(cents_price(limit_cents), "f")
         self.audit(
@@ -1919,7 +1929,10 @@ class LiveEngine:
         """
 
         start = float(record["market_open_epoch"])
-        deadline = float(record.get("entry_deadline_epoch") or self.entry_deadline(record))
+        deadline = float(
+            record.get("opening_quote_capture_deadline_epoch")
+            or self.opening_quote_capture_deadline(record)
+        )
         capture = record.setdefault("opening_quote_capture", {})
         observations = record.setdefault("opening_quote_observations", [])
         if now < start:
@@ -2631,9 +2644,10 @@ class LiveEngine:
             remaining = Decimal(str(order.get("remaining_count") or "0"))
             if remaining <= 0:
                 continue
-            # A v8 dry-run maker record has no exchange order ID by design.
-            # It is simulated public-trade evidence, not an order that can
-            # fill after its shadow deadline.  Treating it as an uncertain
+            # A dry-run maker record has no exchange order ID by design. It is
+            # simulated public-trade evidence, not an exchange order. Once a
+            # risk or market-close cancellation closes it locally, later
+            # public trades cannot fill it. Treating it as an uncertain
             # exchange cancellation was the source of the stale
             # ENTRY_CANCEL_UNCONFIRMED loop observed on August 17.  Mark it
             # conclusively closed locally; real/missing-ID orders still fail
@@ -2773,10 +2787,10 @@ class LiveEngine:
         self.note_entry_execution_summary(record, "shadow_trade_through_refresh")
         return fill
 
-    def entry_deadline(self, record: dict[str, Any]) -> float:
-        """The dynamic-maker phase ends no later than the first minute."""
+    def opening_quote_capture_deadline(self, record: dict[str, Any]) -> float:
+        """Bound high-frequency opening telemetry without expiring the GTC."""
 
-        configured = float(record["market_open_epoch"]) + int(self.config["entry_timeout_seconds"])
+        configured = float(record["market_open_epoch"]) + int(self.config["opening_quote_capture_seconds"])
         return min(float(record["market_close_epoch"]) - 1.0, configured)
 
     def finish_entry_attempt(self, record: dict[str, Any], filled: Decimal, reason: str) -> None:
@@ -3159,9 +3173,8 @@ class LiveEngine:
             if abs(Decimal(str(existing))) > 0:
                 self.trip("existing_position_before_entry")
                 return
-        deadline = float(record.setdefault("entry_deadline_epoch", self.entry_deadline(record)))
-        if now >= deadline:
-            self.finish_entry_attempt(record, Decimal("0"), "entry_deadline_elapsed_before_submission")
+        if now >= float(record["market_close_epoch"]):
+            self.finish_entry_attempt(record, Decimal("0"), "market_closed_before_gtc_submission")
             return
         client_id = deterministic_client_order_id(record["ticker"], side, "entry", self.config)
         maker_tif = str(self.config["maker_order_time_in_force"])
@@ -3170,7 +3183,7 @@ class LiveEngine:
                 "order_id": None, "client_order_id": client_id, "ticker": record["ticker"], "side": side,
                 "quantity": format(quantity, "f"), "position_price": format(maker_price, "f"),
                 "time_in_force": maker_tif, "post_only": True, "reduce_only": False,
-                "expiration_time": int(deadline), "fill_count": "0.00", "remaining_count": format(quantity, "f"),
+                "expiration_time": None, "fill_count": "0.00", "remaining_count": format(quantity, "f"),
                 "average_fill_price": None, "fees_paid": "0", "entry_phase": "maker",
                 "status": "shadow_resting", "shadow_execution": "conservative_public_trade_through",
                 "submitted_at": utc_now(),
@@ -3178,7 +3191,7 @@ class LiveEngine:
         else:
             order = await rest.create_order(
                 ticker=record["ticker"], side=side, position_price=float(maker_price), quantity=float(quantity),
-                tif=maker_tif, expiration_time=int(deadline), dry_run=False,
+                tif=maker_tif, expiration_time=None, dry_run=False,
                 order_key="signal-minus-offset-entry", post_only=True, client_order_id_override=client_id,
             )
             order["entry_phase"] = "maker"
@@ -3198,6 +3211,7 @@ class LiveEngine:
             initial_signal_price_cents=record["initial_signal_price_cents"],
             requested_price_cents=record["entry_limit_cents"], requested_quantity=format(quantity, "f"),
             client_order_id=client_id, exchange_order_id=order.get("order_id"), post_only=True,
+            time_in_force=maker_tif, entry_order_lifetime=self.config["entry_order_lifetime"],
             shadow=self.dry_run,
         )
 
@@ -3236,21 +3250,11 @@ class LiveEngine:
         filled = self.refresh_shadow_entry(feed, record) if self.dry_run else await self.refresh_entry(rest, record)
         if filled > 0:
             self.transition(record, "ENTRY_PARTIAL" if any(Decimal(str(item.get("remaining_count") or "0")) > 0 for item in record["entry_orders"]) else "POSITION_OPEN", "entry_fill_observed")
-        deadline = float(record.get("entry_deadline_epoch") or 0)
-        if now >= deadline:
-            if not await self.cancel_entry_orders_and_confirm(rest, record, next_action="finish_entry"):
-                return
-            # For shadow mode, preserve only the trade-through evidence that
-            # existed before cancellation; later public trades cannot fill a
-            # cancelled simulated maker order.
-            filled = filled if self.dry_run else await self.refresh_entry(rest, record)
-            self.finish_entry_attempt(record, filled, "maker_entry_window_expired")
-            return
         if now >= float(record["market_close_epoch"]):
             if not await self.cancel_entry_orders_and_confirm(rest, record, next_action="finish_entry"):
                 return
             filled = filled if self.dry_run else await self.refresh_entry(rest, record)
-            self.finish_entry_attempt(record, filled, "market_closed_during_maker_entry")
+            self.finish_entry_attempt(record, filled, "gtc_entry_canceled_at_market_close")
 
     def exit_filled_quantity(self, record: dict[str, Any]) -> Decimal:
         return sum(
@@ -3837,7 +3841,7 @@ class LiveEngine:
                 if self.dry_run else await self.refresh_entry(rest, record)
             )
             if status in {"SIGNAL_PENDING", "ENTRY_PENDING", "ENTRY_CANCEL_UNCONFIRMED"} and filled == 0:
-                self.finish_entry_attempt(record, Decimal("0"), "entry_expired_at_market_close")
+                self.finish_entry_attempt(record, Decimal("0"), "gtc_entry_canceled_at_market_close")
                 status = str(record.get("status"))
         maker_exit = self.hybrid_maker_exit_order(record)
         if isinstance(maker_exit, dict) and Decimal(str(maker_exit.get("remaining_count") or "0")) > 0:
@@ -4010,10 +4014,10 @@ class LiveEngine:
                 timing = self.refresh_execution_timing_metrics()
                 record = self.state.get("markets", {}).get(active["ticker"], {}) if active else {}
                 capture = record.get("opening_quote_capture", {}) if isinstance(record, dict) else {}
-                deadline = record.get("entry_deadline_epoch") if isinstance(record, dict) else None
-                deadline_in = (
-                    round(max(0.0, float(deadline) - now), 3)
-                    if deadline not in (None, "") else None
+                market_close = record.get("market_close_epoch") if isinstance(record, dict) else None
+                gtc_market_close_in = (
+                    round(max(0.0, float(market_close) - now), 3)
+                    if market_close not in (None, "") else None
                 )
                 entry_latency = timing["entry_first_fill_from_market_open"]
                 stop_latency = timing["stop_trigger_from_first_fill"]
@@ -4024,10 +4028,10 @@ class LiveEngine:
                     "HEARTBEAT | mode=%s ticker=%s state=%s base=%s exponent=%d target=%s "
                     "deficit=%s threshold=%s tracked=%d filled=%d zero=%d funding_failures=%d "
                     "missed=%d maker_fills=%d ioc_fills=%d mixed=%d opening_quotes=%s "
-                    "first_quote_lag=%s maker_limit=%s deadline_in=%s entry_fill_p50=%s "
+                    "first_quote_lag=%s maker_limit=%s gtc_market_close_in=%s entry_fill_p50=%s "
                     "stop_from_fill_p50=%s shadow_balance=%s shadow_pnl=%s shadow_dd=%s "
                     "completed=%s stops=%s settlements=%s fees=%s hybrid_state=%s exit_class=%s "
-                    "entry_mode=%s maker_tif=%s initial_quotes=%s stop_safety_no_entry=%s "
+                    "entry_mode=%s maker_tif=%s entry_lifetime=%s initial_quotes=%s stop_safety_no_entry=%s "
                     "active=%s breaker=%s",
                     "DRY_RUN" if self.dry_run else "LIVE",
                     active and active["ticker"],
@@ -4040,13 +4044,14 @@ class LiveEngine:
                     execution["market_ioc_fill_markets"], execution["mixed_entry_markets"],
                     capture.get("observation_count"), capture.get("first_capture_lag_seconds"),
                     record.get("maker_entry_price") if isinstance(record, dict) else None,
-                    deadline_in, entry_latency.get("median_seconds"), stop_latency.get("median_seconds"),
+                    gtc_market_close_in, entry_latency.get("median_seconds"), stop_latency.get("median_seconds"),
                     shadow.get("balance"), self.state.get("cumulative_realized_pnl"), shadow.get("max_drawdown"),
                     shadow.get("completed_trades"), shadow.get("stop_count"), shadow.get("settlement_count"),
                     fees["total_fees_paid"], record.get("hybrid_stop", {}).get("state") if isinstance(record, dict) else None,
                     record.get("exit_classification") if isinstance(record, dict) else None,
                     self.config["entry_execution_mode"],
-                    self.config["maker_order_time_in_force"], eligibility["captured_initial_prices"],
+                    self.config["maker_order_time_in_force"], self.config["entry_order_lifetime"],
+                    eligibility["captured_initial_prices"],
                     eligibility["actual_strategy_stop_safety_rejections"],
                     self.state.get("active_market"), self.state["circuit_breaker"].get("blocked"),
                 )
@@ -4137,6 +4142,14 @@ async def async_main(args: argparse.Namespace) -> int:
         LOG.warning(
             "CONFIG MIGRATION | pre-existing maker behavior recorded explicitly as GTC; "
             "preserved exponent=%s deficit=%s markets=%d",
+            state.get("sizing", {}).get("recovery_exponent", 0),
+            state.get("sizing", {}).get("recovery_cycle_pnl", "0"),
+            len(state.get("markets", {})),
+        )
+    if migrations and migrations[-1].get("kind") == "remove_gtc_strategy_timeout":
+        LOG.warning(
+            "CONFIG MIGRATION | GTC strategy timeout removed; entries now rest until fill, "
+            "confirmed risk cancellation, or market close; preserved exponent=%s deficit=%s markets=%d",
             state.get("sizing", {}).get("recovery_exponent", 0),
             state.get("sizing", {}).get("recovery_cycle_pnl", "0"),
             len(state.get("markets", {})),
