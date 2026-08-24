@@ -154,9 +154,16 @@ FLOAT_CONFIG_FIELDS = {
 }
 
 # These profile names are deliberately part of the durable configuration hash.
-# A 30c replay must never inherit recovery/base state from a 40c replay merely
-# because both happen to observe the same Kalshi account in dry-run mode.
-SHADOW_STOP_PROFILE_PRICES = {"sticky_stop_40": Decimal("0.40")}
+# Experimental stop lanes are shadow-only and each receives its own state,
+# ledger, concurrency key, and runtime-state ref.  They can never inherit the
+# canonical 40c lane's recovery/base state or become a live configuration.
+SHADOW_STOP_PROFILE_PRICES = {
+    "sticky_stop_10": Decimal("0.10"),
+    "sticky_stop_20": Decimal("0.20"),
+    "sticky_stop_30": Decimal("0.30"),
+    "sticky_stop_40": Decimal("0.40"),
+}
+CANONICAL_LIVE_SHADOW_PROFILE = "sticky_stop_40"
 
 
 def price_to_cents(value: Decimal | str, name: str = "price") -> int:
@@ -233,6 +240,9 @@ def validate_entry_price_contract(value: dict[str, Any]) -> None:
         raise ValueError(
             f"shadow_profile={profile} requires stop_price={format(expected_profile_stop, 'f')}"
         )
+    trading_mode = str(value.get("trading_mode") or "shadow")
+    if profile != CANONICAL_LIVE_SHADOW_PROFILE and trading_mode != "shadow":
+        raise ValueError("10c/20c/30c stop profiles are shadow-only and cannot be loaded in live mode")
     if int(value["entry_limit_offset_cents"]) < 0:
         raise ValueError("entry_limit_offset_cents cannot be negative")
     level_min = int(value["shadow_entry_level_min_cents"])
@@ -249,8 +259,18 @@ def validate_entry_price_contract(value: dict[str, Any]) -> None:
         raise ValueError("hybrid_stop_trigger_cents must be at least hybrid_hard_stop_cents")
     if not 1 <= hard_stop <= trigger < maker_exit <= 99:
         raise ValueError("hybrid stop prices must be valid integer-cent ticks")
-    if not 40 <= hard_stop <= 49:
-        raise ValueError("hybrid_hard_stop_cents must be between 40 and 49 for the active analytics range")
+    if profile == CANONICAL_LIVE_SHADOW_PROFILE:
+        if not 40 <= hard_stop <= 49:
+            raise ValueError("the canonical 40c profile requires hybrid_hard_stop_cents between 40 and 49")
+    else:
+        profile_cents = price_to_cents(expected_profile_stop, "shadow profile stop")
+        if (hard_stop, trigger, maker_exit) != (
+            profile_cents, profile_cents + 1, profile_cents + 2,
+        ):
+            raise ValueError(
+                "experimental shadow profiles require hard/trigger/maker stops "
+                "at profile/profile+1c/profile+2c"
+            )
     if not _bool(value.get("hybrid_stop_enabled", True)):
         raise ValueError("the active v11 strategy requires hybrid_stop_enabled=true")
     if value.get("shadow_fill_model") != "conservative_public_trade_through":

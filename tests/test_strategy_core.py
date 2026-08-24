@@ -136,7 +136,7 @@ class StrategyCoreTests(unittest.TestCase):
             load_config_from_value(dict(config, starting_base="100.01"))
         with self.assertRaisesRegex(ValueError, "at least 1"):
             load_config_from_value(dict(config, recovery_multiplier="0.99"))
-        with self.assertRaisesRegex(ValueError, "between 40 and 49"):
+        with self.assertRaisesRegex(ValueError, "canonical 40c profile"):
             load_config_from_value(dict(
                 config,
                 hybrid_hard_stop_cents=39,
@@ -192,10 +192,24 @@ class StrategyCoreTests(unittest.TestCase):
         self.assertEqual(sticky_directional_prediction("yes", "no"), ("yes", "hold_after_directional_loss"))
         self.assertEqual(sticky_directional_prediction("yes", "yes"), ("no", "flip_after_directional_win"))
 
-    def test_retired_shadow_stop_profiles_are_rejected(self) -> None:
+    def test_comparison_stop_profiles_are_shadow_only_and_isolated(self) -> None:
         config = load_config(ROOT / "selected_live_strategy.json")
-        with self.assertRaisesRegex(ValueError, "shadow_profile"):
-            load_config_from_value(dict(config, shadow_profile="sticky_stop_30", stop_price="0.30"))
+        for cents in (10, 20, 30):
+            profile = load_config_from_value(dict(
+                config,
+                shadow_profile=f"sticky_stop_{cents}",
+                stop_price=f"0.{cents:02d}",
+                hybrid_hard_stop_cents=cents,
+                hybrid_stop_trigger_cents=cents + 1,
+                hybrid_maker_exit_cents=cents + 2,
+                trading_mode="shadow",
+            ))
+            self.assertEqual(profile["shadow_profile"], f"sticky_stop_{cents}")
+            self.assertEqual(profile["hybrid_hard_stop_cents"], cents)
+            with self.assertRaisesRegex(ValueError, "shadow-only"):
+                load_config_from_value(dict(profile, trading_mode="live"))
+            with self.assertRaisesRegex(ValueError, r"profile/profile\+1c/profile\+2c"):
+                load_config_from_value(dict(profile, hybrid_stop_trigger_cents=cents))
 
     def test_production_workflows_pin_v11_and_never_dispatch_retired_lanes(self) -> None:
         worker = (ROOT / ".github/workflows/kalshi_btc15m_average_down.yml").read_text(encoding="utf-8")
@@ -251,6 +265,24 @@ class StrategyCoreTests(unittest.TestCase):
             self.assertNotIn(retired, watchdog)
             self.assertNotIn(retired, controlled)
             self.assertNotIn(f"- {retired}", worker)
+
+    def test_comparison_stop_workflows_are_shadow_only_and_state_isolated(self) -> None:
+        worker = (ROOT / ".github/workflows/kalshi_btc15m_shadow_stop_experiments.yml").read_text(
+            encoding="utf-8"
+        )
+        watchdog = (ROOT / ".github/workflows/kalshi_btc15m_shadow_stop_watchdog.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('KALSHI_LIVE_ENABLED: "false"', worker)
+        self.assertIn('KALSHI_SHADOW_ONLY: "true"', worker)
+        self.assertIn("--trading-mode shadow", worker)
+        self.assertIn("--dry-run", worker)
+        self.assertNotIn("--live-enabled", worker)
+        self.assertIn('runtime-state-stop-${STOP_CENTS}', worker)
+        self.assertIn('kalshi_shadow_maker_hybrid_v11_sticky_stop_${STOP_CENTS}_state.json', worker)
+        self.assertIn('kalshi-kxbtc15m-shadow-stop-${{ inputs.stop_cents }}', worker)
+        self.assertIn('for stop_cents in 10 20 30', watchdog)
+        self.assertNotIn("live_enabled", watchdog)
 
 
 if __name__ == "__main__":
