@@ -94,12 +94,10 @@ def load_state(path: Path, config: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeError("live state strategy version differs from active configuration; fail closed")
     expected_hash = config_hash(config)
     if value.get("config_hash") != expected_hash:
-        # One narrowly-scoped operational migration is supported: v10 changed
-        # the recovery-exponent circuit breaker from 12 to the explicit zero
-        # sentinel (disabled). This does not reinterpret quantity, P&L, base,
-        # thresholds, fills, positions, or any open record. Verify the exact
-        # prior hash before preserving the cycle; every other change still
-        # fails closed.
+        # Only narrowly-scoped operational migrations are supported. Verify
+        # the exact prior hash before preserving state; every other change
+        # still fails closed. The first changed the recovery-exponent circuit
+        # breaker from 12 to the explicit zero sentinel (disabled).
         legacy_config = dict(config)
         legacy_config["max_recovery_exponent"] = LEGACY_RECOVERY_EXPONENT_LIMIT
         is_uncapped_migration = (
@@ -107,18 +105,39 @@ def load_state(path: Path, config: dict[str, Any]) -> dict[str, Any]:
             == UNCAPPED_RECOVERY_EXPONENT
             and value.get("config_hash") == config_hash(legacy_config)
         )
-        if not is_uncapped_migration:
+        # The maker engine already submitted both entry and maker-exit orders
+        # as GTC before this field became explicit.  Permit only the exact
+        # prior hash obtained by removing this one declarative field.  This
+        # makes the contract fail closed without resetting or reinterpreting
+        # any existing fills, position, recovery state, P&L, or analytics.
+        implicit_gtc_config = dict(config)
+        implicit_gtc_config.pop("maker_order_time_in_force", None)
+        is_explicit_gtc_migration = (
+            config.get("maker_order_time_in_force") == "good_till_canceled"
+            and value.get("config_hash") == config_hash(implicit_gtc_config)
+        )
+        if not is_uncapped_migration and not is_explicit_gtc_migration:
             raise RuntimeError("live state configuration hash differs from active configuration; fail closed")
         migrations = value.setdefault("config_migrations", [])
-        migrations.append({
-            "at": utc_now(),
-            "kind": "disable_recovery_exponent_breaker",
-            "previous_max_recovery_exponent": LEGACY_RECOVERY_EXPONENT_LIMIT,
-            "max_recovery_exponent": UNCAPPED_RECOVERY_EXPONENT,
-            "previous_config_hash": value.get("config_hash"),
-            "config_hash": expected_hash,
-            "policy": "preserve_existing_recovery_cycle_without_reinterpretation",
-        })
+        if is_uncapped_migration:
+            migrations.append({
+                "at": utc_now(),
+                "kind": "disable_recovery_exponent_breaker",
+                "previous_max_recovery_exponent": LEGACY_RECOVERY_EXPONENT_LIMIT,
+                "max_recovery_exponent": UNCAPPED_RECOVERY_EXPONENT,
+                "previous_config_hash": value.get("config_hash"),
+                "config_hash": expected_hash,
+                "policy": "preserve_existing_recovery_cycle_without_reinterpretation",
+            })
+        if is_explicit_gtc_migration:
+            migrations.append({
+                "at": utc_now(),
+                "kind": "make_existing_gtc_order_contract_explicit",
+                "maker_order_time_in_force": "good_till_canceled",
+                "previous_config_hash": value.get("config_hash"),
+                "config_hash": expected_hash,
+                "policy": "preserve_all_existing_state_because_order_execution_was_already_gtc",
+            })
         value["config_hash"] = expected_hash
     for key, default in default_state(config).items():
         value.setdefault(key, default)

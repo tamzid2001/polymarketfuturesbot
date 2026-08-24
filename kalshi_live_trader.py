@@ -4133,6 +4133,14 @@ async def async_main(args: argparse.Namespace) -> int:
             state.get("sizing", {}).get("recovery_exponent", 0),
             state.get("sizing", {}).get("recovery_cycle_pnl", "0"),
         )
+    if migrations and migrations[-1].get("kind") == "make_existing_gtc_order_contract_explicit":
+        LOG.warning(
+            "CONFIG MIGRATION | pre-existing maker behavior recorded explicitly as GTC; "
+            "preserved exponent=%s deficit=%s markets=%d",
+            state.get("sizing", {}).get("recovery_exponent", 0),
+            state.get("sizing", {}).get("recovery_cycle_pnl", "0"),
+            len(state.get("markets", {})),
+        )
     if args.reset_state:
         if state.get("active_market") or any(item.get("status") in ACTIVE_STATES for item in state.get("markets", {}).values() if isinstance(item, dict)):
             raise SystemExit("refusing reset_state with active local strategy exposure; use reconciliation instead")
