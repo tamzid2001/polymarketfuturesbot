@@ -173,6 +173,13 @@ class StrategyCoreTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "entry_order_lifetime"):
             load_config_from_value(dict(config, entry_order_lifetime="until_timeout"))
 
+    def test_active_config_rejects_delayed_signal_or_recovery_exponent_breaker(self) -> None:
+        config = load_config(ROOT / "selected_live_strategy.json")
+        with self.assertRaisesRegex(ValueError, "signal_delay_seconds must be 0"):
+            load_config_from_value(dict(config, signal_delay_seconds=1))
+        with self.assertRaisesRegex(ValueError, "max_recovery_exponent must be 0"):
+            load_config_from_value(dict(config, max_recovery_exponent=12))
+
     def test_v9_fixed_stop_is_not_adjusted_by_actual_entry_price(self) -> None:
         floor = Decimal("0.40")
         baseline = Decimal("0.50")
@@ -278,6 +285,9 @@ class StrategyCoreTests(unittest.TestCase):
         self.assertIn("--trading-mode shadow", worker)
         self.assertIn("--dry-run", worker)
         self.assertNotIn("--live-enabled", worker)
+        self.assertIn('candidate["signal_delay_seconds"] == 0', worker)
+        self.assertIn('candidate["entry_timeout_seconds"] == 0', worker)
+        self.assertIn('candidate["max_recovery_exponent"] == 0', worker)
         self.assertIn('runtime-state-stop-${STOP_CENTS}', worker)
         self.assertIn('kalshi_shadow_maker_hybrid_v11_sticky_stop_${STOP_CENTS}_state.json', worker)
         self.assertIn('kalshi-kxbtc15m-shadow-stop-${{ inputs.stop_cents }}', worker)

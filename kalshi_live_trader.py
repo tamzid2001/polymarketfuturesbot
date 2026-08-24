@@ -226,6 +226,12 @@ def validate_entry_price_contract(value: dict[str, Any]) -> None:
         raise ValueError("the active strategy requires entry_order_lifetime=until_filled_or_market_close")
     if int(value.get("entry_timeout_seconds", -1)) != 0:
         raise ValueError("entry_timeout_seconds must be 0; strategy-time expiration is disabled")
+    if int(value.get("signal_delay_seconds", -1)) != 0:
+        raise ValueError("signal_delay_seconds must be 0; entries are prepared for the opening boundary")
+    if int(value.get("max_recovery_exponent", -1)) != 0:
+        raise ValueError(
+            "max_recovery_exponent must be 0; the active strategy disables the exponent circuit breaker"
+        )
     if value.get("stop_policy") != "hybrid_maker_then_hard_stop":
         raise ValueError("the active strategy requires stop_policy=hybrid_maker_then_hard_stop")
     if stop_baseline != Decimal("0.50"):
