@@ -203,7 +203,7 @@ class MakerHybridV11Tests(unittest.TestCase):
             before_exponent = engine.state["sizing"].get("recovery_exponent", 0)
             before_deficit = Decimal(str(engine.state["sizing"].get("recovery_cycle_pnl", "0")))
             await engine.submit_entry(rest, feed, record, time.time())
-            await engine.manage_entry(rest, feed, record, float(record["entry_deadline_epoch"]) + 1)
+            await engine.manage_entry(rest, feed, record, float(record["market_close_epoch"]) + 1)
             self.assertEqual(record["status"], "ZERO_FILL")
             self.assertEqual(engine.state["sizing"].get("recovery_exponent", 0), before_exponent)
             self.assertEqual(Decimal(str(engine.state["sizing"].get("recovery_cycle_pnl", "0"))), before_deficit)
@@ -234,9 +234,30 @@ class MakerHybridV11Tests(unittest.TestCase):
             record = self.signal(engine)
             await engine.submit_entry(rest, feed, record, time.time())
             exponent = engine.state["sizing"].get("recovery_exponent", 0)
-            await engine.manage_entry(rest, feed, record, float(record["entry_deadline_epoch"]) + 1)
+            await engine.manage_entry(rest, feed, record, float(record["market_close_epoch"]) + 1)
             self.assertEqual(record["exit_classification"], "ENTRY_NOT_FILLED")
             self.assertEqual(engine.state["sizing"].get("recovery_exponent", 0), exponent)
+        asyncio.run(scenario())
+
+    def test_gtc_entry_does_not_expire_after_old_sixty_second_window(self) -> None:
+        async def scenario():
+            engine, feed, rest = self.engine(), BookFeed("0.50"), ShadowRest()
+            record = self.signal(engine)
+            await engine.submit_entry(rest, feed, record, time.time())
+            order = record["entry_orders"][0]
+            self.assertIsNone(order["expiration_time"])
+            self.assertEqual(order["time_in_force"], "good_till_canceled")
+
+            await engine.manage_entry(
+                rest, feed, record, float(record["market_open_epoch"]) + 61,
+            )
+            self.assertEqual(record["status"], "ENTRY_PENDING")
+            self.assertEqual(order["remaining_count"], "1.00")
+
+            await engine.manage_entry(rest, feed, record, float(record["market_close_epoch"]) + 1)
+            self.assertEqual(record["status"], "ZERO_FILL")
+            self.assertEqual(record["exit_classification"], "ENTRY_NOT_FILLED")
+            self.assertEqual(order["remaining_count"], "0.00")
         asyncio.run(scenario())
 
     def test_shadow_levels_winner_50_to_46_has_exact_nested_hits(self) -> None:
