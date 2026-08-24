@@ -1060,6 +1060,26 @@ class LiveEngine:
             record["initial_signal_price_wait_reason"] = str(exc)
             return None
         limit_cents = initial_cents - int(self.config["entry_limit_offset_cents"])
+        # Freeze the source quote before validating whether the derived order
+        # is admissible. A safely rejected/no-entry signal is still part of
+        # the 40–49c path and missed-winner denominators and must remain fully
+        # auditable after a restart.
+        record.update({
+            "initial_signal_price_cents": initial_cents,
+            "initial_signal_price": format(cents_price(initial_cents), "f"),
+            "initial_signal_price_timestamp": utc_now(),
+            "initial_signal_price_epoch": quote_epoch,
+            "initial_signal_quote": quote,
+            "entry_limit_cents": limit_cents,
+        })
+        record["entry_deadline_epoch"] = self.entry_deadline(record)
+        if 1 <= limit_cents <= 99:
+            record["maker_entry_price"] = format(cents_price(limit_cents), "f")
+        self.audit(
+            "initial_signal_price_frozen", ticker=record["ticker"], side=record["signal_side"],
+            initial_signal_price_cents=initial_cents, entry_limit_cents=limit_cents,
+            quote_timestamp=quote_epoch, signal_timestamp=record.get("signal_timestamp"), quote=quote,
+        )
         if not 1 <= limit_cents <= 99:
             record["entry_rejection_quote"] = {
                 "at": utc_now(), "reason": "derived_limit_outside_supported_market_ticks",
@@ -1076,21 +1096,6 @@ class LiveEngine:
             }
             self.finish_entry_attempt(record, Decimal("0"), "derived_limit_at_or_below_hybrid_hard_stop")
             return None
-        record.update({
-            "initial_signal_price_cents": initial_cents,
-            "initial_signal_price": format(cents_price(initial_cents), "f"),
-            "initial_signal_price_timestamp": utc_now(),
-            "initial_signal_price_epoch": quote_epoch,
-            "initial_signal_quote": quote,
-            "entry_limit_cents": limit_cents,
-            "maker_entry_price": format(cents_price(limit_cents), "f"),
-        })
-        record["entry_deadline_epoch"] = self.entry_deadline(record)
-        self.audit(
-            "initial_signal_price_frozen", ticker=record["ticker"], side=record["signal_side"],
-            initial_signal_price_cents=initial_cents, entry_limit_cents=limit_cents,
-            quote_timestamp=quote_epoch, signal_timestamp=record.get("signal_timestamp"), quote=quote,
-        )
         LOG.warning("=" * 60)
         LOG.warning("SIGNAL: %s", record["ticker"])
         LOG.warning("SIDE: %s", str(record["signal_side"]).upper())
@@ -2691,6 +2696,7 @@ class LiveEngine:
         record["exit_classification"] = "ENTRY_NOT_FILLED"
         self.state["sizing"] = zero_fill_snapshot(self.current_parameters(), self.state.get("sizing"))
         self.note_zero_fill()
+        self.refresh_entry_execution_metrics()
         self.audit("zero_fill", ticker=record["ticker"], reason=reason, entry_execution_type=record["entry_execution_type"])
 
     def reserve_shadow_entry_cash(self, quantity: Decimal, price: Decimal) -> None:
