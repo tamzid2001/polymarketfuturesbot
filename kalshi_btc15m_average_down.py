@@ -1,10 +1,10 @@
-"""KXBTC15M settlement-contrarian average-down trader.
+"""ML-side-selected KXBTC15M mechanical average-down trader.
 
-At each new market open, the trader waits only for the immediately preceding
-KXBTC15M outcome to finalize, locks the opposite side, and posts one frozen
-weighted ladder: 40c -> 30c -> 20c -> 10c. The only discretionary live exit
-is an absolute selected-side 5c stop; otherwise every filled contract is held
-through settlement.
+The stored ML inference chooses one side before the market opens.  As soon as
+that market is active, the execution rule mechanically posts one same-side,
+market-close-expiring GTC limit at each fixed 40c -> 30c -> 20c -> 10c rung.
+There is no Prophet, forecast, or mechanical-side fallback if ML inference is
+unavailable.
 
 Live submission is deliberately opt-in: ``DRY_RUN`` must be false and both
 ``--submit`` and ``--allow-live`` are required.  The GitHub workflow persists
@@ -21,28 +21,25 @@ import json
 import logging
 import math
 import os
-import signal
 import subprocess
 import time
 import uuid
 from dataclasses import dataclass
-from decimal import Decimal
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
-from bot.equity_regime import (
-    DEFAULT_CLIENT_ORDER_PREFIX,
-    EquityRegimeController,
-    KalshiRawHistoryAPI,
-    LadderOrder,
-    RegimeConfig,
-    StrategyDecision,
-    synchronize_history,
-    utc_timestamp,
+from kalshi_ladder_scalp_shadow import (
+    EXTENDED_PROFIT_TARGETS,
+    entry_summary as scalp_entry_summary,
+    finalize_ladder_average_entry_scalp,
+    new_ladder_average_entry_scalp_shadow,
+    scalp_performance,
+    simulate_ladder_average_entry_scalp,
 )
+from kalshi_ml_features import FEATURE_SCHEMA, ML_ONLY_FEATURE_COLUMNS
 
 try:  # Installed by the dedicated live-runner requirements file.
     import aiohttp
@@ -69,10 +66,9 @@ except ImportError:  # pragma: no cover - exercised only in minimal local enviro
 LOG = logging.getLogger("kalshi_btc15m_average_down")
 SERIES_TICKER = "KXBTC15M"
 LADDER_LEVELS = (0.40, 0.30, 0.20, 0.10)
-CONFIG_VERSION = 20
-STATE_VERSION = 9
+CONFIG_VERSION = 12
+STATE_VERSION = 7
 ORDER_NAMESPACE = uuid.UUID("4d85857e-4dc6-43ec-960f-0b342523bdb7")
-BOT_CLIENT_ORDER_PREFIX = DEFAULT_CLIENT_ORDER_PREFIX
 KALSHI_WS_URL = os.getenv(
     "KALSHI_WS_URL",
     "wss://external-api-ws.demo.kalshi.co/trade-api/ws/v2"
@@ -83,17 +79,6 @@ QUOTE_STALE_SECONDS = 20.0
 MAINTENANCE_TIMEZONE = ZoneInfo("America/New_York")
 EXCHANGE_RECOVERY_RETRY_SECONDS = 60.0
 CHECKPOINT_RETRY_SECONDS = max(1.0, float(os.getenv("KALSHI_CHECKPOINT_RETRY_SECONDS", "60")))
-# There is no fixed signal delay. The first finalized immediately preceding
-# market is used as soon as it is observable. Kalshi can publish that final
-# result more than five minutes after the next market opens, so retain causal
-# availability through the penultimate minute of each fixed 15-minute market.
-# This avoids substituting an older result while still leaving at least one
-# minute before close for the same-side GTC ladder to rest.
-SETTLEMENT_CONTRARIAN_ENTRY_GRACE_SECONDS = 840.0
-# Shadow-equity results must remain comparable across live account-size
-# changes. The shadow executor therefore always models this fixed 1/2/3/4
-# ladder, independently of the real account's dynamic base-share scaling.
-EQUITY_REGIME_SHADOW_BASE_SHARES = 3.0
 # Polling metadata changes every few seconds and must never turn the bot-state
 # branch into a stream of commits. Everything else is material trading state.
 CHECKPOINT_IGNORED_KEYS = {
@@ -104,28 +89,17 @@ CHECKPOINT_IGNORED_KEYS = {
     "last_heartbeat_at",
     "pause_blocked_at",
     "last_quote_state",
-    "next_predecessor_lookup_epoch",
 }
 
 DEFAULT_CONFIG = {
     "format_version": CONFIG_VERSION,
-    # Share multiplier for the 1/2/3/4 ladder.  The default therefore posts
-    # 3 at 40c, 6 at 30c, 9 at 20c, and 12 at 10c (30 total / $6 maximum).
-    "initial_position_size": 3.0,
+    # Contracts per rung.  This is a quantity, not a dollar amount.
+    "initial_position_size": 0.01,
     "max_active_markets": 1,
-    "max_contracts_per_market": 30.0,
-    "max_total_capital": 6.0,
-    # Capacity values created by this runner may grow with an enabled dynamic
-    # base-share rule.  Explicit Action caps turn the corresponding flag off.
-    "max_contracts_per_market_auto": True,
-    "max_total_capital_auto": True,
-    # Dynamic base-share scaling is deliberately opt-in.  When disabled the
-    # live ladder remains exactly initial_position_size × 1/2/3/4.
-    # Enabled live by owner direction.  Scaling is still based on realized
-    # actual P/L by default; shadow-only P/L cannot enlarge live orders.
-    "enable_dynamic_scaling": True,
-    "base_share_increment": 1.0,
-    "scaling_profit_multiplier": 16.5,
+    "max_contracts_per_market": 0.04,
+    # Principal reserved for all four possible rungs.  Fees are checked against
+    # available balance separately with fee_reserve.
+    "max_total_capital": 0.01,
     "fee_reserve": 0.05,
     # Upper bound on sleep while waiting for the WebSocket; it is not a REST
     # quote-poll interval. Quote changes wake the runner immediately.
@@ -134,72 +108,80 @@ DEFAULT_CONFIG = {
     # order reconciliation if the stream is interrupted.
     "market_refresh_seconds": 15.0,
     "order_reconcile_seconds": 5.0,
+    # This is *not* an entry window.  It is only the short allowance for
+    # observing a brand-new market and starting its watcher. Once started,
+    # a frozen ML side immediately receives its four-rung GTC ladder.
     "watch_start_grace_seconds": 45.0,
-    "live_execution_strategy": "settlement_contrarian_settlement_v2",
-    "live_absolute_stop_price": 0.05,
-    "live_quote_max_age_seconds": 3.0,
-    "settlement_contrarian_entry_grace_seconds": SETTLEMENT_CONTRARIAN_ENTRY_GRACE_SECONDS,
-    # Retained only to migrate prior state. Every eligible current market is
-    # traded; the retired two-loss skip may never suppress a signal or order.
-    "live_consecutive_loss_limit": 0,
-    "live_markets_to_skip_after_loss_limit": 0,
-    "status_log_seconds": 60.0,
-    # Prophet equity forecasts are retired from the live execution path.  The
-    # settlement-contrarian signal is the only live direction source and no
-    # persisted configuration or Action input may restore the former gate.
-    "equity_regime_enabled": False,
-    "equity_regime_dry_run": True,
-    "allow_live_state_transitions": True,
-    "subaccount": 0,
-    "starting_balance": "100.00",
-    "history_start_ts": None,
-    "history_end_ts": None,
-    "history_max_markets": 200,
-    # Retained only so historical state files can be read and stripped during
-    # migration.  The active runner never constructs a Prophet controller.
-    "prophet_history_source": "account_series",
-    "prophet_reference_closed_positions_path": "data/closed-positions-2026-07-27.csv",
-    "allow_endpoint_anchored_ledger_bootstrap": True,
-    "accounting_tolerance": "0.01",
-    "bot_client_order_prefix": BOT_CLIENT_ORDER_PREFIX,
-    "bot_order_group_id": None,
-    "prophet_enabled": False,
-    "prophet_min_history": 200,
-    "prophet_training_window": 201,
-    # The live P10/P90 gate must use a fit that includes the most recently
-    # finalized balance observation.  A multi-market horizon is still written
-    # for diagnostics, but it is never reused after a balance update.
-    "prophet_refit_every_markets": 1,
-    "prophet_future_horizon_markets": 100,
-    "prophet_forecast_frequency_minutes": 15,
-    "prophet_use_log_transform": True,
-    "prophet_uncertainty_samples": 2000,
-    "prophet_changepoint_prior_scale": 0.05,
-    "prophet_seasonality_prior_scale": 10.0,
-    "prophet_daily_seasonality": True,
-    "prophet_weekly_seasonality": False,
-    "prophet_yearly_seasonality": False,
-    "prophet_random_seed": 42,
-    "shadow_fill_model": "conservative_trade_through",
-    "shadow_latency_ms": 0,
-    "shadow_slippage_cents": "0",
-    "shadow_partial_fills": True,
-    "shadow_require_trade_through": True,
-    "scaling_equity_source": "actual",
-    "cooldown_state_source": "separate",
+    # ML is computed before the next market opens from raw candles and settled
+    # outcomes only. A watcher never chooses a side from prices; it only acts
+    # after this frozen model side is ready.
+    "ml_preopen_lead_seconds": 120.0,
+    # Inclusive 50% confidence: every valid binary-model direction receives
+    # the fixed GTC ladder once its market is active.
+    "ml_min_confidence": 0.50,
+    # A paper-only counterfactual of the *opposite* frozen ML side. It never
+    # creates an exchange order. A simulated fill requires a fresh complete
+    # top-of-book quote and displayed executable depth at the posted rung.
+    "inverse_shadow_enabled": True,
+    # Paper-only size is intentionally independent of the 0.01-contract live
+    # ladder. It makes the counterfactual P&L readable without changing a
+    # single live order or risk limit.
+    "inverse_shadow_position_size": 1.0,
+    "inverse_shadow_quote_max_age_seconds": 3.0,
+    # An alternate paper-only range study for the frozen ML side. It mirrors
+    # the 40c/30c/20c/10c entries at one share each and records the full
+    # depth-supported favorable excursion at each held VWAP/size. It tracks
+    # 1c/2c/3c/5c/10c targets but never submits an exchange close.
+    "scalp_shadow_enabled": True,
+    "scalp_shadow_position_size": 1.0,
+    "scalp_shadow_profit_target": 0.01,
+    "scalp_shadow_quote_max_age_seconds": 3.0,
+    # A second, independent paper strategy with 1/2/3/4 contracts at
+    # 40c/30c/20c/10c. Historical trailing results are retained but this
+    # legacy study is disabled for new markets; the active comparison uses
+    # the 5c fixed-loss / 10c activated-trailing bracket below.
+    "weighted_scalp_shadow_enabled": True,
+    "weighted_scalp_trailing_enabled": False,
+    "weighted_scalp_trailing_stop_per_contract": 0.10,
+    "weighted_scalp_trailing_activation_gain_per_contract": 0.10,
+    # The active paper-only comparison holds identical weighted positions
+    # until each separate +1c through +9c, then +10c/+20c/.../+80c gain gate
+    # has been reached, then applies the same 10c trailing retracement. Every gate retains an
+    # absolute selected-side 5c stop, rather than an average-entry loss gap.
+    # It is never a live stop order.
+    "weighted_scalp_activation_comparison_enabled": True,
+    "weighted_scalp_trailing_activation_gains_per_contract": [
+        0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.09,
+        0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80,
+    ],
+    "weighted_scalp_absolute_stop_price": 0.05,
+    # Legacy one-gate bracket retained for archived/manual comparisons only.
+    "weighted_scalp_fixed_stop_loss_enabled": False,
+    "weighted_scalp_fixed_stop_loss_per_contract": 0.05,
+    # When a retrain publishes a new artifact, paper-test both the retained
+    # predecessor and the new model at the same readable size. Neither side
+    # can create or alter an exchange order.
+    "model_transition_shadow_enabled": True,
+    "model_transition_shadow_position_size": 1.0,
+    # Live execution is deliberately explicit and persisted separately from
+    # the paper-only weighted studies above.  The special mode uses the
+    # inverse frozen ML side, a 1/2/3/4-contract ladder, an absolute 5c bid
+    # stop, then a 10c trailing exit only after a 60c gain over the *current*
+    # average filled entry.  It is selected only by an authenticated manual
+    # workflow input; normal_ml_ladder remains the repository default.
+    "live_execution_strategy": "normal_ml_ladder",
+    "live_inverse_ml_hold_gate": 0.60,
+    "live_inverse_ml_absolute_stop_price": 0.05,
+    "live_inverse_ml_trailing_stop": 0.10,
+    "live_inverse_ml_quote_max_age_seconds": 3.0,
+    "status_log_seconds": 30.0,
 }
 
 # Paper-only asymmetric averaging schedule requested for the extended scalp
 # study.  It deliberately has no relationship to the 0.01-contract live GTC
 # ladder or its capital limits.
 WEIGHTED_SCALP_RUNG_QUANTITIES = {0.40: 1.0, 0.30: 2.0, 0.20: 3.0, 0.10: 4.0}
-LIVE_EXECUTION_STRATEGY = "settlement_contrarian_settlement_v2"
-# Records created by the prior live settlement runner remain recoverable. Its
-# retired trail fields are ignored; they are never allowed to create a close.
-LIVE_SETTLEMENT_RECORD_STRATEGIES = {
-    "settlement_contrarian_weighted_hold_gate_live_v1",
-    "settlement_contrarian_settlement_v2",
-}
+LIVE_EXECUTION_STRATEGIES = {"normal_ml_ladder", "inverse_ml_weighted_hold_gate"}
 DEFAULT_WEIGHTED_TRAILING_NORMAL_LEDGER = Path("kalshi_btc15m_weighted_trailing_normal_ledger.json")
 DEFAULT_WEIGHTED_TRAILING_NORMAL_REPORT = Path("kalshi_btc15m_weighted_trailing_normal_report.json")
 DEFAULT_WEIGHTED_TRAILING_INVERSE_LEDGER = Path("kalshi_btc15m_weighted_trailing_inverse_ledger.json")
@@ -228,33 +210,6 @@ def as_float(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return result if math.isfinite(result) else None
-
-
-def as_bool(value: Any) -> bool | None:
-    """Parse persisted booleans and GitHub Action string inputs strictly."""
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        normalized = value.strip().lower()
-        if normalized in {"1", "true", "yes", "on"}:
-            return True
-        if normalized in {"0", "false", "no", "off"}:
-            return False
-    return None
-
-
-def share_quantity(value: Any, name: str) -> float:
-    """Validate the configured 0.01-contract minimum and two-decimal precision."""
-    numeric = as_float(value)
-    rounded = None if numeric is None else round(numeric, 2)
-    if (
-        numeric is None
-        or numeric < 0.01
-        or rounded is None
-        or not math.isclose(numeric, rounded, abs_tol=1e-9)
-    ):
-        raise ValueError(f"{name} must be at least 0.01 and use no more than two decimal places")
-    return rounded
 
 
 def field(obj: Any, *names: str) -> Any:
@@ -364,11 +319,6 @@ def market_can_start_watcher(market: Any, start_grace_seconds: float) -> bool:
     return 0.0 <= seconds_since_open <= start_grace_seconds
 
 
-def entry_start_grace_seconds(config: dict[str, Any]) -> float:
-    """Settlement signals need a short, causal post-open entry grace."""
-    return float(config["settlement_contrarian_entry_grace_seconds"])
-
-
 def market_result(market: Any) -> str | None:
     raw = field(market, "result")
     result = str(getattr(raw, "value", raw) or "").lower()
@@ -446,45 +396,16 @@ def ladder_principal_for_rungs(rung_quantities: dict[float, float]) -> float:
     return round(sum(level * float(rung_quantities.get(level) or 0.0) for level in LADDER_LEVELS), 6)
 
 
-def live_settlement_contrarian_enabled(config: dict[str, Any]) -> bool:
-    """The live runner has one fixed, model-free execution source."""
-    return str(config.get("live_execution_strategy") or "").strip() == LIVE_EXECUTION_STRATEGY
+def live_weighted_inverse_enabled(config: dict[str, Any]) -> bool:
+    return str(config.get("live_execution_strategy") or "").strip() == "inverse_ml_weighted_hold_gate"
 
 
-def live_weighted_strategy_name(config: dict[str, Any]) -> str:
-    return "SETTLEMENT CONTRARIAN"
-
-
-def rung_quantities_for_base_share_count(base_share_count: float) -> dict[float, float]:
-    """Return the fixed 1/2/3/4 ladder for one immutable base-size snapshot."""
-    shares = share_quantity(base_share_count, "base_share_count")
-    return {
-        level: round(shares * WEIGHTED_SCALP_RUNG_QUANTITIES[level], 2)
-        for level in LADDER_LEVELS
-    }
-
-
-def dynamic_base_share_count(state: dict[str, Any] | None, config: dict[str, Any]) -> float:
-    """Return the current base only when the persisted dynamic rule is enabled.
-
-    Existing ladders never call this helper to resize themselves: their
-    per-rung quantities are stored on the market record at submission time.
-    """
-    starting = share_quantity(config["initial_position_size"], "initial_position_size")
-    if not bool(config.get("enable_dynamic_scaling")) or not isinstance(state, dict):
-        return starting
-    control = state.get("dynamic_base_share_scaling")
-    if not isinstance(control, dict) or not bool(control.get("enabled")):
-        return starting
-    current = as_float(control.get("current_base_share_count"))
-    return share_quantity(current, "current_base_share_count") if current is not None and current > 0.0 else starting
-
-
-def live_rung_quantities(
-    config: dict[str, Any], state: dict[str, Any] | None = None,
-) -> dict[float, float]:
-    """Return the new-entry 1/2/3/4 ladder for the current configured base."""
-    return rung_quantities_for_base_share_count(dynamic_base_share_count(state, config))
+def live_rung_quantities(config: dict[str, Any]) -> dict[float, float]:
+    """Use the authorized weighted schedule only for the explicit live mode."""
+    if live_weighted_inverse_enabled(config):
+        return dict(WEIGHTED_SCALP_RUNG_QUANTITIES)
+    quantity = float(config["initial_position_size"])
+    return {level: quantity for level in LADDER_LEVELS}
 
 
 def load_json(path: Path, default: dict[str, Any]) -> dict[str, Any]:
@@ -518,31 +439,11 @@ def checkpoint_projection(value: Any) -> Any:
     return value
 
 
-def checkpoint_fingerprint(
-    state: dict[str, Any], config: dict[str, Any], extra_paths: tuple[Path, ...] = (),
-) -> str:
-    """Hash material state, including durable equity-regime ledgers.
-
-    The settlement ledger changes whenever a closed market is accounted, but
-    an equity-regime-only change need not modify the main trader state.  Hash
-    the explicitly checkpointed companion files too, so the in-run publisher
-    cannot skip a shadow-balance update that the next Actions handoff needs.
-    """
-
-    extra_files: list[dict[str, str | None]] = []
-    for path in extra_paths:
-        resolved = path.expanduser().resolve()
-        try:
-            content_hash = hashlib.sha256(resolved.read_bytes()).hexdigest() if resolved.is_file() else None
-        except OSError:
-            # The normal end-of-run checkpoint can still create a file that
-            # did not exist at initialization; include its path deterministically.
-            content_hash = None
-        extra_files.append({"path": str(resolved), "sha256": content_hash})
+def checkpoint_fingerprint(state: dict[str, Any], config: dict[str, Any]) -> str:
+    """Hash material strategy state without writing secrets or quote noise."""
     payload = {
         "state": checkpoint_projection(state),
         "config": checkpoint_projection(config),
-        "extra_files": extra_files,
     }
     encoded = json.dumps(payload, sort_keys=True, default=str, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
@@ -562,7 +463,14 @@ class StateCheckpointPublisher:
     config_path: Path
     state_path: Path
     report_path: Path
-    extra_paths: tuple[Path, ...]
+    weighted_normal_ledger_path: Path
+    weighted_normal_report_path: Path
+    weighted_inverse_ledger_path: Path
+    weighted_inverse_report_path: Path
+    weighted_fixed_normal_ledger_path: Path
+    weighted_fixed_normal_report_path: Path
+    weighted_fixed_inverse_ledger_path: Path
+    weighted_fixed_inverse_report_path: Path
     config: dict[str, Any]
     last_fingerprint: str
     enabled: bool
@@ -641,7 +549,11 @@ class StateCheckpointPublisher:
     @classmethod
     def create(
         cls, config_path: Path, state_path: Path, report_path: Path,
-        config: dict[str, Any], state: dict[str, Any], extra_paths: tuple[Path, ...] = (),
+        weighted_normal_ledger_path: Path, weighted_normal_report_path: Path,
+        weighted_inverse_ledger_path: Path, weighted_inverse_report_path: Path,
+        weighted_fixed_normal_ledger_path: Path, weighted_fixed_normal_report_path: Path,
+        weighted_fixed_inverse_ledger_path: Path, weighted_fixed_inverse_report_path: Path,
+        config: dict[str, Any], state: dict[str, Any],
     ) -> "StateCheckpointPublisher":
         enabled = (
             os.getenv("GITHUB_ACTIONS", "").lower() == "true"
@@ -655,15 +567,22 @@ class StateCheckpointPublisher:
             config_path=config_path,
             state_path=state_path,
             report_path=report_path,
-            extra_paths=extra_paths,
+            weighted_normal_ledger_path=weighted_normal_ledger_path,
+            weighted_normal_report_path=weighted_normal_report_path,
+            weighted_inverse_ledger_path=weighted_inverse_ledger_path,
+            weighted_inverse_report_path=weighted_inverse_report_path,
+            weighted_fixed_normal_ledger_path=weighted_fixed_normal_ledger_path,
+            weighted_fixed_normal_report_path=weighted_fixed_normal_report_path,
+            weighted_fixed_inverse_ledger_path=weighted_fixed_inverse_ledger_path,
+            weighted_fixed_inverse_report_path=weighted_fixed_inverse_report_path,
             config=config,
-            last_fingerprint=checkpoint_fingerprint(state, config, extra_paths),
+            last_fingerprint=checkpoint_fingerprint(state, config),
             enabled=enabled,
             target_branch=target_branch,
         )
 
     def publish_if_changed(self, state: dict[str, Any], reason: str) -> bool:
-        current = checkpoint_fingerprint(state, self.config, self.extra_paths)
+        current = checkpoint_fingerprint(state, self.config)
         if current == self.last_fingerprint:
             return False
         if not self.enabled:
@@ -674,23 +593,33 @@ class StateCheckpointPublisher:
             return False
         self.last_attempt_at = now
         try:
-            # Dynamic capacity changes are part of the live risk envelope and
-            # must survive the same handoff as the trade state that caused
-            # them. Saving all three files before staging keeps config/report
-            # consistent with the durable ledger.
-            save_json(self.config_path, self.config)
             save_json(self.state_path, state)
             save_json(self.report_path, performance_report(state, self.config))
+            save_ml_weighted_trailing_outputs(
+                state, self.config,
+                normal_ledger_path=self.weighted_normal_ledger_path,
+                normal_report_path=self.weighted_normal_report_path,
+                inverse_ledger_path=self.weighted_inverse_ledger_path,
+                inverse_report_path=self.weighted_inverse_report_path,
+            )
+            save_ml_weighted_fixed_stop_outputs(
+                state, self.config,
+                normal_ledger_path=self.weighted_fixed_normal_ledger_path,
+                normal_report_path=self.weighted_fixed_normal_report_path,
+                inverse_ledger_path=self.weighted_fixed_inverse_ledger_path,
+                inverse_report_path=self.weighted_fixed_inverse_report_path,
+            )
             repository = subprocess.run(
                 ["git", "rev-parse", "--show-toplevel"], check=True, capture_output=True, text=True,
             ).stdout.strip()
             root = Path(repository).resolve()
-            durable_paths = (self.config_path, self.state_path, self.report_path, *self.extra_paths)
-            paths = [
-                str(path.resolve().relative_to(root))
-                for path in durable_paths
-                if path.exists()
-            ]
+            paths = [str(path.resolve().relative_to(root)) for path in (
+                self.config_path, self.state_path, self.report_path,
+                self.weighted_normal_ledger_path, self.weighted_normal_report_path,
+                self.weighted_inverse_ledger_path, self.weighted_inverse_report_path,
+                self.weighted_fixed_normal_ledger_path, self.weighted_fixed_normal_report_path,
+                self.weighted_fixed_inverse_ledger_path, self.weighted_fixed_inverse_report_path,
+            )]
             subprocess.run(["git", "add", *paths], check=True, capture_output=True, text=True)
             diff = subprocess.run(
                 ["git", "diff", "--cached", "--quiet"], capture_output=True, text=True,
@@ -721,60 +650,82 @@ class StateCheckpointPublisher:
 
 
 def validate_config(config: dict[str, Any]) -> dict[str, Any]:
-    # Legacy model, paper-study, and hold-gate keys are intentionally omitted
-    # from DEFAULT_CONFIG and therefore cannot re-enter this live runner.
-    legacy = dict(config)
-    merged = {**DEFAULT_CONFIG, **{key: value for key, value in legacy.items() if key in DEFAULT_CONFIG}}
-    merged["format_version"] = CONFIG_VERSION
-    # A deployment may not select its source dynamically. This prevents an
-    # inherited Action input from restoring a retired model/gate strategy.
-    merged["live_execution_strategy"] = LIVE_EXECUTION_STRATEGY
-    # Every eligible market receives its settlement-contrarian signal.  A
-    # persisted two-loss skip state is observational legacy data only.
-    merged["live_consecutive_loss_limit"] = 0
-    merged["live_markets_to_skip_after_loss_limit"] = 0
-    # The source must be the immediately preceding finalized market, but it
-    # may arrive at any time in this post-open submission window.  This fixed
-    # value prevents old state or Action inputs from silently shortening it.
-    merged["settlement_contrarian_entry_grace_seconds"] = SETTLEMENT_CONTRARIAN_ENTRY_GRACE_SECONDS
-    # Fail closed against persisted Action inputs/configuration that predate
-    # the retirement of live Prophet forecasts.  This runner must never
-    # construct the equity-regime controller or emit a new forecast.
-    merged["equity_regime_enabled"] = False
-    merged["equity_regime_dry_run"] = True
-    merged["prophet_enabled"] = False
-    merged["prophet_refit_every_markets"] = 1
-    for name in ("enable_dynamic_scaling", "max_contracts_per_market_auto", "max_total_capital_auto"):
-        value = as_bool(merged.get(name))
-        if value is None:
-            raise ValueError(f"{name} must be true or false")
-        merged[name] = value
+    merged = {**DEFAULT_CONFIG, **config, "format_version": CONFIG_VERSION}
+    # Earlier versions used a short price-entry window. The persisted watcher
+    # now exists only to attach the frozen ML direction and post the full GTC
+    # ladder, so remove the retired setting when an old config is handed on.
+    merged.pop("initial_entry_window_seconds", None)
     for name in (
         "initial_position_size", "max_contracts_per_market", "max_total_capital",
         "fee_reserve", "poll_seconds", "market_refresh_seconds", "order_reconcile_seconds",
-        "watch_start_grace_seconds", "live_absolute_stop_price", "live_quote_max_age_seconds",
-        "settlement_contrarian_entry_grace_seconds", "scaling_profit_multiplier",
-        "status_log_seconds",
+        "watch_start_grace_seconds", "ml_preopen_lead_seconds", "ml_min_confidence",
+        "inverse_shadow_position_size", "inverse_shadow_quote_max_age_seconds",
+        "scalp_shadow_position_size", "scalp_shadow_profit_target", "scalp_shadow_quote_max_age_seconds",
+        "weighted_scalp_trailing_stop_per_contract", "weighted_scalp_trailing_activation_gain_per_contract",
+        "weighted_scalp_fixed_stop_loss_per_contract", "weighted_scalp_absolute_stop_price",
+        "model_transition_shadow_position_size", "status_log_seconds",
+        "live_inverse_ml_hold_gate", "live_inverse_ml_absolute_stop_price",
+        "live_inverse_ml_trailing_stop", "live_inverse_ml_quote_max_age_seconds",
     ):
         value = as_float(merged.get(name))
         if value is None or value <= 0:
             raise ValueError(f"{name} must be positive")
         merged[name] = value
-    merged["initial_position_size"] = share_quantity(merged["initial_position_size"], "initial_position_size")
-    merged["base_share_increment"] = share_quantity(merged["base_share_increment"], "base_share_increment")
+    if merged["ml_min_confidence"] < 0.5 or merged["ml_min_confidence"] > 1.0:
+        raise ValueError("ml_min_confidence must be between 0.5 and 1.0")
+    execution_strategy = str(merged.get("live_execution_strategy") or "").strip()
+    if execution_strategy not in LIVE_EXECUTION_STRATEGIES:
+        raise ValueError(f"live_execution_strategy must be one of {sorted(LIVE_EXECUTION_STRATEGIES)}")
+    merged["live_execution_strategy"] = execution_strategy
+    shadow_enabled = merged.get("inverse_shadow_enabled", True)
+    if isinstance(shadow_enabled, str):
+        shadow_enabled = shadow_enabled.strip().lower() in {"1", "true", "yes", "on"}
+    merged["inverse_shadow_enabled"] = bool(shadow_enabled)
+    scalp_shadow_enabled = merged.get("scalp_shadow_enabled", True)
+    if isinstance(scalp_shadow_enabled, str):
+        scalp_shadow_enabled = scalp_shadow_enabled.strip().lower() in {"1", "true", "yes", "on"}
+    merged["scalp_shadow_enabled"] = bool(scalp_shadow_enabled)
+    weighted_scalp_enabled = merged.get("weighted_scalp_shadow_enabled", True)
+    if isinstance(weighted_scalp_enabled, str):
+        weighted_scalp_enabled = weighted_scalp_enabled.strip().lower() in {"1", "true", "yes", "on"}
+    merged["weighted_scalp_shadow_enabled"] = bool(weighted_scalp_enabled)
+    trailing_enabled = merged.get("weighted_scalp_trailing_enabled", False)
+    if isinstance(trailing_enabled, str):
+        trailing_enabled = trailing_enabled.strip().lower() in {"1", "true", "yes", "on"}
+    merged["weighted_scalp_trailing_enabled"] = bool(trailing_enabled)
+    fixed_stop_enabled = merged.get("weighted_scalp_fixed_stop_loss_enabled", True)
+    if isinstance(fixed_stop_enabled, str):
+        fixed_stop_enabled = fixed_stop_enabled.strip().lower() in {"1", "true", "yes", "on"}
+    merged["weighted_scalp_fixed_stop_loss_enabled"] = bool(fixed_stop_enabled)
+    activation_comparison_enabled = merged.get("weighted_scalp_activation_comparison_enabled", True)
+    if isinstance(activation_comparison_enabled, str):
+        activation_comparison_enabled = activation_comparison_enabled.strip().lower() in {"1", "true", "yes", "on"}
+    merged["weighted_scalp_activation_comparison_enabled"] = bool(activation_comparison_enabled)
+    raw_gains = merged.get("weighted_scalp_trailing_activation_gains_per_contract", [])
+    if isinstance(raw_gains, str):
+        raw_gains = [part.strip() for part in raw_gains.split(",") if part.strip()]
+    if not isinstance(raw_gains, (list, tuple)):
+        raise ValueError("weighted_scalp_trailing_activation_gains_per_contract must be a list")
+    try:
+        gains = sorted({round(float(gain), 6) for gain in raw_gains})
+    except (TypeError, ValueError) as exc:
+        raise ValueError("weighted_scalp_trailing_activation_gains_per_contract must contain numbers") from exc
+    if not gains or any(gain <= 0.0 or gain >= 1.0 for gain in gains):
+        raise ValueError("weighted_scalp_trailing_activation_gains_per_contract must be between zero and one")
+    merged["weighted_scalp_trailing_activation_gains_per_contract"] = gains
+    transition_shadow_enabled = merged.get("model_transition_shadow_enabled", True)
+    if isinstance(transition_shadow_enabled, str):
+        transition_shadow_enabled = transition_shadow_enabled.strip().lower() in {"1", "true", "yes", "on"}
+    merged["model_transition_shadow_enabled"] = bool(transition_shadow_enabled)
     active = int(merged.get("max_active_markets", 0))
     if active < 1:
         raise ValueError("max_active_markets must be at least one")
     merged["max_active_markets"] = active
-    rungs = live_rung_quantities(merged)
-    required_contracts = round(sum(rungs.values()), 2)
-    required_principal = ladder_principal_for_rungs(rungs)
-    if required_contracts > merged["max_contracts_per_market"] + 1e-9:
-        raise ValueError(
-            f"max_contracts_per_market must fund the {required_contracts:.2f}-contract 1/2/3/4 ladder"
-        )
-    if required_principal > merged["max_total_capital"] + 1e-9:
-        raise ValueError(f"max_total_capital must fund the ${required_principal:.2f} complete ladder")
+    quantity = merged["initial_position_size"]
+    if round(quantity * len(LADDER_LEVELS), 2) > merged["max_contracts_per_market"] + 1e-9:
+        raise ValueError("initial_position_size * four ladder levels exceeds max_contracts_per_market")
+    if ladder_principal(quantity) > merged["max_total_capital"] + 1e-9:
+        raise ValueError("max_total_capital cannot fund the complete four-level ladder")
     return merged
 
 
@@ -782,10 +733,8 @@ def apply_config_overrides(config: dict[str, Any], args: argparse.Namespace) -> 
     names = (
         "initial_position_size", "max_active_markets", "max_contracts_per_market",
         "max_total_capital", "fee_reserve", "poll_seconds", "market_refresh_seconds",
-        "order_reconcile_seconds", "watch_start_grace_seconds", "status_log_seconds",
-        "enable_dynamic_scaling", "base_share_increment", "scaling_profit_multiplier",
-        "allow_live_state_transitions", "subaccount", "starting_balance", "history_max_markets",
-        "history_start_ts", "history_end_ts", "accounting_tolerance", "shadow_fill_model",
+        "order_reconcile_seconds", "watch_start_grace_seconds", "ml_preopen_lead_seconds",
+        "ml_min_confidence", "status_log_seconds", "live_inverse_ml_hold_gate",
     )
     changed = False
     updated = dict(config)
@@ -794,21 +743,27 @@ def apply_config_overrides(config: dict[str, Any], args: argparse.Namespace) -> 
         if value is not None:
             updated[name] = value
             changed = True
-    # The share multiplier is persistent.  Change it alone and both capacity
-    # limits follow the real 1/2/3/4 structure, not four equal rungs.
+    # The share input is the primary sizing control.  When it is changed by
+    # itself, carry the complete four-rung contract cap and principal reserve
+    # with it: 10 contracts per rung becomes a 40-contract/$10 ladder, not an
+    # invalid 10-contract request against the old one-contract defaults.
     rung_override = as_float(getattr(args, "initial_position_size", None))
     if rung_override is not None and rung_override > 0:
-        scaled_rungs = rung_quantities_for_base_share_count(rung_override)
         if getattr(args, "max_contracts_per_market", None) is None:
-            updated["max_contracts_per_market"] = round(sum(scaled_rungs.values()), 2)
-            updated["max_contracts_per_market_auto"] = True
+            updated["max_contracts_per_market"] = round(rung_override * len(LADDER_LEVELS), 2)
         if getattr(args, "max_total_capital", None) is None:
-            updated["max_total_capital"] = ladder_principal_for_rungs(scaled_rungs)
-            updated["max_total_capital_auto"] = True
-    if getattr(args, "max_contracts_per_market", None) is not None:
-        updated["max_contracts_per_market_auto"] = False
-    if getattr(args, "max_total_capital", None) is not None:
-        updated["max_total_capital_auto"] = False
+            updated["max_total_capital"] = ladder_principal(rung_override)
+    strategy_override = getattr(args, "live_execution_strategy", None)
+    if strategy_override is not None:
+        updated["live_execution_strategy"] = strategy_override
+        changed = True
+        if strategy_override == "inverse_ml_weighted_hold_gate":
+            # This mode has no fractional 0.01 ladder: it reserves the full
+            # 1/2/3/4 schedule, i.e. 10 contracts and $2.00 maximum principal.
+            if getattr(args, "max_contracts_per_market", None) is None:
+                updated["max_contracts_per_market"] = round(sum(WEIGHTED_SCALP_RUNG_QUANTITIES.values()), 2)
+            if getattr(args, "max_total_capital", None) is None:
+                updated["max_total_capital"] = ladder_principal_for_rungs(WEIGHTED_SCALP_RUNG_QUANTITIES)
     return validate_config(updated), changed
 
 
@@ -856,11 +811,6 @@ def client_order_id(ticker: str, side: str, order_key: str) -> str:
     An initial protected IOC can itself be observed at 30c/20c/10c. It must
     not collide with the separately requested averaging rung at that price.
     """
-    return f"{BOT_CLIENT_ORDER_PREFIX}{uuid.uuid5(ORDER_NAMESPACE, f'average-down-v1:{ticker}:{side}:{order_key}').hex}"
-
-
-def legacy_client_order_id(ticker: str, side: str, order_key: str) -> str:
-    """The pre-prefix deterministic ID remains recoverable after upgrade."""
     return str(uuid.uuid5(ORDER_NAMESPACE, f"average-down-v1:{ticker}:{side}:{order_key}"))
 
 
@@ -872,7 +822,7 @@ def managed_mechanical_order_role(order: Any) -> tuple[str, str] | None:
         return None
     for side in ("yes", "no"):
         for order_key in ("initial", "0.3000", "0.2000", "0.1000"):
-            if client_id in {client_order_id(ticker, side, order_key), legacy_client_order_id(ticker, side, order_key)}:
+            if client_id == client_order_id(ticker, side, order_key):
                 return side, order_key
     return None
 
@@ -906,7 +856,6 @@ class KalshiLiveFeed:
         self.desired_tickers: set[str] = set()
         self.subscribed_tickers: set[str] = set()
         self.quotes: dict[str, dict[str, Any]] = {}
-        self.public_trades: dict[str, list[dict[str, Any]]] = {}
         self.connected = False
         self.message_count = 0
         self.update_count = 0
@@ -921,7 +870,6 @@ class KalshiLiveFeed:
             # executable for a newly watched ticker.
             for ticker in desired - self.desired_tickers:
                 self.quotes.pop(ticker, None)
-                self.public_trades.pop(ticker, None)
             self.desired_tickers = desired
             self._wake.set()
 
@@ -1046,17 +994,6 @@ class KalshiLiveFeed:
             "quote_age_seconds": round(max(0.0, age), 6),
         }, "executable_top_of_book"
 
-    def public_trades_after(self, ticker: str, created_at: datetime) -> list[dict[str, Any]]:
-        """Post-order public executions only; missing evidence is not a fill."""
-        created = created_at.astimezone(timezone.utc)
-        return [
-            dict(event)
-            for event in self.public_trades.get(ticker, [])
-            if (server_time := utc_timestamp(event.get("source_server_timestamp"))) is not None
-            and (received_time := utc_timestamp(event.get("received_at"))) is not None
-            and server_time > created and received_time >= created
-        ]
-
     async def wait_for_update(self, timeout: float, observed_update_count: int) -> int:
         """Return the latest update sequence without losing a just-arrived event."""
         if self.update_count != observed_update_count:
@@ -1087,7 +1024,7 @@ class KalshiLiveFeed:
         await ws.send_json({
             "id": self._command_id,
             "cmd": "subscribe",
-            "params": {"channels": ["ticker", "trade"], "market_tickers": sorted(tickers)},
+            "params": {"channels": ["ticker"], "market_tickers": sorted(tickers)},
         })
         self.subscribed_tickers.update(tickers)
         LOG.info("WS SUBSCRIBE | tickers=%s", ",".join(sorted(tickers)))
@@ -1112,31 +1049,6 @@ class KalshiLiveFeed:
             self.private_update_count += 1
             self._wake.set()
             return
-        if message_type == "trade":
-            message = payload.get("msg") or {}
-            ticker = str(message.get("market_ticker") or message.get("ticker") or "")
-            trade_id = str(message.get("trade_id") or "")
-            source_time = field(message, "ts_ms", "created_time", "time", "ts")
-            count = as_float(field(message, "count_fp", "count"))
-            yes_price = as_float(field(message, "yes_price_dollars", "yes_price"))
-            no_price = as_float(field(message, "no_price_dollars", "no_price"))
-            if not ticker or not trade_id or source_time is None or count is None or count <= 0:
-                return
-            if yes_price is None and no_price is None:
-                return
-            events = self.public_trades.setdefault(ticker, [])
-            if any(event.get("trade_id") == trade_id for event in events):
-                return
-            events.append({
-                "trade_id": trade_id, "ticker": ticker, "count": round(count, 6),
-                "yes_price": yes_price, "no_price": no_price,
-                "source_server_timestamp": source_time, "received_at": now_iso(),
-            })
-            if len(events) > 5000:
-                del events[:-5000]
-            self.update_count += 1
-            self._wake.set()
-            return
         if message_type != "ticker":
             return
         message = payload.get("msg") or {}
@@ -1148,39 +1060,11 @@ class KalshiLiveFeed:
         yes_ask = as_float(message.get("yes_ask_dollars", message.get("yes_ask")))
         yes_bid_size = as_float(field(message, "yes_bid_size_fp", "yes_bid_size"))
         yes_ask_size = as_float(field(message, "yes_ask_size_fp", "yes_ask_size"))
-        received_epoch = time.time()
-        received_at = now_iso()
-        source_server_timestamp = field(message, "time", "timestamp", "created_time")
-        source_timestamp_ms = field(message, "ts_ms", "timestamp_ms")
         if yes_bid is not None:
             quote["yes_bid"] = yes_bid
-            quote["yes_bid_received_epoch"] = received_epoch
-            quote["yes_bid_source_timestamp"] = source_timestamp_ms or source_server_timestamp
         if yes_ask is not None:
             quote["yes_ask"] = yes_ask
-            quote["yes_ask_received_epoch"] = received_epoch
-            quote["yes_ask_source_timestamp"] = source_timestamp_ms or source_server_timestamp
         quote["received_monotonic"] = time.monotonic()
-        # Provisional outcome inference requires only fresh executable bids,
-        # not displayed size.  Reconstruct the latest bid/ask state with
-        # component timestamps so a final price-only ticker update is not
-        # discarded merely because it omitted depth fields.
-        if (yes_bid is not None or yes_ask is not None) and quote.get("yes_bid") is not None and quote.get("yes_ask") is not None:
-            ticker_sequence = int(quote.get("ticker_sequence") or 0) + 1
-            quote["ticker_sequence"] = ticker_sequence
-            quote["ticker_book"] = {
-                "quote_id": f"{ticker}:ticker:{ticker_sequence}:{received_at}",
-                "yes_bid": quote["yes_bid"],
-                "yes_ask": quote["yes_ask"],
-                "yes_bid_received_epoch": quote.get("yes_bid_received_epoch"),
-                "yes_ask_received_epoch": quote.get("yes_ask_received_epoch"),
-                "yes_bid_source_timestamp": quote.get("yes_bid_source_timestamp"),
-                "yes_ask_source_timestamp": quote.get("yes_ask_source_timestamp"),
-                "received_epoch": received_epoch,
-                "received_at": received_at,
-                "source_server_timestamp": source_server_timestamp,
-                "source_timestamp_ms": source_timestamp_ms,
-            }
         # Preserve only a *complete snapshot* for executable-shadow fills.
         # Delta updates and last-trade-only messages are useful operational
         # signals, but cannot establish a displayed, executable quote.
@@ -1189,6 +1073,7 @@ class KalshiLiveFeed:
             assert yes_bid_size is not None and yes_ask_size is not None
             if 0.0 < yes_bid <= yes_ask < 1.0 and yes_bid_size >= 0.0 and yes_ask_size >= 0.0:
                 sequence = int(quote.get("book_sequence") or 0) + 1
+                received_at = now_iso()
                 quote["book_sequence"] = sequence
                 quote["complete_book"] = {
                     "quote_id": f"{ticker}:{sequence}:{received_at}",
@@ -1198,8 +1083,8 @@ class KalshiLiveFeed:
                     "yes_ask_size": yes_ask_size,
                     "received_monotonic": time.monotonic(),
                     "received_at": received_at,
-                    "source_server_timestamp": source_server_timestamp,
-                    "source_timestamp_ms": source_timestamp_ms,
+                    "source_server_timestamp": field(message, "time", "timestamp", "created_time"),
+                    "source_timestamp_ms": field(message, "ts_ms", "timestamp_ms"),
                 }
         self.update_count += 1
         self._wake.set()
@@ -1231,7 +1116,6 @@ class KalshiLiveFeed:
                         # New socket, new market-data sequence: do not reuse a
                         # quote that was received before this subscription.
                         self.quotes.clear()
-                        self.public_trades.clear()
                         LOG.info("WS CONNECTED | %s", self.url)
                         await self._session_loop(ws)
             except asyncio.CancelledError:
@@ -1565,8 +1449,8 @@ class KalshiREST:
         if KalshiClient is None or KalshiAuth is None:
             raise RuntimeError("Install requirements_kalshi_average_down.txt before running")
         pem = self.pem_path.read_text(encoding="utf-8")
-        self.base_url = "https://demo-api.kalshi.co/trade-api/v2" if self.demo else "https://api.elections.kalshi.com/trade-api/v2"
-        configuration = Configuration(host=self.base_url)
+        base_url = "https://demo-api.kalshi.co/trade-api/v2" if self.demo else "https://api.elections.kalshi.com/trade-api/v2"
+        configuration = Configuration(host=base_url)
         configuration.api_key_id = self.api_key_id
         configuration.private_key_pem = pem
         self.client = KalshiClient(configuration)
@@ -1577,36 +1461,6 @@ class KalshiREST:
         self.orders = OrdersApi(self.client)
         self.pause_until = 0.0
         self.pause_reason: str | None = None
-
-    async def get_raw_json(self, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-        """Signed, retrying GET for historical/accounting endpoints absent from the SDK."""
-        if aiohttp is None:
-            raise RuntimeError("aiohttp is required for Kalshi history synchronization")
-        normalized_path = "/" + path.lstrip("/")
-        # Kalshi signs the complete path from the host root.  ``base_url``
-        # already contains /trade-api/v2, but API helpers receive endpoint
-        # paths relative to it; signing just /portfolio/fills would therefore
-        # fail authentication even though the request URL is correct.
-        signature_path = "/trade-api/v2" + normalized_path
-        last_error: Exception | None = None
-        for attempt in range(4):
-            headers = {"Accept": "application/json", **self.auth.create_auth_headers("GET", signature_path)}
-            try:
-                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as session:
-                    async with session.get(self.base_url + normalized_path, params=params or {}, headers=headers) as response:
-                        if response.status >= 400:
-                            body = await response.text()
-                            raise RuntimeError(f"Kalshi GET {normalized_path} HTTP {response.status}: {body[:240]}")
-                        payload = await response.json(content_type=None)
-                        if not isinstance(payload, dict):
-                            raise RuntimeError(f"Kalshi GET {normalized_path} returned non-object JSON")
-                        return payload
-            except Exception as exc:  # noqa: BLE001 - only read-only GETs retry
-                last_error = exc
-                if attempt < 3:
-                    await asyncio.sleep(min(8.0, 2 ** attempt))
-        assert last_error is not None
-        raise last_error
 
     async def close(self) -> None:
         await self.client.close()
@@ -1621,20 +1475,6 @@ class KalshiREST:
             return cents / 100.0 if cents is not None else None
         except Exception as exc:  # noqa: BLE001
             LOG.warning("Balance lookup failed: %s", exc)
-            return None
-
-    async def balance_decimal(self) -> Decimal | None:
-        """Read the authenticated cash balance without binary-float accounting."""
-
-        try:
-            response = await self.portfolio.get_balance()
-            dollars = field(response, "balance_dollars")
-            if dollars is not None:
-                return Decimal(str(dollars))
-            cents = field(response, "balance")
-            return Decimal(str(cents)) / Decimal("100") if cents is not None else None
-        except Exception as exc:  # noqa: BLE001
-            LOG.warning("Decimal balance lookup failed: %s", exc)
             return None
 
     async def position_for_ticker(self, ticker: str) -> float | None:
@@ -1734,148 +1574,12 @@ class KalshiREST:
                     markets.append(market)
         return markets
 
-    async def latest_settled_btc15m_before(self, cutoff_epoch: float) -> dict[str, Any] | None:
-        """Fetch the latest settled KXBTC15M result available by ``cutoff``.
-
-        This deliberately uses Kalshi's public market records rather than the
-        bot's own order ledger: a fresh worker must be able to reconstruct the
-        causal source after an Actions handoff.  A row is eligible only when
-        its explicit settlement timestamp is no later than the frozen cutoff;
-        markets that merely closed, remain active, or settle later are never
-        considered.  The current endpoint carries recent settlements; the
-        archive endpoint is a read-only fallback for an unusual API rollover.
-        """
-        if aiohttp is None:
-            LOG.error("SETTLEMENT CONTRARIAN UNAVAILABLE | aiohttp is not installed.")
-            return None
-        endpoints = (
-            ("https://external-api.kalshi.com/trade-api/v2/markets", {"status": "settled"}),
-            ("https://external-api.kalshi.com/trade-api/v2/historical/markets", {}),
-        )
-        eligible: list[dict[str, Any]] = []
-        try:
-            timeout = aiohttp.ClientTimeout(total=12)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                for url, parameters in endpoints:
-                    params = {"series_ticker": SERIES_TICKER, "limit": "1000", **parameters}
-                    async with session.get(url, params=params, headers={"Accept": "application/json"}) as response:
-                        if response.status >= 400:
-                            LOG.warning(
-                                "SETTLEMENT CONTRARIAN LOOKUP | %s returned HTTP %s.", url, response.status,
-                            )
-                            continue
-                        payload = await response.json(content_type=None)
-                    markets = payload.get("markets") if isinstance(payload, dict) else None
-                    if not isinstance(markets, list):
-                        continue
-                    for market in markets:
-                        if not isinstance(market, dict):
-                            continue
-                        ticker = str(market.get("ticker") or "")
-                        settled_at = timestamp_epoch(market.get("settlement_ts"))
-                        result = market_result(market)
-                        if (
-                            ticker.startswith(SERIES_TICKER + "-")
-                            and result in {"yes", "no"}
-                            and settled_at is not None
-                            and settled_at <= cutoff_epoch + 1e-9
-                        ):
-                            eligible.append({
-                                "ticker": ticker,
-                                "result": result,
-                                "settlement_ts": market.get("settlement_ts"),
-                                "settlement_epoch": settled_at,
-                                "source": "kalshi_public_current" if "historical" not in url else "kalshi_public_historical",
-                            })
-                    # A current endpoint result is sufficient and avoids an
-                    # unnecessary archival request in the normal live path.
-                    if eligible:
-                        break
-        except Exception as exc:  # noqa: BLE001
-            LOG.warning("SETTLEMENT CONTRARIAN LOOKUP FAILED | %s", exc)
-            return None
-        if not eligible:
-            return None
-        return max(eligible, key=lambda item: (int(item["settlement_epoch"]), str(item["ticker"])))
-
-    async def immediately_preceding_settled_btc15m(
-        self, current_open_epoch: float, available_by_epoch: float,
-    ) -> dict[str, Any] | None:
-        """Return only the finalized market that closed at this market's open.
-
-        This is intentionally narrower than ``latest_settled_btc15m_before``:
-        when a previous 15-minute market is still settling, using an older
-        outcome would silently change the strategy.  A source is eligible only
-        after Kalshi finalizes it and only if its close timestamp equals the
-        current market's opening timestamp.
-        """
-        if aiohttp is None:
-            LOG.error("SETTLEMENT CONTRARIAN UNAVAILABLE | aiohttp is not installed.")
-            return None
-        endpoints = (
-            ("https://external-api.kalshi.com/trade-api/v2/markets", {"status": "settled"}),
-            ("https://external-api.kalshi.com/trade-api/v2/historical/markets", {}),
-        )
-        eligible: list[dict[str, Any]] = []
-        try:
-            timeout = aiohttp.ClientTimeout(total=12)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                for url, parameters in endpoints:
-                    params = {"series_ticker": SERIES_TICKER, "limit": "1000", **parameters}
-                    async with session.get(url, params=params, headers={"Accept": "application/json"}) as response:
-                        if response.status >= 400:
-                            LOG.warning(
-                                "PRECEDING SETTLEMENT LOOKUP | %s returned HTTP %s.", url, response.status,
-                            )
-                            continue
-                        payload = await response.json(content_type=None)
-                    markets = payload.get("markets") if isinstance(payload, dict) else None
-                    if not isinstance(markets, list):
-                        continue
-                    for market in markets:
-                        if not isinstance(market, dict):
-                            continue
-                        ticker = str(market.get("ticker") or "")
-                        close_epoch = timestamp_epoch(market.get("close_time"))
-                        settled_at = timestamp_epoch(market.get("settlement_ts"))
-                        result = market_result(market)
-                        if (
-                            ticker.startswith(SERIES_TICKER + "-")
-                            and result in {"yes", "no"}
-                            and close_epoch is not None
-                            and abs(close_epoch - float(current_open_epoch)) <= 1.0
-                            and settled_at is not None
-                            and settled_at <= float(available_by_epoch) + 1e-9
-                        ):
-                            eligible.append({
-                                "ticker": ticker,
-                                "result": result,
-                                "close_time": market.get("close_time"),
-                                "close_epoch": close_epoch,
-                                "settlement_ts": market.get("settlement_ts"),
-                                "settlement_epoch": settled_at,
-                                "source": "kalshi_public_current" if "historical" not in url else "kalshi_public_historical",
-                            })
-                    if eligible:
-                        break
-        except Exception as exc:  # noqa: BLE001
-            LOG.warning("PRECEDING SETTLEMENT LOOKUP FAILED | %s", exc)
-            return None
-        if not eligible:
-            return None
-        return max(eligible, key=lambda item: (int(item["settlement_epoch"]), str(item["ticker"])))
-
     async def create_order(
         self, *, ticker: str, side: str, position_price: float, quantity: float,
         tif: str, expiration_time: int | None, dry_run: bool, order_key: str,
-        post_only: bool = False, client_order_id_override: str | None = None,
     ) -> dict[str, Any]:
-        # Never silently round an invalid caller quantity at the live API
-        # boundary. Every entry order must preserve the same cent precision
-        # used for dynamic base sizing, ledger accounting, and cap checks.
-        quantity = share_quantity(quantity, "entry order quantity")
         record = {
-            "client_order_id": client_order_id_override or client_order_id(ticker, side, order_key),
+            "client_order_id": client_order_id(ticker, side, order_key),
             "ticker": ticker,
             "side": side,
             "order_type": "ioc_protected" if tif == "immediate_or_cancel" else "limit",
@@ -1884,7 +1588,6 @@ class KalshiREST:
             "expected_outcome_side": side,
             "quantity": round(quantity, 2),
             "time_in_force": tif,
-            "post_only": post_only,
             "submitted_at": now_iso(),
             "status": "dry_run" if dry_run else "submitting",
             "fill_count": 0.0,
@@ -1908,7 +1611,6 @@ class KalshiREST:
             "client_order_id": record["client_order_id"],
             "self_trade_prevention_type": SelfTradePreventionType.TAKER_AT_CROSS,
             "reduce_only": False,
-            "post_only": post_only,
         }
         if expiration_time is not None:
             kwargs["expiration_time"] = int(expiration_time)
@@ -1956,7 +1658,7 @@ class KalshiREST:
 
     async def create_reduce_only_exit(
         self, *, ticker: str, held_side: str, economic_exit_price: float, quantity: float,
-        dry_run: bool, order_key: str, client_order_id_override: str | None = None,
+        dry_run: bool, order_key: str,
     ) -> dict[str, Any]:
         """Close an existing YES/NO position with a marketable, reduce-only IOC.
 
@@ -1967,13 +1669,12 @@ class KalshiREST:
         """
         if held_side not in {"yes", "no"}:
             raise ValueError(f"Unsupported held side for exit: {held_side}")
-        quantity = share_quantity(quantity, "reduce-only exit quantity")
-        if not 0.0 < economic_exit_price < 1.0:
+        if not 0.0 < economic_exit_price < 1.0 or quantity <= 0.0:
             raise ValueError("A live exit requires positive quantity and a valid executable bid")
         api_price = economic_exit_price if held_side == "yes" else 1.0 - economic_exit_price
         book_side = BookSide.ASK if held_side == "yes" else BookSide.BID
         record = {
-            "client_order_id": client_order_id_override or client_order_id(ticker, f"reduce-{held_side}", order_key),
+            "client_order_id": client_order_id(ticker, f"reduce-{held_side}", order_key),
             "ticker": ticker,
             "side": held_side,
             "held_side": held_side,
@@ -1983,11 +1684,6 @@ class KalshiREST:
             "book_side": "ask" if held_side == "yes" else "bid",
             "quantity": round(quantity, 2),
             "time_in_force": "immediate_or_cancel",
-            # This is a price-protected taker exit.  Keep the non-resting
-            # contract explicit in both the durable audit record and the API
-            # request so a future refactor cannot silently turn stops into
-            # maker/GTC orders.
-            "post_only": False,
             "reduce_only": True,
             "submitted_at": now_iso(),
             "status": "dry_run" if dry_run else "submitting",
@@ -2013,7 +1709,6 @@ class KalshiREST:
                 client_order_id=record["client_order_id"],
                 self_trade_prevention_type=SelfTradePreventionType.TAKER_AT_CROSS,
                 reduce_only=True,
-                post_only=False,
             )
         except Exception as exc:  # noqa: BLE001
             if pause_error(exc):
@@ -2034,72 +1729,6 @@ class KalshiREST:
         record["status"] = classify_submission(record["fill_count"], record["remaining_count"], quantity, "immediate_or_cancel")
         LOG.warning(
             "REDUCE-ONLY EXIT %s | %s %s bid=$%.4f x %.2f fill=%.2f remaining=%.2f id=%s",
-            record["status"].upper(), ticker, held_side.upper(), economic_exit_price, quantity,
-            record["fill_count"], record["remaining_count"], record["order_id"] or "?",
-        )
-        return record
-
-    async def create_reduce_only_maker_exit(
-        self, *, ticker: str, held_side: str, economic_exit_price: float, quantity: float,
-        expiration_time: int, dry_run: bool, order_key: str,
-        client_order_id_override: str | None = None,
-    ) -> dict[str, Any]:
-        """Rest a post-only, reduce-only GTC sale for only the held quantity.
-
-        The economic price is always expressed on the held YES/NO contract;
-        this adapter alone maps it to Kalshi's YES-side book representation.
-        Live callers must still reconcile cancellation and the authoritative
-        residual position before sending any hard-stop IOC.
-        """
-
-        if held_side not in {"yes", "no"}:
-            raise ValueError(f"Unsupported held side for maker exit: {held_side}")
-        quantity = share_quantity(quantity, "reduce-only maker exit quantity")
-        if not 0.0 < economic_exit_price < 1.0:
-            raise ValueError("A maker exit requires a valid limit price")
-        api_price = economic_exit_price if held_side == "yes" else 1.0 - economic_exit_price
-        book_side = BookSide.ASK if held_side == "yes" else BookSide.BID
-        record = {
-            "client_order_id": client_order_id_override or client_order_id(ticker, f"maker-reduce-{held_side}", order_key),
-            "ticker": ticker, "side": held_side, "held_side": held_side,
-            "order_type": "reduce_only_exit_maker", "exit_phase": "maker_exit",
-            "position_price": round(economic_exit_price, 4), "api_price": f"{api_price:.4f}",
-            "book_side": "ask" if held_side == "yes" else "bid", "quantity": round(quantity, 2),
-            "time_in_force": "good_till_canceled", "expiration_time": int(expiration_time),
-            "post_only": True, "reduce_only": True, "submitted_at": now_iso(),
-            "status": "dry_run" if dry_run else "submitting", "fill_count": 0.0,
-            "remaining_count": round(quantity, 2), "fees_paid": 0.0,
-        }
-        if dry_run:
-            return record
-        if self.trading_pause_active():
-            record["status"] = "paused"
-            record["error"] = self.pause_reason or "scheduled Kalshi trading pause"
-            return record
-        try:
-            response = await self.orders.create_order_v2(
-                ticker=ticker, side=book_side, count=f"{quantity:.2f}", price=record["api_price"],
-                time_in_force="good_till_canceled", expiration_time=int(expiration_time),
-                client_order_id=record["client_order_id"],
-                self_trade_prevention_type=SelfTradePreventionType.TAKER_AT_CROSS,
-                reduce_only=True, post_only=True,
-            )
-        except Exception as exc:  # noqa: BLE001
-            record["status"] = "paused" if pause_error(exc) else "submit_failed"
-            record["error"] = str(exc)
-            LOG.error("MAKER EXIT REJECTED | %s %s @ $%.4f: %s", ticker, held_side.upper(), economic_exit_price, exc)
-            return record
-        record["order_id"] = str(field(response, "order_id") or "") or None
-        record["fill_count"] = round(order_fill_count(response), 2)
-        remaining = order_remaining_count(response)
-        record["remaining_count"] = round(remaining if remaining is not None else quantity - record["fill_count"], 2)
-        record["average_fill_price"] = order_average_position_price(response, held_side, economic_exit_price)
-        record["fees_paid"] = order_fee_total(response)
-        record["status"] = classify_submission(
-            record["fill_count"], record["remaining_count"], quantity, "good_till_canceled",
-        )
-        LOG.warning(
-            "REDUCE-ONLY MAKER EXIT %s | %s %s @ $%.4f x %.2f fill=%.2f remaining=%.2f id=%s",
             record["status"].upper(), ticker, held_side.upper(), economic_exit_price, quantity,
             record["fill_count"], record["remaining_count"], record["order_id"] or "?",
         )
@@ -2181,47 +1810,25 @@ class KalshiREST:
                 return
             LOG.warning("Exit order lookup failed for %s: %s", order_id, exc)
 
-    async def cancel_order(self, record: dict[str, Any], dry_run: bool) -> bool:
-        """Cancel an order and report whether its disappearance is confirmed.
-
-        Callers that may replace an entry or flatten a position must treat a
-        ``False`` return as a hard stop.  In particular, merely logging a
-        cancellation exception and continuing can leave a resting maker order
-        able to fill after an IOC replacement or a reduce-only exit.
-        """
+    async def cancel_order(self, record: dict[str, Any], dry_run: bool) -> None:
         order_id = record.get("order_id")
         if not order_id or float(record.get("remaining_count") or 0.0) <= 0.004:
-            return float(record.get("remaining_count") or 0.0) <= 0.004
+            return
         if dry_run:
             record["status"] = "dry_run_canceled"
             record["remaining_count"] = 0.0
-            return True
+            return
         try:
-            response = await self.orders.cancel_order_v2(order_id)
-            canceled = field(response, "order") or response
-            if canceled is not None:
-                final_fill = order_fill_count(canceled)
-                if final_fill or float(record.get("fill_count") or 0.0) <= 0.004:
-                    record["fill_count"] = round(max(float(record.get("fill_count") or 0.0), final_fill), 2)
-                held_side = str(record.get("held_side") or record.get("side") or "")
-                if held_side in {"yes", "no"} and float(record.get("fill_count") or 0.0) > 0:
-                    record["average_fill_price"] = order_average_position_price(
-                        canceled, held_side, float(record.get("position_price") or 0.0),
-                    )
-                record["fees_paid"] = max(float(record.get("fees_paid") or 0.0), order_fee_total(canceled))
+            await self.orders.cancel_order_v2(order_id)
             record["status"] = "canceled"
             record["canceled_at"] = now_iso()
             record["remaining_count"] = 0.0
             LOG.info("CANCELED | %s", order_id)
-            return True
         except Exception as exc:  # noqa: BLE001
             # Closed markets reject cancellation after the exchange has already
-            # canceled resting orders.  Keep the failure audit trail and make
-            # the uncertainty explicit to the caller; it must reconcile before
-            # it may place a replacement or an exit.
+            # canceled resting orders.  Keep the failure audit trail.
             record["cancel_error"] = str(exc)
             LOG.warning("Cancel failed for %s: %s", order_id, exc)
-            return False
 
 
 def expiration_epoch(market: Any) -> int | None:
@@ -2234,7 +1841,7 @@ def market_record(state: dict[str, Any], ticker: str) -> dict[str, Any]:
         markets[ticker] = {
             "ticker": ticker,
             "created_at": now_iso(),
-            "strategy": LIVE_EXECUTION_STRATEGY,
+            "strategy": "ml_side_preposted_gtc_ladder_v2",
             "orders": {},
             "locked_side": None,
             "status": "watching",
@@ -2242,758 +1849,7 @@ def market_record(state: dict[str, Any], ticker: str) -> dict[str, Any]:
     return markets[ticker]
 
 
-FINAL_RECORD_STATUSES = {
-    "finalized", "finalized_unfilled", "finalized_no_signal", "exited_early",
-    "entry_skipped_loss_circuit_breaker", "signal_window_missed",
-}
-
-# A stopped or deliberately skipped market is already terminal for execution,
-# but its frozen signal is not scoreable until the target market itself is
-# officially finalized.  Avoid repeatedly polling that closed record before
-# its settlement is even possible, and then use a modest retry cadence while
-# Kalshi publishes the official result.
-DIRECTIONAL_SIGNAL_SETTLEMENT_RECHECK_SECONDS = 30.0
-
-
-def settlement_contrarian_signal_side(record: dict[str, Any]) -> str | None:
-    """Return only the already-frozen causal prediction for a record."""
-    signal = record.get("settlement_contrarian_signal")
-    if not isinstance(signal, dict):
-        return None
-    side = str(signal.get("side") or "").lower()
-    return side if side in {"yes", "no"} else None
-
-
-def directional_signal_is_scored(record: dict[str, Any]) -> bool:
-    """Whether the frozen settlement-only signal has an official outcome."""
-    scored = record.get("directional_signal")
-    return (
-        isinstance(scored, dict)
-        and str(scored.get("prediction") or "").lower() in {"yes", "no"}
-        and str(scored.get("outcome") or "").lower() in {"yes", "no"}
-        and isinstance(scored.get("correct"), bool)
-    )
-
-
-def directional_signal_settlement_check_due(record: dict[str, Any], now_epoch: float | None = None) -> bool:
-    """Return whether an execution-terminal signal needs a settlement lookup.
-
-    A target market cannot have an official outcome before its close.  This
-    guard keeps a stopped/zero-order record from creating one REST request per
-    reconciliation cycle for the remainder of the 15-minute market.
-    """
-    if directional_signal_is_scored(record):
-        return False
-    if str(record.get("settlement_outcome") or "").lower() in {"yes", "no"}:
-        return True
-    now_value = time.time() if now_epoch is None else float(now_epoch)
-    close_epoch = timestamp_epoch(record.get("market_close_time"))
-    if close_epoch is not None and now_value + 1e-9 < close_epoch:
-        return False
-    next_check = as_float(record.get("directional_signal_next_check_epoch"))
-    return next_check is None or now_value + 1e-9 >= next_check
-
-
-def defer_directional_signal_settlement_check(record: dict[str, Any], now_epoch: float | None = None) -> None:
-    """Persist the next official-result retry without changing signal state."""
-    now_value = time.time() if now_epoch is None else float(now_epoch)
-    record["directional_signal_next_check_epoch"] = round(
-        now_value + DIRECTIONAL_SIGNAL_SETTLEMENT_RECHECK_SECONDS, 3,
-    )
-
-
-def record_directional_signal_outcome(record: dict[str, Any], outcome: str) -> bool:
-    """Score a frozen signal from settlement, independent of any ladder fill.
-
-    This is intentionally separate from realized trade P&L. A zero-fill
-    ladder and an intentional two-loss skip still have a valid model-free
-    directional prediction; their win/loss is solely the selected side versus
-    the target market's final YES/NO result.
-    """
-    prediction = settlement_contrarian_signal_side(record)
-    resolved = str(outcome or "").lower()
-    if prediction not in {"yes", "no"} or resolved not in {"yes", "no"}:
-        return False
-    existing = record.get("directional_signal")
-    if (
-        isinstance(existing, dict)
-        and str(existing.get("prediction") or "").lower() == prediction
-        and str(existing.get("outcome") or "").lower() == resolved
-        and isinstance(existing.get("correct"), bool)
-    ):
-        record.setdefault("settlement_outcome", resolved)
-        return False
-    signal = record.get("settlement_contrarian_signal")
-    signal = signal if isinstance(signal, dict) else {}
-    record["settlement_outcome"] = resolved
-    record["directional_signal"] = {
-        "prediction": prediction,
-        "outcome": resolved,
-        "correct": prediction == resolved,
-        "source_ticker": signal.get("source_ticker"),
-        "source_result": signal.get("source_result"),
-        "frozen_at": signal.get("frozen_at"),
-        "scored_at": now_iso(),
-        "entry_status": record.get("status"),
-        "entry_filled_contracts": filled_contracts(record),
-    }
-    record.pop("directional_signal_next_check_epoch", None)
-    return True
-
-
-def live_completed_trade_records(state: dict[str, Any]) -> list[tuple[tuple[int, str], dict[str, Any]]]:
-    """Return completed, actually-filled live trades in completion order.
-
-    A zero-fill market is operational history, not a trade.  Completed 5c
-    stops and settlement finalizations both count because each has a realized
-    exchange P&L.  Explicit dry-run records are excluded from this live risk
-    control; older live records predate the marker and remain eligible.
-    """
-    completed: list[tuple[tuple[int, str], dict[str, Any]]] = []
-    for ticker, record in state.get("markets", {}).items():
-        if not isinstance(record, dict):
-            continue
-        if record.get("strategy") not in LIVE_SETTLEMENT_RECORD_STRATEGIES:
-            continue
-        if record.get("execution_mode") == "dry_run":
-            continue
-        if record.get("status") not in {"finalized", "exited_early"}:
-            continue
-        if float(record.get("contracts") or 0.0) <= 0.004:
-            continue
-        completed_at = record.get("exited_at") or record.get("settled_at")
-        completed_epoch = timestamp_epoch(completed_at)
-        if completed_epoch is None:
-            # A record without an authoritative completion time cannot safely
-            # be ordered against a later actual trade, so it never drives the
-            # circuit breaker.
-            continue
-        completed.append(((completed_epoch, str(record.get("ticker") or ticker)), record))
-    return sorted(completed, key=lambda item: item[0])
-
-
-def _dynamic_scaling_control(state: dict[str, Any]) -> dict[str, Any]:
-    """Return the durable actual-balance base-share scaling control record."""
-    control = state.get("dynamic_base_share_scaling")
-    if not isinstance(control, dict):
-        control = {}
-        state["dynamic_base_share_scaling"] = control
-    # Version one accumulated only the local bot ledger's realized P/L.  Keep
-    # its version until refresh migrates it with an authenticated balance.
-    control.setdefault("format_version", 1)
-    control.setdefault("enabled", False)
-    control.setdefault("initialized", False)
-    control.setdefault("scale_events", [])
-    if not isinstance(control.get("scale_events"), list):
-        control["scale_events"] = []
-    return control
-
-
-def dynamic_scaling_starting_balance(config: dict[str, Any]) -> float:
-    """Return the fixed account-equity baseline for live base scaling.
-
-    This is intentionally the configured original account balance, not a
-    replayed ledger total and not the shadow-equity balance.  The setting is
-    shared with the equity controller so a restart cannot silently choose a
-    new base for either component.
-    """
-    starting_balance = as_float(config.get("starting_balance"))
-    if starting_balance is None or starting_balance <= 0:
-        raise ValueError("starting_balance must be positive for dynamic scaling")
-    return starting_balance
-
-
-def _dynamic_scaling_threshold_base_units(
-    control: dict[str, Any], *, starting: float, current: float, increment: float,
-) -> float:
-    """Return the cumulative base-share units required for the next promotion.
-
-    The first promotion charges one interval at the configured starting base.
-    Every later promotion adds another interval at the newly-current base.  For
-    example, with a 3-share start and one-share increments, the thresholds use
-    3 units, then 3 + 4, then 3 + 4 + 5, and so on.  The persisted value keeps
-    that history intact if an operator later changes the configured increment.
-    """
-    persisted = as_float(control.get("threshold_base_share_units"))
-    if persisted is not None and persisted > 0:
-        return round(persisted, 6)
-
-    completed_increases = max(0, int(round((current - starting) / increment)))
-    expected_current = starting + (completed_increases * increment)
-    if math.isclose(current, expected_current, abs_tol=1e-9):
-        # Arithmetic-series form of starting + ... + current, avoiding the
-        # rounding accumulation that a loop over fractional share increments
-        # would introduce.
-        return round(
-            ((completed_increases + 1) * starting)
-            + (increment * completed_increases * (completed_increases + 1) / 2),
-            6,
-        )
-
-    # A pre-v4 state may have been saved after its increment setting changed.
-    # Its retained events are a better reconstruction than silently charging
-    # only the current base.  New v4 states always persist the exact units.
-    events = control.get("scale_events")
-    if isinstance(events, list) and events:
-        prior_bases = [
-            as_float(event.get("base_share_count_before"))
-            for event in events
-            if isinstance(event, dict)
-        ]
-        if all(base is not None and base > 0 for base in prior_bases):
-            return round(sum(float(base) for base in prior_bases) + current, 6)
-    return round(current, 6)
-
-
-def _ensure_auto_scaling_capacity(config: dict[str, Any], base_share_count: float) -> bool:
-    """Expand only runner-owned limits needed by a newly increased base.
-
-    A user-supplied explicit cap is never overwritten. In that case the base
-    still records its prescribed increase, but a later entry is safely blocked
-    until the operator raises the explicit cap.
-    """
-    rungs = rung_quantities_for_base_share_count(base_share_count)
-    required_contracts = round(sum(rungs.values()), 2)
-    required_principal = ladder_principal_for_rungs(rungs)
-    changed = False
-    if bool(config.get("max_contracts_per_market_auto")):
-        current = float(config["max_contracts_per_market"])
-        if current + 1e-9 < required_contracts:
-            config["max_contracts_per_market"] = required_contracts
-            changed = True
-    if bool(config.get("max_total_capital_auto")):
-        current = float(config["max_total_capital"])
-        if current + 1e-9 < required_principal:
-            config["max_total_capital"] = required_principal
-            changed = True
-    return changed
-
-
-def dynamic_scaling_snapshot(state: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
-    """Expose sizing from the durable authenticated actual-balance snapshot."""
-    control = state.get("dynamic_base_share_scaling") if isinstance(state, dict) else None
-    control = control if isinstance(control, dict) else {}
-    enabled = bool(config.get("enable_dynamic_scaling"))
-    starting = share_quantity(config["initial_position_size"], "initial_position_size")
-    starting_balance = dynamic_scaling_starting_balance(config)
-    current = dynamic_base_share_count(state, config)
-    increment = float(config["base_share_increment"])
-    multiplier = float(config["scaling_profit_multiplier"])
-    # The configured starting balance is intentionally immutable for a live
-    # scaling run.  Do not let an old checkpoint's funding rebase leak into a
-    # report (or its threshold) before refresh has migrated that checkpoint.
-    balance_baseline = starting_balance
-    actual_balance = as_float(control.get("actual_balance"))
-    # A version-one state has no persisted authenticated balance. Keep its
-    # prior number only until refresh receives the actual account balance;
-    # live execution never treats that provisional value as a scale trigger.
-    profit = (
-        actual_balance - balance_baseline
-        if enabled and actual_balance is not None
-        else (float(as_float(control.get("profit_since_last_increase")) or 0.0) if enabled else 0.0)
-    )
-    threshold_base_units = _dynamic_scaling_threshold_base_units(
-        control, starting=starting, current=current, increment=increment,
-    )
-    required = round(threshold_base_units * multiplier, 6)
-    events = control.get("scale_events") if isinstance(control.get("scale_events"), list) else []
-    return {
-        "enabled": enabled,
-        "starting_base_share_count": starting,
-        "current_base_share_count": current,
-        "base_share_increment": increment,
-        "scaling_profit_multiplier": multiplier,
-        "starting_balance": round(starting_balance, 6),
-        "actual_balance": None if actual_balance is None else round(actual_balance, 6),
-        "actual_balance_baseline": round(balance_baseline, 6),
-        "profit_since_last_increase": round(profit, 6),
-        "threshold_base_share_units": threshold_base_units,
-        "required_profit": required,
-        "profit_remaining_to_increase": round(required - profit, 6),
-        "next_increase_actual_balance": round(balance_baseline + required, 6),
-        "scale_count": len(events),
-        "last_scale": events[-1] if events else None,
-        "max_contracts_per_market_auto": bool(config.get("max_contracts_per_market_auto")),
-        "max_total_capital_auto": bool(config.get("max_total_capital_auto")),
-        "current_ladder_rungs": {
-            f"{level:.4f}": quantity
-            for level, quantity in rung_quantities_for_base_share_count(current).items()
-        },
-    }
-
-
-def refresh_dynamic_base_share_scaling(
-    state: dict[str, Any], config: dict[str, Any], now_epoch: float | None = None,
-    actual_balance: float | None = None,
-) -> dict[str, Any]:
-    """Apply the actual account balance to the opt-in base-share rule.
-
-    The configured starting balance remains fixed across scale increases and
-    external cash movements.  Each promotion adds an interval sized at that stage's
-    base: base three promotes at baseline + (3 × multiplier); base four then
-    promotes at baseline + ((3 + 4) × multiplier), and so on.  Losses never
-    reduce an already-earned base.  The shadow ledger is never read or mutated here:
-    shadow performance may control the regime, but cannot enlarge real orders.
-    """
-    now_epoch = time.time() if now_epoch is None else float(now_epoch)
-    control = _dynamic_scaling_control(state)
-    enabled = bool(config.get("enable_dynamic_scaling"))
-    starting = share_quantity(config["initial_position_size"], "initial_position_size")
-    starting_balance = dynamic_scaling_starting_balance(config)
-    prior_starting = as_float(control.get("starting_base_share_count"))
-    prior_starting_balance = as_float(control.get("starting_balance"))
-    prior_enabled = bool(control.get("enabled"))
-    observed_actual_balance = as_float(actual_balance)
-    if observed_actual_balance is None:
-        observed_actual_balance = as_float(control.get("actual_balance"))
-    if observed_actual_balance is not None and observed_actual_balance <= 0:
-        raise ValueError("actual balance must be positive for dynamic scaling")
-    if not enabled:
-        already_reset = (
-            bool(control.get("initialized"))
-            and not prior_enabled
-            and prior_starting is not None
-            and math.isclose(prior_starting, starting, abs_tol=1e-9)
-            and prior_starting_balance is not None
-            and math.isclose(prior_starting_balance, starting_balance, abs_tol=1e-9)
-            and math.isclose(as_float(control.get("current_base_share_count")) or starting, starting, abs_tol=1e-9)
-            and math.isclose(as_float(control.get("profit_since_last_increase")) or 0.0, 0.0, abs_tol=1e-9)
-            and int(as_float(control.get("format_version")) or 0) >= 5
-        )
-        if already_reset:
-            return control
-        reset_reason = "dynamic_scaling_disabled"
-        prior_current = as_float(control.get("current_base_share_count"))
-        control.update({
-            "enabled": False,
-            "initialized": True,
-            "initialized_at": datetime.fromtimestamp(now_epoch, tz=timezone.utc).isoformat(),
-            "starting_base_share_count": starting,
-            "starting_balance": starting_balance,
-            "current_base_share_count": starting,
-            "actual_balance_baseline": starting_balance,
-            "profit_since_last_increase": 0.0,
-            "last_reset_at": datetime.fromtimestamp(now_epoch, tz=timezone.utc).isoformat(),
-            "last_reset_reason": reset_reason,
-            "format_version": 5,
-            "threshold_base_share_units": starting,
-            "threshold_policy": "configured_starting_balance_plus_cumulative_base_intervals",
-        })
-        if observed_actual_balance is not None:
-            control["actual_balance"] = round(observed_actual_balance, 6)
-        if prior_enabled or (prior_current is not None and not math.isclose(prior_current, starting, abs_tol=1e-9)):
-            LOG.warning(
-                "DYNAMIC BASE SCALING DISABLED | base reset to %.2f; new ladders remain fixed until re-enabled.",
-                starting,
-            )
-        return control
-
-    # Versions two through four could retain a funding-adjusted baseline.
-    # Preserve the already-earned base while restoring the configured starting
-    # balance and the stage-by-stage cumulative threshold policy.  Version one
-    # is handled by the authenticated-balance initialization below because it
-    # has no trustworthy balance baseline.
-    prior_format = int(as_float(control.get("format_version")) or 0)
-    if prior_format in {2, 3, 4} and bool(control.get("initialized")):
-        fixed_baseline = round(starting_balance, 6)
-        current = dynamic_base_share_count(state, config)
-        threshold_base_units = _dynamic_scaling_threshold_base_units(
-            control,
-            starting=starting,
-            current=current,
-            increment=float(config["base_share_increment"]),
-        )
-        control.update({
-            "format_version": 5,
-            "actual_balance_baseline": fixed_baseline,
-            "threshold_base_share_units": threshold_base_units,
-            "profit_since_last_increase": round(
-                (observed_actual_balance - fixed_baseline)
-                if observed_actual_balance is not None
-                else float(as_float(control.get("profit_since_last_increase")) or 0.0),
-                6,
-            ),
-            "threshold_policy": "configured_starting_balance_plus_cumulative_base_intervals",
-            "last_reset_at": datetime.fromtimestamp(now_epoch, tz=timezone.utc).isoformat(),
-            "last_reset_reason": "fixed_starting_balance_migration",
-        })
-        LOG.warning(
-            "DYNAMIC BASE SCALING MIGRATED | base=%.2f fixed_starting_balance=$%.4f; "
-            "the next increase includes every base interval through the current base.",
-            current, fixed_baseline,
-        )
-
-    if (
-        not prior_enabled
-        or not bool(control.get("initialized"))
-        or prior_starting is None
-        or not math.isclose(prior_starting, starting, abs_tol=1e-9)
-        or prior_starting_balance is None
-        or not math.isclose(prior_starting_balance, starting_balance, abs_tol=1e-9)
-        or int(as_float(control.get("format_version")) or 0) < 5
-    ):
-        reset_reason = (
-            "configured_starting_base_changed"
-            if prior_starting is not None and not math.isclose(prior_starting, starting, abs_tol=1e-9)
-            else (
-                "configured_starting_balance_changed"
-                if prior_starting_balance is not None and not math.isclose(prior_starting_balance, starting_balance, abs_tol=1e-9)
-                else "actual_balance_scaling_migration"
-            )
-        )
-        control.update({
-            "enabled": enabled,
-            "initialized": True,
-            "initialized_at": datetime.fromtimestamp(now_epoch, tz=timezone.utc).isoformat(),
-            "starting_base_share_count": starting,
-            "starting_balance": starting_balance,
-            "current_base_share_count": starting,
-            "actual_balance_baseline": starting_balance,
-            "profit_since_last_increase": 0.0,
-            "last_reset_at": datetime.fromtimestamp(now_epoch, tz=timezone.utc).isoformat(),
-            "last_reset_reason": reset_reason,
-            "format_version": 5,
-            "threshold_base_share_units": starting,
-            "threshold_policy": "configured_starting_balance_plus_cumulative_base_intervals",
-        })
-        _ensure_auto_scaling_capacity(config, starting)
-        LOG.warning(
-            "DYNAMIC BASE SCALING INITIALIZED | starting_balance=$%.4f starting_base=%.2f increment=%.2f threshold=$%.4f; authenticated actual balance is the only equity source.",
-            starting_balance, starting, float(config["base_share_increment"]),
-            starting * float(config["scaling_profit_multiplier"]),
-        )
-    if observed_actual_balance is None:
-        # Never infer account equity from the local order ledger.  A later
-        # authenticated snapshot will migrate any old version-one state and
-        # calculate the balance delta atomically.
-        return control
-
-    control["actual_balance"] = round(observed_actual_balance, 6)
-    control["threshold_policy"] = "configured_starting_balance_plus_cumulative_base_intervals"
-    # Always repair this field as well as using the fixed value below.  This
-    # makes a stale checkpoint self-heal before it can be published again.
-    balance_baseline = starting_balance
-    control["actual_balance_baseline"] = round(balance_baseline, 6)
-    accumulated = observed_actual_balance - balance_baseline
-    control["profit_since_last_increase"] = round(accumulated, 6)
-    current = dynamic_base_share_count(state, config)
-    # A restart can restore an already-increased base while loading the
-    # original 3-share auto-cap values from configuration.  Auto capacity is
-    # owned by the runner, so reconcile it on every authenticated refresh,
-    # not only in the transaction that originally increased the base.
-    _ensure_auto_scaling_capacity(config, current)
-    threshold_base_units = _dynamic_scaling_threshold_base_units(
-        control,
-        starting=starting,
-        current=current,
-        increment=float(config["base_share_increment"]),
-    )
-    required = threshold_base_units * float(config["scaling_profit_multiplier"])
-    if accumulated + 1e-9 >= required:
-        increased = share_quantity(
-            current + float(config["base_share_increment"]), "current_base_share_count",
-        )
-        event = {
-            "at": datetime.fromtimestamp(now_epoch, tz=timezone.utc).isoformat(),
-            "actual_balance": round(observed_actual_balance, 6),
-            "actual_balance_baseline_before": round(balance_baseline, 6),
-            "profit_since_last_increase": round(accumulated, 6),
-            "profit_threshold": round(required, 6),
-            "threshold_base_share_units": threshold_base_units,
-            "base_share_count_before": current,
-            "base_share_count_after": increased,
-        }
-        events = control.setdefault("scale_events", [])
-        events.append(event)
-        del events[:-50]
-        control.update({
-            "current_base_share_count": increased,
-            # Keep the configured starting balance fixed: the next promotion is
-            # based on every base interval through the newly-current base.
-            "profit_since_last_increase": round(accumulated, 6),
-            "threshold_base_share_units": round(threshold_base_units + increased, 6),
-            "last_scale_at": event["at"],
-        })
-        auto_capacity_changed = _ensure_auto_scaling_capacity(config, increased)
-        rungs = rung_quantities_for_base_share_count(increased)
-        LOG.warning(
-            "DYNAMIC BASE SCALE INCREASE | actual_balance=$%.4f profit=$%+.4f threshold=$%.4f base=%.2f→%.2f ladder=%s caps=%s.",
-            observed_actual_balance, accumulated, required, current, increased,
-            "/".join(f"{rungs[level]:.2f}x${level:.2f}" for level in LADDER_LEVELS),
-            "auto-expanded" if auto_capacity_changed else "unchanged",
-        )
-    return control
-
-
-def rebase_dynamic_scaling_for_authenticated_balance_adjustment(
-    state: dict[str, Any], *, adjustment: Decimal, actual_balance: Decimal, ticker: str,
-) -> bool:
-    """Record external cash changes without changing the fixed scaling baseline.
-
-    Dynamic scaling is explicitly measured from the configured starting
-    balance for the run.  The authenticated post-close balance can still be
-    recorded with its unexplained cash adjustment for auditability, but that
-    adjustment must never move the next scaling threshold.
-    """
-
-    if abs(adjustment) <= Decimal("0.0001"):
-        return False
-    control = _dynamic_scaling_control(state)
-    if not bool(control.get("enabled")) or not bool(control.get("initialized")):
-        return False
-    # Use the persisted configured starting balance even if this hook is
-    # invoked before the normal refresh has migrated an old checkpoint.
-    baseline = as_float(control.get("starting_balance"))
-    if baseline is None:
-        baseline = as_float(control.get("actual_balance_baseline"))
-    if baseline is None:
-        return False
-    control["actual_balance_baseline"] = round(baseline, 6)
-    control["actual_balance"] = round(float(actual_balance), 6)
-    control["profit_since_last_increase"] = round(float(actual_balance - Decimal(str(baseline))), 6)
-    events = control.setdefault("external_balance_adjustments", [])
-    if not isinstance(events, list):
-        events = []
-        control["external_balance_adjustments"] = events
-    events.append({
-        "at": now_iso(),
-        "ticker": ticker,
-        "amount": format(adjustment, "f"),
-        "actual_balance": format(actual_balance, "f"),
-        "actual_balance_baseline_after": format(Decimal(str(baseline)), "f"),
-        "reason": "authenticated_balance_change_not_explained_by_strategy_realized_pnl",
-    })
-    del events[:-50]
-    LOG.warning(
-        "DYNAMIC SCALING BALANCE ADJUSTMENT RECORDED | %s adjustment=$%+.4f actual=$%.4f fixed_baseline=$%.4f; "
-        "the configured starting balance does not move.",
-        ticker, adjustment, actual_balance, baseline,
-    )
-    return True
-
-
-def _entry_loss_skip_control(state: dict[str, Any]) -> dict[str, Any]:
-    """Return the durable two-loss/two-signal circuit-breaker state."""
-    control = state.get("entry_loss_skip")
-    if not isinstance(control, dict):
-        control = {}
-        state["entry_loss_skip"] = control
-    control["format_version"] = 1
-    control["consecutive_completed_losses"] = max(
-        0, int(as_float(control.get("consecutive_completed_losses")) or 0)
-    )
-    control["markets_remaining_to_skip"] = max(
-        0, int(as_float(control.get("markets_remaining_to_skip")) or 0)
-    )
-    control.setdefault("initialized", False)
-    return control
-
-
-def _entry_loss_skip_cursor(control: dict[str, Any]) -> tuple[int, str] | None:
-    epoch = as_float(control.get("last_processed_completion_epoch"))
-    ticker = control.get("last_processed_completion_ticker")
-    if epoch is None or ticker is None:
-        return None
-    return int(epoch), str(ticker)
-
-
-def _clear_entry_loss_skip(control: dict[str, Any], reason: str, at_epoch: float) -> None:
-    control.update({
-        "consecutive_completed_losses": 0,
-        "markets_remaining_to_skip": 0,
-        "skip_armed_at": None,
-        "skip_triggering_ticker": None,
-        "last_reset_at": datetime.fromtimestamp(at_epoch, tz=timezone.utc).isoformat(),
-        "last_reset_reason": reason,
-    })
-
-
-def _arm_entry_loss_skip(
-    control: dict[str, Any], config: dict[str, Any], completed_epoch: float, ticker: str,
-) -> None:
-    """Arm the next-two-signals skip after the second realized loss."""
-    control.update({
-        "consecutive_completed_losses": int(config["live_consecutive_loss_limit"]),
-        "markets_remaining_to_skip": int(config["live_markets_to_skip_after_loss_limit"]),
-        "skip_armed_at": datetime.fromtimestamp(completed_epoch, tz=timezone.utc).isoformat(),
-        "skip_triggering_ticker": ticker,
-    })
-
-
-def _initialize_entry_loss_skip_from_live_ledger(
-    state: dict[str, Any], config: dict[str, Any], now_epoch: float,
-) -> dict[str, Any]:
-    """Seed the new safeguard from the tail of the already-live ledger.
-
-    The first rollout honors an existing tail of two completed live losses by
-    skipping the next two normally generated signals. Older completed records
-    are marked as processed so they cannot be counted twice on a handoff.
-    """
-    control = _entry_loss_skip_control(state)
-    if control.get("initialized"):
-        return control
-    completed = live_completed_trade_records(state)
-    if completed:
-        last_key, last_record = completed[-1]
-        control["last_processed_completion_epoch"] = last_key[0]
-        control["last_processed_completion_ticker"] = last_key[1]
-        control["last_completed_trade"] = {
-            "ticker": last_key[1],
-            "completed_at": last_record.get("exited_at") or last_record.get("settled_at"),
-            "net_profit_loss": float(last_record.get("net_profit_loss") or 0.0),
-        }
-        losses = 0
-        for key, record in reversed(completed):
-            profit_loss = float(record.get("net_profit_loss") or 0.0)
-            if profit_loss > 0.0:
-                break
-            if profit_loss < 0.0:
-                losses += 1
-                if losses >= int(config["live_consecutive_loss_limit"]):
-                    break
-        if losses >= int(config["live_consecutive_loss_limit"]):
-            _arm_entry_loss_skip(control, config, last_key[0], last_key[1])
-            LOG.warning(
-                "ENTRY SKIP RESTORED | two most-recent completed live losses; the next %d normal signals will be skipped.",
-                control["markets_remaining_to_skip"],
-            )
-        else:
-            control["consecutive_completed_losses"] = losses
-    control["initialized"] = True
-    control["initialized_at"] = datetime.fromtimestamp(now_epoch, tz=timezone.utc).isoformat()
-    return control
-
-
-def refresh_entry_loss_skip(
-    state: dict[str, Any], config: dict[str, Any], now_epoch: float | None = None,
-) -> dict[str, Any]:
-    """Process newly completed live trades and return the durable skip state.
-
-    Only a finalized/exited record with filled contracts is eligible.  Wins
-    clear both the loss count and a pending skip immediately. Break-even
-    trades leave the current count unchanged.
-    """
-    now_epoch = time.time() if now_epoch is None else float(now_epoch)
-    limit = int(config["live_consecutive_loss_limit"])
-    if limit <= 0 or int(config["live_markets_to_skip_after_loss_limit"]) <= 0:
-        # Migration is explicit: old loss-skip counters remain auditable but
-        # can never defer a current eligible market.
-        control = _entry_loss_skip_control(state)
-        control["initialized"] = True
-        control.setdefault("initialized_at", datetime.fromtimestamp(now_epoch, tz=timezone.utc).isoformat())
-        _clear_entry_loss_skip(control, "retired_loss_skip_policy", now_epoch)
-        return control
-    control = _initialize_entry_loss_skip_from_live_ledger(state, config, now_epoch)
-    cursor = _entry_loss_skip_cursor(control)
-    for key, record in live_completed_trade_records(state):
-        if cursor is not None and key <= cursor:
-            continue
-        completed_epoch, ticker = key
-        profit_loss = float(record.get("net_profit_loss") or 0.0)
-        control["last_processed_completion_epoch"] = completed_epoch
-        control["last_processed_completion_ticker"] = ticker
-        control["last_completed_trade"] = {
-            "ticker": ticker,
-            "completed_at": record.get("exited_at") or record.get("settled_at"),
-            "net_profit_loss": profit_loss,
-        }
-        if profit_loss > 0.0:
-            pending_skips = int(control.get("markets_remaining_to_skip") or 0)
-            _clear_entry_loss_skip(control, "completed_winning_trade", now_epoch)
-            LOG.warning(
-                "ENTRY LOSS COUNT RESET | %s completed a realized win of $%+.4f%s.",
-                ticker, profit_loss, "; pending skips cleared" if pending_skips else "",
-            )
-        elif profit_loss < 0.0:
-            control["last_completed_loss_at"] = record.get("exited_at") or record.get("settled_at")
-            control["last_completed_loss_ticker"] = ticker
-            pending_skips = int(control.get("markets_remaining_to_skip") or 0)
-            if pending_skips:
-                # This can only be a position that was already open before
-                # the breaker armed. It must not extend the fixed two-market
-                # skip beyond the user's requested policy.
-                control["consecutive_completed_losses"] = limit
-                LOG.warning(
-                    "ENTRY SKIP NOTE | %s completed at $%+.4f while %d scheduled skip(s) remain; skip count is unchanged.",
-                    ticker, profit_loss, pending_skips,
-                )
-            else:
-                losses = int(control.get("consecutive_completed_losses") or 0) + 1
-                control["consecutive_completed_losses"] = losses
-                if losses >= limit:
-                    _arm_entry_loss_skip(control, config, completed_epoch, ticker)
-                    LOG.critical(
-                        "ENTRY SKIP ARMED | %s completed the second consecutive realized loss ($%+.4f); next %d normal signals will be skipped.",
-                        ticker, profit_loss, control["markets_remaining_to_skip"],
-                    )
-                else:
-                    LOG.warning(
-                        "ENTRY LOSS COUNT | %s completed a realized loss of $%+.4f; consecutive losses=%d/%d.",
-                        ticker, profit_loss, losses, limit,
-                    )
-        cursor = key
-    return control
-
-
-def consume_entry_loss_skip(
-    state: dict[str, Any], record: dict[str, Any], selected_side: str, config: dict[str, Any],
-) -> bool:
-    """Consume one pending skip after its normal causal signal is frozen."""
-    control = refresh_entry_loss_skip(state, config)
-    remaining = int(control.get("markets_remaining_to_skip") or 0)
-    if remaining <= 0:
-        return False
-    ticker = str(record.get("ticker") or "?")
-    remaining_after = remaining - 1
-    control["markets_remaining_to_skip"] = remaining_after
-    control.setdefault("skipped_markets", []).append({
-        "ticker": ticker,
-        "side": selected_side,
-        "skipped_at": now_iso(),
-        "remaining_after": remaining_after,
-        "reason": "two_consecutive_completed_losses",
-    })
-    # Keep this bounded while retaining the most recent operational audit.
-    control["skipped_markets"] = control["skipped_markets"][-20:]
-    record.update({
-        "candidate_side": selected_side,
-        "locked_side": selected_side,
-        "locked_at": now_iso(),
-        "strategy": LIVE_EXECUTION_STRATEGY,
-        "execution_mode": "not_entered_loss_skip",
-        "status": "entry_skipped_loss_circuit_breaker",
-        "entry_skip": {
-            "reason": "two_consecutive_completed_losses",
-            "triggering_ticker": control.get("skip_triggering_ticker"),
-            "selected_side": selected_side,
-            "skipped_at": now_iso(),
-            "remaining_after": remaining_after,
-        },
-    })
-    if remaining_after == 0:
-        _clear_entry_loss_skip(control, "two_markets_skipped", time.time())
-    LOG.warning(
-        "ENTRY SKIPPED | %s selected_side=%s from the normal settlement-contrarian signal; %d/%d skips remain. No exchange order submitted.",
-        ticker, selected_side.upper(), remaining_after, int(config["live_markets_to_skip_after_loss_limit"]),
-    )
-    return True
-
-
-def entry_loss_skip_snapshot(state: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
-    """Expose the persisted circuit breaker without altering trading state."""
-    control = state.get("entry_loss_skip") if isinstance(state.get("entry_loss_skip"), dict) else {}
-    return {
-        "loss_limit": int(config["live_consecutive_loss_limit"]),
-        "markets_to_skip_after_limit": int(config["live_markets_to_skip_after_loss_limit"]),
-        "consecutive_completed_losses": int(as_float(control.get("consecutive_completed_losses")) or 0),
-        "markets_remaining_to_skip": int(as_float(control.get("markets_remaining_to_skip")) or 0),
-        "skip_armed_at": control.get("skip_armed_at"),
-        "triggering_ticker": control.get("skip_triggering_ticker"),
-        "last_completed_trade": control.get("last_completed_trade"),
-        "last_reset_at": control.get("last_reset_at"),
-        "last_reset_reason": control.get("last_reset_reason"),
-        "retired": int(config["live_consecutive_loss_limit"]) <= 0,
-    }
+FINAL_RECORD_STATUSES = {"finalized", "finalized_unfilled", "finalized_no_signal", "exited_early"}
 
 
 def start_market_watcher(state: dict[str, Any], market: Any, config: dict[str, Any]) -> dict[str, Any] | None:
@@ -3009,7 +1865,7 @@ def start_market_watcher(state: dict[str, Any], market: Any, config: dict[str, A
     existing = state.get("markets", {}).get(ticker)
     if isinstance(existing, dict):
         return existing if existing.get("status") == "watching" else None
-    if not market_can_start_watcher(market, entry_start_grace_seconds(config)):
+    if not market_can_start_watcher(market, config["watch_start_grace_seconds"]):
         return None
     record = market_record(state, ticker)
     record.update({
@@ -3019,143 +1875,10 @@ def start_market_watcher(state: dict[str, Any], market: Any, config: dict[str, A
         "watch_started_at": now_iso(),
     })
     LOG.info(
-        "WATCH STARTED | %s awaiting the immediately preceding KXBTC15M finalization; it will lock the opposite side and post the persistent 1/2/3/4 GTC ladder as soon as that result is available, up to %.0fs after open.",
-        ticker, entry_start_grace_seconds(config),
+        "WATCH STARTED | %s awaiting its frozen ML side; once ready, it will immediately post that side's 40c/30c/20c/10c GTC ladder.",
+        ticker,
     )
     return record
-
-
-def build_equity_regime_decision(
-    state: dict[str, Any], record: dict[str, Any], market: Any, config: dict[str, Any], side: str,
-) -> StrategyDecision:
-    """Build the fixed-size shadow decision for the settlement strategy.
-
-    Live entry sizing is calculated independently in ``consider_initial_entry``
-    and may use dynamic scaling from the authenticated account balance. The
-    shadow curve always uses the fixed 3/6/9/12 ladder so its balance is never
-    rebased or resized by a real-account threshold crossing.
-    """
-    ticker = str(field(market, "ticker") or record.get("ticker") or "")
-    close_epoch = timestamp_epoch(field(market, "close_time", "expected_expiration_time") or record.get("market_close_time"))
-    if not ticker or close_epoch is None:
-        raise ValueError("equity-regime decision requires ticker and close time")
-    generated = datetime.now(tz=timezone.utc)
-    target_close = datetime.fromtimestamp(close_epoch, tz=timezone.utc)
-    if target_close <= generated:
-        raise ValueError("refusing an equity-regime decision for an expired market")
-    # Deliberately overwrite any pre-threshold/restart snapshot. A stale
-    # dynamically-sized snapshot must not leak into shadow accounting.
-    _ = state, config
-    rungs = rung_quantities_for_base_share_count(EQUITY_REGIME_SHADOW_BASE_SHARES)
-    record["regime_shadow_base_share_count"] = EQUITY_REGIME_SHADOW_BASE_SHARES
-    record["regime_base_share_count"] = EQUITY_REGIME_SHADOW_BASE_SHARES
-    record["regime_scaling_equity_source"] = "fixed_shadow_ladder"
-    record["regime_ladder_quantities"] = {
-        f"{level:.4f}": rungs[level] for level in LADDER_LEVELS
-    }
-    source = record.get("settlement_contrarian_signal") or {}
-    return StrategyDecision(
-        target_ticker=ticker,
-        source_ticker=str(source.get("source_ticker") or "") or None,
-        selected_side=side,
-        eligible=True,
-        skip_reason=None,
-        ladder_orders=tuple(
-            LadderOrder(Decimal(str(level)), Decimal(str(rungs[level])), f"{level:.4f}")
-            for level in LADDER_LEVELS
-        ),
-        stop_price=Decimal(str(config["live_absolute_stop_price"])),
-        # The active live policy has no trailing exit. These deliberately
-        # unreachable values preserve its absolute-stop/settlement behavior
-        # inside the shadow executor.
-        trailing_activation_gain=Decimal("2"),
-        trailing_retracement=Decimal("2"),
-        generated_at=generated,
-        target_close_time=target_close,
-        strategy_name=LIVE_EXECUTION_STRATEGY,
-    )
-
-
-async def account_equity_regime_finalization(
-    rest: KalshiREST,
-    regime: EquityRegimeController,
-    trader_state: dict[str, Any],
-    record: dict[str, Any],
-    market: Any | None,
-    *,
-    dry_run: bool,
-) -> None:
-    """Append one finalized active-strategy market exactly once to both curves."""
-    if record.get("regime_accounted"):
-        return
-    outcome = str(record.get("settlement_outcome") or (market_result(market) if market is not None else "") or "").lower()
-    if outcome not in {"yes", "no"}:
-        return
-    close_time = utc_timestamp(
-        record.get("settled_at")
-        or (field(market, "close_time", "expected_expiration_time") if market is not None else None)
-        or record.get("market_close_time")
-    )
-    if close_time is None:
-        return
-    actual_balance_after = await rest.balance_decimal()
-    if actual_balance_after is None:
-        raise RuntimeError("Cannot account an equity-regime market without authenticated current Kalshi balance")
-    actual_balance_before = Decimal(str(regime.state.get("actual_balance") or actual_balance_after))
-    selected_side = record.get("locked_side") or record.get("candidate_side")
-    suppressed = bool(record.get("regime_live_entry_suppressed"))
-    # ``execution_mode`` is the source of truth for this historical market.
-    # Global dry-run only applies to the present process, so an older real
-    # record without the marker remains live unless it was explicitly a
-    # dry/shadow/loss-skip record.
-    actual_was_live = (
-        not dry_run
-        and not suppressed
-        and record.get("execution_mode") not in {
-            "dry_run", "regime_shadow_only", "not_entered_loss_skip",
-        }
-    )
-    settlement_contracts = Decimal(str(record.get("settlement_contracts") or "0"))
-    settlement_payout = settlement_contracts if selected_side == outcome else Decimal("0")
-    gross_payout = Decimal(str(record.get("gross_payout") or "0"))
-    actual_pnl = Decimal(str(record.get("net_profit_loss") or "0")) if actual_was_live else Decimal("0")
-    regime.close_market(
-        ticker=str(record.get("ticker") or ""), outcome=outcome, market_close_time=close_time,
-        actual_realized_pnl=actual_pnl,
-        actual_metadata={
-            "selected_side": selected_side, "contracts_bought": record.get("contracts", 0),
-            "contracts_sold": record.get("early_exit_contracts", 0),
-            "average_entry": record.get("average_entry"), "entry_cost": record.get("total_cost", 0),
-            "exit_proceeds": format(gross_payout - settlement_payout, "f"),
-            "settlement_payout": format(settlement_payout, "f"), "fees": record.get("kalshi_fees", 0),
-            "exit_method": record.get("exit_method") or "settlement", "source": "live_bot_ledger",
-            "reconciliation_status": "pending_api_reconciliation",
-        },
-        actual_was_live=actual_was_live,
-        actual_balance_after=actual_balance_after,
-    )
-    rebase_dynamic_scaling_for_authenticated_balance_adjustment(
-        trader_state,
-        adjustment=actual_balance_after - actual_balance_before - actual_pnl,
-        actual_balance=actual_balance_after,
-        ticker=str(record.get("ticker") or ""),
-    )
-    record["regime_accounted"] = True
-    # Startup may correctly defer the endpoint-anchored 200-market balance
-    # rebuild while an inherited position is filled.  Immediately after that
-    # position is closed there is a causal, no-open-exposure window before the
-    # next market is considered, so perform the rebuild here rather than
-    # waiting for another five-hour Actions handoff.
-    rebuilt = regime.bootstrap_from_live_ledger(
-        trader_state,
-        api_current_balance=actual_balance_after,
-    )
-    if rebuilt:
-        regime.save()
-        LOG.warning(
-            "ABSOLUTE 200-MARKET REGIME BOOTSTRAP | rows=%d after terminal market=%s",
-            rebuilt, record.get("ticker"),
-        )
 
 
 def orders_for_market(record: dict[str, Any]) -> list[dict[str, Any]]:
@@ -3169,127 +1892,6 @@ def filled_contracts(record: dict[str, Any]) -> float:
 def opposite_side(side: str) -> str | None:
     normalized = str(side).lower()
     return "no" if normalized == "yes" else ("yes" if normalized == "no" else None)
-
-
-async def settlement_contrarian_side_for_market(
-    rest: Any, market: Any, record: dict[str, Any], config: dict[str, Any], now_epoch: float | None = None,
-) -> str | None:
-    """Lock the opposite of the immediately preceding finalized KXBTC15M result.
-
-    There is deliberately no fixed post-open delay.  The source must have a
-    close timestamp equal to this market's opening timestamp, so an older
-    finalized market can never be substituted while the immediate predecessor
-    is still settling.  Once the source is found, it is persisted and reused
-    across handoffs without recalculating or changing sides.
-    """
-    ticker = str(field(market, "ticker") or record.get("ticker") or "")
-    open_epoch = timestamp_epoch(field(market, "open_time") or record.get("market_open_time"))
-    if not ticker or open_epoch is None:
-        record["settlement_contrarian_status"] = "missing_market_open_time"
-        return None
-    current_epoch = time.time() if now_epoch is None else float(now_epoch)
-    persisted = record.get("settlement_contrarian_signal")
-    if isinstance(persisted, dict):
-        side = str(persisted.get("side") or "").lower()
-        source_epoch = as_float(persisted.get("source_settlement_epoch"))
-        persisted_frozen_epoch = as_float(
-            persisted.get("decision_available_epoch", persisted.get("decision_cutoff_epoch"))
-        )
-        source_close_epoch = as_float(persisted.get("source_close_epoch"))
-        if (
-            side in {"yes", "no"}
-            and source_epoch is not None and persisted_frozen_epoch is not None
-            and source_epoch <= persisted_frozen_epoch + 1e-9
-            and str(persisted.get("source_ticker") or "") != ticker
-            and (source_close_epoch is None or abs(source_close_epoch - float(open_epoch)) <= 1.0)
-        ):
-            record["settlement_contrarian_status"] = "resumed_frozen_signal"
-            return side
-        record["settlement_contrarian_status"] = "invalid_persisted_signal"
-        LOG.critical("SETTLEMENT CONTRARIAN BLOCKED | %s has an invalid persisted source signal.", ticker)
-        return None
-    # This is terminal for a zero-order watcher. Keeping it terminal prevents
-    # both a late ladder and a warning on every subsequent quote-loop wakeup.
-    if record.get("status") == "signal_window_missed":
-        return None
-    if current_epoch + 1e-9 < float(open_epoch):
-        if record.get("settlement_contrarian_status") != "waiting_for_market_open":
-            LOG.info(
-                "SETTLEMENT CONTRARIAN WAIT | %s has not opened; no side or order before open.", ticker,
-            )
-        record["settlement_contrarian_status"] = "waiting_for_market_open"
-        return None
-    entry_deadline = float(open_epoch) + float(config["settlement_contrarian_entry_grace_seconds"])
-    if current_epoch > entry_deadline + 1e-9:
-        window = float(config["settlement_contrarian_entry_grace_seconds"])
-        record.update({
-            "status": "signal_window_missed",
-            "settlement_contrarian_status": "signal_window_missed",
-            "signal_window_deadline_epoch": entry_deadline,
-            "signal_window_missed_at": now_iso(),
-            "signal_window_missed_reason": "immediate_predecessor_not_finalized_before_deadline",
-            "reserved_principal": 0.0,
-        })
-        LOG.warning(
-            "SETTLEMENT CONTRARIAN SKIPPED | %s immediate predecessor was not finalized by the %.0fs causal window; "
-            "watcher is terminal and no late ladder will be posted.",
-            ticker, window,
-        )
-        return None
-    lookup = getattr(rest, "immediately_preceding_settled_btc15m", None)
-    if not callable(lookup):
-        record["settlement_contrarian_status"] = "preceding_settlement_lookup_unsupported"
-        LOG.critical("SETTLEMENT CONTRARIAN BLOCKED | %s REST adapter cannot read the immediately preceding settlement.", ticker)
-        return None
-    next_lookup_epoch = as_float(record.get("next_predecessor_lookup_epoch"))
-    if next_lookup_epoch is not None and current_epoch + 1e-9 < next_lookup_epoch:
-        return None
-    # The authenticated stream can wake this loop many times a second.  Probe
-    # the public settlement endpoint at the normal two-second cadence instead
-    # of turning a busy quote stream into duplicate HTTP calls.
-    record["next_predecessor_lookup_epoch"] = current_epoch + max(1.0, min(float(config["poll_seconds"]), 5.0))
-    source = await lookup(float(open_epoch), current_epoch)
-    source_side = str(field(source, "result") or "").lower() if source is not None else ""
-    source_epoch = as_float(field(source, "settlement_epoch", "settlement_ts")) if source is not None else None
-    source_close_epoch = as_float(field(source, "close_epoch", "close_time")) if source is not None else None
-    if (
-        source_side not in {"yes", "no"}
-        or source_epoch is None
-        or source_epoch > current_epoch + 1e-9
-        or source_close_epoch is None
-        or abs(source_close_epoch - float(open_epoch)) > 1.0
-    ):
-        if record.get("settlement_contrarian_status") != "awaiting_immediate_predecessor":
-            LOG.warning(
-                "SETTLEMENT CONTRARIAN WAIT | %s immediately preceding KXBTC15M market is not finalized yet; refusing to substitute an older settlement.",
-                ticker,
-            )
-        record["settlement_contrarian_status"] = "awaiting_immediate_predecessor"
-        return None
-    side = opposite_side(source_side)
-    assert side is not None
-    record.pop("next_predecessor_lookup_epoch", None)
-    record["settlement_contrarian_signal"] = {
-        "source": "immediately_preceding_finalized_outcome_opposite_v2",
-        "decision_available_epoch": current_epoch,
-        "decision_available": datetime.fromtimestamp(current_epoch, tz=timezone.utc).isoformat(),
-        "source_ticker": str(field(source, "ticker") or ""),
-        "source_settlement": field(source, "settlement_ts"),
-        "source_settlement_epoch": source_epoch,
-        "source_close_epoch": source_close_epoch,
-        "source_result": source_side,
-        "side": side,
-        "source_lookup": field(source, "source"),
-        "frozen_at": now_iso(),
-    }
-    record["settlement_contrarian_status"] = "frozen"
-    LOG.warning(
-        "SETTLEMENT CONTRARIAN SIDE READY | %s source=%s settled=%s result=%s selected=%s available_at=%s.",
-        ticker, str(field(source, "ticker") or "?"),
-        str(field(source, "settlement_ts") or source_epoch), source_side.upper(), side.upper(),
-        datetime.fromtimestamp(current_epoch, tz=timezone.utc).isoformat(),
-    )
-    return side
 
 
 def new_quote_paper_shadow(
@@ -4095,24 +2697,10 @@ async def recover_exchange_state(rest: KalshiREST, state: dict[str, Any], config
 
         side = next(iter(sides))
         typed_orders = [item for item in records if item is not None]
+        quantities = {float(item["quantity"]) for item in typed_orders}
         record = market_record(state, ticker)
         existing_side = record.get("locked_side") or record.get("candidate_side")
-        quantity_by_level = {float(item["ladder_level"]): float(item["quantity"]) for item in typed_orders}
-        quantities = set(quantity_by_level.values())
-        weighted_bases = [
-            quantity / WEIGHTED_SCALP_RUNG_QUANTITIES[level]
-            for level, quantity in quantity_by_level.items()
-            if level in WEIGHTED_SCALP_RUNG_QUANTITIES
-        ]
-        recovered_base = weighted_bases[0] if weighted_bases else None
-        weighted_ladder = all(
-            level in WEIGHTED_SCALP_RUNG_QUANTITIES
-            and recovered_base is not None
-            and abs(quantity - recovered_base * WEIGHTED_SCALP_RUNG_QUANTITIES[level]) <= 0.004
-            for level, quantity in quantity_by_level.items()
-        )
-        uniform_ladder = len(quantities) == 1
-        if (not (uniform_ladder or weighted_ladder)) or existing_side not in {None, side}:
+        if len(quantities) != 1 or existing_side not in {None, side}:
             record.update({
                 "status": "recovery_blocked_ambiguous",
                 "exchange_recovery_blocked": "quantity or side conflicts with persisted ledger",
@@ -4123,43 +2711,18 @@ async def recover_exchange_state(rest: KalshiREST, state: dict[str, Any], config
             continue
 
         market = await rest.get_market(ticker)
-        recovered_rungs = (
-            rung_quantities_for_base_share_count(float(recovered_base))
-            if weighted_ladder and recovered_base is not None else None
-        )
-        recovered_quantity = max(recovered_rungs.values()) if recovered_rungs is not None else next(iter(quantities))
-        recovered_reserve = (
-            ladder_principal_for_rungs(recovered_rungs)
-            if recovered_rungs is not None else ladder_principal(float(typed_orders[0]["quantity"]))
-        )
         record.update({
             "candidate_side": side,
             "locked_side": side,
-            "quantity": recovered_quantity,
+            "quantity": quantities.pop(),
             "status": "ladder_active",
             "ladder_mode": "preposted_gtc_v2",
-            "reserved_principal": recovered_reserve,
+            "reserved_principal": ladder_principal(float(typed_orders[0]["quantity"])),
             "market_open_time": field(market, "open_time") if market is not None else record.get("market_open_time"),
             "market_close_time": field(market, "close_time", "expected_expiration_time") if market is not None else record.get("market_close_time"),
             "recovered_at": now_iso(),
             "recovery_source": "Kalshi resting deterministic client-order IDs",
         })
-        if weighted_ladder:
-            prior_strategy = str(record.get("strategy") or "")
-            recovered_strategy = (
-                prior_strategy if prior_strategy in LIVE_SETTLEMENT_RECORD_STRATEGIES
-                else LIVE_EXECUTION_STRATEGY
-            )
-            record.update({
-                "strategy": recovered_strategy,
-                "base_share_count": float(recovered_base),
-                "rung_quantities": {f"{level:.4f}": quantity for level, quantity in (recovered_rungs or {}).items()},
-            })
-            record.setdefault("settlement_contrarian_signal", {
-                "source": "recovered_weighted_ladder_source_unknown",
-                "side": side,
-                "recovered_at": now_iso(),
-            })
         for item in typed_orders:
             record.setdefault("orders", {})[f"{float(item['ladder_level']):.4f}"] = item
         if not await exchange_position_guard(rest, record, config):
@@ -4223,22 +2786,6 @@ async def reconcile_orders(rest: KalshiREST, record: dict[str, Any], dry_run: bo
                 float(order.get("fees_paid") or 0.0),
                 order.get("order_id") or order.get("client_order_id") or "?",
             )
-            prior_fill = float(before[0] or 0.0)
-            current_fill = float(order.get("fill_count") or 0.0)
-            if (record.get("strategy") in LIVE_SETTLEMENT_RECORD_STRATEGIES
-                    and current_fill > prior_fill + 0.004):
-                total_filled = filled_contracts(record)
-                total_cost = live_entry_cost(record)
-                LOG.warning(
-                    "LIVE %s ENTRY FILL | %s side=%s rung=$%.2f delta=%.2f rung_total=%.2f "
-                    "position=%.2f avg_entry=$%.4f cost=$%.4f fee=$%.4f id=%s; real exchange fill.",
-                    live_record_source_label(record), record.get("ticker", "?"), str(order.get("side") or "?").upper(),
-                    float(order.get("ladder_level") or order.get("position_price") or 0.0),
-                    current_fill - prior_fill, current_fill, total_filled,
-                    total_cost / total_filled if total_filled > 0.004 else 0.0, total_cost,
-                    float(order.get("fees_paid") or 0.0),
-                    order.get("order_id") or order.get("client_order_id") or "?",
-                )
             changed = True
     live_exit = record.get("live_exit_orders")
     if isinstance(live_exit, list):
@@ -4255,21 +2802,6 @@ async def reconcile_orders(rest: KalshiREST, record: dict[str, Any], dry_run: bo
                     float(exit_order.get("fill_count") or 0.0), float(exit_order.get("remaining_count") or 0.0),
                     exit_order.get("order_id") or exit_order.get("client_order_id") or "?",
                 )
-                prior_fill = float(before[0] or 0.0)
-                current_fill = float(exit_order.get("fill_count") or 0.0)
-                if (record.get("strategy") in LIVE_SETTLEMENT_RECORD_STRATEGIES
-                        and current_fill > prior_fill + 0.004):
-                    entry_total = filled_contracts(record)
-                    exit_total = live_exit_filled_contracts(record)
-                    LOG.warning(
-                        "LIVE %s EXIT FILL | %s side=%s trigger=%s delta=%.2f exited=%.2f "
-                        "remaining=%.2f avg_exit=$%.4f id=%s; real reduce-only exchange fill.",
-                        live_record_source_label(record), record.get("ticker", "?"), str(exit_order.get("held_side") or exit_order.get("side") or "?").upper(),
-                        str(exit_order.get("trigger") or "unknown"), current_fill - prior_fill, exit_total,
-                        max(0.0, entry_total - exit_total),
-                        float(exit_order.get("average_fill_price") or exit_order.get("position_price") or 0.0),
-                        exit_order.get("order_id") or exit_order.get("client_order_id") or "?",
-                    )
                 changed = True
     initial = (record.get("orders") or {}).get("0.4000")
     if isinstance(initial, dict) and initial.get("direction_verified") is False:
@@ -4372,10 +2904,6 @@ def live_exit_fees(record: dict[str, Any]) -> float:
     ), 6)
 
 
-def live_record_source_label(record: dict[str, Any]) -> str:
-    return "SETTLEMENT CONTRARIAN"
-
-
 def mark_live_exit_if_flat(record: dict[str, Any]) -> bool:
     """Finalize an early live close only after all entry contracts were sold."""
     entries = filled_contracts(record)
@@ -4403,113 +2931,44 @@ def mark_live_exit_if_flat(record: dict[str, Any]) -> bool:
             (record.get("live_exit_protection") or {}).get("trigger") or "unknown"
         ),
     })
-    source_detail = (
-        str((record.get("settlement_contrarian_signal") or {}).get("source_ticker") or "?")
-        if live_record_source_label(record) == "SETTLEMENT CONTRARIAN"
-        else str(record.get("source_ml_side") or "?").upper()
-    )
     LOG.warning(
-        "LIVE %s TRADE CLOSED | %s source=%s side=%s method=%s contracts=%.2f "
-        "cost=$%.4f proceeds=$%.4f fees=$%.4f net=$%+.4f roi=%+.2f%%; real exchange result.",
-        live_record_source_label(record), record.get("ticker", "?"), source_detail,
-        str(record.get("locked_side") or record.get("candidate_side") or "?").upper(),
-        str(record.get("exit_method") or "unknown"), entries, cost, proceeds, entry_fees + exit_fees, net,
-        100.0 * net / cost if cost else 0.0,
+        "LIVE EXIT COMPLETE | %s contracts=%.2f cost=$%.4f proceeds=$%.4f net=$%+.4f",
+        record.get("ticker", "?"), entries, cost, proceeds, net,
     )
     return True
 
 
-def annotate_early_exit_settlement_outcome(record: dict[str, Any], market: Any) -> bool:
-    """Attach an official result to an already-closed 5c-stop record.
-
-    This is informational only. The reduce-only exit already fixed realized
-    P&L, so no order, position, average cost, or profit field is modified.
-    It prevents a finalized stopped market from permanently showing
-    ``outcome=?`` in the compact live report.
-    """
-    if record.get("status") != "exited_early":
-        return False
-    result = market_result(market)
-    market_status = str(field(market, "status") or "").lower()
-    if result not in {"yes", "no"} or market_status != "finalized":
-        return False
-    side = str(record.get("locked_side") or record.get("candidate_side") or "").lower()
-    directional_result = "would_have_won" if side == result else "would_have_lost"
-    changed = record_directional_signal_outcome(record, result)
-    if not changed and str(record.get("settlement_outcome") or "").lower() in {"yes", "no"}:
-        return False
-    record.update({
-        "settlement_outcome": result,
-        "settlement_outcome_observed_at": now_iso(),
-        "post_exit_directional_result": directional_result,
-    })
-    LOG.info(
-        "LIVE POST-EXIT SETTLEMENT | %s side=%s official_outcome=%s %s; "
-        "the earlier reduce-only exit and realized P&L are unchanged.",
-        record.get("ticker", "?"), side.upper() or "?", result.upper(), directional_result,
-    )
-    return True
-
-
-def annotate_skipped_signal_settlement_outcome(record: dict[str, Any], market: Any) -> bool:
-    """Score a deliberately unentered two-loss-skip signal at settlement."""
-    if record.get("status") != "entry_skipped_loss_circuit_breaker":
-        return False
-    result = market_result(market)
-    market_status = str(field(market, "status") or "").lower()
-    if result not in {"yes", "no"} or market_status != "finalized":
-        return False
-    changed = record_directional_signal_outcome(record, result)
-    if changed:
-        record["settlement_outcome_observed_at"] = now_iso()
-    return changed
-
-
-async def monitor_live_absolute_stop(
+async def monitor_live_inverse_ml_weighted_hold_gate(
     rest: KalshiREST, record: dict[str, Any], feed: KalshiLiveFeed | None,
     config: dict[str, Any], dry_run: bool,
 ) -> bool:
-    """Close a live position only at the absolute selected-side 5c stop.
+    """Manage the explicit live inverse-ML 1/2/3/4 entry after fills.
 
-    No profit gate, trailing high, or trailing retracement is evaluated here.
-    Every other filled position remains open until Kalshi finalizes it.
+    All trigger decisions are made from a current complete WebSocket top of
+    book with enough displayed depth to close the *whole remaining position*.
+    The hard stop is an absolute selected-side 5c bid.  The trailing exit
+    starts only after bid >= current average entry + 60c; it remains armed
+    after later lower-rung fills, but its high is rebased to a quote that has
+    depth for the enlarged position.
     """
-    if record.get("strategy") not in LIVE_SETTLEMENT_RECORD_STRATEGIES:
+    if not live_weighted_inverse_enabled(config):
+        return False
+    if record.get("strategy") != "inverse_ml_weighted_hold_gate_live_v1":
         return False
     if record.get("status") not in {"ladder_active", "live_exit_pending"}:
         return False
     side = str(record.get("locked_side") or record.get("candidate_side") or "").lower()
     ticker = str(record.get("ticker") or "")
-    strategy_label = "SETTLEMENT CONTRARIAN"
     if feed is None or side not in {"yes", "no"} or not ticker:
         return False
     entries = filled_contracts(record)
     exits = live_exit_filled_contracts(record)
     remaining = round(max(0.0, entries - exits), 2)
     protection = record.setdefault("live_exit_protection", {})
-    # A handoff can recover a position while the retired gate/trail was marked
-    # pending. If no reduce-only exit has actually filled, explicitly retire
-    # that intent and continue to settlement under the new policy.
-    retired_trigger = str(protection.get("trigger") or "")
-    if (
-        record.get("status") == "live_exit_pending"
-        and retired_trigger
-        and retired_trigger != "absolute_5c_stop"
-        and exits <= 0.004
-    ):
-        record["status"] = "ladder_active"
-        protection.update({
-            "retired_exit_trigger": retired_trigger,
-            "retired_exit_at": now_iso(),
-            "retired_exit_reason": "profit gate and trailing exits removed; hold to settlement",
-        })
-        for key in ("trigger", "triggered_at", "trigger_bid", "exit_latched", "exit_latched_at", "armed", "trailing_high_bid"):
-            protection.pop(key, None)
-        LOG.warning("LIVE POLICY MIGRATION | %s retired pending %s exit; holding filled position to settlement.", ticker, retired_trigger)
     if remaining <= 0.004:
         return mark_live_exit_if_flat(record)
     quote, quote_state = feed.executable_shadow_exit_quote(
-        ticker, side, remaining, float(config["live_quote_max_age_seconds"]),
+        ticker, side, remaining, float(config["live_inverse_ml_quote_max_age_seconds"]),
     )
     protection["last_quote_state"] = quote_state
     protection["last_checked_at"] = now_iso()
@@ -4523,37 +2982,45 @@ async def monitor_live_absolute_stop(
     if average_entry is None:
         return False
     protection["average_filled_entry"] = round(average_entry, 6)
-    hard_stop = float(config["live_absolute_stop_price"])
-    latched_trigger = str(protection.get("trigger") or "")
-    exit_latched = bool(protection.get("exit_latched")) or (
-        record.get("status") == "live_exit_pending"
-        and latched_trigger == "absolute_5c_stop"
-    )
-    trigger: str | None = latched_trigger if exit_latched else None
-    if not exit_latched:
-        if bid <= hard_stop + 1e-9:
-            trigger = "absolute_5c_stop"
-        if trigger is None:
-            return False
+    prior_quantity = float(protection.get("high_depth_contracts") or 0.0)
+    # A high that was only executable for a smaller position must not be used
+    # as the trailing reference after a new rung increases exposure.
+    if remaining > prior_quantity + 0.004:
+        protection["trailing_high_bid"] = None
+        protection["high_depth_contracts"] = remaining
+        protection["rebaselined_at"] = now_iso()
+    gate = float(config["live_inverse_ml_hold_gate"])
+    trail = float(config["live_inverse_ml_trailing_stop"])
+    hard_stop = float(config["live_inverse_ml_absolute_stop_price"])
+    armed = bool(protection.get("armed"))
+    if not armed and bid + 1e-9 >= average_entry + gate:
         protection.update({
-            "trigger": trigger,
-            "triggered_at": now_iso(),
-            "trigger_bid": bid,
-            # A stop is terminal.  Once observed on a fresh full-depth book,
-            # a rebound during cancellation/reconfirmation must not silently
-            # abandon the close and leave a partially filled position behind.
-            "exit_latched": True,
-            "exit_latched_at": now_iso(),
+            "armed": True, "armed_at": now_iso(), "armed_average_entry": round(average_entry, 6),
+            "trailing_high_bid": bid, "high_depth_contracts": remaining,
         })
-        record["status"] = "live_exit_pending"
-        LOG.critical(
-            "LIVE 5C STOP TRIGGER | %s side=%s bid=$%.4f avg=$%.4f remaining=%.2f; canceling entries before reduce-only IOC.",
-            ticker, side.upper(), bid, average_entry, remaining,
+        armed = True
+        LOG.warning(
+            "LIVE INVERSE ML TRAIL ARMED | %s %s avg=$%.4f gate=+$%.2f bid=$%.4f stop=$%.4f qty=%.2f",
+            ticker, side.upper(), average_entry, gate, bid, bid - trail, remaining,
         )
-    if trigger != "absolute_5c_stop":
-        protection["exit_blocked"] = "invalid latched exit trigger"
-        LOG.critical("LIVE EXIT BLOCKED | %s %s", ticker, protection["exit_blocked"])
+    high = as_float(protection.get("trailing_high_bid"))
+    if armed and (high is None or bid > high + 1e-9):
+        protection["trailing_high_bid"] = bid
+        protection["high_depth_contracts"] = remaining
+        high = bid
+    trigger: str | None = None
+    if bid <= hard_stop + 1e-9:
+        trigger = "absolute_5c_stop"
+    elif armed and high is not None and bid <= high - trail + 1e-9:
+        trigger = "60c_gate_10c_trail"
+    if trigger is None:
         return False
+    protection.update({"trigger": trigger, "triggered_at": now_iso(), "trigger_bid": bid})
+    LOG.critical(
+        "LIVE INVERSE ML EXIT TRIGGER | %s %s reason=%s bid=$%.4f avg=$%.4f high=%s remaining=%.2f; canceling entries before reduce-only IOC.",
+        ticker, side.upper(), trigger, bid, average_entry,
+        "none" if high is None else f"${high:.4f}", remaining,
+    )
     # Kalshi does not permit a reduce-only close while this runner's entry
     # limits could still add exposure. Cancel every remaining entry first.
     for entry in orders_for_market(record):
@@ -4563,45 +3030,29 @@ async def monitor_live_absolute_stop(
     # relying on the ledger quantity for a reduce-only close.
     for entry in orders_for_market(record):
         await rest.refresh_order(entry)
-    outstanding_entries = [
-        entry for entry in orders_for_market(record)
-        if float(entry.get("remaining_count") or 0.0) > 0.004
-    ]
-    if outstanding_entries:
-        pending_ids = ",".join(
-            str(entry.get("order_id") or entry.get("client_order_id") or "?")
-            for entry in outstanding_entries
-        )
-        if protection.get("entry_cancel_pending") != pending_ids:
-            LOG.critical(
-                "LIVE EXIT WAITING FOR ENTRY CANCELS | %s trigger=%s outstanding=%s; no reduce-only exit will be sent yet.",
-                ticker, trigger, pending_ids,
-            )
-        protection.update({
-            "entry_cancel_pending": pending_ids,
-            "exit_blocked": "waiting for all entry cancels to be confirmed",
-        })
-        record["status"] = "live_exit_pending"
-        return False
-    protection.pop("entry_cancel_pending", None)
-    protection.pop("exit_blocked", None)
     entries = filled_contracts(record)
     exits = live_exit_filled_contracts(record)
     remaining = round(max(0.0, entries - exits), 2)
     if remaining <= 0.004:
         return mark_live_exit_if_flat(record)
     confirm_quote, confirm_state = feed.executable_shadow_exit_quote(
-        ticker, side, remaining, float(config["live_quote_max_age_seconds"]),
+        ticker, side, remaining, float(config["live_inverse_ml_quote_max_age_seconds"]),
     )
     protection["last_quote_state"] = confirm_state
     if confirm_quote is None:
         return False
     bid = float(confirm_quote["economic_price"])
     protection["last_executable_bid"] = bid
-    # ``exit_latched`` intentionally survives this fresh quote even if it is
-    # better than the original stop.  The stop was already triggered from a
-    # depth-supported quote, so the fresh bid is now the safer executable
-    # price for completing that already-requested exit.
+    high = as_float(protection.get("trailing_high_bid"))
+    if high is None or bid > high + 1e-9:
+        protection["trailing_high_bid"] = bid
+        protection["high_depth_contracts"] = remaining
+        high = bid
+    still_triggered = bid <= hard_stop + 1e-9 or (armed and high is not None and bid <= high - trail + 1e-9)
+    if not still_triggered:
+        protection.pop("trigger", None)
+        protection.pop("triggered_at", None)
+        return False
     position = await rest.position_for_ticker(ticker)
     if position is None:
         protection["exit_blocked"] = "exchange position unavailable after entry cancels"
@@ -4641,6 +3092,20 @@ async def settle_or_cancel(rest: KalshiREST, record: dict[str, Any], market: Any
     record["closed_at"] = now_iso()
     result = market_result(market)
     market_status = str(field(market, "status") or "").lower()
+    if result is not None and market_status == "finalized":
+        finalize_inverse_shadow(record, result)
+        finalize_ml_scalp_shadow(record, result)
+        finalize_ml_weighted_trailing_scalp_shadow(
+            record, result, record_key="ml_weighted_trailing_scalp_shadow", label="ML NORMAL")
+        finalize_ml_weighted_trailing_scalp_shadow(
+            record, result, record_key="inverse_ml_weighted_trailing_scalp_shadow", label="ML INVERSE")
+        finalize_ml_weighted_trailing_scalp_shadow(
+            record, result, record_key="ml_weighted_fixed_stop_loss_shadow", label="ML NORMAL BRACKET")
+        finalize_ml_weighted_trailing_scalp_shadow(
+            record, result, record_key="inverse_ml_weighted_fixed_stop_loss_shadow", label="ML INVERSE BRACKET")
+        finalize_ml_weighted_activation_comparison(record, result, inverse=False)
+        finalize_ml_weighted_activation_comparison(record, result, inverse=True)
+        finalize_model_transition_shadow(record, result)
     if not record.get("candidate_side") and not orders_for_market(record):
         if result is None or market_status != "finalized":
             if prior_status != "closed_waiting_finalization":
@@ -4652,7 +3117,7 @@ async def settle_or_cancel(rest: KalshiREST, record: dict[str, Any], market: Any
             "gross_payout": 0.0, "gross_profit_loss": 0.0, "kalshi_fees": 0.0,
             "net_profit_loss": 0.0, "return_percentage": None,
         })
-        LOG.info("WATCH COMPLETE | %s settled %s with no valid causal settlement signal; no GTC ladder submitted.",
+        LOG.info("WATCH COMPLETE | %s settled %s with no valid frozen ML side; no GTC ladder submitted.",
                  record["ticker"], result.upper())
         return
     for order in orders_for_market(record):
@@ -4673,13 +3138,8 @@ async def settle_or_cancel(rest: KalshiREST, record: dict[str, Any], market: Any
             "gross_payout": 0.0, "gross_profit_loss": 0.0, "kalshi_fees": 0.0,
             "net_profit_loss": 0.0, "return_percentage": None,
         })
-        record_directional_signal_outcome(record, result)
-        direction = (record.get("directional_signal") or {}).get("correct")
-        LOG.info(
-            "FINALIZED UNFILLED | %s %s: zero contracts held; no financial trade, directional_signal=%s.",
-            record["ticker"], result.upper(),
-            "WIN" if direction is True else ("LOSS" if direction is False else "not_eligible"),
-        )
+        LOG.info("FINALIZED UNFILLED | %s %s: zero contracts held; excluded from performance.",
+                 record["ticker"], result.upper())
         return
     cost = live_entry_cost(record)
     entry_fees = live_entry_fees(record)
@@ -4701,16 +3161,15 @@ async def settle_or_cancel(rest: KalshiREST, record: dict[str, Any], market: Any
         "early_exit_contracts": round(exit_count, 2),
         "settlement_contracts": round(remaining_contracts, 2),
     })
-    record_directional_signal_outcome(record, result)
     LOG.info("SETTLED | %s %s contracts=%.2f net=$%.4f", record["ticker"], result.upper(), quantity, net)
 
 
 async def consider_initial_entry(
     rest: KalshiREST, state: dict[str, Any], market: Any, config: dict[str, Any], dry_run: bool,
     live_asks: dict[str, float | None] | None = None, ml_side: str | None = None,
-    paper_monitor_only: bool = False, signal_source: str = "ml",
+    paper_monitor_only: bool = False,
 ) -> bool:
-    """Post the complete fixed GTC ladder for one frozen causal signal.
+    """Post the complete fixed GTC ladder for one frozen ML side.
 
     The ML decision—not a transient quote—chooses the economic outcome.  The
     four limits are deliberately created only after the market is tradeable,
@@ -4745,7 +3204,7 @@ async def consider_initial_entry(
         or record["orders"][f"{level:.4f}"].get("status") in {"submit_failed", "paused"}
         for level in LADDER_LEVELS
     )
-    if missing_or_rejected_rungs and not market_can_start_watcher(market, entry_start_grace_seconds(config)):
+    if missing_or_rejected_rungs and not market_can_start_watcher(market, config["watch_start_grace_seconds"]):
         # Never let a scheduled/unscheduled pause (or a partial network/API
         # failure) turn into a late mid-market ladder. Missing rungs may retry
         # only in the original opening grace; the next market starts clean.
@@ -4755,17 +3214,12 @@ async def consider_initial_entry(
             "GTC LADDER SKIPPED | %s opening grace expired; refusing to pre-post a new ladder mid-market.", ticker,
         )
         return False
-    # The signal was produced through the ordinary settlement-contrarian path
-    # above. Only now—after its causal side is frozen and the market is still
-    # within the normal entry window—consume a pending loss-circuit skip.
-    if not dry_run and consume_entry_loss_skip(state, record, ml_side, config):
-        return False
-    # ML paper studies remain attached only to an actual ML signal.  The
-    # settlement-contrarian live mode neither invokes nor labels itself as ML.
-    if signal_source == "ml":
-        ensure_ml_weighted_trailing_scalp_shadows(record, market, config, ml_side)
-        ensure_ml_weighted_fixed_stop_loss_shadows(record, market, config, ml_side)
-        ensure_ml_weighted_activation_comparison_shadows(record, market, config, ml_side)
+    # The counterfactual begins from the exact frozen ML decision and same
+    # fresh-market policy even if the live ladder is later blocked by balance,
+    # capacity, or exchange recovery. It remains paper-only in all modes.
+    ensure_ml_weighted_trailing_scalp_shadows(record, market, config, ml_side)
+    ensure_ml_weighted_fixed_stop_loss_shadows(record, market, config, ml_side)
+    ensure_ml_weighted_activation_comparison_shadows(record, market, config, ml_side)
     if paper_monitor_only:
         # The isolated report Action keeps the exact frozen ML side and uses
         # the authenticated quote stream only for its normal/inverse weighted
@@ -4783,35 +3237,28 @@ async def consider_initial_entry(
             "market_close_time": field(market, "close_time", "expected_expiration_time"),
         })
         LOG.info(
-            "WEIGHTED %s MONITOR STARTED | %s frozen_side=%s; subscribing to each actual YES/NO book for normal/inverse "
+            "WEIGHTED ML MONITOR STARTED | %s frozen_side=%s; subscribing to each actual YES/NO book for normal/inverse "
             "1x$0.40/2x$0.30/3x$0.20/4x$0.10 fills, a selected-side $0.05 stop, and separate 10c trails armed at +1c through +9c, then +10c/+20c/…/+80c. No order exists.",
-            signal_source.upper(), ticker, ml_side.upper(),
+            ticker, ml_side.upper(),
         )
         return True
-    if signal_source == "ml":
-        ensure_inverse_shadow(record, market, config, ml_side)
-        ensure_ml_scalp_shadow(record, market, config, ml_side)
-        ensure_model_transition_shadow(record, market, config)
+    ensure_inverse_shadow(record, market, config, ml_side)
+    ensure_ml_scalp_shadow(record, market, config, ml_side)
+    ensure_model_transition_shadow(record, market, config)
     other_active = [candidate for candidate in active_strategy_records(state) if candidate is not record]
     if len(other_active) >= config["max_active_markets"]:
         return False
-    # Quotes are not a directional filter. The causal settlement side alone
-    # selects the complete market-close-expiring GTC ladder.
+    # Quotes remain useful for heartbeat/audit output, but they do not gate
+    # this mode.  Once the frozen ML side is available, every fixed rung is a
+    # market-close-expiring GTC limit on that side.
     _ = live_asks
-    side = ml_side
+    inverse_weighted_live = live_weighted_inverse_enabled(config)
+    side = opposite_side(ml_side) if inverse_weighted_live else ml_side
     if side not in {"yes", "no"}:
         return False
-    base_share_count = dynamic_base_share_count(state, config)
-    rung_quantities = rung_quantities_for_base_share_count(base_share_count)
+    rung_quantities = live_rung_quantities(config)
     quantity = max(rung_quantities.values())
     reserve = ladder_principal_for_rungs(rung_quantities)
-    required_contracts = round(sum(rung_quantities.values()), 2)
-    if required_contracts > config["max_contracts_per_market"] + 1e-9:
-        LOG.critical(
-            "DYNAMIC SIZE BLOCKED | %s base=%.2f needs %.2f contracts but configured cap is %.2f; no partial ladder posted.",
-            ticker, base_share_count, required_contracts, config["max_contracts_per_market"],
-        )
-        return False
     # A retried, partially submitted ladder is already included in the active
     # reserve. Replace that record's reserve rather than adding it twice.
     existing_reserve = as_float(record.get("reserved_principal")) if record.get("candidate_side") else None
@@ -4838,16 +3285,13 @@ async def consider_initial_entry(
         "ladder_mode": "preposted_gtc_v2",
         "reserved_principal": reserve,
         "rung_quantities": {f"{level:.4f}": rung_quantities[level] for level in LADDER_LEVELS},
-        # This sizing snapshot is immutable for the life of this market. A
-        # later realized profit may increase the dynamic base for a new
-        # market, never for these already-posted GTC orders.
-        "base_share_count": base_share_count,
-        "dynamic_scaling_at_entry": dynamic_scaling_snapshot(state, config),
-        "strategy": LIVE_EXECUTION_STRATEGY,
-        "execution_mode": "dry_run" if dry_run else "live",
+        "strategy": (
+            "inverse_ml_weighted_hold_gate_live_v1" if inverse_weighted_live
+            else "ml_side_preposted_gtc_ladder_v2"
+        ),
+        "source_ml_side": ml_side,
         "market_close_time": field(market, "close_time", "expected_expiration_time"),
     })
-    record.pop("source_ml_side", None)
     if not await exchange_position_guard(rest, record, config):
         record["status"] = "initial_blocked_exchange_position"
         LOG.critical("GTC LADDER BLOCKED | %s no order submitted because the live exchange position is unsafe.", ticker)
@@ -4857,14 +3301,17 @@ async def consider_initial_entry(
         record["status"] = "initial_blocked_no_expiry"
         LOG.critical("GTC LADDER BLOCKED | %s has no market-close expiry; no GTC orders submitted.", ticker)
         return False
-    source = record.get("settlement_contrarian_signal") or {}
-    LOG.warning(
-        "LIVE SIDE LOCKED | %s prior=%s result=%s selected=%s; posting %s GTC ladder through close_epoch=%d; "
-        "only selected-side bid <= $0.05 can exit before settlement.",
-        ticker, str(source.get("source_ticker") or "?").upper(),
-        str(source.get("source_result") or "?").upper(), side.upper(),
-        "/".join(f"{rung_quantities[level]:.2f}x${level:.2f}" for level in LADDER_LEVELS), expiry,
-    )
+    if inverse_weighted_live:
+        LOG.warning(
+            "LIVE INVERSE ML SIDE LOCKED | %s source_ml=%s selected=%s; posting 1x$0.40/2x$0.30/3x$0.20/4x$0.10 "
+            "GTC ladder through close_epoch=%d; absolute bid stop=$0.05, trail arms at current average+$0.60 then retraces $0.10.",
+            ticker, ml_side.upper(), side.upper(), expiry,
+        )
+    else:
+        LOG.info(
+            "SIDE LOCKED | %s %s from frozen ML decision; immediately posting GTC ladder $0.40/$0.30/$0.20/$0.10 through close_epoch=%d.",
+            ticker, side.upper(), expiry,
+        )
     for level in LADDER_LEVELS:
         key = f"{level:.4f}"
         prior_order = record["orders"].get(key)
@@ -4892,21 +3339,8 @@ async def consider_initial_entry(
             order_key="initial" if level == LADDER_LEVELS[0] else key,
         )
         order["ladder_level"] = level
-        order["reason"] = (
-            "Frozen settlement-contrarian side; pre-posted fixed GTC ladder held through market close."
-        )
+        order["reason"] = "Frozen ML side; pre-posted fixed GTC ladder through market close."
         record["orders"][key] = order
-        if float(order.get("fill_count") or 0.0) > 0.004:
-            total_filled = filled_contracts(record)
-            total_cost = live_entry_cost(record)
-            LOG.warning(
-                "LIVE %s ENTRY FILL | %s side=%s rung=$%.2f delta=%.2f rung_total=%.2f "
-                "position=%.2f avg_entry=$%.4f cost=$%.4f fee=$%.4f id=%s; real exchange fill at submission.",
-                live_weighted_strategy_name(config), ticker, side.upper(), level, float(order.get("fill_count") or 0.0),
-                float(order.get("fill_count") or 0.0), total_filled,
-                total_cost / total_filled if total_filled > 0.004 else 0.0, total_cost,
-                float(order.get("fees_paid") or 0.0), order.get("order_id") or order.get("client_order_id") or "?",
-            )
         if order.get("status") == "paused":
             # Do not generate four rejected submissions or retry in a late
             # market. The watcher remains safe and the next fresh market will
@@ -4934,9 +3368,13 @@ async def consider_initial_entry(
             "GTC LADDER INCOMPLETE | %s %s accepted=%d/%d; will retry only missing same-side rungs.",
             ticker, side.upper(), accepted_rungs, len(LADDER_LEVELS),
         )
+    ml_signal = record.get("ml_inference") if isinstance(record.get("ml_inference"), dict) else {}
     LOG.info(
-        "LIVE LADDER POSTED | %s %s source=latest_settlement_opposite rungs=%d/%d; hold filled contracts to settlement unless bid reaches $0.05.",
-        ticker, side.upper(), accepted_rungs, len(LADDER_LEVELS),
+        "GTC LADDER POSTED | %s %s p_yes=%s confidence=%s rungs=%d/%d; no opposite-side order exists.",
+        ticker, side.upper(),
+        "unknown" if ml_signal.get("probability_yes") is None else f"{float(ml_signal['probability_yes']):.4f}",
+        "unknown" if ml_signal.get("confidence") is None else f"{float(ml_signal['confidence']):.4f}",
+        accepted_rungs, len(LADDER_LEVELS),
     )
     return accepted_rungs > 0
 
@@ -4981,20 +3419,8 @@ def rung_performance(settled: list[dict[str, Any]]) -> dict[str, dict[str, Any]]
                 continue
             result = stats[f"{level:.2f}"]
             average_price = float(order.get("average_fill_price") or order.get("position_price") or 0.0)
-            entry_fee = float(order.get("fees_paid") or 0.0)
-            if record.get("status") == "exited_early":
-                # A completed 5c stop has no settlement payout. Allocate its
-                # actual exit proceeds and fees by filled entry size so a
-                # later informational settlement outcome cannot make the
-                # rung report treat already-sold contracts as a $1 payout.
-                entry_total = filled_contracts(record)
-                share = fill / entry_total if entry_total > 0.004 else 0.0
-                order_net = (
-                    share * (live_exit_proceeds(record) - live_exit_fees(record))
-                    - fill * average_price - entry_fee
-                )
-            else:
-                order_net = (fill if position_side == resolved_side else 0.0) - fill * average_price - entry_fee
+            fee = float(order.get("fees_paid") or 0.0)
+            order_net = (fill if position_side == resolved_side else 0.0) - fill * average_price - fee
             result["filled_orders"] += 1
             result["filled_contracts"] += fill
             result["net_profit"] += order_net
@@ -5614,18 +4040,13 @@ def model_transition_shadow_performance(state: dict[str, Any]) -> dict[str, Any]
     }
 
 
-def live_weighted_hold_gate_performance(
-    state: dict[str, Any], config: dict[str, Any], strategy: str,
-) -> dict[str, Any]:
-    """Report one real weighted hold-gate source separately from paper paths."""
+def live_inverse_ml_hold_gate_performance(state: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
+    """Report the real inverse-ML live mode separately from every paper path."""
     records = [
         record for record in state.get("markets", {}).values()
-        if isinstance(record, dict) and record.get("strategy") == strategy
+        if isinstance(record, dict) and record.get("strategy") == "inverse_ml_weighted_hold_gate_live_v1"
     ]
-    closed = sorted(
-        (record for record in records if record.get("status") in {"finalized", "exited_early"}),
-        key=lambda record: str(record.get("settled_at") or record.get("exited_at") or ""),
-    )
+    closed = [record for record in records if record.get("status") in {"finalized", "exited_early"}]
     active = [record for record in records if record.get("status") in {"ladder_active", "live_exit_pending"}]
     pnls = [float(record.get("net_profit_loss") or 0.0) for record in closed]
     costs = [float(record.get("total_cost") or 0.0) for record in closed]
@@ -5646,9 +4067,8 @@ def live_weighted_hold_gate_performance(
                 break
             current_streak += 1
     exits = [order for record in records for order in (record.get("live_exit_orders") or []) if isinstance(order, dict)]
-    last_closed = closed[-1] if closed else None
     return {
-        "strategy": strategy,
+        "strategy": "inverse_ml_weighted_hold_gate_live_v1",
         "mode": "live_exchange_orders",
         "started_markets": len(records), "active_markets": len(active), "closed_markets": len(closed),
         "winning_trades": wins, "losing_trades": losses,
@@ -5664,186 +4084,10 @@ def live_weighted_hold_gate_performance(
         "hold_gate": float(config["live_inverse_ml_hold_gate"]),
         "trailing_retracement": float(config["live_inverse_ml_trailing_stop"]),
         "ladder": "1x40c/2x30c/3x20c/4x10c",
-        "last_closed_trade": None if last_closed is None else {
-            "ticker": last_closed.get("ticker"),
-            "source_ml_side": last_closed.get("source_ml_side"),
-            "settlement_contrarian_signal": last_closed.get("settlement_contrarian_signal"),
-            "selected_side": last_closed.get("locked_side") or last_closed.get("candidate_side"),
-            "exit_method": last_closed.get("exit_method") or "settlement",
-            "contracts": float(last_closed.get("contracts") or 0.0),
-            "total_cost": float(last_closed.get("total_cost") or 0.0),
-            "gross_payout": float(last_closed.get("gross_payout") or 0.0),
-            "fees": float(last_closed.get("kalshi_fees") or 0.0),
-            "net_profit_loss": float(last_closed.get("net_profit_loss") or 0.0),
-            "return_percentage": last_closed.get("return_percentage"),
-            "closed_at": last_closed.get("exited_at") or last_closed.get("settled_at"),
-        },
-    }
-
-
-def live_inverse_ml_hold_gate_performance(state: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
-    """Backward-compatible report key for the retired inverse-ML source."""
-    return live_weighted_hold_gate_performance(state, config, "inverse_ml_weighted_hold_gate_live_v1")
-
-
-def live_settlement_contrarian_hold_gate_performance(state: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
-    """Real-exchange performance for the non-ML settlement-contrarian source."""
-    return live_weighted_hold_gate_performance(state, config, "settlement_contrarian_weighted_hold_gate_live_v1")
-
-
-def directional_signal_performance(records: list[dict[str, Any]]) -> dict[str, Any]:
-    """Score causal settlement signals without reference to ladder execution."""
-    scored: list[tuple[tuple[int, str], dict[str, Any], bool]] = []
-    for record in records:
-        prediction = settlement_contrarian_signal_side(record)
-        outcome = str(record.get("settlement_outcome") or "").lower()
-        if prediction not in {"yes", "no"} or outcome not in {"yes", "no"}:
-            continue
-        directional = record.get("directional_signal")
-        score_time = (
-            directional.get("scored_at") if isinstance(directional, dict) else None
-        ) or record.get("settlement_outcome_observed_at") or record.get("settled_at") or record.get("exited_at")
-        epoch = timestamp_epoch(score_time) or 0
-        scored.append(((epoch, str(record.get("ticker") or "")), record, prediction == outcome))
-    scored.sort(key=lambda item: item[0])
-
-    def counts(items: list[tuple[tuple[int, str], dict[str, Any], bool]]) -> tuple[int, int]:
-        return sum(item[2] for item in items), sum(not item[2] for item in items)
-
-    wins, losses = counts(scored)
-    unfilled = [item for item in scored if item[1].get("status") == "finalized_unfilled"]
-    loss_skips = [item for item in scored if item[1].get("status") == "entry_skipped_loss_circuit_breaker"]
-    executed = [item for item in scored if float(item[1].get("contracts") or 0.0) > 0.004]
-    outcomes = [1.0 if item[2] else -1.0 for item in scored]
-    current_streak = 0
-    current_kind = "none"
-    if outcomes:
-        current_kind = "win" if outcomes[-1] > 0.0 else "loss"
-        for outcome in reversed(outcomes):
-            if (outcome > 0.0) != (outcomes[-1] > 0.0):
-                break
-            current_streak += 1
-    unfilled_wins, unfilled_losses = counts(unfilled)
-    skipped_wins, skipped_losses = counts(loss_skips)
-    executed_wins, executed_losses = counts(executed)
-    return {
-        "eligible_signals": len(scored),
-        "wins": wins,
-        "losses": losses,
-        "win_rate": round(wins / len(scored), 6) if scored else None,
-        "current_streak": current_streak,
-        "current_streak_kind": current_kind,
-        "longest_winning_streak": streak(outcomes, True),
-        "longest_losing_streak": streak(outcomes, False),
-        "executed_signals": len(executed),
-        "executed_wins": executed_wins,
-        "executed_losses": executed_losses,
-        "unfilled_ladder_signals": len(unfilled),
-        "unfilled_ladder_wins": unfilled_wins,
-        "unfilled_ladder_losses": unfilled_losses,
-        "loss_skipped_signals": len(loss_skips),
-        "loss_skipped_wins": skipped_wins,
-        "loss_skipped_losses": skipped_losses,
     }
 
 
 def performance_report(state: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
-    """Return only the current settlement-contrarian live ledger.
-
-    Legacy model/paper records remain in historical state files, but cannot
-    leak into the live report or affect this strategy's P&L.
-    """
-    records = [
-        record for record in state.get("markets", {}).values()
-        if isinstance(record, dict) and record.get("strategy") in LIVE_SETTLEMENT_RECORD_STRATEGIES
-    ]
-    closed = sorted(
-        (record for record in records if record.get("status") in {"finalized", "exited_early"}
-         and float(record.get("contracts") or 0.0) > 0.004),
-        key=lambda record: str(record.get("settled_at") or record.get("exited_at") or ""),
-    )
-    active = [record for record in records if record.get("status") in {
-        "watching", "initial_submitted", "ladder_active", "live_exit_pending",
-    }]
-    unfilled = sum(record.get("status") == "finalized_unfilled" for record in records)
-    skipped_after_losses = sum(record.get("status") == "entry_skipped_loss_circuit_breaker" for record in records)
-    source_window_misses = sum(record.get("status") == "signal_window_missed" for record in records)
-    pnls = [float(record.get("net_profit_loss") or 0.0) for record in closed]
-    costs = [float(record.get("total_cost") or 0.0) for record in closed]
-    contracts = [float(record.get("contracts") or 0.0) for record in closed]
-    wins = sum(value > 0.0 for value in pnls)
-    losses = sum(value < 0.0 for value in pnls)
-    equity = peak = 0.0
-    drawdowns: list[float] = []
-    for value in pnls:
-        equity += value
-        peak = max(peak, equity)
-        drawdowns.append(peak - equity)
-    five_cent_stops = sum(
-        str(record.get("exit_method") or "").endswith("absolute_5c_stop")
-        for record in closed
-    )
-    settlement_exits = len(closed) - five_cent_stops
-    last_trade = closed[-1] if closed else None
-    current_streak = 0
-    current_streak_kind = "none"
-    if pnls:
-        current_streak_kind = "win" if pnls[-1] > 0.0 else "loss"
-        current_is_win = pnls[-1] > 0.0
-        for value in reversed(pnls):
-            if (value > 0.0) != current_is_win:
-                break
-            current_streak += 1
-    return {
-        "generated_at": now_iso(),
-        "strategy": LIVE_EXECUTION_STRATEGY,
-        "configuration": config,
-        "markets_started": len(records),
-        "active_markets": len(active),
-        "settled_trades": len(closed),
-        "unfilled_markets": int(unfilled),
-        "markets_skipped_due_to_loss_circuit_breaker": int(skipped_after_losses),
-        "markets_skipped_due_to_source_finalization_window": int(source_window_misses),
-        "winning_trades": wins,
-        "losing_trades": losses,
-        "win_rate": round(wins / len(closed), 6) if closed else None,
-        "net_profit": round(sum(pnls), 6),
-        "total_cost": round(sum(costs), 6),
-        "return_on_capital": round(sum(pnls) / sum(costs), 6) if sum(costs) else None,
-        "total_contracts": round(sum(contracts), 2),
-        "average_contracts_per_trade": round(sum(contracts) / len(closed), 4) if closed else None,
-        "average_entry_price": round(sum(costs) / sum(contracts), 6) if sum(contracts) else None,
-        "maximum_drawdown": round(max(drawdowns, default=0.0), 6),
-        "current_streak": current_streak,
-        "current_streak_kind": current_streak_kind,
-        "longest_winning_streak": streak(pnls, True),
-        "longest_losing_streak": streak(pnls, False),
-        "five_cent_stop_exits": five_cent_stops,
-        "settlement_exits": settlement_exits,
-        "directional_signal_performance": directional_signal_performance(records),
-        "entry_loss_skip": entry_loss_skip_snapshot(state, config),
-        "dynamic_base_share_scaling": dynamic_scaling_snapshot(state, config),
-        "rung_performance": rung_performance(closed),
-        "rung_order_activity": rung_order_activity({"markets": {str(index): record for index, record in enumerate(records)}}),
-        "last_closed_trade": None if last_trade is None else {
-            "ticker": last_trade.get("ticker"),
-            "selected_side": last_trade.get("locked_side") or last_trade.get("candidate_side"),
-            "settlement_outcome": last_trade.get("settlement_outcome"),
-            "exit_method": last_trade.get("exit_method") or "settlement",
-            "contracts": float(last_trade.get("contracts") or 0.0),
-            "total_cost": float(last_trade.get("total_cost") or 0.0),
-            "gross_payout": float(last_trade.get("gross_payout") or 0.0),
-            "fees": float(last_trade.get("kalshi_fees") or 0.0),
-            "net_profit_loss": float(last_trade.get("net_profit_loss") or 0.0),
-            "return_percentage": last_trade.get("return_percentage"),
-            "closed_at": last_trade.get("exited_at") or last_trade.get("settled_at"),
-            "post_exit_directional_result": last_trade.get("post_exit_directional_result"),
-        },
-        "exit_policy": "hold every filled contract to settlement; only fresh full-depth selected-side bid <= $0.05 triggers a reduce-only close",
-    }
-
-    # Historical reporting implementation retained below only so historical
-    # research files can still be read offline; it is unreachable in live use.
     settled = sorted((record for record in state.get("markets", {}).values()
                       if isinstance(record, dict) and record.get("status") in {"finalized", "exited_early"}
                       and float(record.get("contracts") or 0.0) > 0.004),
@@ -5895,7 +4139,6 @@ def performance_report(state: dict[str, Any], config: dict[str, Any]) -> dict[st
             [record for record in settled if record.get("status") == "finalized"]
         ),
         "live_inverse_ml_hold_gate_performance": live_inverse_ml_hold_gate_performance(state, config),
-        "live_settlement_contrarian_hold_gate_performance": live_settlement_contrarian_hold_gate_performance(state, config),
         "ml_model_transition_side_comparison": model_transition_side_comparison(state),
         "ml_model_transition_shadow_performance": model_transition_shadow_performance(state),
         "inverse_ml_shadow_performance": inverse_shadow_performance(state),
@@ -5947,69 +4190,7 @@ def performance_report(state: dict[str, Any], config: dict[str, Any]) -> dict[st
 
 
 def log_performance_summary(report: dict[str, Any], context: str) -> None:
-    """Emit a compact, periodic summary without model or paper-study noise."""
-    streak = "none" if not report["current_streak"] else f"{report['current_streak']} {report['current_streak_kind']}"
-    LOG.info(
-        "LIVE SETTLEMENT SUMMARY | %s started=%d active=%d executed=%d unfilled=%d loss_skips=%d source_window_misses=%d executed_W/L=%d/%d executed_win_rate=%s "
-        "net=$%+.4f roi=%s costs=$%.4f contracts=%.2f stops=5c:%d/settlement:%d streak=%s longest_W/L=%d/%d max_dd=$%.4f.",
-        context, report["markets_started"], report["active_markets"], report["settled_trades"], report["unfilled_markets"],
-        report["markets_skipped_due_to_loss_circuit_breaker"],
-        report["markets_skipped_due_to_source_finalization_window"],
-        report["winning_trades"], report["losing_trades"],
-        "n/a" if report["win_rate"] is None else f"{100 * report['win_rate']:.2f}%",
-        report["net_profit"], "n/a" if report["return_on_capital"] is None else f"{100 * report['return_on_capital']:.2f}%",
-        report["total_cost"], report["total_contracts"], report["five_cent_stop_exits"], report["settlement_exits"],
-        streak, report["longest_winning_streak"], report["longest_losing_streak"], report["maximum_drawdown"],
-    )
-    directional = report["directional_signal_performance"]
-    LOG.info(
-        "LIVE DIRECTIONAL SIGNAL SUMMARY | %s eligible=%d W/L=%d/%d win_rate=%s streak=%s longest_W/L=%d/%d "
-        "executed=%d(%d/%d) zero_fill=%d(%d/%d) loss_skipped=%d(%d/%d); settlement outcome only, no ladder-fill dependency.",
-        context, directional["eligible_signals"], directional["wins"], directional["losses"],
-        "n/a" if directional["win_rate"] is None else f"{100 * directional['win_rate']:.2f}%",
-        "none" if not directional["current_streak"] else f"{directional['current_streak']} {directional['current_streak_kind']}",
-        directional["longest_winning_streak"], directional["longest_losing_streak"],
-        directional["executed_signals"], directional["executed_wins"], directional["executed_losses"],
-        directional["unfilled_ladder_signals"], directional["unfilled_ladder_wins"], directional["unfilled_ladder_losses"],
-        directional["loss_skipped_signals"], directional["loss_skipped_wins"], directional["loss_skipped_losses"],
-    )
-    last = report["last_closed_trade"]
-    if isinstance(last, dict):
-        LOG.info(
-            "LIVE LAST CLOSED TRADE | %s side=%s outcome=%s exit=%s contracts=%.2f cost=$%.4f payout=$%.4f fees=$%.4f net=$%+.4f roi=%s%s.",
-            last["ticker"] or "?", str(last["selected_side"] or "?").upper(), str(last["settlement_outcome"] or "pending").upper(),
-            last["exit_method"], last["contracts"], last["total_cost"], last["gross_payout"], last["fees"],
-            last["net_profit_loss"], "n/a" if last["return_percentage"] is None else f"{last['return_percentage']:+.2f}%",
-            "" if not last.get("post_exit_directional_result") else f" later_{last['post_exit_directional_result']}",
-        )
-    loss_skip = report["entry_loss_skip"]
-    LOG.info(
-        "LIVE ENTRY LOSS SKIP | %s consecutive_losses=%d/%d pending_market_skips=%d/%d trigger=%s last_reset=%s.",
-        context,
-        loss_skip["consecutive_completed_losses"], loss_skip["loss_limit"],
-        loss_skip["markets_remaining_to_skip"], loss_skip["markets_to_skip_after_limit"],
-        loss_skip["triggering_ticker"] or "none",
-        loss_skip["last_reset_reason"] or "none",
-    )
-    scaling = report["dynamic_base_share_scaling"]
-    actual_balance_text = (
-        "unavailable"
-        if scaling["actual_balance"] is None
-        else f"${scaling['actual_balance']:.4f}"
-    )
-    LOG.info(
-        "LIVE DYNAMIC BASE SCALING | %s enabled=%s actual_balance=%s(baseline $%.4f) base=%.2f(start %.2f) increment=%.2f multiplier=$%.4f "
-        "profit_since_baseline=$%+.4f next_balance_threshold=$%.4f remaining=$%.4f increases=%d caps=contracts:%s/capital:%s.",
-        context, scaling["enabled"], actual_balance_text, scaling["actual_balance_baseline"],
-        scaling["current_base_share_count"], scaling["starting_base_share_count"],
-        scaling["base_share_increment"], scaling["scaling_profit_multiplier"],
-        scaling["profit_since_last_increase"], scaling["next_increase_actual_balance"], scaling["profit_remaining_to_increase"],
-        scaling["scale_count"], "auto" if scaling["max_contracts_per_market_auto"] else "explicit",
-        "auto" if scaling["max_total_capital_auto"] else "explicit",
-    )
-    return
-
-    # Historical verbose report retained below for offline research only.
+    """Print the realized ledger summary alongside live quote/position logs."""
     ratio = report["win_loss_ratio"]
     ratio_text = "n/a (no losses yet)" if ratio is None and report["winning_trades"] else (
         "n/a" if ratio is None else f"{ratio:.2f}"
@@ -6051,43 +4232,22 @@ def log_performance_summary(report: dict[str, Any], context: str) -> None:
         "n/a" if model["average_model_confidence"] is None else f"{model['average_model_confidence']:.4f}",
         "n/a" if model["average_probability_yes"] is None else f"{model['average_probability_yes']:.4f}",
     )
-    for source_label, live_mode, configured in (
-        ("INVERSE ML", report["live_inverse_ml_hold_gate_performance"], live_weighted_inverse_enabled(report["configuration"])),
-        ("SETTLEMENT CONTRARIAN", report["live_settlement_contrarian_hold_gate_performance"], live_settlement_contrarian_enabled(report["configuration"])),
-    ):
-        if not (live_mode["started_markets"] or configured):
-            continue
-        streak_text = "none" if not live_mode["current_streak"] else (
-            f"{live_mode['current_streak']} {live_mode['current_streak_kind']}"
+    live_inverse = report["live_inverse_ml_hold_gate_performance"]
+    if live_inverse["started_markets"] or live_weighted_inverse_enabled(report["configuration"]):
+        streak_text = "none" if not live_inverse["current_streak"] else (
+            f"{live_inverse['current_streak']} {live_inverse['current_streak_kind']}"
         )
         LOG.warning(
-            "LIVE %s HOLD-GATE | %s started=%d active=%d closed=%d W/L=%d/%d streak=%s longest_W/L=%d/%d "
+            "LIVE INVERSE ML HOLD-GATE | %s started=%d active=%d closed=%d W/L=%d/%d streak=%s longest_W/L=%d/%d "
             "net=$%+.4f roi=%s exits=%d | 1x40c/2x30c/3x20c/4x10c; selected-side absolute stop=$%.2f; "
             "gate=+$%.2f then trailing retracement=$%.2f.",
-            source_label, context, live_mode["started_markets"], live_mode["active_markets"], live_mode["closed_markets"],
-            live_mode["winning_trades"], live_mode["losing_trades"], streak_text,
-            live_mode["longest_winning_streak"], live_mode["longest_losing_streak"], live_mode["net_profit"],
-            "n/a" if live_mode["return_on_capital"] is None else f"{100 * live_mode['return_on_capital']:.2f}%",
-            live_mode["exit_orders_submitted"], live_mode["absolute_stop_price"], live_mode["hold_gate"],
-            live_mode["trailing_retracement"],
+            context, live_inverse["started_markets"], live_inverse["active_markets"], live_inverse["closed_markets"],
+            live_inverse["winning_trades"], live_inverse["losing_trades"], streak_text,
+            live_inverse["longest_winning_streak"], live_inverse["longest_losing_streak"], live_inverse["net_profit"],
+            "n/a" if live_inverse["return_on_capital"] is None else f"{100 * live_inverse['return_on_capital']:.2f}%",
+            live_inverse["exit_orders_submitted"], live_inverse["absolute_stop_price"], live_inverse["hold_gate"],
+            live_inverse["trailing_retracement"],
         )
-        last_trade = live_mode["last_closed_trade"]
-        if isinstance(last_trade, dict):
-            source_detail = (
-                str((last_trade.get("settlement_contrarian_signal") or {}).get("source_ticker") or "?")
-                if source_label == "SETTLEMENT CONTRARIAN" else str(last_trade.get("source_ml_side") or "?").upper()
-            )
-            LOG.warning(
-                "LIVE %s LAST TRADE | %s source=%s side=%s exit=%s contracts=%.2f "
-                "cost=$%.4f proceeds=$%.4f fees=$%.4f net=$%+.4f roi=%s closed_at=%s.",
-                source_label, last_trade.get("ticker") or "?", source_detail,
-                str(last_trade.get("selected_side") or "?").upper(), last_trade.get("exit_method") or "settlement",
-                float(last_trade.get("contracts") or 0.0), float(last_trade.get("total_cost") or 0.0),
-                float(last_trade.get("gross_payout") or 0.0), float(last_trade.get("fees") or 0.0),
-                float(last_trade.get("net_profit_loss") or 0.0),
-                "n/a" if last_trade.get("return_percentage") is None else f"{float(last_trade['return_percentage']):+.2f}%",
-                last_trade.get("closed_at") or "unknown",
-            )
     transition_summary = report["ml_model_transition_side_comparison"]
     for transition in transition_summary["comparisons"]:
         LOG.info(
@@ -6323,48 +4483,8 @@ async def log_heartbeat(
     elapsed_seconds: float,
     feed: KalshiLiveFeed | None = None,
 ) -> None:
-    """Emit one compact summary and active-position detail at the set interval."""
-    report = performance_report(state, config)
+    """Emit enough live context to audit decisions without 2-second log spam."""
     balance = await rest.balance_dollars()
-    LOG.info(
-        "LIVE HEARTBEAT | mode=%s elapsed=%.0fs balance=%s stream=%s messages=%d reserved=$%.2f/$%.2f.",
-        "DRY_RUN" if dry_run else "LIVE", elapsed_seconds,
-        "unknown" if balance is None else f"${balance:.2f}",
-        "connected" if feed and feed.connected else "fallback", 0 if feed is None else feed.message_count,
-        reserved_principal(state), config["max_total_capital"],
-    )
-    log_performance_summary(report, "heartbeat")
-    for record in active_strategy_records(state):
-        if record.get("strategy") not in LIVE_SETTLEMENT_RECORD_STRATEGIES:
-            continue
-        ticker = str(record.get("ticker") or "?")
-        side = str(record.get("locked_side") or record.get("candidate_side") or "?").lower()
-        protection = record.get("live_exit_protection") if isinstance(record.get("live_exit_protection"), dict) else {}
-        filled = filled_contracts(record)
-        quote = None
-        if feed is not None and side in {"yes", "no"}:
-            quote, quote_state = feed.executable_shadow_exit_quote(
-                ticker, side, filled, float(config["live_quote_max_age_seconds"]),
-            )
-        else:
-            quote_state = "awaiting_quote"
-        bid = as_float((quote or {}).get("economic_price"))
-        avg = live_entry_cost(record) / filled if filled > 0.004 else None
-        rung_state = "/".join(
-            f"{float((record.get('orders') or {}).get(f'{level:.4f}', {}).get('fill_count') or 0.0):.2f}/"
-            f"{float((record.get('orders') or {}).get(f'{level:.4f}', {}).get('quantity') or 0.0):.2f}@{int(level * 100)}c"
-            for level in LADDER_LEVELS
-        )
-        LOG.info(
-            "LIVE POSITION | %s side=%s status=%s filled=%.2f avg=%s bid=%s stop=$0.05 quote=%s rungs=%s; holding to settlement unless the 5c stop is hit.",
-            ticker, side.upper(), record.get("status", "?"), filled,
-            "none" if avg is None else f"${avg:.4f}", "none" if bid is None else f"${bid:.4f}",
-            quote_state, rung_state,
-        )
-    return
-
-    # Historical verbose model/paper heartbeat retained below only for
-    # offline research; it is unreachable from the live settlement runner.
     active_records = active_strategy_records(state)
     watching_count = sum(record.get("status") == "watching" for record in active_records)
     active_ladders = sum(record.get("status") in {"initial_submitted", "ladder_active"} for record in active_records)
@@ -6386,69 +4506,40 @@ async def log_heartbeat(
         watch_state = str(record.get("status")) if isinstance(record, dict) else "not_started"
         ml_signal = record.get("ml_inference") if isinstance(record, dict) and isinstance(record.get("ml_inference"), dict) else {}
         ml_side = str(ml_signal.get("side") or "").lower()
-        contrarian_signal = (
-            record.get("settlement_contrarian_signal")
-            if isinstance(record, dict) and isinstance(record.get("settlement_contrarian_signal"), dict) else {}
-        )
-        contrarian_side = str(contrarian_signal.get("side") or "").lower()
         preposted = isinstance(record, dict) and record.get("ladder_mode") == "preposted_gtc_v2"
         trigger = (
             "GTC_LADDER_POSTED"
             if preposted else
-            ("SETTLEMENT_CONTRARIAN_READY_POSTING_GTC" if watch_state == "watching" and contrarian_side else
-             ("ML_READY_POSTING_GTC" if watch_state == "watching" and ml_side else
-              ("awaiting_settlement_cutoff" if live_settlement_contrarian_enabled(config) and watch_state == "watching" else
-               ("awaiting_ml" if watch_state == "watching" else "none"))))
+            ("ML_READY_POSTING_GTC" if watch_state == "watching" and ml_side else
+             ("awaiting_ml" if watch_state == "watching" else "none"))
         )
         LOG.info(
-            "QUOTE | %s source=%s yes_ask=%s no_ask=%s watcher=%s signal_side=%s signal_source=%s trigger=%s close=%s",
+            "QUOTE | %s source=%s yes_ask=%s no_ask=%s watcher=%s ml_side=%s trigger=%s close=%s",
             ticker or "?", "WS" if live_asks is not None else "REST_FALLBACK",
             "none" if asks["yes"] is None else f"${asks['yes']:.4f}",
             "none" if asks["no"] is None else f"${asks['no']:.4f}",
-            watch_state, (contrarian_side or ml_side).upper() or "none",
-            "settlement_contrarian" if contrarian_side else ("ml" if ml_side else "none"), trigger,
+            watch_state, ml_side.upper() or "none", trigger,
             field(market, "close_time", "expected_expiration_time") or "unknown",
         )
     for record in state.get("markets", {}).values():
         if not isinstance(record, dict) or record.get("status") in FINAL_RECORD_STATUSES:
             continue
-        if record.get("strategy") in LIVE_WEIGHTED_HOLD_GATE_RECORD_STRATEGIES:
+        if record.get("strategy") == "inverse_ml_weighted_hold_gate_live_v1":
             protection = record.get("live_exit_protection") if isinstance(record.get("live_exit_protection"), dict) else {}
             entry_count = filled_contracts(record)
             exit_count = live_exit_filled_contracts(record)
-            remaining = max(0.0, entry_count - exit_count)
-            entry_cost = live_entry_cost(record)
-            entry_fees = live_entry_fees(record)
-            exit_fees = live_exit_fees(record)
-            bid = as_float(protection.get("last_executable_bid"))
-            marked_net = None if bid is None else (
-                live_exit_proceeds(record) + remaining * bid - entry_cost - entry_fees - exit_fees
-            )
-            rung_state = "/".join(
-                f"${level:.2f}:{float((record.get('orders') or {}).get(f'{level:.4f}', {}).get('fill_count') or 0.0):.2f}/"
-                f"{float((record.get('orders') or {}).get(f'{level:.4f}', {}).get('quantity') or 0.0):.2f}:"
-                f"{str((record.get('orders') or {}).get(f'{level:.4f}', {}).get('status') or 'missing')}"
-                for level in LADDER_LEVELS
-            )
-            source_detail = (
-                str((record.get("settlement_contrarian_signal") or {}).get("source_ticker") or "?")
-                if live_record_source_label(record) == "SETTLEMENT CONTRARIAN"
-                else str(record.get("source_ml_side") or "?").upper()
-            )
             LOG.warning(
-                "LIVE %s STATUS | %s source=%s side=%s status=%s filled=%.2f exited=%.2f avg=%s "
-                "bid=%s marked_net=%s quote_state=%s armed=%s high=%s stop=$%.2f gate=+$%.2f trail=$%.2f "
-                "rungs=[%s]; real exchange orders enabled.",
-                live_record_source_label(record), record.get("ticker", "?"), source_detail,
+                "LIVE INVERSE ML STATUS | %s source_ml=%s side=%s status=%s filled=%.2f exited=%.2f avg=%s "
+                "bid=%s quote_state=%s armed=%s high=%s stop=$%.2f gate=+$%.2f trail=$%.2f; real exchange orders enabled.",
+                record.get("ticker", "?"), str(record.get("source_ml_side") or "?").upper(),
                 str(record.get("locked_side") or record.get("candidate_side") or "?").upper(), record.get("status", "?"),
                 entry_count, exit_count,
                 "none" if protection.get("average_filled_entry") is None else f"${float(protection['average_filled_entry']):.4f}",
                 "none" if protection.get("last_executable_bid") is None else f"${float(protection['last_executable_bid']):.4f}",
-                "none" if marked_net is None else f"${marked_net:+.4f}",
                 protection.get("last_quote_state", "awaiting_quote"), "yes" if protection.get("armed") else "no",
                 "none" if protection.get("trailing_high_bid") is None else f"${float(protection['trailing_high_bid']):.4f}",
                 float(config["live_inverse_ml_absolute_stop_price"]), float(config["live_inverse_ml_hold_gate"]),
-                float(config["live_inverse_ml_trailing_stop"]), rung_state,
+                float(config["live_inverse_ml_trailing_stop"]),
             )
         shadow = record.get("inverse_ml_shadow")
         if isinstance(shadow, dict):
@@ -6564,15 +4655,6 @@ async def log_heartbeat(
                     "none" if book.get("no_ask") is None else f"${float(book['no_ask']):.4f}",
                 )
         if record.get("status") == "watching":
-            if live_settlement_contrarian_enabled(config):
-                signal = record.get("settlement_contrarian_signal") or {}
-                side = str(signal.get("side") or "").upper()
-                LOG.info(
-                    "WATCH | %s active; %s.", record.get("ticker", "?"),
-                    (f"settlement-contrarian selected {side} from {str(signal.get('source_ticker') or '?').upper()}; full weighted GTC ladder will post immediately"
-                     if side else "awaiting the immediately preceding KXBTC15M finalization; no order can be placed"),
-                )
-                continue
             ml_signal = record.get("ml_inference") if isinstance(record.get("ml_inference"), dict) else {}
             ml_side = str(ml_signal.get("side") or "").upper()
             LOG.info(
@@ -6622,363 +4704,7 @@ async def cancel_open_mechanical_orders(rest: KalshiREST, state: dict[str, Any],
     return canceled
 
 
-async def run_settlement_only(args: argparse.Namespace) -> int:
-    """Run the sole supported live strategy: contrarian ladder to settlement."""
-    config_path = args.config.expanduser()
-    config = validate_config(load_json(config_path, DEFAULT_CONFIG))
-    config, config_changed = apply_config_overrides(config, args)
-    if args.persist_config or config_changed:
-        save_json(config_path, config)
-    dry_run = os.getenv("DRY_RUN", "true").lower() in {"1", "true", "yes"}
-    live_allowed = not dry_run and args.submit and args.allow_live
-    control_only = args.cancel_open_orders or args.cancel_all_resting_mechanical_orders
-    if args.paper_monitor_only:
-        raise SystemExit("--paper-monitor-only belongs to the retired paper runner and is unavailable here")
-    if not dry_run and not live_allowed and not control_only:
-        raise SystemExit("Refusing live orders: pass both --submit and --allow-live with DRY_RUN=false")
-
-    state_path = args.state_file.expanduser()
-    state = load_json(state_path, default_state())
-    state.setdefault("markets", {})
-    state["format_version"] = STATE_VERSION
-    for record in state["markets"].values():
-        if (
-            isinstance(record, dict)
-            and record.get("strategy") in {
-                "inverse_ml_weighted_hold_gate_live_v1",
-                "ml_side_preposted_gtc_ladder_v2",
-            }
-            and record.get("status") not in FINAL_RECORD_STATUSES
-        ):
-            record.update({
-                "strategy": LIVE_EXECUTION_STRATEGY,
-                "settlement_only_migrated_at": now_iso(),
-                "settlement_only_migration_note": "retired model/gate path; retain position to settlement with 5c stop only",
-            })
-    # Initialize the persisted completed-loss circuit breaker before a
-    # recovered or newly discovered market can submit an order. Dynamic
-    # scaling waits for the authenticated actual-balance source below.
-    if not dry_run:
-        refresh_entry_loss_skip(state, config)
-    regime_state_path = args.equity_regime_state.expanduser()
-    regime_data_dir = regime_state_path.parent
-    checkpoint = StateCheckpointPublisher.create(
-        config_path,
-        state_path,
-        args.report.expanduser(),
-        config,
-        state,
-        extra_paths=(
-            regime_state_path,
-            regime_data_dir / "kalshi_actual_equity_history.csv",
-            regime_data_dir / "kalshi_shadow_equity_history.csv",
-        ),
-    )
-    api_key = os.getenv("KALSHI_API_KEY_ID", "")
-    pem_path = Path(os.getenv("KALSHI_PEM_PATH", "kalshi_private_key.pem"))
-    if not api_key or not pem_path.exists():
-        raise SystemExit("KALSHI_API_KEY_ID and KALSHI_PEM_PATH are required")
-    rest = KalshiREST(api_key, pem_path, os.getenv("KALSHI_DEMO", "false").lower() in {"1", "true", "yes"})
-    regime: EquityRegimeController | None = None
-    if config.get("equity_regime_enabled", False):
-        regime_config = RegimeConfig.from_mapping(config)
-        regime = EquityRegimeController(
-            regime_config, regime_state_path, args.equity_regime_output_dir.expanduser(),
-        )
-        try:
-            await synchronize_history(regime, KalshiRawHistoryAPI(rest), state)
-            repaired_shadow_rows = regime.repair_legacy_live_equivalent_shadow_rows(state)
-            if repaired_shadow_rows:
-                LOG.warning(
-                    "EQUITY REGIME STARTUP REPAIRED | rows=%d fixed-shadow ledger rows were replayed before live recovery.",
-                    repaired_shadow_rows,
-                )
-            # Every finalized record present before this process started is
-            # historical scope.  The controller bootstrapped/reconciled its
-            # bounded 200-market universe above; marking the pre-existing
-            # ledger rows prevents the live loop from replaying older records
-            # after a restart.  Newly finalized records are marked only after
-            # their atomic controller update succeeds.
-            for record in state["markets"].values():
-                if (
-                    isinstance(record, dict)
-                    and record.get("status") in FINAL_RECORD_STATUSES
-                    and str(record.get("settlement_outcome") or "").lower() in {"yes", "no"}
-                ):
-                    record["regime_accounted"] = True
-            regime.save()
-            LOG.warning(
-                "EQUITY REGIME STARTUP | history=%d window=%s min_history=%d dry_run=%s live_control=%s actual_balance=%s shadow_balance=%s reconciled=%s",
-                regime_config.history_max_markets, regime_config.prophet_training_window,
-                regime_config.prophet_min_history, regime_config.dry_run, regime_config.controls_live_execution,
-                regime.state.get("actual_balance"), regime.state.get("shadow_balance"), regime.balance_reconciled,
-            )
-        except Exception as exc:  # noqa: BLE001 - accounting failure must never control a live entry
-            LOG.exception("EQUITY REGIME STARTUP FAILED | %s", exc)
-            if regime_config.controls_live_execution:
-                await rest.close()
-                raise
-            regime = None
-    if not dry_run:
-        # The regime's actual balance is persisted from the authenticated
-        # portfolio endpoint at startup/finalization. Dynamic scaling reads
-        # that value only; it never consumes or alters the shadow ledger.
-        actual_balance = as_float(regime.state.get("actual_balance")) if regime is not None else None
-        if actual_balance is None:
-            actual_balance = as_float(await rest.balance_decimal())
-        refresh_dynamic_base_share_scaling(state, config, actual_balance=actual_balance)
-    if control_only:
-        try:
-            canceled = (
-                await rest.cancel_resting_mechanical_orders()
-                if args.cancel_all_resting_mechanical_orders
-                else await cancel_open_mechanical_orders(rest, state, dry_run)
-            )
-            save_json(state_path, state)
-            save_json(args.report.expanduser(), performance_report(state, config))
-            LOG.warning("CANCEL-ONLY COMPLETE | canceled_open_mechanical_orders=%d", canceled)
-            return 0
-        finally:
-            await rest.close()
-
-    shutdown_requested = asyncio.Event()
-    shutdown_signal: list[str] = []
-    loop = asyncio.get_running_loop()
-
-    def request_shutdown(signum: int) -> None:
-        name = signal.Signals(signum).name
-        if not shutdown_requested.is_set():
-            shutdown_signal.append(name)
-            LOG.warning("GRACEFUL SHUTDOWN REQUESTED | signal=%s; saving state and allowing open positions to settle.", name)
-        shutdown_requested.set()
-
-    installed_signals: list[signal.Signals] = []
-    for item in (signal.SIGTERM, signal.SIGINT):
-        try:
-            loop.add_signal_handler(item, request_shutdown, int(item))
-            installed_signals.append(item)
-        except (NotImplementedError, RuntimeError):  # pragma: no cover - Windows/minimal loops
-            pass
-
-    feed = KalshiLiveFeed(rest.auth)
-    feed_task = asyncio.create_task(feed.run(), name="kalshi-settlement-contrarian-ws")
-    started_at = loop.time()
-    deadline = started_at + args.run_seconds
-    last_heartbeat_at = float("-inf")
-    last_market_refresh_at = float("-inf")
-    last_order_reconcile_at = float("-inf")
-    last_exchange_recovery_at = float("-inf")
-    last_private_update_count = 0
-    last_feed_update_count = feed.update_count
-    active_markets: list[Any] = []
-    recovery_ready = False
-    rungs = live_rung_quantities(config, state)
-    scaling = dynamic_scaling_snapshot(state, config)
-    LOG.warning(
-        "LIVE SETTLEMENT POLICY | enabled=%s ladder=%s total_contracts=%.2f max_principal=$%.2f "
-        "absolute_selected_side_stop=$%.2f; all other filled contracts hold to settlement.",
-        not dry_run, "/".join(f"{rungs[level]:.2f}x${level:.2f}" for level in LADDER_LEVELS),
-        sum(rungs.values()), ladder_principal_for_rungs(rungs), config["live_absolute_stop_price"],
-    )
-    LOG.warning(
-        "DYNAMIC BASE SCALING POLICY | enabled=%s base=%.2f start=%.2f increment=%.2f multiplier=$%.4f "
-        "next_balance_threshold=$%.4f; auto_caps=contracts:%s/capital:%s.",
-        scaling["enabled"], scaling["current_base_share_count"], scaling["starting_base_share_count"],
-        scaling["base_share_increment"], scaling["scaling_profit_multiplier"], scaling["next_increase_actual_balance"],
-        scaling["max_contracts_per_market_auto"], scaling["max_total_capital_auto"],
-    )
-    try:
-        while not shutdown_requested.is_set():
-            monotonic_now = loop.time()
-            if not recovery_ready and monotonic_now - last_exchange_recovery_at >= EXCHANGE_RECOVERY_RETRY_SECONDS:
-                recovery_ready = await recover_exchange_state(rest, state, config, dry_run)
-                last_exchange_recovery_at = monotonic_now
-            if monotonic_now - last_market_refresh_at >= config["market_refresh_seconds"]:
-                active_markets = await rest.active_markets()
-                last_market_refresh_at = monotonic_now
-            tracked = [
-                str(ticker) for ticker, record in state["markets"].items()
-                if isinstance(record, dict) and record.get("status") not in FINAL_RECORD_STATUSES
-            ]
-            feed.set_tickers(tracked + [str(field(market, "ticker") or "") for market in active_markets])
-            private_update = feed.private_update_count != last_private_update_count
-            reconciled_orders = False
-            if private_update or monotonic_now - last_order_reconcile_at >= config["order_reconcile_seconds"]:
-                for ticker, record in list(state["markets"].items()):
-                    if not isinstance(record, dict):
-                        continue
-                    if record.get("status") in FINAL_RECORD_STATUSES:
-                        # An early stop or intentional loss-skip has no
-                        # settlement result in its order ledger yet. Its
-                        # frozen causal signal is still scored from the target
-                        # outcome, without changing realized P&L or entries.
-                        if record.get("status") in {
-                            "exited_early", "entry_skipped_loss_circuit_breaker",
-                        } and directional_signal_settlement_check_due(record):
-                            known_outcome = str(record.get("settlement_outcome") or "").lower()
-                            if known_outcome in {"yes", "no"}:
-                                record_directional_signal_outcome(record, known_outcome)
-                            else:
-                                market = await rest.get_market(ticker)
-                                if market is not None:
-                                    market_result_value = market_result(market)
-                                    market_status = str(field(market, "status") or "").lower()
-                                    if market_result_value not in {"yes", "no"} or market_status != "finalized":
-                                        defer_directional_signal_settlement_check(record)
-                                    elif record.get("status") == "exited_early":
-                                        annotate_early_exit_settlement_outcome(record, market)
-                                    else:
-                                        annotate_skipped_signal_settlement_outcome(record, market)
-                                else:
-                                    defer_directional_signal_settlement_check(record)
-                        if regime is not None and not record.get("regime_accounted"):
-                            outcome = str(record.get("settlement_outcome") or "").lower()
-                            market_for_regime = None
-                            if outcome not in {"yes", "no"}:
-                                market_for_regime = await rest.get_market(ticker)
-                            await account_equity_regime_finalization(
-                                rest, regime, state, record, market_for_regime, dry_run=dry_run,
-                            )
-                        continue
-                    market = await rest.get_market(ticker)
-                    if market is None:
-                        continue
-                    record_dry_run = (
-                        dry_run
-                        or bool(record.get("regime_live_entry_suppressed"))
-                        or record.get("execution_mode") in {"dry_run", "regime_shadow_only"}
-                    )
-                    await reconcile_orders(rest, record, record_dry_run)
-                    await settle_or_cancel(rest, record, market, record_dry_run)
-                    if (
-                        market_is_tradeable(market)
-                        and not record.get("paper_monitor_only")
-                        and not record.get("regime_live_entry_suppressed")
-                    ):
-                        await submit_ladder(rest, record, market, config, record_dry_run)
-                    if regime is not None and record.get("status") in FINAL_RECORD_STATUSES:
-                        await account_equity_regime_finalization(rest, regime, state, record, market, dry_run=dry_run)
-                last_order_reconcile_at = monotonic_now
-                last_private_update_count = feed.private_update_count
-                reconciled_orders = True
-            # A settlement or completed 5c stop above may have changed the
-            # authenticated actual balance. Refresh scaling and the loss skip
-            # before handling a new signal; each one therefore applies to
-            # this same loop's next market without changing an already-posted
-            # ladder.
-            if not dry_run:
-                actual_balance = as_float(regime.state.get("actual_balance")) if regime is not None else None
-                if actual_balance is None and reconciled_orders:
-                    actual_balance = as_float(await rest.balance_decimal())
-                refresh_dynamic_base_share_scaling(state, config, actual_balance=actual_balance)
-                refresh_entry_loss_skip(state, config)
-            for market in active_markets:
-                ticker = str(field(market, "ticker") or "")
-                record = state["markets"].get(ticker)
-                if not isinstance(record, dict):
-                    record = start_market_watcher(state, market, config)
-                if not isinstance(record, dict) or record.get("status") != "watching":
-                    continue
-                side = await settlement_contrarian_side_for_market(rest, market, record, config)
-                if regime is not None and side in {"yes", "no"}:
-                    try:
-                        decision = build_equity_regime_decision(state, record, market, config, side)
-                        regime.start_market(decision)
-                    except Exception as exc:  # noqa: BLE001 - no unguarded live order after a controller failure
-                        record["regime_entry_blocked_at"] = now_iso()
-                        record["regime_entry_blocked_reason"] = str(exc)
-                        LOG.exception("EQUITY REGIME ENTRY BLOCKED | %s error=%s", ticker, exc)
-                        continue
-                    if regime.should_suppress_new_live_orders():
-                        record.update({
-                            "candidate_side": side,
-                            "locked_side": side,
-                            "locked_at": now_iso(),
-                            "strategy": LIVE_EXECUTION_STRATEGY,
-                            "execution_mode": "regime_shadow_only",
-                            "status": "regime_shadow_active",
-                            "market_close_time": field(market, "close_time", "expected_expiration_time"),
-                            "regime_live_entry_suppressed": True,
-                            "regime_live_entry_suppressed_at": now_iso(),
-                            "regime_state_reason": regime.state.get("state_reason"),
-                        })
-                        LOG.warning(
-                            "LIVE ENTRY SUPPRESSED BY EQUITY REGIME | %s side=%s shadow=%s P10=%s P90=%s; "
-                            "shadow decision continues and no real order was created.",
-                            ticker, side.upper(), regime.state["shadow_balance"],
-                            regime.state.get("last_p10"), regime.state.get("last_p90"),
-                        )
-                        continue
-                await consider_initial_entry(
-                    rest, state, market, config, dry_run, live_asks=feed.executable_asks(ticker),
-                    ml_side=side, signal_source="settlement_contrarian",
-                )
-            for record in state["markets"].values():
-                if isinstance(record, dict):
-                    record_dry_run = (
-                        dry_run
-                        or bool(record.get("regime_live_entry_suppressed"))
-                        or record.get("execution_mode") in {"dry_run", "regime_shadow_only"}
-                    )
-                    await monitor_live_absolute_stop(rest, record, feed, config, record_dry_run)
-                    if regime is not None:
-                        if regime.observe_shadow_market(
-                            str(record.get("ticker") or ""),
-                            feed.executable_shadow_quote,
-                            feed.executable_shadow_exit_quote,
-                            feed.public_trades_after if feed.connected else None,
-                        ):
-                            # Include a compact material marker in the main
-                            # bot checkpoint so a GitHub Actions crash cannot
-                            # lose a shadow fill/stop between handoffs.
-                            record["regime_shadow_last_material_update_at"] = now_iso()
-            monotonic_now = loop.time()
-            if monotonic_now - last_heartbeat_at >= config["status_log_seconds"]:
-                await log_heartbeat(rest, state, active_markets, config, dry_run, monotonic_now - started_at, feed)
-                if regime is not None:
-                    regime.heartbeat()
-                last_heartbeat_at = monotonic_now
-            save_json(state_path, state)
-            save_json(args.report.expanduser(), performance_report(state, config))
-            checkpoint.publish_if_changed(state, "material_strategy_event")
-            if monotonic_now >= deadline:
-                break
-            next_due = min(
-                deadline - monotonic_now,
-                config["market_refresh_seconds"] - (monotonic_now - last_market_refresh_at),
-                config["order_reconcile_seconds"] - (monotonic_now - last_order_reconcile_at),
-                config["status_log_seconds"] - (monotonic_now - last_heartbeat_at),
-            )
-            last_feed_update_count = await feed.wait_for_update(
-                min(config["poll_seconds"], max(0.01, next_due)), last_feed_update_count,
-            )
-    finally:
-        if shutdown_requested.is_set():
-            state["last_graceful_shutdown"] = {
-                "at": now_iso(), "signal": shutdown_signal[0] if shutdown_signal else "requested",
-                "policy": "open positions preserved for settlement; only the 5c stop remains active after handoff",
-            }
-        feed_task.cancel()
-        await asyncio.gather(feed_task, return_exceptions=True)
-        if regime is not None:
-            regime.save()
-        save_json(state_path, state)
-        final_report = performance_report(state, config)
-        save_json(args.report.expanduser(), final_report)
-        checkpoint.publish_if_changed(state, "graceful_shutdown" if shutdown_requested.is_set() else "run_complete")
-        log_performance_summary(final_report, "graceful_shutdown" if shutdown_requested.is_set() else "run_complete")
-        await rest.close()
-        for item in installed_signals:
-            loop.remove_signal_handler(item)
-    LOG.info("SETTLEMENT RUN COMPLETE | mode=%s active_records=%d", "DRY_RUN" if dry_run else "LIVE", len(active_strategy_records(state)))
-    return 0
-
-
 async def run(args: argparse.Namespace) -> int:
-    return await run_settlement_only(args)
-
-    # Legacy model/paper runner retained below for offline historical tooling;
-    # the live workflow cannot reach it.
     config_path = args.config.expanduser()
     config = validate_config(load_json(config_path, DEFAULT_CONFIG))
     config, config_changed = apply_config_overrides(config, args)
@@ -7043,29 +4769,25 @@ async def run(args: argparse.Namespace) -> int:
             return 0
         finally:
             await rest.close()
-    ml_selector: MLDirectionSelector | None = None
-    model_metadata: dict[str, Any] = {}
-    validation_report: dict[str, Any] = {}
-    if not live_settlement_contrarian_enabled(config):
-        if args.ml_training_csv is None or args.ml_model_path is None:
-            await rest.close()
-            raise SystemExit("ML-side execution requires --ml-training-csv and --ml-model-path; refusing a price-only fallback")
-        model_metadata = load_json(args.ml_model_metadata.expanduser(), {}) if args.ml_model_metadata else {}
-        validation_report = load_json(args.ml_validation_report.expanduser(), {}) if args.ml_validation_report else {}
-        previous_model_metadata = load_json(args.previous_ml_model_metadata.expanduser(), {}) if args.previous_ml_model_metadata else {}
-        try:
-            preflight_ml_deployment(args.ml_model_path.expanduser(), model_metadata)
-            if args.previous_ml_model_path is not None:
-                preflight_ml_deployment(args.previous_ml_model_path.expanduser(), previous_model_metadata)
-            ml_selector = MLDirectionSelector(
-                args.ml_training_csv.expanduser(), args.ml_model_path.expanduser(), config["ml_preopen_lead_seconds"],
-                config["ml_min_confidence"], model_metadata, args.ml_model_run_id, args.ml_training_run_id,
-                args.previous_ml_model_path.expanduser() if args.previous_ml_model_path else None,
-                previous_model_metadata, args.previous_ml_model_run_id,
-            )
-        except Exception:
-            await rest.close()
-            raise
+    if args.ml_training_csv is None or args.ml_model_path is None:
+        await rest.close()
+        raise SystemExit("ML-side execution requires --ml-training-csv and --ml-model-path; refusing a price-only fallback")
+    model_metadata = load_json(args.ml_model_metadata.expanduser(), {}) if args.ml_model_metadata else {}
+    validation_report = load_json(args.ml_validation_report.expanduser(), {}) if args.ml_validation_report else {}
+    previous_model_metadata = load_json(args.previous_ml_model_metadata.expanduser(), {}) if args.previous_ml_model_metadata else {}
+    try:
+        preflight_ml_deployment(args.ml_model_path.expanduser(), model_metadata)
+        if args.previous_ml_model_path is not None:
+            preflight_ml_deployment(args.previous_ml_model_path.expanduser(), previous_model_metadata)
+        ml_selector = MLDirectionSelector(
+            args.ml_training_csv.expanduser(), args.ml_model_path.expanduser(), config["ml_preopen_lead_seconds"],
+            config["ml_min_confidence"], model_metadata, args.ml_model_run_id, args.ml_training_run_id,
+            args.previous_ml_model_path.expanduser() if args.previous_ml_model_path else None,
+            previous_model_metadata, args.previous_ml_model_run_id,
+        )
+    except Exception:
+        await rest.close()
+        raise
     recovery_ready = await recover_exchange_state(rest, state, config, dry_run)
     checkpoint.publish_if_changed(state, "startup_exchange_recovery")
     feed = KalshiLiveFeed(rest.auth)
@@ -7085,12 +4807,12 @@ async def run(args: argparse.Namespace) -> int:
         config["initial_position_size"], config["max_contracts_per_market"], "/".join(f"${level:.2f}" for level in LADDER_LEVELS),
         config["max_total_capital"],
     )
-    if live_weighted_hold_gate_enabled(config):
+    if live_weighted_inverse_enabled(config):
         LOG.warning(
-            "LIVE %s POLICY | enabled=%s ladder=1x$0.40/2x$0.30/3x$0.20/4x$0.10 total_contracts=10 "
+            "LIVE INVERSE ML POLICY | enabled=%s ladder=1x$0.40/2x$0.30/3x$0.20/4x$0.10 total_contracts=10 "
             "max_principal=$%.2f absolute_bid_stop=$%.2f hold_gate=+$%.2f trailing_retracement=$%.2f "
             "quote_max_age=%.1fs. This submits real exchange orders when LIVE mode is enabled.",
-            live_weighted_strategy_name(config), not dry_run, ladder_principal_for_rungs(WEIGHTED_SCALP_RUNG_QUANTITIES),
+            not dry_run, ladder_principal_for_rungs(WEIGHTED_SCALP_RUNG_QUANTITIES),
             config["live_inverse_ml_absolute_stop_price"], config["live_inverse_ml_hold_gate"],
             config["live_inverse_ml_trailing_stop"], config["live_inverse_ml_quote_max_age_seconds"],
         )
@@ -7103,19 +4825,13 @@ async def run(args: argparse.Namespace) -> int:
         "will be compared only on identical frozen inputs.",
         bool(config["model_transition_shadow_enabled"]), config["model_transition_shadow_position_size"],
     )
-    if ml_selector is None:
-        LOG.warning(
-            "SETTLEMENT CONTRARIAN POLICY | no ML model, ledger, probability, or model-transition comparison is loaded. "
-            "After each market opens, the immediately preceding finalized KXBTC15M result is read and the opposite side is frozen without a fixed delay.",
-        )
-    else:
-        LOG.info(
-            "ML SIDE FILTER | stored_model=%s feature_ledger=%s preopen_lead=%.0fs confidence_gate=%.2f fallback=disabled",
-            args.ml_model_path, args.ml_training_csv, config["ml_preopen_lead_seconds"], config["ml_min_confidence"],
-        )
-        log_ml_deployment(
-            model_metadata, validation_report, args.ml_model_run_id, args.ml_training_run_id, config["ml_min_confidence"],
-        )
+    LOG.info(
+        "ML SIDE FILTER | stored_model=%s feature_ledger=%s preopen_lead=%.0fs confidence_gate=%.2f fallback=disabled",
+        args.ml_model_path, args.ml_training_csv, config["ml_preopen_lead_seconds"], config["ml_min_confidence"],
+    )
+    log_ml_deployment(
+        model_metadata, validation_report, args.ml_model_run_id, args.ml_training_run_id, config["ml_min_confidence"],
+    )
     log_performance_summary(performance_report(state, config), "startup")
     try:
         while True:
@@ -7123,8 +4839,7 @@ async def run(args: argparse.Namespace) -> int:
             if not recovery_ready and monotonic_now - last_exchange_recovery_at >= EXCHANGE_RECOVERY_RETRY_SECONDS:
                 recovery_ready = await recover_exchange_state(rest, state, config, dry_run)
                 last_exchange_recovery_at = monotonic_now
-            if ml_selector is not None:
-                await ml_selector.maybe_prepare_next()
+            await ml_selector.maybe_prepare_next()
             # Discover the current KXBTC15M window periodically.  Once known,
             # the authenticated ticker stream—not REST polling—is the entry
             # trigger for every quote change.
@@ -7163,16 +4878,11 @@ async def run(args: argparse.Namespace) -> int:
                     record = start_market_watcher(state, market, config)
                 if not isinstance(record, dict) or record.get("status") != "watching":
                     continue
-                if ml_selector is None:
-                    ml_side = await settlement_contrarian_side_for_market(rest, market, record, config)
-                    signal_source = "settlement_contrarian"
-                else:
-                    ml_side = await ml_selector.side_for_market(market, record)
-                    signal_source = "ml"
+                ml_side = await ml_selector.side_for_market(market, record)
                 await consider_initial_entry(
                     rest, state, market, config, dry_run,
                     live_asks=feed.executable_asks(ticker), ml_side=ml_side,
-                    paper_monitor_only=args.paper_monitor_only, signal_source=signal_source,
+                    paper_monitor_only=args.paper_monitor_only,
                 )
             # The counterfactual is intentionally driven only by the
             # authenticated ticker stream. It is evaluated separately from
@@ -7228,8 +4938,7 @@ async def run(args: argparse.Namespace) -> int:
     finally:
         feed_task.cancel()
         await asyncio.gather(feed_task, return_exceptions=True)
-        if ml_selector is not None:
-            await ml_selector.close()
+        await ml_selector.close()
         save_json(state_path, state)
         final_report = performance_report(state, config)
         save_json(args.report.expanduser(), final_report)
@@ -7254,57 +4963,6 @@ async def run(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="KXBTC15M settlement-contrarian live trader")
-    parser.add_argument("--config", type=Path, default=Path("kalshi_btc15m_average_down_config.json"))
-    parser.add_argument("--state-file", type=Path, default=Path("kalshi_btc15m_average_down_state.json"))
-    parser.add_argument("--report", type=Path, default=Path("kalshi_btc15m_average_down_report.json"))
-    parser.add_argument("--run-seconds", type=float, default=840.0)
-    parser.add_argument("--cancel-open-orders", action="store_true")
-    parser.add_argument("--cancel-all-resting-mechanical-orders", action="store_true")
-    parser.add_argument("--persist-config", action="store_true")
-    parser.add_argument("--submit", action="store_true")
-    parser.add_argument("--allow-live", action="store_true")
-    parser.add_argument("--initial-position-size", type=float, help="Persistent share multiplier: 3 means 3/6/9/12 contracts.")
-    parser.add_argument(
-        "--enable-dynamic-scaling", choices=("true", "false"),
-        help="Opt in or out of realized-P&L base-share scaling; false keeps the configured starting base fixed.",
-    )
-    parser.add_argument(
-        "--base-share-increment", type=float,
-        help="Base shares added on each dynamic scaling threshold (minimum precision: 0.01).",
-    )
-    parser.add_argument(
-        "--scaling-profit-multiplier", type=float,
-        help="Realized profit required per current base share before the next dynamic increase.",
-    )
-    parser.add_argument("--max-active-markets", type=int)
-    parser.add_argument("--max-contracts-per-market", type=float)
-    parser.add_argument("--max-total-capital", type=float)
-    parser.add_argument("--fee-reserve", type=float)
-    parser.add_argument("--poll-seconds", type=float)
-    parser.add_argument("--market-refresh-seconds", type=float)
-    parser.add_argument("--order-reconcile-seconds", type=float)
-    parser.add_argument("--watch-start-grace-seconds", type=float)
-    parser.add_argument("--status-log-seconds", type=float)
-    parser.add_argument("--equity-regime-enabled", action=argparse.BooleanOptionalAction, default=None)
-    parser.add_argument("--equity-regime-dry-run", action=argparse.BooleanOptionalAction, default=None)
-    parser.add_argument("--allow-live-state-transitions", action=argparse.BooleanOptionalAction, default=None)
-    parser.add_argument("--subaccount", type=int)
-    parser.add_argument("--starting-balance")
-    parser.add_argument("--history-max-markets", type=int)
-    parser.add_argument("--history-start-ts")
-    parser.add_argument("--history-end-ts")
-    parser.add_argument("--accounting-tolerance")
-    parser.add_argument("--prophet-min-history", type=int)
-    parser.add_argument("--prophet-training-window", type=int)
-    parser.add_argument("--prophet-refit-every-markets", type=int)
-    parser.add_argument("--shadow-fill-model", choices=("conservative_trade_through", "touch", "live_equivalent"))
-    parser.add_argument("--equity-regime-state", type=Path, default=Path("data/kalshi_equity_regime_state.json"))
-    parser.add_argument("--equity-regime-output-dir", type=Path, default=Path("outputs"))
-    parser.add_argument("--paper-monitor-only", action="store_true", help=argparse.SUPPRESS)
-    return parser
-
-    # Legacy parser retained below for offline historical tooling only.
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=Path("kalshi_btc15m_average_down_config.json"))
     parser.add_argument("--state-file", type=Path, default=Path("kalshi_btc15m_average_down_state.json"))
@@ -7364,12 +5022,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--allow-live", action="store_true")
     parser.add_argument(
         "--live-execution-strategy", choices=sorted(LIVE_EXECUTION_STRATEGIES),
-        help=("Persisted real-order mode. inverse_ml_weighted_hold_gate is the inverse-ML 1/2/3/4 strategy; "
-              "settlement_contrarian_weighted_hold_gate uses the opposite of the immediately preceding finalized settlement and never loads ML."),
+        help="Persisted real-order mode. inverse_ml_weighted_hold_gate is the explicit inverse-ML 1/2/3/4 exit-protected strategy.",
     )
     parser.add_argument(
         "--live-inverse-ml-hold-gate", type=float,
-        help="Profit gain over current average entry needed to arm either weighted live mode's 10c trailing exit.",
+        help="Profit gain over the current average entry needed to arm the live inverse-ML 10c trailing exit.",
     )
     parser.add_argument("--initial-position-size", type=float)
     parser.add_argument("--max-active-markets", type=int)
