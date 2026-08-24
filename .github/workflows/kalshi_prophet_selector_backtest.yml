@@ -1,0 +1,72 @@
+name: Kalshi Prophet Selector Historical Backtest
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: "Successful Kalshi BTC 15-min Historical Backtest run whose stored Prophet artifact to replay."
+        required: true
+        default: "29698207476"
+      selection_fraction:
+        description: "Chronological fraction used only to select a trailing window or fixed side; final remainder is untouched holdout."
+        required: true
+        default: "0.80"
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  selector-historical-backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+
+      - name: Setup Python 3.13
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Run leakage-safety unit tests
+        run: |
+          python -m py_compile kalshi_prophet_selector_backtest.py
+          python test_kalshi_prophet_selector_backtest.py
+
+      - name: Download completed Prophet backtest artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+        run: |
+          set -euo pipefail
+          mkdir -p stored_backtest
+          gh run download "$SOURCE_RUN_ID" \
+            --repo "$GITHUB_REPOSITORY" \
+            --name "kalshi-btc15m-backtest-${SOURCE_RUN_ID}" \
+            --dir stored_backtest
+          test -s stored_backtest/prophet_ml_backtest_rows.csv
+
+      - name: Replay normal, inverse, windows, and vote
+        env:
+          PYTHONUNBUFFERED: "1"
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          SELECTION_FRACTION: ${{ inputs.selection_fraction }}
+        run: |
+          set -euo pipefail
+          python kalshi_prophet_selector_backtest.py \
+            --input-csv stored_backtest/prophet_ml_backtest_rows.csv \
+            --output-dir prophet_selector_backtest_output \
+            --source-run-id "$SOURCE_RUN_ID" \
+            --selection-fraction "$SELECTION_FRACTION"
+          sed -n '1,240p' prophet_selector_backtest_output/prophet_selector_backtest_report.md
+
+      - name: Upload selector backtest report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kalshi-prophet-selector-backtest-${{ github.run_id }}
+          path: prophet_selector_backtest_output/
+          if-no-files-found: warn
+          retention-days: 30
