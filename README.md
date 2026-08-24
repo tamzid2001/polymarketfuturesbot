@@ -94,6 +94,19 @@ Forensic check of the archived v10 40¢ IOC shadow state (not live exchange exec
 
 This is a **fixed shadow-ledger settlement replay with observed/inferred execution and Monte Carlo late-path sensitivity**, not an exact fill reconstruction. The archived v10 file retained first-minute books and old 40¢ stop events, but not the complete later quote path or maker queue priority. A known old 40¢ path is therefore treated as an execution opportunity through any resting limit above 45¢ and as a known 45¢ crossing; this does not claim an exchange fill. For winner paths that never reached the old 40¢ stop, the base Monte Carlo uses the retained first-minute evidence: 26 of 50 touched the derived limit (52.00%), and 10 of those 26 subsequently showed an executable bid at or below 45¢ (38.46%). These two rates are explicit sensitivity proxies for the missing late path.
 
+The archived strategy itself was profitable: its 214 completed shadow fills produced **+$1.7803**, taking the shadow balance from $1,000 to **$1,001.7803**. That is the realized result of the old IOC-entry/40¢-stop implementation and is not replaced by the newer counterfactual. The earlier 191-row calculation was based on an incomplete visible subset. The complete checkpoint has **193** old actual entries above 45¢: 50 profitable settlements and 143 stops, comprising 96 directional losers and 47 stopped eventual winners.
+
+The following arithmetic reconciles that positive ledger with the 45¢ proposal. These are fixed-one-share, gross bounds that assume every old IOC fill—or every old IOC fill shifted down one cent—would participate. They do not model whether a new resting maker order actually fills.
+
+| Entry-price proxy | Eligible | Profitable settlements | Old stops | Additional profitable winners with a retained post-fill bid ≤45¢ | Zero-additional-stop P&L / EV | First-minute-evidence P&L / EV |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Old actual IOC entry | 193 | 50 | 143 | 10 | **+$11.98 / +6.21¢** | **+$6.48 / +3.36¢** |
+| Old actual IOC entry minus 1¢ | 187 | 50 | 137 | 10 | **+$13.91 / +7.44¢** | **+$8.41 / +4.50¢** |
+
+Thus, the optimistic 45¢ calculation is positive. The complete-ledger equivalent of +$12.53 over the 191 pasted rows is **+$11.98 over 193 rows**; the two missing rows were directional losers. Applying the one-cent discount directly to the old fills gives the separate **+$13.91 over 187 eligible rows** proxy. But the checkpoint already proves that at least 10 of the 50 old profitable settlements showed a post-fill executable bid at or below 45¢ within the retained first minute, reducing those bounds by $5.50 before fees. Complete later paths could reveal more false stops.
+
+The actual new rule uses the first fresh signal-time ask minus one cent, not the old IOC fill minus one cent. It can therefore select different prices and, crucially, can miss winners while adverse paths fill. That maker-participation effect is why the execution-aware replay below can be negative even though both the old realized ledger and the all-fill arithmetic bounds are positive.
+
 | Retained evidence | Count |
 | --- | ---: |
 | Archived records with outcomes and opening books | 214 |
@@ -120,7 +133,7 @@ The 10,000-replication base late-path sensitivity produced mean P&L **-$4.4887**
 | Exit averages 43¢ | 5,000 | -$13.6555 | **-$13.8912** | -$22.4218 / -$3.9426 |
 | Perfect 45¢ exit plus 1¢ cost per filled share | 5,000 | -$9.6458 | **-$9.9020** | -$18.2984 / -$0.3578 |
 
-The empirical base case is therefore negative in this small recent shadow window. The only profitable deterministic row assumes every eligible maker order fills and no additional unobserved winner is stopped, so it should not be used as the expectation. The principal drag is false stopping: the retained evidence already contains 53 correct-direction markets that crossed the stop path. The earlier archived 40¢ IOC shadow result of +$1.7803 is not directly comparable because both entry execution and stop policy changed.
+The execution-aware empirical base case is therefore negative in this small recent shadow window, while the archived realized result and fixed-fill arithmetic bounds are positive. The difference is principally maker adverse selection and false stopping—not a claim that the old +$1.7803 ledger was negative. The profitable all-eligible-fill row assumes every eligible maker order fills and no additional unobserved winner is stopped, so it should not be treated as the new strategy expectation.
 
 Reproduce the primary run with:
 

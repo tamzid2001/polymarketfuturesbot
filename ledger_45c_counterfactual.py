@@ -179,6 +179,106 @@ def load_ledger_trades(path: Path, entry_offset_cents: int = 1) -> list[LedgerTr
     return sorted(result, key=lambda trade: (trade.market_open_epoch, trade.ticker))
 
 
+def archived_ledger_reconciliation(
+    path: Path, *, stop_cents: int = 45, entry_offset_cents: int = 1,
+) -> dict[str, Any]:
+    """Reconcile the old realized ledger and two fixed-share price proxies.
+
+    The old IOC entry and ``old IOC entry - offset`` views are arithmetic
+    bounds, not maker-fill reconstructions. They deliberately preserve the old
+    stop/settlement classification so the archived positive P&L can be compared
+    with the newer signal-time-ask execution model without conflating them.
+    """
+    state = json.loads(path.read_text(encoding="utf-8"))
+    completed: list[dict[str, Any]] = []
+    for record in state.get("markets", {}).values():
+        if decimal(record.get("actual_quantity") or "0") <= ZERO:
+            continue
+        outcome = _outcome(record)
+        side = str(record.get("signal_side") or "").lower()
+        if outcome not in {"yes", "no"} or side not in {"yes", "no"}:
+            continue
+        entry_cents = price_cents(record["actual_average_entry_price"])
+        fill_epoch = float(
+            (record.get("entry_timing") or {}).get("first_fill_observed_epoch") or 0.0
+        )
+        observed_stop_after_fill = any(
+            (quote_epoch(observation) or -1.0) >= fill_epoch
+            and price_cents(observation["selected_best_bid"]) <= stop_cents
+            for observation in (record.get("opening_quote_observations") or [])
+            if observation.get("selected_best_bid") is not None
+        )
+        completed.append({
+            "entry_cents": entry_cents,
+            "eventual_winner": outcome == side,
+            "old_stopped": record.get("realized_method") == "stop",
+            "realized_positive": decimal(record.get("realized_net_pnl") or "0") > ZERO,
+            "realized_pnl": decimal(record.get("realized_net_pnl") or "0"),
+            "observed_stop_after_fill": observed_stop_after_fill,
+        })
+
+    def fixed_share_proxy(offset_cents: int) -> dict[str, Any]:
+        eligible = [
+            (record, record["entry_cents"] - offset_cents)
+            for record in completed
+            if record["entry_cents"] - offset_cents > stop_cents
+        ]
+        optimistic_pnl = ZERO
+        observed_pnl = ZERO
+        for record, entry_cents in eligible:
+            settlement_pnl = Decimal(100 - entry_cents) / Decimal(100)
+            stop_pnl = Decimal(stop_cents - entry_cents) / Decimal(100)
+            optimistic_pnl += stop_pnl if record["old_stopped"] else settlement_pnl
+            observed_pnl += (
+                stop_pnl
+                if record["old_stopped"] or record["observed_stop_after_fill"]
+                else settlement_pnl
+            )
+        old_stops = [record for record, _ in eligible if record["old_stopped"]]
+        return {
+            "eligible": len(eligible),
+            "eventual_winners": sum(record["eventual_winner"] for record, _ in eligible),
+            "eventual_losers": sum(not record["eventual_winner"] for record, _ in eligible),
+            "old_profitable_settlements": sum(
+                record["realized_positive"] for record, _ in eligible
+            ),
+            "old_stops": len(old_stops),
+            "old_stopped_eventual_winners": sum(
+                record["eventual_winner"] for record in old_stops
+            ),
+            "old_stopped_eventual_losers": sum(
+                not record["eventual_winner"] for record in old_stops
+            ),
+            "additional_profitable_winners_with_observed_post_fill_bid_at_or_below_stop": sum(
+                not record["old_stopped"] and record["observed_stop_after_fill"]
+                for record, _ in eligible
+            ),
+            "optimistic_fixed_one_share_gross_pnl": format(optimistic_pnl, "f"),
+            "observed_first_minimum_fixed_one_share_gross_pnl": format(observed_pnl, "f"),
+            "optimistic_fixed_one_share_ev_per_eligible": report_decimal(
+                optimistic_pnl / Decimal(len(eligible)),
+            ),
+            "observed_first_minimum_fixed_one_share_ev_per_eligible": report_decimal(
+                observed_pnl / Decimal(len(eligible)),
+            ),
+        }
+
+    realized = sum((record["realized_pnl"] for record in completed), ZERO)
+    return {
+        "completed_fills": len(completed),
+        "realized_positive_trades": sum(record["realized_positive"] for record in completed),
+        "realized_nonpositive_trades": sum(not record["realized_positive"] for record in completed),
+        "eventual_directional_winners": sum(record["eventual_winner"] for record in completed),
+        "eventual_directional_losers": sum(not record["eventual_winner"] for record in completed),
+        "old_stops": sum(record["old_stopped"] for record in completed),
+        "old_settlements": sum(not record["old_stopped"] for record in completed),
+        "archived_realized_pnl": format(realized, "f"),
+        "archived_final_balance": format(decimal(state["shadow_metrics"]["balance"]), "f"),
+        "old_actual_entry_proxy": fixed_share_proxy(0),
+        "old_actual_entry_minus_offset_proxy": fixed_share_proxy(entry_offset_cents),
+    }
+
+
 def empirical_calibration(trades: Iterable[LedgerTrade], stop_cents: int = 45) -> dict[str, Any]:
     rows = list(trades)
     eligible = [trade for trade in rows if trade.entry_limit_cents > stop_cents]
@@ -362,6 +462,7 @@ def monte_carlo_summary(results: list[ReplayMetrics]) -> dict[str, Any]:
 def write_outputs(
     output_dir: Path,
     trades: list[LedgerTrade],
+    reconciliation: dict[str, Any],
     calibration: dict[str, Any],
     deterministic: list[ReplayMetrics],
     mc_summaries: dict[str, dict[str, Any]],
@@ -389,6 +490,7 @@ def write_outputs(
         "stop_cents": arguments.stop_cents,
         "stop_slippage_cents": arguments.stop_slippage_cents,
         "fee_per_filled_share": arguments.fee_per_filled_share,
+        "archived_ledger_reconciliation": reconciliation,
         "calibration": calibration,
         "deterministic_scenarios": rows,
         "monte_carlo": mc_summaries,
@@ -399,15 +501,37 @@ def write_outputs(
         "",
         "This is not an exact historical fill/stop replay. Settlements and retained books are fixed; unobserved late execution is simulated.",
         "",
+        f"- Archived realized P&L: ${reconciliation['archived_realized_pnl']} (final balance ${reconciliation['archived_final_balance']})",
         f"- Markets: {calibration['markets']}",
         f"- Eligible derived limits above {arguments.stop_cents}c: {calibration['eligible']}",
         f"- Rejected because derived limit was at/below stop: {calibration['stop_ineligible']}",
         f"- Winner-survivor first-minute one-cent-lower touches: {calibration['winner_survivor_limit_touches_60s']}/{calibration['eligible_winner_survivors']}",
         f"- Observed 45c stop after those touches: {calibration['winner_survivor_stop45_after_touch_60s']}/{calibration['winner_survivor_limit_touches_60s']}",
         "",
+        "## Archived-fill arithmetic bounds",
+        "",
+        "These fixed-one-share bounds assume every old IOC fill, or every old IOC fill minus the configured offset, would participate. They do not model maker non-fills.",
+        "",
+        "| Price proxy | Eligible | Old settlements | Old stops | Additional observed winner stops | Optimistic P&L | First-minute-evidence P&L |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+    ]
+    for label, key in (
+        ("Old actual IOC entry", "old_actual_entry_proxy"),
+        ("Old actual IOC entry minus offset", "old_actual_entry_minus_offset_proxy"),
+    ):
+        row = reconciliation[key]
+        report.append(
+            f"| {label} | {row['eligible']} | {row['old_profitable_settlements']} | {row['old_stops']} "
+            f"| {row['additional_profitable_winners_with_observed_post_fill_bid_at_or_below_stop']} "
+            f"| ${row['optimistic_fixed_one_share_gross_pnl']} | ${row['observed_first_minimum_fixed_one_share_gross_pnl']} |"
+        )
+    report.extend([
+        "",
+        "The optimistic column is the zero-additional-false-stop calculation. The first-minute-evidence column also stops old profitable settlements whose retained post-fill executable bid was already at or below the new stop. Complete later paths remain unavailable.",
+        "",
         "| Sizing | Scenario | P&L | Final balance | Return | Max drawdown | Fills | Stops | False stops |",
         "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
-    ]
+    ])
     for row in deterministic:
         report.append(
             f"| {row.sizing_profile} | {row.scenario} | ${row.pnl:.4f} | ${row.final_balance:.4f} | {row.return_percent:.4f}% "
@@ -464,6 +588,11 @@ def main() -> int:
     if not trades:
         raise SystemExit("no complete filled ledger records were found")
     calibration = empirical_calibration(trades, arguments.stop_cents)
+    reconciliation = archived_ledger_reconciliation(
+        arguments.state_file,
+        stop_cents=arguments.stop_cents,
+        entry_offset_cents=arguments.entry_offset_cents,
+    )
     recovery_parameters = StrategyParameters(
         recovery_multiplier=Decimal("1.01"), first_base_threshold=Decimal("350.00"),
         threshold_growth_multiplier=Decimal("1.01"), base_increment=Decimal("0.50"),
@@ -512,8 +641,12 @@ def main() -> int:
             "late_fill_probability_proxy": late_fill,
             "late_stop_probability_proxy": late_stop,
         })
-    write_outputs(arguments.output_dir, trades, calibration, deterministic, summaries, arguments)
+    write_outputs(
+        arguments.output_dir, trades, reconciliation, calibration,
+        deterministic, summaries, arguments,
+    )
     print(json.dumps({
+        "archived_ledger_reconciliation": reconciliation,
         "calibration": calibration,
         "deterministic": [row.json_row() for row in deterministic],
         "monte_carlo": summaries,

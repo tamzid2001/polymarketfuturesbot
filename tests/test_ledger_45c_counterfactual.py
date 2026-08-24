@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import unittest
 from decimal import Decimal
+from pathlib import Path
 
 from ledger_45c_counterfactual import (
     LedgerTrade,
+    archived_ledger_reconciliation,
     empirical_calibration,
     replay,
     report_decimal,
@@ -90,6 +92,33 @@ class Ledger45cCounterfactualTests(unittest.TestCase):
 
     def test_report_decimal_removes_interpolation_noise(self) -> None:
         self.assertEqual(report_decimal(Decimal("1.5592049999999984720484")), "1.5592")
+
+    def test_archived_positive_pnl_and_complete_45c_cohorts_are_reconciled(self) -> None:
+        result = archived_ledger_reconciliation(
+            Path("data/kalshi_shadow_market_ioc_v10_sticky_stop_40_state.json"),
+        )
+        self.assertEqual(result["completed_fills"], 214)
+        self.assertEqual(result["archived_realized_pnl"], "1.7803")
+        self.assertEqual(result["eventual_directional_winners"], 105)
+        self.assertEqual(result["eventual_directional_losers"], 109)
+
+        actual = result["old_actual_entry_proxy"]
+        self.assertEqual(actual["eligible"], 193)
+        self.assertEqual(actual["old_stopped_eventual_winners"], 47)
+        self.assertEqual(actual["old_stopped_eventual_losers"], 96)
+        self.assertEqual(actual["optimistic_fixed_one_share_gross_pnl"], "11.98")
+        self.assertEqual(
+            actual[
+                "additional_profitable_winners_with_observed_post_fill_bid_at_or_below_stop"
+            ],
+            10,
+        )
+        self.assertEqual(actual["observed_first_minimum_fixed_one_share_gross_pnl"], "6.48")
+
+        shifted = result["old_actual_entry_minus_offset_proxy"]
+        self.assertEqual(shifted["eligible"], 187)
+        self.assertEqual(shifted["optimistic_fixed_one_share_gross_pnl"], "13.91")
+        self.assertEqual(shifted["observed_first_minimum_fixed_one_share_gross_pnl"], "8.41")
 
 
 if __name__ == "__main__":
