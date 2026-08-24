@@ -17,7 +17,7 @@ from kalshi_live_trader import (
     LiveEngine, ProvisionalOutcomeTracker, QuoteObservation, deterministic_client_order_id, epoch,
     live_mode_allowed, load_config,
 )
-from live_state import default_state, load_state, save_state
+from live_state import config_hash, default_state, load_state, save_state
 from strategy_core import sizing_state
 
 
@@ -191,6 +191,32 @@ class LiveExecutionTests(unittest.TestCase):
             sizing_state(engine.current_parameters(), engine.state["sizing"]).prescribed_quantity(),
             Decimal("100.00"),
         )
+
+    def test_explicit_gtc_contract_migrates_only_the_exact_implicit_gtc_hash(self) -> None:
+        temporary = Path(tempfile.mkdtemp()) / "state.json"
+        implicit_gtc_config = dict(self.config)
+        implicit_gtc_config.pop("maker_order_time_in_force")
+        state = default_state(implicit_gtc_config)
+        state["sizing"] = {
+            "base_share_count": "1.00", "recovery_exponent": 7,
+            "recovery_cycle_pnl": "-0.42", "next_base_threshold": "350.00",
+        }
+        state["markets"] = {
+            "KXBTC15M-existing": {
+                "ticker": "KXBTC15M-existing", "status": "ZERO_FILL",
+                "initial_signal_price_cents": 42,
+            },
+        }
+        save_state(temporary, state)
+
+        migrated = load_state(temporary, self.config)
+        self.assertEqual(migrated["sizing"], state["sizing"])
+        self.assertEqual(migrated["markets"], state["markets"])
+        self.assertEqual(
+            migrated["config_migrations"][-1]["kind"],
+            "make_existing_gtc_order_contract_explicit",
+        )
+        self.assertEqual(migrated["config_hash"], config_hash(self.config))
 
     def test_unrelated_configuration_change_still_fails_closed(self) -> None:
         temporary = Path(tempfile.mkdtemp()) / "state.json"
