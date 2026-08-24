@@ -118,6 +118,32 @@ class StrategyCoreTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "only the canonical sticky_stop_40"):
                 export_selected_live_strategy(path, row, selection_basis="test")
 
+    def test_initial_shares_are_configurable_but_exact_and_capped(self) -> None:
+        config = load_config(ROOT / "selected_live_strategy.json")
+        changed = load_config_from_value(dict(config, starting_base="2.50"))
+        self.assertEqual(changed["starting_base"], "2.50")
+        self.assertEqual(prescribed_quantity(StrategyParameters(
+            recovery_multiplier=Decimal(changed["recovery_multiplier"]),
+            first_base_threshold=Decimal(changed["first_base_threshold"]),
+            threshold_growth_multiplier=Decimal(changed["threshold_growth_multiplier"]),
+            base_increment=Decimal(changed["base_increment"]),
+            starting_base=Decimal(changed["starting_base"]),
+            max_position=Decimal(changed["max_position"]),
+        ))[0], Decimal("2.50"))
+        with self.assertRaisesRegex(ValueError, "at most two decimal"):
+            load_config_from_value(dict(config, starting_base="1.001"))
+        with self.assertRaisesRegex(ValueError, "no greater than max_position"):
+            load_config_from_value(dict(config, starting_base="100.01"))
+        with self.assertRaisesRegex(ValueError, "at least 1"):
+            load_config_from_value(dict(config, recovery_multiplier="0.99"))
+        with self.assertRaisesRegex(ValueError, "between 40 and 49"):
+            load_config_from_value(dict(
+                config,
+                hybrid_hard_stop_cents=39,
+                hybrid_stop_trigger_cents=40,
+                hybrid_maker_exit_cents=41,
+            ))
+
     def test_legacy_live_configuration_fails_closed(self) -> None:
         config = load_config(ROOT / "selected_live_strategy.json")
         legacy_version = dict(config, strategy_version="kxbtc15m-hybrid-live-v1")
@@ -175,29 +201,52 @@ class StrategyCoreTests(unittest.TestCase):
         worker = (ROOT / ".github/workflows/kalshi_btc15m_average_down.yml").read_text(encoding="utf-8")
         watchdog = (ROOT / ".github/workflows/kalshi_btc15m_watchdog.yml").read_text(encoding="utf-8")
         controlled = (ROOT / ".github/workflows/kalshi_btc15m_controlled_restart.yml").read_text(encoding="utf-8")
+        trader = (ROOT / "kalshi_live_trader.py").read_text(encoding="utf-8")
         self.assertIn('entry_execution_mode"] == "signal_price_minus_offset_maker"', worker)
         self.assertIn('maker_order_time_in_force"] == "good_till_canceled"', worker)
         self.assertIn('entry_order_lifetime"] == "until_filled_or_market_close"', worker)
         self.assertIn('entry_timeout_seconds"] == 0', worker)
-        self.assertIn("--opening-quote-capture-seconds", worker)
         self.assertNotIn("--entry-timeout-seconds", worker)
-        self.assertIn("hybrid=45/46/44", worker)
+        self.assertIn("hybrid=validated_configurable", worker)
         self.assertIn("kalshi_shadow_maker_hybrid_v11_sticky_stop_40", worker)
         self.assertIn("--persist-config", worker)
+        self.assertIn('--starting-base "$INITIAL_SHARES"', worker)
+        self.assertIn('--recovery-multiplier "$SCALING_MULTIPLIER"', worker)
+        self.assertIn('--threshold-growth-multiplier "$SCALING_MULTIPLIER"', worker)
+        self.assertIn('--first-base-threshold "$PROFIT_THRESHOLD"', worker)
+        self.assertIn('--base-increment "$SHARES_ADDED_AFTER_PROFIT_THRESHOLD"', worker)
+        self.assertIn('--hybrid-hard-stop-cents "$MAX_STOP_LOSS_CENTS"', worker)
         self.assertIn("RUNTIME_STATE_RESTORED=runtime-state", worker)
         self.assertIn("python live_checkpoint.py --reason end-of-run", worker)
+        self.assertLess(
+            trader.index("state = load_state(args.state_file, config)"),
+            trader.index("if args.persist_config:", trader.index("async def async_main")),
+        )
         self.assertNotIn("git push origin HEAD:main", worker)
         self.assertNotIn("chore: checkpoint KXBTC15M hybrid state", worker)
         self.assertIn("RUNTIME_STATE_RESTORED=runtime-state", controlled)
         self.assertIn("WATCHDOG MAINTENANCE HOLD", watchdog)
         self.assertNotIn("cron:", worker)
         self.assertIn('cron: "2-59/5 * * * *"', watchdog)
-        workflow_input_count = len(__import__("re").findall(
+        input_names = set(__import__("re").findall(
             r"^      [a-zA-Z0-9_]+:\s*$",
             worker[worker.index("    inputs:"):worker.index("# Serialized runs")],
             flags=__import__("re").MULTILINE,
         ))
-        self.assertLessEqual(workflow_input_count, 25)
+        input_names = {name.strip()[:-1] for name in input_names}
+        self.assertEqual(input_names, {
+            "live_enabled", "reconcile_only", "initial_shares", "scaling_multiplier",
+            "profit_threshold", "shares_added_after_profit_threshold", "max_stop_loss_cents",
+        })
+        controlled_inputs = set(__import__("re").findall(
+            r"^      [a-zA-Z0-9_]+:\s*$",
+            controlled[controlled.index("    inputs:"):controlled.index("permissions:")],
+            flags=__import__("re").MULTILINE,
+        ))
+        self.assertEqual({name.strip()[:-1] for name in controlled_inputs}, {"source_run_id", "target_live"})
+        for retired_input in ("dry_run", "shadow_profile", "reset_state", "run_seconds"):
+            self.assertNotIn(f"-f {retired_input}=", watchdog)
+            self.assertNotIn(f"-f {retired_input}=", controlled)
         for retired in ("sticky_stop_30", "sticky_stop_20", "sticky_stop_10"):
             self.assertNotIn(retired, watchdog)
             self.assertNotIn(retired, controlled)

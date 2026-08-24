@@ -250,6 +250,55 @@ class LiveExecutionTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "configuration hash differs"):
             load_state(temporary, dict(self.config, max_position="99.00"))
 
+    def test_reviewed_strategy_inputs_migrate_only_flat_state_and_preserve_cycle(self) -> None:
+        temporary = Path(tempfile.mkdtemp()) / "state.json"
+        state = default_state(self.config)
+        state["sizing"] = {
+            "base_share_count": "1.00", "recovery_exponent": 2,
+            "recovery_cycle_pnl": "-0.13", "next_base_threshold": "350.00",
+        }
+        state["cycle_strategy_parameters"] = {
+            name: self.config[name] for name in (
+                "recovery_multiplier", "first_base_threshold", "threshold_growth_multiplier",
+                "base_increment", "starting_base", "max_position",
+            )
+        }
+        save_state(temporary, state)
+        changed = dict(
+            self.config,
+            starting_base="2.00",
+            recovery_multiplier="1.02",
+            threshold_growth_multiplier="1.02",
+            first_base_threshold="400.00",
+            base_increment="0.25",
+            hybrid_hard_stop_cents=40,
+            hybrid_stop_trigger_cents=41,
+            hybrid_maker_exit_cents=42,
+        )
+
+        migrated = load_state(temporary, changed)
+        self.assertEqual(migrated["sizing"], state["sizing"])
+        self.assertEqual(migrated["active_config_snapshot"], changed)
+        self.assertEqual(
+            migrated["config_migrations"][-1]["kind"],
+            "apply_reviewed_flat_state_strategy_tuning",
+        )
+        engine = LiveEngine(
+            changed, migrated, temporary, temporary.with_suffix(".jsonl"), dry_run=True,
+        )
+        self.assertEqual(engine.current_parameters().recovery_multiplier, Decimal("1.01"))
+        self.assertEqual(engine.current_parameters().starting_base, Decimal("1.00"))
+
+    def test_reviewed_strategy_inputs_fail_closed_while_order_is_active(self) -> None:
+        temporary = Path(tempfile.mkdtemp()) / "state.json"
+        state = default_state(self.config)
+        state["current_order_id"] = "existing-order"
+        state["markets"] = {"KXBTC15M-active": {"status": "ENTRY_PENDING"}}
+        save_state(temporary, state)
+        changed = dict(self.config, recovery_multiplier="1.02", threshold_growth_multiplier="1.02")
+        with self.assertRaisesRegex(RuntimeError, "configuration hash differs"):
+            load_state(temporary, changed)
+
     def test_discovery_preloads_api_successor_from_bounded_close_window(self) -> None:
         async def scenario() -> None:
             now = time.time()
