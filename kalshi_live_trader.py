@@ -249,6 +249,8 @@ def validate_entry_price_contract(value: dict[str, Any]) -> None:
         raise ValueError("hybrid_stop_trigger_cents must be at least hybrid_hard_stop_cents")
     if not 1 <= hard_stop <= trigger < maker_exit <= 99:
         raise ValueError("hybrid stop prices must be valid integer-cent ticks")
+    if not 40 <= hard_stop <= 49:
+        raise ValueError("hybrid_hard_stop_cents must be between 40 and 49 for the active analytics range")
     if not _bool(value.get("hybrid_stop_enabled", True)):
         raise ValueError("the active v11 strategy requires hybrid_stop_enabled=true")
     if value.get("shadow_fill_model") != "conservative_public_trade_through":
@@ -257,6 +259,26 @@ def validate_entry_price_contract(value: dict[str, Any]) -> None:
         raise ValueError("maker_price_offset cannot be negative")
     if int(value["opening_quote_max_observations"]) < 1:
         raise ValueError("opening_quote_max_observations must be at least one")
+
+
+def validate_sizing_config(value: dict[str, Any]) -> None:
+    """Validate the small set of sizing values exposed by GitHub Actions."""
+
+    starting_base = decimal(value["starting_base"])
+    base_increment = decimal(value["base_increment"])
+    max_position = decimal(value["max_position"])
+    if starting_base != round_shares(starting_base):
+        raise ValueError("starting_base must have at most two decimal places")
+    if base_increment != round_shares(base_increment):
+        raise ValueError("base_increment must have at most two decimal places")
+    if starting_base <= Decimal("0") or starting_base > max_position:
+        raise ValueError("starting_base must be positive and no greater than max_position")
+    if decimal(value["recovery_multiplier"]) < Decimal("1"):
+        raise ValueError("recovery_multiplier must be at least 1")
+    if decimal(value["threshold_growth_multiplier"]) < Decimal("1"):
+        raise ValueError("threshold_growth_multiplier must be at least 1")
+    if decimal(value["first_base_threshold"]) <= Decimal("0") or base_increment <= Decimal("0"):
+        raise ValueError("profit threshold and base increment must be positive")
 
 
 def load_config(path: Path) -> dict[str, Any]:
@@ -343,8 +365,7 @@ def load_config(path: Path) -> dict[str, Any]:
     if value["signal_mode"] != "sticky_until_directional_win":
         raise ValueError("the active shadow strategy requires signal_mode=sticky_until_directional_win")
     validate_entry_price_contract(value)
-    if decimal(value["starting_base"]) != Decimal("1.00"):
-        raise ValueError("the hybrid strategy must start at exactly 1.00 share")
+    validate_sizing_config(value)
     if not 1 <= int(value["opening_quote_capture_seconds"]) <= 300:
         raise ValueError("opening_quote_capture_seconds must be between 1 and 300")
     if int(value["handoff_guard_seconds"]) < 60:
@@ -402,8 +423,8 @@ def load_config_from_value(value: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("invalid overridden live strategy configuration")
     assert_active_strategy_contract(temporary)
     # Reuse the normal rules without doing a file round-trip.
-    if temporary["series"] != "KXBTC15M" or decimal(temporary["starting_base"]) != Decimal("1.00"):
-        raise ValueError("invalid strategy series or starting base")
+    if temporary["series"] != "KXBTC15M":
+        raise ValueError("invalid strategy series")
     temporary.setdefault("shadow_fill_model", "conservative_public_trade_through")
     temporary.setdefault("starting_shadow_balance", "1000.00")
     temporary.setdefault("maker_price_offset", "0.01")
@@ -432,6 +453,7 @@ def load_config_from_value(value: dict[str, Any]) -> dict[str, Any]:
     temporary.setdefault("hybrid_hard_stop_cents", 44)
     temporary.setdefault("trading_mode", "shadow")
     validate_entry_price_contract(temporary)
+    validate_sizing_config(temporary)
     if temporary["trading_mode"] not in {"shadow", "live"}:
         raise ValueError("trading_mode must be shadow or live")
     if temporary["signal_mode"] != "sticky_until_directional_win":
@@ -4108,8 +4130,6 @@ def parser() -> argparse.ArgumentParser:
 
 async def async_main(args: argparse.Namespace) -> int:
     config = apply_overrides(load_config(args.config), args)
-    if args.persist_config:
-        save_config(args.config, config)
     requested_live = bool(args.live_enabled)
     environment_live = _bool(os.getenv("KALSHI_LIVE_ENABLED", "false"))
     shadow_only_lock = _bool(os.getenv("KALSHI_SHADOW_ONLY", "false"))
@@ -4131,6 +4151,11 @@ async def async_main(args: argparse.Namespace) -> int:
     if not api_key or not pem_path.exists():
         raise SystemExit("Kalshi authentication is required; credentials are never logged")
     state = load_state(args.state_file, config)
+    # Never checkpoint an override until its hash has been accepted against
+    # durable state. An active-order rejection must leave the last known-good
+    # config in place so the watchdog can restart it without manual repair.
+    if args.persist_config:
+        save_config(args.config, config)
     migrations = state.get("config_migrations", [])
     if migrations and migrations[-1].get("kind") == "disable_recovery_exponent_breaker":
         LOG.warning(

@@ -83,6 +83,10 @@ class StrategyParameters:
             object.__setattr__(self, name, decimal(getattr(self, name)))
         if self.starting_base != round_shares(self.starting_base):
             raise ValueError("starting_base must have at most two decimal places")
+        if self.base_increment != round_shares(self.base_increment):
+            raise ValueError("base_increment must have at most two decimal places")
+        if self.starting_base <= ZERO or self.starting_base > self.max_position:
+            raise ValueError("starting_base must be positive and no greater than max_position")
 
     def as_dict(self) -> dict[str, str]:
         return {

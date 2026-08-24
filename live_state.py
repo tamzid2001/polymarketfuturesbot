@@ -7,6 +7,7 @@ import json
 import os
 import tempfile
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +15,32 @@ from typing import Any
 STATE_VERSION = 1
 UNCAPPED_RECOVERY_EXPONENT = 0
 LEGACY_RECOVERY_EXPONENT_LIMIT = 12
+TUNABLE_STRATEGY_FIELDS = {
+    "starting_base",
+    "recovery_multiplier",
+    "threshold_growth_multiplier",
+    "first_base_threshold",
+    "base_increment",
+    "hybrid_stop_trigger_cents",
+    "hybrid_maker_exit_cents",
+    "hybrid_hard_stop_cents",
+}
+TUNABLE_OPERATIONAL_FIELDS = {"trading_mode"}
+CONFIG_TUNING_ACTIVE_STATES = {
+    "SIGNAL_PENDING",
+    "ENTRY_PENDING",
+    "ENTRY_PARTIAL",
+    "POSITION_OPEN",
+    "STOP_PENDING",
+    "SETTLEMENT_PENDING",
+    "ENTRY_CANCEL_UNCONFIRMED",
+    "RECONCILIATION_PENDING",
+    "ACCOUNTING_RECONCILIATION_PENDING",
+    "MAKER_EXIT_PENDING",
+    "MAKER_EXIT_PARTIAL",
+    "MAKER_EXIT_CANCEL_UNCONFIRMED",
+    "HARD_STOP_PENDING",
+}
 
 
 def utc_now() -> str:
@@ -25,11 +52,32 @@ def config_hash(config: dict[str, Any]) -> str:
     return hashlib.sha256(stable.encode("utf-8")).hexdigest()
 
 
+def _flat_for_config_tuning(value: dict[str, Any]) -> bool:
+    """Only permit a reviewed parameter change when no order/risk is active."""
+
+    try:
+        if Decimal(str(value.get("current_position", "0"))) != 0:
+            return False
+    except (InvalidOperation, TypeError, ValueError):
+        return False
+    if value.get("current_order_id"):
+        return False
+    return not any(
+        isinstance(record, dict) and record.get("status") in CONFIG_TUNING_ACTIVE_STATES
+        for record in value.get("markets", {}).values()
+    )
+
+
 def default_state(config: dict[str, Any]) -> dict[str, Any]:
     return {
         "state_version": STATE_VERSION,
         "strategy_version": config["strategy_version"],
         "config_hash": config_hash(config),
+        # This snapshot lets a later worker prove that a config-hash change is
+        # limited to reviewed workflow inputs. Hash mismatch alone cannot show
+        # which fields changed, so older states first acquire this while their
+        # hash still matches before any tuning is accepted.
+        "active_config_snapshot": dict(config),
         "config_migrations": [],
         "created_at": utc_now(),
         "updated_at": utc_now(),
@@ -137,7 +185,29 @@ def load_state(path: Path, config: dict[str, Any]) -> dict[str, Any]:
                 config_hash(bounded_implicit_gtc_config),
             }
         )
-        if not is_uncapped_migration and not is_explicit_gtc_migration and not is_persistent_gtc_migration:
+        prior_snapshot = value.get("active_config_snapshot")
+        changed_fields: set[str] = set()
+        if isinstance(prior_snapshot, dict):
+            changed_fields = {
+                name
+                for name in set(prior_snapshot) | set(config)
+                if prior_snapshot.get(name) != config.get(name)
+            }
+        tuning_fields = TUNABLE_STRATEGY_FIELDS | TUNABLE_OPERATIONAL_FIELDS
+        negative_cycle = Decimal(str(value.get("sizing", {}).get("recovery_cycle_pnl", "0"))) < 0
+        cycle_is_preserved = not negative_cycle or isinstance(value.get("cycle_strategy_parameters"), dict)
+        is_reviewed_tuning = (
+            bool(changed_fields)
+            and changed_fields <= tuning_fields
+            and _flat_for_config_tuning(value)
+            and cycle_is_preserved
+        )
+        if not any((
+            is_uncapped_migration,
+            is_explicit_gtc_migration,
+            is_persistent_gtc_migration,
+            is_reviewed_tuning,
+        )):
             raise RuntimeError("live state configuration hash differs from active configuration; fail closed")
         migrations = value.setdefault("config_migrations", [])
         if is_uncapped_migration:
@@ -171,7 +241,17 @@ def load_state(path: Path, config: dict[str, Any]) -> dict[str, Any]:
                 "config_hash": expected_hash,
                 "policy": "preserve_existing_state_and_apply_unbounded_lifetime_to_open_and_future_gtc_entries",
             })
+        if is_reviewed_tuning:
+            migrations.append({
+                "at": utc_now(),
+                "kind": "apply_reviewed_flat_state_strategy_tuning",
+                "changed_fields": sorted(changed_fields),
+                "previous_config_hash": value.get("config_hash"),
+                "config_hash": expected_hash,
+                "policy": "open_records_and_negative_recovery_cycle_keep_their_creation_parameters",
+            })
         value["config_hash"] = expected_hash
+        value["active_config_snapshot"] = dict(config)
     for key, default in default_state(config).items():
         value.setdefault(key, default)
     return value

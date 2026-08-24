@@ -78,8 +78,7 @@ jobs:
                 fi
               fi
               gh workflow run kalshi_btc15m_average_down.yml --repo "$REPOSITORY" --ref main \
-                -f live_enabled=false -f dry_run=true -f shadow_profile="$profile" \
-                -f reconcile_only=false -f reset_state=false -f run_seconds=18000
+                -f live_enabled=false -f reconcile_only=false
               echo "WATCHDOG DISPATCHED | profile=$profile canonical shadow recovery queued."
             exit 0
           fi
@@ -93,10 +92,10 @@ jobs:
           prior_live="$(jq -r '(.displayTitle // "") | endswith("LIVE")' <<<"$latest")"
           if [ "$KALSHI_LIVE_ENABLED" = "true" ] && { [ "$TRIGGER" = "schedule" ] || [ "$prior_live" = "true" ]; }; then
             gh workflow run kalshi_btc15m_average_down.yml --repo "$REPOSITORY" --ref main \
-              -f live_enabled=true -f dry_run=false -f reconcile_only=false -f reset_state=false -f run_seconds=18000
+              -f live_enabled=true -f reconcile_only=false
             echo "WATCHDOG DISPATCHED | gated live hybrid recovery queued."
           else
             gh workflow run kalshi_btc15m_average_down.yml --repo "$REPOSITORY" --ref main \
-              -f live_enabled=false -f dry_run=true -f shadow_profile=sticky_stop_40 -f reconcile_only=false -f reset_state=false -f run_seconds=18000
+              -f live_enabled=false -f reconcile_only=false
             echo "WATCHDOG DISPATCHED | shadow hybrid recovery queued."
           fi

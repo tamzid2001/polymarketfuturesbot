@@ -16,18 +16,6 @@ on:
         required: true
         type: boolean
         default: false
-      shadow_profile:
-        description: "Shadow lane to restart; live mode always uses the single sticky_stop_40 live lane."
-        required: true
-        type: choice
-        default: sticky_stop_40
-        options:
-          - sticky_stop_40
-      run_seconds:
-        description: "Replacement worker duration before its next safe handoff."
-        required: true
-        type: string
-        default: "18000"
 
 permissions:
   contents: read
@@ -72,7 +60,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           SOURCE_RUN_ID: ${{ inputs.source_run_id }}
           TARGET_LIVE: ${{ inputs.target_live }}
-          SHADOW_PROFILE: ${{ inputs.shadow_profile }}
+          SHADOW_PROFILE: "sticky_stop_40"
           LIVE_GATE: ${{ vars.KALSHI_LIVE_ENABLED || 'false' }}
           SHADOW_ONLY_LOCK: ${{ vars.KALSHI_SHADOW_ONLY || 'true' }}
         run: |
@@ -141,7 +129,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           SOURCE_RUN_ID: ${{ inputs.source_run_id }}
           TARGET_LIVE: ${{ inputs.target_live }}
-          SHADOW_PROFILE: ${{ inputs.shadow_profile }}
+          SHADOW_PROFILE: "sticky_stop_40"
         run: |
           set -euo pipefail
           source_title="$(gh run view "$SOURCE_RUN_ID" --repo "$GITHUB_REPOSITORY" \
@@ -184,18 +172,15 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TARGET_LIVE: ${{ inputs.target_live }}
-          SHADOW_PROFILE: ${{ inputs.shadow_profile }}
-          RUN_SECONDS: ${{ inputs.run_seconds }}
+          SHADOW_PROFILE: "sticky_stop_40"
         run: |
           set -euo pipefail
           if [ "$TARGET_LIVE" = "true" ]; then
             gh workflow run kalshi_btc15m_average_down.yml --repo "$GITHUB_REPOSITORY" --ref main \
-              -f live_enabled=true -f dry_run=false -f shadow_profile=sticky_stop_40 \
-              -f reconcile_only=false -f reset_state=false -f run_seconds="$RUN_SECONDS"
+              -f live_enabled=true -f reconcile_only=false
             echo "CONTROLLED HANDOFF QUEUED | target=LIVE ref=main reconciliation_required=true"
           else
             gh workflow run kalshi_btc15m_average_down.yml --repo "$GITHUB_REPOSITORY" --ref main \
-              -f live_enabled=false -f dry_run=true -f shadow_profile="$SHADOW_PROFILE" \
-              -f reconcile_only=false -f reset_state=false -f run_seconds="$RUN_SECONDS"
+              -f live_enabled=false -f reconcile_only=false
             echo "CONTROLLED HANDOFF QUEUED | target=DRY_RUN profile=$SHADOW_PROFILE ref=main"
           fi
