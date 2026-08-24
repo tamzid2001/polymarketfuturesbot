@@ -15,7 +15,9 @@ on:
         options:
           - "10"
           - "20"
+          - "25"
           - "30"
+          - "35"
 
 concurrency:
   group: kalshi-kxbtc15m-shadow-stop-${{ inputs.stop_cents }}
@@ -39,8 +41,8 @@ jobs:
         run: |
           set -euo pipefail
           case "$STOP_CENTS" in
-            10|20|30) ;;
-            *) echo "::error::stop_cents must be 10, 20, or 30"; exit 2 ;;
+            10|20|25|30|35) ;;
+            *) echo "::error::stop_cents must be 10, 20, 25, 30, or 35"; exit 2 ;;
           esac
 
       - name: Restore isolated bounded runtime state

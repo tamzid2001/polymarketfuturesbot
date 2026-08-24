@@ -1,6 +1,6 @@
 name: Kalshi KXBTC15M Shadow Stop Watchdog
 
-# Recovery-only dispatcher for the three shadow comparison lanes. The worker
+# Recovery-only dispatcher for the five shadow comparison lanes. The worker
 # remains responsible for exchange-event timing and safe five-hour handoffs.
 on:
   schedule:
@@ -33,7 +33,7 @@ jobs:
           runs="$(gh run list --repo "$REPOSITORY" \
             --workflow kalshi_btc15m_shadow_stop_experiments.yml --limit 100 \
             --json databaseId,status,conclusion,updatedAt,displayTitle)"
-          for stop_cents in 10 20 30; do
+          for stop_cents in 10 20 25 30 35; do
             title="stop_${stop_cents}"
             profile_runs="$(jq --arg title "$title" '[.[] | select((.displayTitle // "") | contains($title))]' <<<"$runs")"
             active="$(jq '[.[] | select(.status == "in_progress" or .status == "queued" or .status == "waiting")] | length' <<<"$profile_runs")"
