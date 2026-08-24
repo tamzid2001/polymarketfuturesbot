@@ -7,7 +7,7 @@
     "reason": null,
     "triggered_at": null
   },
-  "config_hash": "382be39f3177117a34e8a2e2ce2f0b45722626dccc3bcd07ee8ca4ce54ec8d24",
+  "config_hash": "37482e770ca62ead99fb1934279e2127b3a4782e11654163d7f5527c1531473f",
   "config_migrations": [
     {
       "at": "2026-08-24T01:24:11.529798+00:00",
@@ -16,12 +16,23 @@
       "maker_order_time_in_force": "good_till_canceled",
       "policy": "preserve_all_existing_state_because_order_execution_was_already_gtc",
       "previous_config_hash": "b7c1e240dc553d1971031e5b94d5b8e0dae24dcd63a18f5d558507fd9ff83c0d"
+    },
+    {
+      "at": "2026-08-24T01:37:55.752922+00:00",
+      "config_hash": "37482e770ca62ead99fb1934279e2127b3a4782e11654163d7f5527c1531473f",
+      "entry_order_lifetime": "until_filled_or_market_close",
+      "entry_timeout_seconds": 0,
+      "kind": "remove_gtc_strategy_timeout",
+      "opening_quote_capture_seconds": 60,
+      "policy": "preserve_existing_state_and_apply_unbounded_lifetime_to_open_and_future_gtc_entries",
+      "previous_config_hash": "382be39f3177117a34e8a2e2ce2f0b45722626dccc3bcd07ee8ca4ce54ec8d24",
+      "previous_entry_timeout_seconds": 60
     }
   ],
   "created_at": "2026-08-24T00:58:24.978982+00:00",
   "cumulative_realized_pnl": "-0.0900",
   "current_order_id": null,
-  "current_position": "0.00",
+  "current_position": "0",
   "cycle_strategy_parameters": {
     "base_increment": "0.50",
     "first_base_threshold": "350.00",
@@ -400,7 +411,7 @@
   },
   "last_completed_trade": "KXBTC15M-26AUG232145-45",
   "last_reconciliation": {
-    "at": "2026-08-24T01:24:12.210982+00:00",
+    "at": "2026-08-24T01:37:56.226330+00:00",
     "balance": "0.4724",
     "managed_open_orders": 0,
     "markets_discovered": 8,
@@ -431,7 +442,7 @@
       "entry_accounting_reconciled": true,
       "entry_accounting_reconciliation": {
         "accounted_entry_quantity": "0.000000",
-        "at": "2026-08-24T01:24:12.084908+00:00",
+        "at": "2026-08-24T01:37:56.184027+00:00",
         "authoritative_quantity": "0",
         "matched_fill_count": 0,
         "reconciled": true
@@ -481,7 +492,7 @@
       },
       "exit_accounting_reconciliation": {
         "accounted_exit_quantity": "0",
-        "at": "2026-08-24T01:24:12.084479+00:00",
+        "at": "2026-08-24T01:37:56.183563+00:00",
         "matched_fill_count": 0
       },
       "exit_classification": "ENTRY_NOT_FILLED",
@@ -2316,7 +2327,7 @@
       "entry_accounting_reconciled": true,
       "entry_accounting_reconciliation": {
         "accounted_entry_quantity": "0.000000",
-        "at": "2026-08-24T01:24:12.085638+00:00",
+        "at": "2026-08-24T01:37:56.184898+00:00",
         "authoritative_quantity": "0",
         "matched_fill_count": 0,
         "reconciled": true
@@ -2367,7 +2378,7 @@
       },
       "exit_accounting_reconciliation": {
         "accounted_exit_quantity": "0",
-        "at": "2026-08-24T01:24:12.085266+00:00",
+        "at": "2026-08-24T01:37:56.184474+00:00",
         "matched_fill_count": 0
       },
       "exit_classification": "ENTRY_NOT_FILLED",
@@ -4101,6 +4112,7 @@
       "actual_average_entry_price": "0.5",
       "actual_quantity": "1.00",
       "analytics_settlement_finalized": false,
+      "authoritative_open_quantity": "0",
       "base_after": "1.00",
       "base_before": "1.00",
       "completed_at": "2026-08-24T01:30:05.954897+00:00",
@@ -4116,6 +4128,14 @@
       "created_at": "2026-08-24T01:30:00.773152+00:00",
       "directional_transition": "hold_after_directional_loss",
       "effective_stop_price": "0.45",
+      "entry_accounting_reconciled": true,
+      "entry_accounting_reconciliation": {
+        "accounted_entry_quantity": "1.00",
+        "at": "2026-08-24T01:37:56.185719+00:00",
+        "authoritative_quantity": "1.00",
+        "matched_fill_count": 0,
+        "reconciled": true
+      },
       "entry_cancellation_confirmed_at": "2026-08-24T01:30:04.127341+00:00",
       "entry_deadline_epoch": 1787535060.0,
       "entry_execution_mode": "signal_price_minus_offset_maker",
@@ -4222,6 +4242,11 @@
             "submitted_epoch": 1787535001.014685
           }
         ]
+      },
+      "exit_accounting_reconciliation": {
+        "accounted_exit_quantity": "1.00",
+        "at": "2026-08-24T01:37:56.185292+00:00",
+        "matched_fill_count": 0
       },
       "exit_classification": "HARD_STOP_ONLY",
       "exit_orders": [
@@ -6307,5 +6332,5 @@
   },
   "state_version": 1,
   "strategy_version": "kxbtc15m-hybrid-live-v11",
-  "updated_at": "2026-08-24T01:36:16.004451+00:00"
+  "updated_at": "2026-08-24T01:37:56.227401+00:00"
 }
