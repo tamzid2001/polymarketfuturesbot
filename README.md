@@ -21,7 +21,7 @@ All dollar results below are gross unless explicitly marked otherwise. Fees, liv
 
 ## Current live/shadow configuration
 
-[`selected_live_strategy.json`](selected_live_strategy.json) is the canonical base configuration. The active contract is `kxbtc15m-hybrid-live-v11` / schema `11`. The Python loader and GitHub Action both assert that exact version, the maker-entry mode, all 40–49¢ analytics levels, a valid hybrid-stop hierarchy, and the single `sticky_stop_40` lane before the worker can submit anything. Older IOC/fixed-stop configurations and checkpoints cannot be loaded under the v11 state paths. Only the reviewed sizing/profit/hard-stop fields described below can change through Actions; execution and timing internals remain pinned.
+[`selected_live_strategy.json`](selected_live_strategy.json) is the canonical base configuration. The active contract is `kxbtc15m-hybrid-live-v11` / schema `11`. The Python loader and GitHub Action both assert that exact version, the maker-entry mode, all 40–49¢ analytics levels, and a valid hybrid-stop hierarchy before the worker can submit anything. `sticky_stop_40` remains the only canonical lane that can participate in the separately gated live workflow. The 10¢/20¢/30¢ profiles are accepted only with `trading_mode=shadow` and run through a workflow that contains no live input or `--live-enabled` path. Older IOC/fixed-stop configurations and checkpoints cannot be loaded under the v11 state paths.
 
 | Setting | Current value | Notes |
 | --- | ---: | --- |
@@ -34,7 +34,8 @@ All dollar results below are gross unless explicitly marked otherwise. Fees, liv
 | Entry order | **Post-only GTC limit, exactly 1¢ below the frozen ask** | One deterministic order; no market/IOC fallback; only exchange fills or conservative shadow trade-through evidence create exposure |
 | Entry lifetime | **Until filled or market close** | No strategy-time expiry; a resting remainder is cancelled only at market close or when confirmed cancellation is required to protect filled exposure |
 | Shadow entry analytics | **40¢ through 49¢, every cent** | Touch, simulated fill, eventual winner capture, and missed winner are distinct facts |
-| Active workflow lane | **`sticky_stop_40` only** | The 30/20/10 comparison Actions are retired and the watchdog never recreates them |
+| Canonical workflow lane | **`sticky_stop_40`** | Sole live-capable lane; still gated off by default |
+| Shadow comparisons | **`sticky_stop_10`, `sticky_stop_20`, `sticky_stop_30`** | Isolated dry-run-only workers; no live control exists in their workflow |
 | Hybrid trigger | **Executable bid ≤45¢ default** | Always one cent above the configured hard-stop input |
 | Hybrid maker exit | **46¢ default** | Always two cents above the configured hard-stop input |
 | Hybrid hard stop | **Executable bid ≤44¢ default** | Confirms maker cancellation/fills, then IOC-exits only authoritative residual exposure |
@@ -75,16 +76,19 @@ entered YES + current settles YES -> enter NO next  (directional win: flip)
 
 Entry fills, zero fills, hybrid exits, recovery P&L, and permanent-base scaling never change that directional side. Only the completed market result relative to the prior selected side does. A provisional/official mismatch is preserved as an audit discrepancy; it never rewrites an already-submitted entry.
 
-### Single production shadow lane
+### Canonical lane and isolated stop comparisons
 
-Only `sticky_stop_40` is accepted by configuration, workflow input, watchdog, optimizer export, and controlled restart:
+`sticky_stop_40` remains the only profile accepted by the optimizer export, canonical worker, canonical watchdog, and controlled restart. The comparison workflow runs 10¢/20¢/30¢ profiles with the same signal, GTC ask-minus-1¢ entry, sizing engine, analytics, and audit code, but with a shadow-only hybrid hierarchy `hard=H`, `trigger=H+1¢`, `maker exit=H+2¢`:
 
-| Mode | Durable state | Append-only audit ledger |
-| --- | --- | --- |
-| Shadow | `data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_state.json` | `data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_audit.jsonl` |
-| Live | `data/kalshi_live_maker_hybrid_v11_state.json` | `data/kalshi_live_maker_hybrid_v11_audit.jsonl` |
+| Lane | Durable state | Append-only audit ledger | Runtime ref |
+| --- | --- | --- | --- |
+| Canonical 40¢ shadow | `data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_state.json` | `data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_audit.jsonl` | `runtime-state` |
+| Live | `data/kalshi_live_maker_hybrid_v11_state.json` | `data/kalshi_live_maker_hybrid_v11_audit.jsonl` | `runtime-state` |
+| 10¢ shadow comparison | `data/kalshi_shadow_maker_hybrid_v11_sticky_stop_10_state.json` | `data/kalshi_shadow_maker_hybrid_v11_sticky_stop_10_audit.jsonl` | `runtime-state-stop-10` |
+| 20¢ shadow comparison | `data/kalshi_shadow_maker_hybrid_v11_sticky_stop_20_state.json` | `data/kalshi_shadow_maker_hybrid_v11_sticky_stop_20_audit.jsonl` | `runtime-state-stop-20` |
+| 30¢ shadow comparison | `data/kalshi_shadow_maker_hybrid_v11_sticky_stop_30_state.json` | `data/kalshi_shadow_maker_hybrid_v11_sticky_stop_30_audit.jsonl` | `runtime-state-stop-30` |
 
-The v8/v9/v10 files remain archived evidence. v11 starts in a separate namespace at a $1,000 shadow balance and 1.00 permanent base, so no older IOC, comparison-stop, or synthetic-cancellation state can be reinterpreted as current execution. The single workflow concurrency group serializes shadow/live workers, and the watchdog dispatches only v11 `sticky_stop_40`.
+The v8/v9/v10 files remain archived evidence. Every v11 lane starts in a separate namespace at a $1,000 shadow balance and 1.00 permanent base, so no older IOC, comparison-stop, or synthetic-cancellation state can be reinterpreted as current execution. Each comparison worker has a dedicated concurrency group and bounded parentless runtime branch; concurrent checkpoints cannot overwrite the canonical lane or another stop lane. [`kalshi_btc15m_shadow_stop_watchdog.yml`](.github/workflows/kalshi_btc15m_shadow_stop_watchdog.yml) can recreate only these shadow-only comparison workers.
 
 Forensic check of the archived v10 40¢ IOC shadow state (not live exchange execution and not a v11 maker result): it contains **214 shadow-executed IOC fills**, all with a later outcome, split into **105 eventual directional winners / 109 losers**. The lowest recorded shadow selected-side fill that later settled correctly was **41¢ NO**, 2.17 shares, in `KXBTC15M-26AUG181215-15`; that simulated position hit its stop and realized **-$0.0868**, so it is not labeled a profitable trade. The lowest recorded shadow entry with positive realized net P&L was **42¢ YES**, 2.42 shares, in `KXBTC15M-26AUG181500-00`; it was held to a YES settlement and realized **+$1.4036** in the archived shadow ledger. This distinction prevents “eventual directional winner” from being confused with “profitable after the stop policy,” or shadow execution from being confused with exchange fills.
 
