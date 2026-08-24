@@ -160,6 +160,20 @@ class MakerHybridV11Tests(unittest.TestCase):
             self.assertEqual(len(record["entry_orders"]), 1)
         asyncio.run(scenario())
 
+    def test_rejected_below_hard_stop_retains_initial_quote_and_analytics(self) -> None:
+        engine, feed = self.engine(), BookFeed("0.44")
+        record = self.signal(engine, "KXBTC15M-rejected-low")
+        self.assertIsNone(engine.freeze_initial_signal_price(feed, record, time.time()))
+        self.assertEqual(record["status"], "ZERO_FILL")
+        self.assertEqual(record["initial_signal_price_cents"], 44)
+        self.assertEqual(record["entry_limit_cents"], 43)
+        self.assertEqual(record["exit_classification"], "ENTRY_NOT_FILLED")
+        self.assertEqual(engine.state["entry_execution_metrics"]["zero_fill_markets"], 1)
+        engine.observe_price_analytics(feed, record)
+        self.assertTrue(record["shadow_entry_levels"]["49"]["touched"])
+        self.assertTrue(record["shadow_entry_levels"]["44"]["touched"])
+        self.assertFalse(record["shadow_entry_levels"]["43"]["touched"])
+
     def test_limit_never_fills_and_winner_is_counted_as_missed_without_sizing_change(self) -> None:
         async def scenario():
             engine, feed, rest = self.engine(), BookFeed("0.50"), ShadowRest()
