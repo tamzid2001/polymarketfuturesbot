@@ -1,18 +1,12 @@
-name: Kalshi KXBTC15M Hybrid Live Watchdog
+name: Kalshi BTC 15m Live Trader Watchdog
 
-# A recovery safety net for the hybrid trader. Normal five-hour workers only
-# hand off in the middle 13 minutes of a KXBTC15M market. This workflow is a
-# recovery path for a failed/missing worker; it never bypasses the live gate.
-# While KALSHI_SHADOW_ONLY=true, only the canonical sticky_stop_40 v11 lane is
-# maintained. Retired 30c/20c/10c experiments are never redispatched.
+# A recovery safety net for the settlement-only trader. The trader's normal
+# 5h25m self-handoff remains primary. This runs every five minutes only to
+# dispatch a replacement when no trader is active/queued and the last success
+# has had time to enqueue its successor.
 on:
   schedule:
-    # Avoid minute zero, when GitHub Actions is most likely to delay or drop
-    # scheduled jobs under load.
-    - cron: "2-59/5 * * * *"
-  workflow_run:
-    workflows: ["Kalshi KXBTC15M Hybrid Live"]
-    types: [completed]
+    - cron: "*/5 * * * *"
   workflow_dispatch:
 
 concurrency:
@@ -24,79 +18,45 @@ permissions:
   contents: read
 
 jobs:
-  ensure-hybrid-runner:
-    # A successful worker queues its own safe handoff. Failed workers and an
-    # absent scheduled worker are recovered in their prior/safe mode.
-    if: >-
-      github.event_name != 'workflow_run' ||
-      github.event.workflow_run.conclusion != 'success'
+  ensure-live-runner:
     runs-on: ubuntu-latest
     steps:
-      - name: Dispatch the canonical lane only when it is idle
+      - name: Dispatch only when the live runner is absent
         env:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
-          TRIGGER: ${{ github.event_name }}
-          KALSHI_LIVE_ENABLED: ${{ vars.KALSHI_LIVE_ENABLED || 'false' }}
-          KALSHI_SHADOW_ONLY: ${{ vars.KALSHI_SHADOW_ONLY || 'true' }}
-          KALSHI_MAINTENANCE_MODE: ${{ vars.KALSHI_MAINTENANCE_MODE || 'false' }}
         run: |
           set -euo pipefail
-          if [ "$KALSHI_MAINTENANCE_MODE" = "true" ]; then
-            echo "WATCHDOG MAINTENANCE HOLD | dispatch disabled for controlled repository maintenance."
-            exit 0
-          fi
-          # A controlled restart cancels a live run before it queues its
-          # reconciliation replacement. Give that replacement a brief window
-          # to claim the singleton so a deliberate handoff never races a live
-          # recovery dispatch.
-          if [ "$TRIGGER" = "workflow_run" ]; then
-            sleep 45
-          fi
           runs="$(gh run list --repo "$REPOSITORY" \
-            --workflow kalshi_btc15m_average_down.yml --limit 100 \
-            --json databaseId,status,conclusion,updatedAt,displayTitle,event)"
-
-          if [ "$KALSHI_SHADOW_ONLY" = "true" ]; then
-              profile=sticky_stop_40
-              profile_runs="$(jq --arg title "DRY_RUN $profile" '[.[] | select((.displayTitle // "") | contains($title))]' <<<"$runs")"
-              active="$(jq '[.[] | select(.status == "in_progress" or .status == "queued" or .status == "waiting")] | length' <<<"$profile_runs")"
-              if [ "$active" -gt 0 ]; then
-                echo "WATCHDOG HOLD | profile=$profile active_or_queued=$active"
-                exit 0
-              fi
-              latest="$(jq -c 'sort_by(.updatedAt // "") | last // {}' <<<"$profile_runs")"
-              conclusion="$(jq -r '.conclusion // "none"' <<<"$latest")"
-              completed="$(jq -r '.updatedAt // ""' <<<"$latest")"
-              if [ "$conclusion" = "success" ] && [ -n "$completed" ]; then
-                completed_epoch="$(date -u -d "$completed" +%s)"
-                now_epoch="$(date -u +%s)"
-                age_seconds=$((now_epoch - completed_epoch))
-                if [ "$age_seconds" -lt 600 ]; then
-                  echo "WATCHDOG WAIT | profile=$profile successful ${age_seconds}s ago; allowing handoff."
-                  exit 0
-                fi
-              fi
-              gh workflow run kalshi_btc15m_average_down.yml --repo "$REPOSITORY" --ref main \
-                -f live_enabled=false -f dry_run=true -f shadow_profile="$profile" \
-                -f reconcile_only=false -f reset_state=false -f run_seconds=18000
-              echo "WATCHDOG DISPATCHED | profile=$profile canonical shadow recovery queued."
-            exit 0
-          fi
-
+            --workflow kalshi_btc15m_average_down.yml --limit 20 \
+            --json databaseId,status,conclusion,updatedAt)"
           active="$(jq '[.[] | select(.status == "in_progress" or .status == "queued" or .status == "waiting")] | length' <<<"$runs")"
           if [ "$active" -gt 0 ]; then
-            echo "WATCHDOG HOLD | active_or_queued_hybrid_runs=$active; refusing overlap."
+            echo "WATCHDOG OK | active_or_queued_live_runs=$active"
             exit 0
           fi
+
           latest="$(jq -c 'sort_by(.updatedAt // "") | last // {}' <<<"$runs")"
-          prior_live="$(jq -r '(.displayTitle // "") | endswith("LIVE")' <<<"$latest")"
-          if [ "$KALSHI_LIVE_ENABLED" = "true" ] && { [ "$TRIGGER" = "schedule" ] || [ "$prior_live" = "true" ]; }; then
-            gh workflow run kalshi_btc15m_average_down.yml --repo "$REPOSITORY" --ref main \
-              -f live_enabled=true -f dry_run=false -f reconcile_only=false -f reset_state=false -f run_seconds=18000
-            echo "WATCHDOG DISPATCHED | gated live hybrid recovery queued."
-          else
-            gh workflow run kalshi_btc15m_average_down.yml --repo "$REPOSITORY" --ref main \
-              -f live_enabled=false -f dry_run=true -f shadow_profile=sticky_stop_40 -f reconcile_only=false -f reset_state=false -f run_seconds=18000
-            echo "WATCHDOG DISPATCHED | shadow hybrid recovery queued."
+          conclusion="$(jq -r '.conclusion // "none"' <<<"$latest")"
+          completed="$(jq -r '.updatedAt // ""' <<<"$latest")"
+          if [ "$conclusion" = "success" ] && [ -n "$completed" ]; then
+            completed_epoch="$(date -u -d "$completed" +%s)"
+            now_epoch="$(date -u +%s)"
+            age_seconds=$((now_epoch - completed_epoch))
+            if [ "$age_seconds" -lt 600 ]; then
+              echo "WATCHDOG WAIT | last successful runner completed ${age_seconds}s ago; allowing its normal handoff to appear."
+              exit 0
+            fi
           fi
+
+          gh workflow run kalshi_btc15m_average_down.yml \
+            --repo "$REPOSITORY" --ref main \
+            -f live_trading=true \
+            -f enable_dynamic_scaling=true \
+            -f equity_regime_enabled=true \
+            -f equity_regime_dry_run=false \
+            -f prophet_min_history=100 \
+            -f prophet_refit_every_markets=1 \
+            -f shadow_fill_model=conservative_trade_through \
+            -f starting_balance=100.00
+          echo "WATCHDOG DISPATCHED | no active/queued live runner; replacement queued."

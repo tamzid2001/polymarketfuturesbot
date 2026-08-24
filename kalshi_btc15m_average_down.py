@@ -69,7 +69,7 @@ except ImportError:  # pragma: no cover - exercised only in minimal local enviro
 LOG = logging.getLogger("kalshi_btc15m_average_down")
 SERIES_TICKER = "KXBTC15M"
 LADDER_LEVELS = (0.40, 0.30, 0.20, 0.10)
-CONFIG_VERSION = 20
+CONFIG_VERSION = 19
 STATE_VERSION = 9
 ORDER_NAMESPACE = uuid.UUID("4d85857e-4dc6-43ec-960f-0b342523bdb7")
 BOT_CLIENT_ORDER_PREFIX = DEFAULT_CLIENT_ORDER_PREFIX
@@ -90,10 +90,6 @@ CHECKPOINT_RETRY_SECONDS = max(1.0, float(os.getenv("KALSHI_CHECKPOINT_RETRY_SEC
 # This avoids substituting an older result while still leaving at least one
 # minute before close for the same-side GTC ladder to rest.
 SETTLEMENT_CONTRARIAN_ENTRY_GRACE_SECONDS = 840.0
-# Shadow-equity results must remain comparable across live account-size
-# changes. The shadow executor therefore always models this fixed 1/2/3/4
-# ladder, independently of the real account's dynamic base-share scaling.
-EQUITY_REGIME_SHADOW_BASE_SHARES = 3.0
 # Polling metadata changes every few seconds and must never turn the bot-state
 # branch into a stream of commits. Everything else is material trading state.
 CHECKPOINT_IGNORED_KEYS = {
@@ -139,39 +135,31 @@ DEFAULT_CONFIG = {
     "live_absolute_stop_price": 0.05,
     "live_quote_max_age_seconds": 3.0,
     "settlement_contrarian_entry_grace_seconds": SETTLEMENT_CONTRARIAN_ENTRY_GRACE_SECONDS,
-    # Retained only to migrate prior state. Every eligible current market is
-    # traded; the retired two-loss skip may never suppress a signal or order.
-    "live_consecutive_loss_limit": 0,
-    "live_markets_to_skip_after_loss_limit": 0,
+    # Realized-trade circuit breaker. These are intentionally fixed by the
+    # live policy rather than exposed as workflow inputs: two completed losses
+    # skip the next two causally generated market signals. A completed winner
+    # clears the loss count immediately.
+    "live_consecutive_loss_limit": 2,
+    "live_markets_to_skip_after_loss_limit": 2,
     "status_log_seconds": 60.0,
-    # Prophet equity forecasts are retired from the live execution path.  The
-    # settlement-contrarian signal is the only live direction source and no
-    # persisted configuration or Action input may restore the former gate.
-    "equity_regime_enabled": False,
-    "equity_regime_dry_run": True,
+    # The owner explicitly enabled the guarded P10/P90 live regime.  A
+    # startup API reconciliation or unavailable post-stop shadow tape fails
+    # closed before it can permit a new live entry.
+    "equity_regime_enabled": True,
+    "equity_regime_dry_run": False,
     "allow_live_state_transitions": True,
     "subaccount": 0,
     "starting_balance": "100.00",
     "history_start_ts": None,
     "history_end_ts": None,
     "history_max_markets": 200,
-    # Retained only so historical state files can be read and stripped during
-    # migration.  The active runner never constructs a Prophet controller.
-    "prophet_history_source": "account_series",
-    "prophet_reference_closed_positions_path": "data/closed-positions-2026-07-27.csv",
-    "allow_endpoint_anchored_ledger_bootstrap": True,
     "accounting_tolerance": "0.01",
     "bot_client_order_prefix": BOT_CLIENT_ORDER_PREFIX,
     "bot_order_group_id": None,
-    "prophet_enabled": False,
-    "prophet_min_history": 200,
-    "prophet_training_window": 201,
-    # The live P10/P90 gate must use a fit that includes the most recently
-    # finalized balance observation.  A multi-market horizon is still written
-    # for diagnostics, but it is never reused after a balance update.
+    "prophet_enabled": True,
+    "prophet_min_history": 100,
+    "prophet_training_window": 75,
     "prophet_refit_every_markets": 1,
-    "prophet_future_horizon_markets": 100,
-    "prophet_forecast_frequency_minutes": 15,
     "prophet_use_log_transform": True,
     "prophet_uncertainty_samples": 2000,
     "prophet_changepoint_prior_scale": 0.05,
@@ -518,31 +506,11 @@ def checkpoint_projection(value: Any) -> Any:
     return value
 
 
-def checkpoint_fingerprint(
-    state: dict[str, Any], config: dict[str, Any], extra_paths: tuple[Path, ...] = (),
-) -> str:
-    """Hash material state, including durable equity-regime ledgers.
-
-    The settlement ledger changes whenever a closed market is accounted, but
-    an equity-regime-only change need not modify the main trader state.  Hash
-    the explicitly checkpointed companion files too, so the in-run publisher
-    cannot skip a shadow-balance update that the next Actions handoff needs.
-    """
-
-    extra_files: list[dict[str, str | None]] = []
-    for path in extra_paths:
-        resolved = path.expanduser().resolve()
-        try:
-            content_hash = hashlib.sha256(resolved.read_bytes()).hexdigest() if resolved.is_file() else None
-        except OSError:
-            # The normal end-of-run checkpoint can still create a file that
-            # did not exist at initialization; include its path deterministically.
-            content_hash = None
-        extra_files.append({"path": str(resolved), "sha256": content_hash})
+def checkpoint_fingerprint(state: dict[str, Any], config: dict[str, Any]) -> str:
+    """Hash material strategy state without writing secrets or quote noise."""
     payload = {
         "state": checkpoint_projection(state),
         "config": checkpoint_projection(config),
-        "extra_files": extra_files,
     }
     encoded = json.dumps(payload, sort_keys=True, default=str, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
@@ -657,13 +625,13 @@ class StateCheckpointPublisher:
             report_path=report_path,
             extra_paths=extra_paths,
             config=config,
-            last_fingerprint=checkpoint_fingerprint(state, config, extra_paths),
+            last_fingerprint=checkpoint_fingerprint(state, config),
             enabled=enabled,
             target_branch=target_branch,
         )
 
     def publish_if_changed(self, state: dict[str, Any], reason: str) -> bool:
-        current = checkpoint_fingerprint(state, self.config, self.extra_paths)
+        current = checkpoint_fingerprint(state, self.config)
         if current == self.last_fingerprint:
             return False
         if not self.enabled:
@@ -729,21 +697,15 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
     # A deployment may not select its source dynamically. This prevents an
     # inherited Action input from restoring a retired model/gate strategy.
     merged["live_execution_strategy"] = LIVE_EXECUTION_STRATEGY
-    # Every eligible market receives its settlement-contrarian signal.  A
-    # persisted two-loss skip state is observational legacy data only.
-    merged["live_consecutive_loss_limit"] = 0
-    merged["live_markets_to_skip_after_loss_limit"] = 0
+    # This risk circuit breaker is a fixed live safeguard. Do not let an old
+    # persisted config or an Action input silently change its two-loss /
+    # two-market behavior.
+    merged["live_consecutive_loss_limit"] = 2
+    merged["live_markets_to_skip_after_loss_limit"] = 2
     # The source must be the immediately preceding finalized market, but it
     # may arrive at any time in this post-open submission window.  This fixed
     # value prevents old state or Action inputs from silently shortening it.
     merged["settlement_contrarian_entry_grace_seconds"] = SETTLEMENT_CONTRARIAN_ENTRY_GRACE_SECONDS
-    # Fail closed against persisted Action inputs/configuration that predate
-    # the retirement of live Prophet forecasts.  This runner must never
-    # construct the equity-regime controller or emit a new forecast.
-    merged["equity_regime_enabled"] = False
-    merged["equity_regime_dry_run"] = True
-    merged["prophet_enabled"] = False
-    merged["prophet_refit_every_markets"] = 1
     for name in ("enable_dynamic_scaling", "max_contracts_per_market_auto", "max_total_capital_auto"):
         value = as_bool(merged.get(name))
         if value is None:
@@ -784,8 +746,10 @@ def apply_config_overrides(config: dict[str, Any], args: argparse.Namespace) -> 
         "max_total_capital", "fee_reserve", "poll_seconds", "market_refresh_seconds",
         "order_reconcile_seconds", "watch_start_grace_seconds", "status_log_seconds",
         "enable_dynamic_scaling", "base_share_increment", "scaling_profit_multiplier",
-        "allow_live_state_transitions", "subaccount", "starting_balance", "history_max_markets",
-        "history_start_ts", "history_end_ts", "accounting_tolerance", "shadow_fill_model",
+        "equity_regime_enabled", "equity_regime_dry_run", "allow_live_state_transitions",
+        "subaccount", "starting_balance", "history_max_markets", "history_start_ts", "history_end_ts",
+        "accounting_tolerance", "prophet_min_history", "prophet_training_window",
+        "prophet_refit_every_markets", "shadow_fill_model",
     )
     changed = False
     updated = dict(config)
@@ -1148,39 +1112,11 @@ class KalshiLiveFeed:
         yes_ask = as_float(message.get("yes_ask_dollars", message.get("yes_ask")))
         yes_bid_size = as_float(field(message, "yes_bid_size_fp", "yes_bid_size"))
         yes_ask_size = as_float(field(message, "yes_ask_size_fp", "yes_ask_size"))
-        received_epoch = time.time()
-        received_at = now_iso()
-        source_server_timestamp = field(message, "time", "timestamp", "created_time")
-        source_timestamp_ms = field(message, "ts_ms", "timestamp_ms")
         if yes_bid is not None:
             quote["yes_bid"] = yes_bid
-            quote["yes_bid_received_epoch"] = received_epoch
-            quote["yes_bid_source_timestamp"] = source_timestamp_ms or source_server_timestamp
         if yes_ask is not None:
             quote["yes_ask"] = yes_ask
-            quote["yes_ask_received_epoch"] = received_epoch
-            quote["yes_ask_source_timestamp"] = source_timestamp_ms or source_server_timestamp
         quote["received_monotonic"] = time.monotonic()
-        # Provisional outcome inference requires only fresh executable bids,
-        # not displayed size.  Reconstruct the latest bid/ask state with
-        # component timestamps so a final price-only ticker update is not
-        # discarded merely because it omitted depth fields.
-        if (yes_bid is not None or yes_ask is not None) and quote.get("yes_bid") is not None and quote.get("yes_ask") is not None:
-            ticker_sequence = int(quote.get("ticker_sequence") or 0) + 1
-            quote["ticker_sequence"] = ticker_sequence
-            quote["ticker_book"] = {
-                "quote_id": f"{ticker}:ticker:{ticker_sequence}:{received_at}",
-                "yes_bid": quote["yes_bid"],
-                "yes_ask": quote["yes_ask"],
-                "yes_bid_received_epoch": quote.get("yes_bid_received_epoch"),
-                "yes_ask_received_epoch": quote.get("yes_ask_received_epoch"),
-                "yes_bid_source_timestamp": quote.get("yes_bid_source_timestamp"),
-                "yes_ask_source_timestamp": quote.get("yes_ask_source_timestamp"),
-                "received_epoch": received_epoch,
-                "received_at": received_at,
-                "source_server_timestamp": source_server_timestamp,
-                "source_timestamp_ms": source_timestamp_ms,
-            }
         # Preserve only a *complete snapshot* for executable-shadow fills.
         # Delta updates and last-trade-only messages are useful operational
         # signals, but cannot establish a displayed, executable quote.
@@ -1189,6 +1125,7 @@ class KalshiLiveFeed:
             assert yes_bid_size is not None and yes_ask_size is not None
             if 0.0 < yes_bid <= yes_ask < 1.0 and yes_bid_size >= 0.0 and yes_ask_size >= 0.0:
                 sequence = int(quote.get("book_sequence") or 0) + 1
+                received_at = now_iso()
                 quote["book_sequence"] = sequence
                 quote["complete_book"] = {
                     "quote_id": f"{ticker}:{sequence}:{received_at}",
@@ -1198,8 +1135,8 @@ class KalshiLiveFeed:
                     "yes_ask_size": yes_ask_size,
                     "received_monotonic": time.monotonic(),
                     "received_at": received_at,
-                    "source_server_timestamp": source_server_timestamp,
-                    "source_timestamp_ms": source_timestamp_ms,
+                    "source_server_timestamp": field(message, "time", "timestamp", "created_time"),
+                    "source_timestamp_ms": field(message, "ts_ms", "timestamp_ms"),
                 }
         self.update_count += 1
         self._wake.set()
@@ -1623,20 +1560,6 @@ class KalshiREST:
             LOG.warning("Balance lookup failed: %s", exc)
             return None
 
-    async def balance_decimal(self) -> Decimal | None:
-        """Read the authenticated cash balance without binary-float accounting."""
-
-        try:
-            response = await self.portfolio.get_balance()
-            dollars = field(response, "balance_dollars")
-            if dollars is not None:
-                return Decimal(str(dollars))
-            cents = field(response, "balance")
-            return Decimal(str(cents)) / Decimal("100") if cents is not None else None
-        except Exception as exc:  # noqa: BLE001
-            LOG.warning("Decimal balance lookup failed: %s", exc)
-            return None
-
     async def position_for_ticker(self, ticker: str) -> float | None:
         """Return the signed live Kalshi position for one market.
 
@@ -1868,14 +1791,13 @@ class KalshiREST:
     async def create_order(
         self, *, ticker: str, side: str, position_price: float, quantity: float,
         tif: str, expiration_time: int | None, dry_run: bool, order_key: str,
-        post_only: bool = False, client_order_id_override: str | None = None,
     ) -> dict[str, Any]:
         # Never silently round an invalid caller quantity at the live API
         # boundary. Every entry order must preserve the same cent precision
         # used for dynamic base sizing, ledger accounting, and cap checks.
         quantity = share_quantity(quantity, "entry order quantity")
         record = {
-            "client_order_id": client_order_id_override or client_order_id(ticker, side, order_key),
+            "client_order_id": client_order_id(ticker, side, order_key),
             "ticker": ticker,
             "side": side,
             "order_type": "ioc_protected" if tif == "immediate_or_cancel" else "limit",
@@ -1884,7 +1806,6 @@ class KalshiREST:
             "expected_outcome_side": side,
             "quantity": round(quantity, 2),
             "time_in_force": tif,
-            "post_only": post_only,
             "submitted_at": now_iso(),
             "status": "dry_run" if dry_run else "submitting",
             "fill_count": 0.0,
@@ -1908,7 +1829,6 @@ class KalshiREST:
             "client_order_id": record["client_order_id"],
             "self_trade_prevention_type": SelfTradePreventionType.TAKER_AT_CROSS,
             "reduce_only": False,
-            "post_only": post_only,
         }
         if expiration_time is not None:
             kwargs["expiration_time"] = int(expiration_time)
@@ -1956,7 +1876,7 @@ class KalshiREST:
 
     async def create_reduce_only_exit(
         self, *, ticker: str, held_side: str, economic_exit_price: float, quantity: float,
-        dry_run: bool, order_key: str, client_order_id_override: str | None = None,
+        dry_run: bool, order_key: str,
     ) -> dict[str, Any]:
         """Close an existing YES/NO position with a marketable, reduce-only IOC.
 
@@ -1973,7 +1893,7 @@ class KalshiREST:
         api_price = economic_exit_price if held_side == "yes" else 1.0 - economic_exit_price
         book_side = BookSide.ASK if held_side == "yes" else BookSide.BID
         record = {
-            "client_order_id": client_order_id_override or client_order_id(ticker, f"reduce-{held_side}", order_key),
+            "client_order_id": client_order_id(ticker, f"reduce-{held_side}", order_key),
             "ticker": ticker,
             "side": held_side,
             "held_side": held_side,
@@ -1983,11 +1903,6 @@ class KalshiREST:
             "book_side": "ask" if held_side == "yes" else "bid",
             "quantity": round(quantity, 2),
             "time_in_force": "immediate_or_cancel",
-            # This is a price-protected taker exit.  Keep the non-resting
-            # contract explicit in both the durable audit record and the API
-            # request so a future refactor cannot silently turn stops into
-            # maker/GTC orders.
-            "post_only": False,
             "reduce_only": True,
             "submitted_at": now_iso(),
             "status": "dry_run" if dry_run else "submitting",
@@ -2013,7 +1928,6 @@ class KalshiREST:
                 client_order_id=record["client_order_id"],
                 self_trade_prevention_type=SelfTradePreventionType.TAKER_AT_CROSS,
                 reduce_only=True,
-                post_only=False,
             )
         except Exception as exc:  # noqa: BLE001
             if pause_error(exc):
@@ -2034,72 +1948,6 @@ class KalshiREST:
         record["status"] = classify_submission(record["fill_count"], record["remaining_count"], quantity, "immediate_or_cancel")
         LOG.warning(
             "REDUCE-ONLY EXIT %s | %s %s bid=$%.4f x %.2f fill=%.2f remaining=%.2f id=%s",
-            record["status"].upper(), ticker, held_side.upper(), economic_exit_price, quantity,
-            record["fill_count"], record["remaining_count"], record["order_id"] or "?",
-        )
-        return record
-
-    async def create_reduce_only_maker_exit(
-        self, *, ticker: str, held_side: str, economic_exit_price: float, quantity: float,
-        expiration_time: int, dry_run: bool, order_key: str,
-        client_order_id_override: str | None = None,
-    ) -> dict[str, Any]:
-        """Rest a post-only, reduce-only GTC sale for only the held quantity.
-
-        The economic price is always expressed on the held YES/NO contract;
-        this adapter alone maps it to Kalshi's YES-side book representation.
-        Live callers must still reconcile cancellation and the authoritative
-        residual position before sending any hard-stop IOC.
-        """
-
-        if held_side not in {"yes", "no"}:
-            raise ValueError(f"Unsupported held side for maker exit: {held_side}")
-        quantity = share_quantity(quantity, "reduce-only maker exit quantity")
-        if not 0.0 < economic_exit_price < 1.0:
-            raise ValueError("A maker exit requires a valid limit price")
-        api_price = economic_exit_price if held_side == "yes" else 1.0 - economic_exit_price
-        book_side = BookSide.ASK if held_side == "yes" else BookSide.BID
-        record = {
-            "client_order_id": client_order_id_override or client_order_id(ticker, f"maker-reduce-{held_side}", order_key),
-            "ticker": ticker, "side": held_side, "held_side": held_side,
-            "order_type": "reduce_only_exit_maker", "exit_phase": "maker_exit",
-            "position_price": round(economic_exit_price, 4), "api_price": f"{api_price:.4f}",
-            "book_side": "ask" if held_side == "yes" else "bid", "quantity": round(quantity, 2),
-            "time_in_force": "good_till_canceled", "expiration_time": int(expiration_time),
-            "post_only": True, "reduce_only": True, "submitted_at": now_iso(),
-            "status": "dry_run" if dry_run else "submitting", "fill_count": 0.0,
-            "remaining_count": round(quantity, 2), "fees_paid": 0.0,
-        }
-        if dry_run:
-            return record
-        if self.trading_pause_active():
-            record["status"] = "paused"
-            record["error"] = self.pause_reason or "scheduled Kalshi trading pause"
-            return record
-        try:
-            response = await self.orders.create_order_v2(
-                ticker=ticker, side=book_side, count=f"{quantity:.2f}", price=record["api_price"],
-                time_in_force="good_till_canceled", expiration_time=int(expiration_time),
-                client_order_id=record["client_order_id"],
-                self_trade_prevention_type=SelfTradePreventionType.TAKER_AT_CROSS,
-                reduce_only=True, post_only=True,
-            )
-        except Exception as exc:  # noqa: BLE001
-            record["status"] = "paused" if pause_error(exc) else "submit_failed"
-            record["error"] = str(exc)
-            LOG.error("MAKER EXIT REJECTED | %s %s @ $%.4f: %s", ticker, held_side.upper(), economic_exit_price, exc)
-            return record
-        record["order_id"] = str(field(response, "order_id") or "") or None
-        record["fill_count"] = round(order_fill_count(response), 2)
-        remaining = order_remaining_count(response)
-        record["remaining_count"] = round(remaining if remaining is not None else quantity - record["fill_count"], 2)
-        record["average_fill_price"] = order_average_position_price(response, held_side, economic_exit_price)
-        record["fees_paid"] = order_fee_total(response)
-        record["status"] = classify_submission(
-            record["fill_count"], record["remaining_count"], quantity, "good_till_canceled",
-        )
-        LOG.warning(
-            "REDUCE-ONLY MAKER EXIT %s | %s %s @ $%.4f x %.2f fill=%.2f remaining=%.2f id=%s",
             record["status"].upper(), ticker, held_side.upper(), economic_exit_price, quantity,
             record["fill_count"], record["remaining_count"], record["order_id"] or "?",
         )
@@ -2181,47 +2029,25 @@ class KalshiREST:
                 return
             LOG.warning("Exit order lookup failed for %s: %s", order_id, exc)
 
-    async def cancel_order(self, record: dict[str, Any], dry_run: bool) -> bool:
-        """Cancel an order and report whether its disappearance is confirmed.
-
-        Callers that may replace an entry or flatten a position must treat a
-        ``False`` return as a hard stop.  In particular, merely logging a
-        cancellation exception and continuing can leave a resting maker order
-        able to fill after an IOC replacement or a reduce-only exit.
-        """
+    async def cancel_order(self, record: dict[str, Any], dry_run: bool) -> None:
         order_id = record.get("order_id")
         if not order_id or float(record.get("remaining_count") or 0.0) <= 0.004:
-            return float(record.get("remaining_count") or 0.0) <= 0.004
+            return
         if dry_run:
             record["status"] = "dry_run_canceled"
             record["remaining_count"] = 0.0
-            return True
+            return
         try:
-            response = await self.orders.cancel_order_v2(order_id)
-            canceled = field(response, "order") or response
-            if canceled is not None:
-                final_fill = order_fill_count(canceled)
-                if final_fill or float(record.get("fill_count") or 0.0) <= 0.004:
-                    record["fill_count"] = round(max(float(record.get("fill_count") or 0.0), final_fill), 2)
-                held_side = str(record.get("held_side") or record.get("side") or "")
-                if held_side in {"yes", "no"} and float(record.get("fill_count") or 0.0) > 0:
-                    record["average_fill_price"] = order_average_position_price(
-                        canceled, held_side, float(record.get("position_price") or 0.0),
-                    )
-                record["fees_paid"] = max(float(record.get("fees_paid") or 0.0), order_fee_total(canceled))
+            await self.orders.cancel_order_v2(order_id)
             record["status"] = "canceled"
             record["canceled_at"] = now_iso()
             record["remaining_count"] = 0.0
             LOG.info("CANCELED | %s", order_id)
-            return True
         except Exception as exc:  # noqa: BLE001
             # Closed markets reject cancellation after the exchange has already
-            # canceled resting orders.  Keep the failure audit trail and make
-            # the uncertainty explicit to the caller; it must reconcile before
-            # it may place a replacement or an exit.
+            # canceled resting orders.  Keep the failure audit trail.
             record["cancel_error"] = str(exc)
             LOG.warning("Cancel failed for %s: %s", order_id, exc)
-            return False
 
 
 def expiration_epoch(market: Any) -> int | None:
@@ -2373,14 +2199,12 @@ def live_completed_trade_records(state: dict[str, Any]) -> list[tuple[tuple[int,
 
 
 def _dynamic_scaling_control(state: dict[str, Any]) -> dict[str, Any]:
-    """Return the durable actual-balance base-share scaling control record."""
+    """Return the durable live-only base-share scaling control record."""
     control = state.get("dynamic_base_share_scaling")
     if not isinstance(control, dict):
         control = {}
         state["dynamic_base_share_scaling"] = control
-    # Version one accumulated only the local bot ledger's realized P/L.  Keep
-    # its version until refresh migrates it with an authenticated balance.
-    control.setdefault("format_version", 1)
+    control["format_version"] = 1
     control.setdefault("enabled", False)
     control.setdefault("initialized", False)
     control.setdefault("scale_events", [])
@@ -2389,60 +2213,25 @@ def _dynamic_scaling_control(state: dict[str, Any]) -> dict[str, Any]:
     return control
 
 
-def dynamic_scaling_starting_balance(config: dict[str, Any]) -> float:
-    """Return the fixed account-equity baseline for live base scaling.
-
-    This is intentionally the configured original account balance, not a
-    replayed ledger total and not the shadow-equity balance.  The setting is
-    shared with the equity controller so a restart cannot silently choose a
-    new base for either component.
-    """
-    starting_balance = as_float(config.get("starting_balance"))
-    if starting_balance is None or starting_balance <= 0:
-        raise ValueError("starting_balance must be positive for dynamic scaling")
-    return starting_balance
+def _dynamic_scaling_cursor(control: dict[str, Any]) -> tuple[int, str] | None:
+    epoch = as_float(control.get("last_processed_completion_epoch"))
+    ticker = control.get("last_processed_completion_ticker")
+    if epoch is None or ticker is None:
+        return None
+    return int(epoch), str(ticker)
 
 
-def _dynamic_scaling_threshold_base_units(
-    control: dict[str, Any], *, starting: float, current: float, increment: float,
-) -> float:
-    """Return the cumulative base-share units required for the next promotion.
-
-    The first promotion charges one interval at the configured starting base.
-    Every later promotion adds another interval at the newly-current base.  For
-    example, with a 3-share start and one-share increments, the thresholds use
-    3 units, then 3 + 4, then 3 + 4 + 5, and so on.  The persisted value keeps
-    that history intact if an operator later changes the configured increment.
-    """
-    persisted = as_float(control.get("threshold_base_share_units"))
-    if persisted is not None and persisted > 0:
-        return round(persisted, 6)
-
-    completed_increases = max(0, int(round((current - starting) / increment)))
-    expected_current = starting + (completed_increases * increment)
-    if math.isclose(current, expected_current, abs_tol=1e-9):
-        # Arithmetic-series form of starting + ... + current, avoiding the
-        # rounding accumulation that a loop over fractional share increments
-        # would introduce.
-        return round(
-            ((completed_increases + 1) * starting)
-            + (increment * completed_increases * (completed_increases + 1) / 2),
-            6,
-        )
-
-    # A pre-v4 state may have been saved after its increment setting changed.
-    # Its retained events are a better reconstruction than silently charging
-    # only the current base.  New v4 states always persist the exact units.
-    events = control.get("scale_events")
-    if isinstance(events, list) and events:
-        prior_bases = [
-            as_float(event.get("base_share_count_before"))
-            for event in events
-            if isinstance(event, dict)
-        ]
-        if all(base is not None and base > 0 for base in prior_bases):
-            return round(sum(float(base) for base in prior_bases) + current, 6)
-    return round(current, 6)
+def _set_dynamic_scaling_cursor_to_latest(
+    control: dict[str, Any], state: dict[str, Any],
+) -> None:
+    completed = live_completed_trade_records(state)
+    if not completed:
+        control.pop("last_processed_completion_epoch", None)
+        control.pop("last_processed_completion_ticker", None)
+        return
+    key, _ = completed[-1]
+    control["last_processed_completion_epoch"] = key[0]
+    control["last_processed_completion_ticker"] = key[1]
 
 
 def _ensure_auto_scaling_capacity(config: dict[str, Any], base_share_count: float) -> bool:
@@ -2470,47 +2259,25 @@ def _ensure_auto_scaling_capacity(config: dict[str, Any], base_share_count: floa
 
 
 def dynamic_scaling_snapshot(state: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
-    """Expose sizing from the durable authenticated actual-balance snapshot."""
+    """Expose current sizing and the next threshold without replaying history."""
     control = state.get("dynamic_base_share_scaling") if isinstance(state, dict) else None
     control = control if isinstance(control, dict) else {}
     enabled = bool(config.get("enable_dynamic_scaling"))
     starting = share_quantity(config["initial_position_size"], "initial_position_size")
-    starting_balance = dynamic_scaling_starting_balance(config)
     current = dynamic_base_share_count(state, config)
-    increment = float(config["base_share_increment"])
     multiplier = float(config["scaling_profit_multiplier"])
-    # The configured starting balance is intentionally immutable for a live
-    # scaling run.  Do not let an old checkpoint's funding rebase leak into a
-    # report (or its threshold) before refresh has migrated that checkpoint.
-    balance_baseline = starting_balance
-    actual_balance = as_float(control.get("actual_balance"))
-    # A version-one state has no persisted authenticated balance. Keep its
-    # prior number only until refresh receives the actual account balance;
-    # live execution never treats that provisional value as a scale trigger.
-    profit = (
-        actual_balance - balance_baseline
-        if enabled and actual_balance is not None
-        else (float(as_float(control.get("profit_since_last_increase")) or 0.0) if enabled else 0.0)
-    )
-    threshold_base_units = _dynamic_scaling_threshold_base_units(
-        control, starting=starting, current=current, increment=increment,
-    )
-    required = round(threshold_base_units * multiplier, 6)
+    profit = float(as_float(control.get("profit_since_last_increase")) or 0.0) if enabled else 0.0
+    required = round(current * multiplier, 6)
     events = control.get("scale_events") if isinstance(control.get("scale_events"), list) else []
     return {
         "enabled": enabled,
         "starting_base_share_count": starting,
         "current_base_share_count": current,
-        "base_share_increment": increment,
+        "base_share_increment": float(config["base_share_increment"]),
         "scaling_profit_multiplier": multiplier,
-        "starting_balance": round(starting_balance, 6),
-        "actual_balance": None if actual_balance is None else round(actual_balance, 6),
-        "actual_balance_baseline": round(balance_baseline, 6),
         "profit_since_last_increase": round(profit, 6),
-        "threshold_base_share_units": threshold_base_units,
         "required_profit": required,
         "profit_remaining_to_increase": round(required - profit, 6),
-        "next_increase_actual_balance": round(balance_baseline + required, 6),
         "scale_count": len(events),
         "last_scale": events[-1] if events else None,
         "max_contracts_per_market_auto": bool(config.get("max_contracts_per_market_auto")),
@@ -2524,41 +2291,29 @@ def dynamic_scaling_snapshot(state: dict[str, Any], config: dict[str, Any]) -> d
 
 def refresh_dynamic_base_share_scaling(
     state: dict[str, Any], config: dict[str, Any], now_epoch: float | None = None,
-    actual_balance: float | None = None,
 ) -> dict[str, Any]:
-    """Apply the actual account balance to the opt-in base-share rule.
+    """Apply new realized live P&L to the opt-in dynamic base-share rule.
 
-    The configured starting balance remains fixed across scale increases and
-    external cash movements.  Each promotion adds an interval sized at that stage's
-    base: base three promotes at baseline + (3 × multiplier); base four then
-    promotes at baseline + ((3 + 4) × multiplier), and so on.  Losses never
-    reduce an already-earned base.  The shadow ledger is never read or mutated here:
-    shadow performance may control the regime, but cannot enlarge real orders.
+    Enabling begins from the configured starting base and only counts trades
+    completed after enablement. This deliberately avoids retrospectively
+    resizing from historical ledger P&L. Every completed filled live trade,
+    including a 5c stop, contributes its realized net P&L. A threshold hit
+    produces one base increase and resets the accumulator exactly as specified.
     """
     now_epoch = time.time() if now_epoch is None else float(now_epoch)
     control = _dynamic_scaling_control(state)
     enabled = bool(config.get("enable_dynamic_scaling"))
     starting = share_quantity(config["initial_position_size"], "initial_position_size")
-    starting_balance = dynamic_scaling_starting_balance(config)
     prior_starting = as_float(control.get("starting_base_share_count"))
-    prior_starting_balance = as_float(control.get("starting_balance"))
     prior_enabled = bool(control.get("enabled"))
-    observed_actual_balance = as_float(actual_balance)
-    if observed_actual_balance is None:
-        observed_actual_balance = as_float(control.get("actual_balance"))
-    if observed_actual_balance is not None and observed_actual_balance <= 0:
-        raise ValueError("actual balance must be positive for dynamic scaling")
     if not enabled:
         already_reset = (
             bool(control.get("initialized"))
             and not prior_enabled
             and prior_starting is not None
             and math.isclose(prior_starting, starting, abs_tol=1e-9)
-            and prior_starting_balance is not None
-            and math.isclose(prior_starting_balance, starting_balance, abs_tol=1e-9)
             and math.isclose(as_float(control.get("current_base_share_count")) or starting, starting, abs_tol=1e-9)
             and math.isclose(as_float(control.get("profit_since_last_increase")) or 0.0, 0.0, abs_tol=1e-9)
-            and int(as_float(control.get("format_version")) or 0) >= 5
         )
         if already_reset:
             return control
@@ -2569,18 +2324,12 @@ def refresh_dynamic_base_share_scaling(
             "initialized": True,
             "initialized_at": datetime.fromtimestamp(now_epoch, tz=timezone.utc).isoformat(),
             "starting_base_share_count": starting,
-            "starting_balance": starting_balance,
             "current_base_share_count": starting,
-            "actual_balance_baseline": starting_balance,
             "profit_since_last_increase": 0.0,
             "last_reset_at": datetime.fromtimestamp(now_epoch, tz=timezone.utc).isoformat(),
             "last_reset_reason": reset_reason,
-            "format_version": 5,
-            "threshold_base_share_units": starting,
-            "threshold_policy": "configured_starting_balance_plus_cumulative_base_intervals",
         })
-        if observed_actual_balance is not None:
-            control["actual_balance"] = round(observed_actual_balance, 6)
+        _set_dynamic_scaling_cursor_to_latest(control, state)
         if prior_enabled or (prior_current is not None and not math.isclose(prior_current, starting, abs_tol=1e-9)):
             LOG.warning(
                 "DYNAMIC BASE SCALING DISABLED | base reset to %.2f; new ladders remain fixed until re-enabled.",
@@ -2588,188 +2337,84 @@ def refresh_dynamic_base_share_scaling(
             )
         return control
 
-    # Versions two through four could retain a funding-adjusted baseline.
-    # Preserve the already-earned base while restoring the configured starting
-    # balance and the stage-by-stage cumulative threshold policy.  Version one
-    # is handled by the authenticated-balance initialization below because it
-    # has no trustworthy balance baseline.
-    prior_format = int(as_float(control.get("format_version")) or 0)
-    if prior_format in {2, 3, 4} and bool(control.get("initialized")):
-        fixed_baseline = round(starting_balance, 6)
-        current = dynamic_base_share_count(state, config)
-        threshold_base_units = _dynamic_scaling_threshold_base_units(
-            control,
-            starting=starting,
-            current=current,
-            increment=float(config["base_share_increment"]),
-        )
-        control.update({
-            "format_version": 5,
-            "actual_balance_baseline": fixed_baseline,
-            "threshold_base_share_units": threshold_base_units,
-            "profit_since_last_increase": round(
-                (observed_actual_balance - fixed_baseline)
-                if observed_actual_balance is not None
-                else float(as_float(control.get("profit_since_last_increase")) or 0.0),
-                6,
-            ),
-            "threshold_policy": "configured_starting_balance_plus_cumulative_base_intervals",
-            "last_reset_at": datetime.fromtimestamp(now_epoch, tz=timezone.utc).isoformat(),
-            "last_reset_reason": "fixed_starting_balance_migration",
-        })
-        LOG.warning(
-            "DYNAMIC BASE SCALING MIGRATED | base=%.2f fixed_starting_balance=$%.4f; "
-            "the next increase includes every base interval through the current base.",
-            current, fixed_baseline,
-        )
-
     if (
         not prior_enabled
         or not bool(control.get("initialized"))
         or prior_starting is None
         or not math.isclose(prior_starting, starting, abs_tol=1e-9)
-        or prior_starting_balance is None
-        or not math.isclose(prior_starting_balance, starting_balance, abs_tol=1e-9)
-        or int(as_float(control.get("format_version")) or 0) < 5
     ):
         reset_reason = (
             "configured_starting_base_changed"
             if prior_starting is not None and not math.isclose(prior_starting, starting, abs_tol=1e-9)
-            else (
-                "configured_starting_balance_changed"
-                if prior_starting_balance is not None and not math.isclose(prior_starting_balance, starting_balance, abs_tol=1e-9)
-                else "actual_balance_scaling_migration"
-            )
+            else "dynamic_scaling_enabled"
         )
+        prior_current = as_float(control.get("current_base_share_count"))
         control.update({
             "enabled": enabled,
             "initialized": True,
             "initialized_at": datetime.fromtimestamp(now_epoch, tz=timezone.utc).isoformat(),
             "starting_base_share_count": starting,
-            "starting_balance": starting_balance,
             "current_base_share_count": starting,
-            "actual_balance_baseline": starting_balance,
             "profit_since_last_increase": 0.0,
             "last_reset_at": datetime.fromtimestamp(now_epoch, tz=timezone.utc).isoformat(),
             "last_reset_reason": reset_reason,
-            "format_version": 5,
-            "threshold_base_share_units": starting,
-            "threshold_policy": "configured_starting_balance_plus_cumulative_base_intervals",
         })
+        _set_dynamic_scaling_cursor_to_latest(control, state)
         _ensure_auto_scaling_capacity(config, starting)
         LOG.warning(
-            "DYNAMIC BASE SCALING INITIALIZED | starting_balance=$%.4f starting_base=%.2f increment=%.2f threshold=$%.4f; authenticated actual balance is the only equity source.",
-            starting_balance, starting, float(config["base_share_increment"]),
-            starting * float(config["scaling_profit_multiplier"]),
+            "DYNAMIC BASE SCALING ENABLED | starting_base=%.2f increment=%.2f threshold=$%.4f; prior ledger P&L is not replayed.",
+            starting, float(config["base_share_increment"]), starting * float(config["scaling_profit_multiplier"]),
         )
-    if observed_actual_balance is None:
-        # Never infer account equity from the local order ledger.  A later
-        # authenticated snapshot will migrate any old version-one state and
-        # calculate the balance delta atomically.
         return control
 
-    control["actual_balance"] = round(observed_actual_balance, 6)
-    control["threshold_policy"] = "configured_starting_balance_plus_cumulative_base_intervals"
-    # Always repair this field as well as using the fixed value below.  This
-    # makes a stale checkpoint self-heal before it can be published again.
-    balance_baseline = starting_balance
-    control["actual_balance_baseline"] = round(balance_baseline, 6)
-    accumulated = observed_actual_balance - balance_baseline
-    control["profit_since_last_increase"] = round(accumulated, 6)
-    current = dynamic_base_share_count(state, config)
-    # A restart can restore an already-increased base while loading the
-    # original 3-share auto-cap values from configuration.  Auto capacity is
-    # owned by the runner, so reconcile it on every authenticated refresh,
-    # not only in the transaction that originally increased the base.
-    _ensure_auto_scaling_capacity(config, current)
-    threshold_base_units = _dynamic_scaling_threshold_base_units(
-        control,
-        starting=starting,
-        current=current,
-        increment=float(config["base_share_increment"]),
-    )
-    required = threshold_base_units * float(config["scaling_profit_multiplier"])
-    if accumulated + 1e-9 >= required:
-        increased = share_quantity(
-            current + float(config["base_share_increment"]), "current_base_share_count",
-        )
-        event = {
-            "at": datetime.fromtimestamp(now_epoch, tz=timezone.utc).isoformat(),
-            "actual_balance": round(observed_actual_balance, 6),
-            "actual_balance_baseline_before": round(balance_baseline, 6),
-            "profit_since_last_increase": round(accumulated, 6),
-            "profit_threshold": round(required, 6),
-            "threshold_base_share_units": threshold_base_units,
-            "base_share_count_before": current,
-            "base_share_count_after": increased,
+    cursor = _dynamic_scaling_cursor(control)
+    for key, record in live_completed_trade_records(state):
+        if cursor is not None and key <= cursor:
+            continue
+        completed_epoch, ticker = key
+        profit_loss = float(record.get("net_profit_loss") or 0.0)
+        accumulated = float(as_float(control.get("profit_since_last_increase")) or 0.0) + profit_loss
+        control["last_processed_completion_epoch"] = completed_epoch
+        control["last_processed_completion_ticker"] = ticker
+        control["last_completed_trade"] = {
+            "ticker": ticker,
+            "completed_at": record.get("exited_at") or record.get("settled_at"),
+            "net_profit_loss": profit_loss,
         }
-        events = control.setdefault("scale_events", [])
-        events.append(event)
-        del events[:-50]
-        control.update({
-            "current_base_share_count": increased,
-            # Keep the configured starting balance fixed: the next promotion is
-            # based on every base interval through the newly-current base.
-            "profit_since_last_increase": round(accumulated, 6),
-            "threshold_base_share_units": round(threshold_base_units + increased, 6),
-            "last_scale_at": event["at"],
-        })
-        auto_capacity_changed = _ensure_auto_scaling_capacity(config, increased)
-        rungs = rung_quantities_for_base_share_count(increased)
-        LOG.warning(
-            "DYNAMIC BASE SCALE INCREASE | actual_balance=$%.4f profit=$%+.4f threshold=$%.4f base=%.2f→%.2f ladder=%s caps=%s.",
-            observed_actual_balance, accumulated, required, current, increased,
-            "/".join(f"{rungs[level]:.2f}x${level:.2f}" for level in LADDER_LEVELS),
-            "auto-expanded" if auto_capacity_changed else "unchanged",
-        )
+        control["profit_since_last_increase"] = round(accumulated, 6)
+        current = dynamic_base_share_count(state, config)
+        required = current * float(config["scaling_profit_multiplier"])
+        if accumulated + 1e-9 >= required:
+            increased = share_quantity(
+                current + float(config["base_share_increment"]), "current_base_share_count",
+            )
+            event = {
+                "at": datetime.fromtimestamp(completed_epoch, tz=timezone.utc).isoformat(),
+                "triggering_ticker": ticker,
+                "triggering_net_profit_loss": round(profit_loss, 6),
+                "profit_threshold": round(required, 6),
+                "base_share_count_before": current,
+                "base_share_count_after": increased,
+            }
+            events = control.setdefault("scale_events", [])
+            events.append(event)
+            del events[:-50]
+            control.update({
+                "current_base_share_count": increased,
+                "profit_since_last_increase": 0.0,
+                "last_scale_at": event["at"],
+                "last_scale_ticker": ticker,
+            })
+            auto_capacity_changed = _ensure_auto_scaling_capacity(config, increased)
+            rungs = rung_quantities_for_base_share_count(increased)
+            LOG.warning(
+                "DYNAMIC BASE SCALE INCREASE | %s realized $%+.4f; threshold=$%.4f base=%.2f→%.2f ladder=%s caps=%s.",
+                ticker, profit_loss, required, current, increased,
+                "/".join(f"{rungs[level]:.2f}x${level:.2f}" for level in LADDER_LEVELS),
+                "auto-expanded" if auto_capacity_changed else "unchanged",
+            )
+        cursor = key
     return control
-
-
-def rebase_dynamic_scaling_for_authenticated_balance_adjustment(
-    state: dict[str, Any], *, adjustment: Decimal, actual_balance: Decimal, ticker: str,
-) -> bool:
-    """Record external cash changes without changing the fixed scaling baseline.
-
-    Dynamic scaling is explicitly measured from the configured starting
-    balance for the run.  The authenticated post-close balance can still be
-    recorded with its unexplained cash adjustment for auditability, but that
-    adjustment must never move the next scaling threshold.
-    """
-
-    if abs(adjustment) <= Decimal("0.0001"):
-        return False
-    control = _dynamic_scaling_control(state)
-    if not bool(control.get("enabled")) or not bool(control.get("initialized")):
-        return False
-    # Use the persisted configured starting balance even if this hook is
-    # invoked before the normal refresh has migrated an old checkpoint.
-    baseline = as_float(control.get("starting_balance"))
-    if baseline is None:
-        baseline = as_float(control.get("actual_balance_baseline"))
-    if baseline is None:
-        return False
-    control["actual_balance_baseline"] = round(baseline, 6)
-    control["actual_balance"] = round(float(actual_balance), 6)
-    control["profit_since_last_increase"] = round(float(actual_balance - Decimal(str(baseline))), 6)
-    events = control.setdefault("external_balance_adjustments", [])
-    if not isinstance(events, list):
-        events = []
-        control["external_balance_adjustments"] = events
-    events.append({
-        "at": now_iso(),
-        "ticker": ticker,
-        "amount": format(adjustment, "f"),
-        "actual_balance": format(actual_balance, "f"),
-        "actual_balance_baseline_after": format(Decimal(str(baseline)), "f"),
-        "reason": "authenticated_balance_change_not_explained_by_strategy_realized_pnl",
-    })
-    del events[:-50]
-    LOG.warning(
-        "DYNAMIC SCALING BALANCE ADJUSTMENT RECORDED | %s adjustment=$%+.4f actual=$%.4f fixed_baseline=$%.4f; "
-        "the configured starting balance does not move.",
-        ticker, adjustment, actual_balance, baseline,
-    )
-    return True
 
 
 def _entry_loss_skip_control(state: dict[str, Any]) -> dict[str, Any]:
@@ -2874,16 +2519,8 @@ def refresh_entry_loss_skip(
     trades leave the current count unchanged.
     """
     now_epoch = time.time() if now_epoch is None else float(now_epoch)
-    limit = int(config["live_consecutive_loss_limit"])
-    if limit <= 0 or int(config["live_markets_to_skip_after_loss_limit"]) <= 0:
-        # Migration is explicit: old loss-skip counters remain auditable but
-        # can never defer a current eligible market.
-        control = _entry_loss_skip_control(state)
-        control["initialized"] = True
-        control.setdefault("initialized_at", datetime.fromtimestamp(now_epoch, tz=timezone.utc).isoformat())
-        _clear_entry_loss_skip(control, "retired_loss_skip_policy", now_epoch)
-        return control
     control = _initialize_entry_loss_skip_from_live_ledger(state, config, now_epoch)
+    limit = int(config["live_consecutive_loss_limit"])
     cursor = _entry_loss_skip_cursor(control)
     for key, record in live_completed_trade_records(state):
         if cursor is not None and key <= cursor:
@@ -2992,7 +2629,6 @@ def entry_loss_skip_snapshot(state: dict[str, Any], config: dict[str, Any]) -> d
         "last_completed_trade": control.get("last_completed_trade"),
         "last_reset_at": control.get("last_reset_at"),
         "last_reset_reason": control.get("last_reset_reason"),
-        "retired": int(config["live_consecutive_loss_limit"]) <= 0,
     }
 
 
@@ -3019,7 +2655,7 @@ def start_market_watcher(state: dict[str, Any], market: Any, config: dict[str, A
         "watch_started_at": now_iso(),
     })
     LOG.info(
-        "WATCH STARTED | %s awaiting the immediately preceding KXBTC15M finalization; it will lock the opposite side and post the persistent 1/2/3/4 GTC ladder as soon as that result is available, up to %.0fs after open.",
+        "WATCH STARTED | %s awaiting the immediately preceding KXBTC15M finalization; it will lock the opposite side and post the persistent 1/2/3/4 GTC ladder as soon as that result is available, up to %.0fs after open, unless the two-loss entry skip is pending.",
         ticker, entry_start_grace_seconds(config),
     )
     return record
@@ -3028,12 +2664,13 @@ def start_market_watcher(state: dict[str, Any], market: Any, config: dict[str, A
 def build_equity_regime_decision(
     state: dict[str, Any], record: dict[str, Any], market: Any, config: dict[str, Any], side: str,
 ) -> StrategyDecision:
-    """Build the fixed-size shadow decision for the settlement strategy.
+    """Adapt the active settlement-only strategy without reimplementing it.
 
-    Live entry sizing is calculated independently in ``consider_initial_entry``
-    and may use dynamic scaling from the authenticated account balance. The
-    shadow curve always uses the fixed 3/6/9/12 ladder so its balance is never
-    rebased or resized by a real-account threshold crossing.
+    The immutable decision is constructed from the same frozen settlement
+    signal and the same 1/2/3/4 ladder sizes that ``consider_initial_entry``
+    will use for this market.  Prophet gating may decide whether that shared
+    decision reaches the live executor, but cannot choose a new side, price,
+    rung, or exit policy.
     """
     ticker = str(field(market, "ticker") or record.get("ticker") or "")
     close_epoch = timestamp_epoch(field(market, "close_time", "expected_expiration_time") or record.get("market_close_time"))
@@ -3043,16 +2680,20 @@ def build_equity_regime_decision(
     target_close = datetime.fromtimestamp(close_epoch, tz=timezone.utc)
     if target_close <= generated:
         raise ValueError("refusing an equity-regime decision for an expired market")
-    # Deliberately overwrite any pre-threshold/restart snapshot. A stale
-    # dynamically-sized snapshot must not leak into shadow accounting.
-    _ = state, config
-    rungs = rung_quantities_for_base_share_count(EQUITY_REGIME_SHADOW_BASE_SHARES)
-    record["regime_shadow_base_share_count"] = EQUITY_REGIME_SHADOW_BASE_SHARES
-    record["regime_base_share_count"] = EQUITY_REGIME_SHADOW_BASE_SHARES
-    record["regime_scaling_equity_source"] = "fixed_shadow_ladder"
-    record["regime_ladder_quantities"] = {
-        f"{level:.4f}": rungs[level] for level in LADDER_LEVELS
-    }
+    snapshot = record.get("regime_ladder_quantities")
+    if isinstance(snapshot, dict) and all(f"{level:.4f}" in snapshot for level in LADDER_LEVELS):
+        rungs = {level: float(snapshot[f"{level:.4f}"]) for level in LADDER_LEVELS}
+    else:
+        # The active dynamic base is based on realized actual P/L by default.
+        # Freeze this exact 1/2/3/4 quantity snapshot before either executor
+        # can observe the target market, so live and shadow cannot drift.
+        base = dynamic_base_share_count(state, config)
+        rungs = rung_quantities_for_base_share_count(base)
+        record["regime_base_share_count"] = base
+        record["regime_scaling_equity_source"] = config.get("scaling_equity_source", "actual")
+        record["regime_ladder_quantities"] = {
+            f"{level:.4f}": rungs[level] for level in LADDER_LEVELS
+        }
     source = record.get("settlement_contrarian_signal") or {}
     return StrategyDecision(
         target_ticker=ticker,
@@ -3076,14 +2717,8 @@ def build_equity_regime_decision(
     )
 
 
-async def account_equity_regime_finalization(
-    rest: KalshiREST,
-    regime: EquityRegimeController,
-    trader_state: dict[str, Any],
-    record: dict[str, Any],
-    market: Any | None,
-    *,
-    dry_run: bool,
+def account_equity_regime_finalization(
+    regime: EquityRegimeController, record: dict[str, Any], market: Any | None, *, dry_run: bool,
 ) -> None:
     """Append one finalized active-strategy market exactly once to both curves."""
     if record.get("regime_accounted"):
@@ -3098,10 +2733,6 @@ async def account_equity_regime_finalization(
     )
     if close_time is None:
         return
-    actual_balance_after = await rest.balance_decimal()
-    if actual_balance_after is None:
-        raise RuntimeError("Cannot account an equity-regime market without authenticated current Kalshi balance")
-    actual_balance_before = Decimal(str(regime.state.get("actual_balance") or actual_balance_after))
     selected_side = record.get("locked_side") or record.get("candidate_side")
     suppressed = bool(record.get("regime_live_entry_suppressed"))
     # ``execution_mode`` is the source of truth for this historical market.
@@ -3132,30 +2763,8 @@ async def account_equity_regime_finalization(
             "reconciliation_status": "pending_api_reconciliation",
         },
         actual_was_live=actual_was_live,
-        actual_balance_after=actual_balance_after,
-    )
-    rebase_dynamic_scaling_for_authenticated_balance_adjustment(
-        trader_state,
-        adjustment=actual_balance_after - actual_balance_before - actual_pnl,
-        actual_balance=actual_balance_after,
-        ticker=str(record.get("ticker") or ""),
     )
     record["regime_accounted"] = True
-    # Startup may correctly defer the endpoint-anchored 200-market balance
-    # rebuild while an inherited position is filled.  Immediately after that
-    # position is closed there is a causal, no-open-exposure window before the
-    # next market is considered, so perform the rebuild here rather than
-    # waiting for another five-hour Actions handoff.
-    rebuilt = regime.bootstrap_from_live_ledger(
-        trader_state,
-        api_current_balance=actual_balance_after,
-    )
-    if rebuilt:
-        regime.save()
-        LOG.warning(
-            "ABSOLUTE 200-MARKET REGIME BOOTSTRAP | rows=%d after terminal market=%s",
-            rebuilt, record.get("ticker"),
-        )
 
 
 def orders_for_market(record: dict[str, Any]) -> list[dict[str, Any]]:
@@ -5992,18 +5601,12 @@ def log_performance_summary(report: dict[str, Any], context: str) -> None:
         loss_skip["last_reset_reason"] or "none",
     )
     scaling = report["dynamic_base_share_scaling"]
-    actual_balance_text = (
-        "unavailable"
-        if scaling["actual_balance"] is None
-        else f"${scaling['actual_balance']:.4f}"
-    )
     LOG.info(
-        "LIVE DYNAMIC BASE SCALING | %s enabled=%s actual_balance=%s(baseline $%.4f) base=%.2f(start %.2f) increment=%.2f multiplier=$%.4f "
-        "profit_since_baseline=$%+.4f next_balance_threshold=$%.4f remaining=$%.4f increases=%d caps=contracts:%s/capital:%s.",
-        context, scaling["enabled"], actual_balance_text, scaling["actual_balance_baseline"],
-        scaling["current_base_share_count"], scaling["starting_base_share_count"],
+        "LIVE DYNAMIC BASE SCALING | %s enabled=%s base=%.2f(start %.2f) increment=%.2f multiplier=$%.4f "
+        "profit_since_increase=$%+.4f next_threshold=$%.4f remaining=$%.4f increases=%d caps=contracts:%s/capital:%s.",
+        context, scaling["enabled"], scaling["current_base_share_count"], scaling["starting_base_share_count"],
         scaling["base_share_increment"], scaling["scaling_profit_multiplier"],
-        scaling["profit_since_last_increase"], scaling["next_increase_actual_balance"], scaling["profit_remaining_to_increase"],
+        scaling["profit_since_last_increase"], scaling["required_profit"], scaling["profit_remaining_to_increase"],
         scaling["scale_count"], "auto" if scaling["max_contracts_per_market_auto"] else "explicit",
         "auto" if scaling["max_total_capital_auto"] else "explicit",
     )
@@ -6656,9 +6259,9 @@ async def run_settlement_only(args: argparse.Namespace) -> int:
                 "settlement_only_migration_note": "retired model/gate path; retain position to settlement with 5c stop only",
             })
     # Initialize the persisted completed-loss circuit breaker before a
-    # recovered or newly discovered market can submit an order. Dynamic
-    # scaling waits for the authenticated actual-balance source below.
+    # recovered or newly discovered market can submit an order.
     if not dry_run:
+        refresh_dynamic_base_share_scaling(state, config)
         refresh_entry_loss_skip(state, config)
     regime_state_path = args.equity_regime_state.expanduser()
     regime_data_dir = regime_state_path.parent
@@ -6686,13 +6289,8 @@ async def run_settlement_only(args: argparse.Namespace) -> int:
             regime_config, regime_state_path, args.equity_regime_output_dir.expanduser(),
         )
         try:
+            replayed = regime.bootstrap_from_live_ledger(state)
             await synchronize_history(regime, KalshiRawHistoryAPI(rest), state)
-            repaired_shadow_rows = regime.repair_legacy_live_equivalent_shadow_rows(state)
-            if repaired_shadow_rows:
-                LOG.warning(
-                    "EQUITY REGIME STARTUP REPAIRED | rows=%d fixed-shadow ledger rows were replayed before live recovery.",
-                    repaired_shadow_rows,
-                )
             # Every finalized record present before this process started is
             # historical scope.  The controller bootstrapped/reconciled its
             # bounded 200-market universe above; marking the pre-existing
@@ -6708,10 +6306,9 @@ async def run_settlement_only(args: argparse.Namespace) -> int:
                     record["regime_accounted"] = True
             regime.save()
             LOG.warning(
-                "EQUITY REGIME STARTUP | history=%d window=%s min_history=%d dry_run=%s live_control=%s actual_balance=%s shadow_balance=%s reconciled=%s",
-                regime_config.history_max_markets, regime_config.prophet_training_window,
+                "EQUITY REGIME STARTUP | history=%d replayed=%d window=%s min_history=%d dry_run=%s live_control=%s",
+                regime_config.history_max_markets, replayed, regime_config.prophet_training_window,
                 regime_config.prophet_min_history, regime_config.dry_run, regime_config.controls_live_execution,
-                regime.state.get("actual_balance"), regime.state.get("shadow_balance"), regime.balance_reconciled,
             )
         except Exception as exc:  # noqa: BLE001 - accounting failure must never control a live entry
             LOG.exception("EQUITY REGIME STARTUP FAILED | %s", exc)
@@ -6719,14 +6316,6 @@ async def run_settlement_only(args: argparse.Namespace) -> int:
                 await rest.close()
                 raise
             regime = None
-    if not dry_run:
-        # The regime's actual balance is persisted from the authenticated
-        # portfolio endpoint at startup/finalization. Dynamic scaling reads
-        # that value only; it never consumes or alters the shadow ledger.
-        actual_balance = as_float(regime.state.get("actual_balance")) if regime is not None else None
-        if actual_balance is None:
-            actual_balance = as_float(await rest.balance_decimal())
-        refresh_dynamic_base_share_scaling(state, config, actual_balance=actual_balance)
     if control_only:
         try:
             canceled = (
@@ -6782,9 +6371,9 @@ async def run_settlement_only(args: argparse.Namespace) -> int:
     )
     LOG.warning(
         "DYNAMIC BASE SCALING POLICY | enabled=%s base=%.2f start=%.2f increment=%.2f multiplier=$%.4f "
-        "next_balance_threshold=$%.4f; auto_caps=contracts:%s/capital:%s.",
+        "next_threshold=$%.4f; auto_caps=contracts:%s/capital:%s.",
         scaling["enabled"], scaling["current_base_share_count"], scaling["starting_base_share_count"],
-        scaling["base_share_increment"], scaling["scaling_profit_multiplier"], scaling["next_increase_actual_balance"],
+        scaling["base_share_increment"], scaling["scaling_profit_multiplier"], scaling["required_profit"],
         scaling["max_contracts_per_market_auto"], scaling["max_total_capital_auto"],
     )
     try:
@@ -6802,7 +6391,6 @@ async def run_settlement_only(args: argparse.Namespace) -> int:
             ]
             feed.set_tickers(tracked + [str(field(market, "ticker") or "") for market in active_markets])
             private_update = feed.private_update_count != last_private_update_count
-            reconciled_orders = False
             if private_update or monotonic_now - last_order_reconcile_at >= config["order_reconcile_seconds"]:
                 for ticker, record in list(state["markets"].items()):
                     if not isinstance(record, dict):
@@ -6836,8 +6424,8 @@ async def run_settlement_only(args: argparse.Namespace) -> int:
                             market_for_regime = None
                             if outcome not in {"yes", "no"}:
                                 market_for_regime = await rest.get_market(ticker)
-                            await account_equity_regime_finalization(
-                                rest, regime, state, record, market_for_regime, dry_run=dry_run,
+                            account_equity_regime_finalization(
+                                regime, record, market_for_regime, dry_run=dry_run,
                             )
                         continue
                     market = await rest.get_market(ticker)
@@ -6857,20 +6445,15 @@ async def run_settlement_only(args: argparse.Namespace) -> int:
                     ):
                         await submit_ladder(rest, record, market, config, record_dry_run)
                     if regime is not None and record.get("status") in FINAL_RECORD_STATUSES:
-                        await account_equity_regime_finalization(rest, regime, state, record, market, dry_run=dry_run)
+                        account_equity_regime_finalization(regime, record, market, dry_run=dry_run)
                 last_order_reconcile_at = monotonic_now
                 last_private_update_count = feed.private_update_count
-                reconciled_orders = True
             # A settlement or completed 5c stop above may have changed the
-            # authenticated actual balance. Refresh scaling and the loss skip
-            # before handling a new signal; each one therefore applies to
-            # this same loop's next market without changing an already-posted
-            # ladder.
+            # realized sequence. Refresh scaling and the loss skip before
+            # handling a new signal; each one therefore applies to this same
+            # loop's next market without changing an already-posted ladder.
             if not dry_run:
-                actual_balance = as_float(regime.state.get("actual_balance")) if regime is not None else None
-                if actual_balance is None and reconciled_orders:
-                    actual_balance = as_float(await rest.balance_decimal())
-                refresh_dynamic_base_share_scaling(state, config, actual_balance=actual_balance)
+                refresh_dynamic_base_share_scaling(state, config)
                 refresh_entry_loss_skip(state, config)
             for market in active_markets:
                 ticker = str(field(market, "ticker") or "")
@@ -6905,7 +6488,7 @@ async def run_settlement_only(args: argparse.Namespace) -> int:
                         LOG.warning(
                             "LIVE ENTRY SUPPRESSED BY EQUITY REGIME | %s side=%s shadow=%s P10=%s P90=%s; "
                             "shadow decision continues and no real order was created.",
-                            ticker, side.upper(), regime.state["shadow_balance"],
+                            ticker, side.upper(), regime.state["shadow_equity"],
                             regime.state.get("last_p10"), regime.state.get("last_p90"),
                         )
                         continue
