@@ -59,6 +59,8 @@ For the default hard stop of 44¢, bid ≤45¢ starts a post-only/reduce-only ma
 
 Every signal also maintains independent analytics for 40, 41, …, 49¢. It records executable-ask touches separately from conservative simulated fills. At official settlement, it records winner capture and missed-winner rates, the minimum selected-side ask, eventual-winner maximum drawdown, and whether a stopped position would later have won. A stopped record remains observed until official settlement; verification never changes already-realized recovery P&L.
 
+The `OPENING ENTRY SNAPSHOT` log prints the exact selected side, first fresh post-open executable ask, derived ask-minus-1¢ limit, exchange timestamp, exchange-quote lag from open, worker-observation lag, and the monitored 40–49¢ range. Those same facts are atomically checkpointed in the per-market state and appended to the fsynced audit ledger. `SETTLEMENT PRICE PATH` later prints and persists the initial ask, actual average fill (if any), minimum observed ask, every 40–49¢ hit/miss, and the maximum drawdown in cents for an eventual directional winner. The five-minute aggregate also distinguishes the lowest actual fill among eventual directional winners from the lowest entry that produced positive realized net P&L.
+
 ### Sticky signal transition
 
 The v11 signal has no loss-skip rule and is independent of execution. For each new market, the worker freezes the immediately preceding market’s realtime provisional outcome, later checks it against official settlement, and records the transition in both state and audit ledger:
@@ -83,6 +85,8 @@ Only `sticky_stop_40` is accepted by configuration, workflow input, watchdog, op
 | Live | `data/kalshi_live_maker_hybrid_v11_state.json` | `data/kalshi_live_maker_hybrid_v11_audit.jsonl` |
 
 The v8/v9/v10 files remain archived evidence. v11 starts in a separate namespace at a $1,000 shadow balance and 1.00 permanent base, so no older IOC, comparison-stop, or synthetic-cancellation state can be reinterpreted as current execution. The single workflow concurrency group serializes shadow/live workers, and the watchdog dispatches only v11 `sticky_stop_40`.
+
+Forensic check of the archived v10 40¢ IOC shadow state (not a v11 maker result): it contains **214 actual filled markets**, all with a later outcome, split into **105 eventual directional winners / 109 losers**. The lowest actual selected-side fill that later settled correctly was **41¢ NO**, 2.17 shares, in `KXBTC15M-26AUG181215-15`; that position hit its stop and realized **-$0.0868**, so it is not labeled a profitable trade. The lowest actual entry with positive realized net P&L was **42¢ YES**, 2.42 shares, in `KXBTC15M-26AUG181500-00`; it was held to a YES settlement and realized **+$1.4036** in the archived shadow ledger. This distinction prevents “eventual directional winner” from being confused with “profitable after the stop policy.”
 
 ## Reconstructed historical directional results — prior inverse baseline
 
