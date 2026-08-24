@@ -165,6 +165,12 @@ class StrategyCoreTests(unittest.TestCase):
         self.assertIn("--persist-config", worker)
         self.assertNotIn("cron:", worker)
         self.assertIn('cron: "2-59/5 * * * *"', watchdog)
+        workflow_input_count = len(__import__("re").findall(
+            r"^      [a-zA-Z0-9_]+:\s*$",
+            worker[worker.index("    inputs:"):worker.index("# Serialized runs")],
+            flags=__import__("re").MULTILINE,
+        ))
+        self.assertLessEqual(workflow_input_count, 25)
         for retired in ("sticky_stop_30", "sticky_stop_20", "sticky_stop_10"):
             self.assertNotIn(retired, watchdog)
             self.assertNotIn(retired, controlled)
