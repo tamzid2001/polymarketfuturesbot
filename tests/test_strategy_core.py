@@ -93,6 +93,7 @@ class StrategyCoreTests(unittest.TestCase):
         self.assertEqual(config["base_increment"], "1.00")
         self.assertEqual(config["opening_price_discovery_seconds"], 3)
         self.assertEqual(config["entry_execution_mode"], "signal_price_minus_offset_maker")
+        self.assertEqual(config["maker_order_time_in_force"], "good_till_canceled")
         self.assertEqual(config["entry_limit_offset_cents"], 1)
         self.assertEqual(config["max_recovery_exponent"], 0)
         self.assertEqual(config["stop_policy"], "hybrid_maker_then_hard_stop")
@@ -131,6 +132,11 @@ class StrategyCoreTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "entry_execution_mode"):
             load_config_from_value(dict(config, entry_execution_mode="maker_then_ioc"))
 
+    def test_active_config_rejects_non_gtc_maker_orders(self) -> None:
+        config = load_config(ROOT / "selected_live_strategy.json")
+        with self.assertRaisesRegex(ValueError, "maker_order_time_in_force"):
+            load_config_from_value(dict(config, maker_order_time_in_force="immediate_or_cancel"))
+
     def test_v9_fixed_stop_is_not_adjusted_by_actual_entry_price(self) -> None:
         floor = Decimal("0.40")
         baseline = Decimal("0.50")
@@ -160,6 +166,7 @@ class StrategyCoreTests(unittest.TestCase):
         watchdog = (ROOT / ".github/workflows/kalshi_btc15m_watchdog.yml").read_text(encoding="utf-8")
         controlled = (ROOT / ".github/workflows/kalshi_btc15m_controlled_restart.yml").read_text(encoding="utf-8")
         self.assertIn('entry_execution_mode"] == "signal_price_minus_offset_maker"', worker)
+        self.assertIn('maker_order_time_in_force"] == "good_till_canceled"', worker)
         self.assertIn("hybrid=45/46/44", worker)
         self.assertIn("kalshi_shadow_maker_hybrid_v11_sticky_stop_40", worker)
         self.assertIn("--persist-config", worker)

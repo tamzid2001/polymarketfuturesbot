@@ -137,6 +137,7 @@ def export_selected_live_strategy(path: Path, row: dict[str, Any], *, selection_
         "hybrid_hard_stop_cents": 44,
         "stop_baseline_entry_price": "0.50",
         "entry_execution_mode": "signal_price_minus_offset_maker",
+        "maker_order_time_in_force": "good_till_canceled",
         "entry_limit_offset_cents": 1,
         "starting_base": "1.00",
         "recovery_multiplier": f"{float(row['recovery_multiplier']):.2f}",

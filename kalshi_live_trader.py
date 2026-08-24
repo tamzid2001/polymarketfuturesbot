@@ -213,6 +213,8 @@ def validate_entry_price_contract(value: dict[str, Any]) -> None:
         raise ValueError("reference entry_price must satisfy stop < entry_price < 1")
     if value.get("entry_execution_mode") != "signal_price_minus_offset_maker":
         raise ValueError("the active strategy requires entry_execution_mode=signal_price_minus_offset_maker")
+    if value.get("maker_order_time_in_force") != "good_till_canceled":
+        raise ValueError("the active strategy requires maker_order_time_in_force=good_till_canceled")
     if value.get("stop_policy") != "hybrid_maker_then_hard_stop":
         raise ValueError("the active strategy requires stop_policy=hybrid_maker_then_hard_stop")
     if stop_baseline != Decimal("0.50"):
@@ -261,6 +263,7 @@ def load_config(path: Path) -> dict[str, Any]:
         "strategy_version", "series", "entry_price", "stop_price", "starting_base", "recovery_multiplier",
         "first_base_threshold", "threshold_growth_multiplier", "base_increment", "max_position",
         "stop_policy", "stop_baseline_entry_price", "entry_execution_mode", "entry_limit_offset_cents",
+        "maker_order_time_in_force",
         "shadow_fill_model", "shadow_entry_level_min_cents", "shadow_entry_level_max_cents",
         "shadow_entry_level_step_cents", "hybrid_stop_enabled", "hybrid_stop_trigger_cents",
         "hybrid_maker_exit_cents", "hybrid_hard_stop_cents", "trading_mode", "config_schema_version",
@@ -289,6 +292,7 @@ def load_config(path: Path) -> dict[str, Any]:
     value.setdefault("maker_price_offset", "0.01")
     value.setdefault("stop_policy", "hybrid_maker_then_hard_stop")
     value.setdefault("entry_execution_mode", "signal_price_minus_offset_maker")
+    value.setdefault("maker_order_time_in_force", "good_till_canceled")
     value.setdefault("stop_baseline_entry_price", "0.50")
     value.setdefault("signal_delay_seconds", 0)
     value.setdefault("signal_mode", "sticky_until_directional_win")
@@ -381,6 +385,7 @@ def load_config_from_value(value: dict[str, Any]) -> dict[str, Any]:
         "strategy_version", "series", "entry_price", "stop_price", "starting_base", "recovery_multiplier",
         "first_base_threshold", "threshold_growth_multiplier", "base_increment", "max_position", "stop_policy",
         "stop_baseline_entry_price", "entry_execution_mode", "entry_limit_offset_cents", "shadow_fill_model",
+        "maker_order_time_in_force",
         "shadow_entry_level_min_cents", "shadow_entry_level_max_cents", "shadow_entry_level_step_cents",
         "hybrid_stop_enabled", "hybrid_stop_trigger_cents", "hybrid_maker_exit_cents",
         "hybrid_hard_stop_cents", "trading_mode", "config_schema_version",
@@ -396,6 +401,7 @@ def load_config_from_value(value: dict[str, Any]) -> dict[str, Any]:
     temporary.setdefault("maker_price_offset", "0.01")
     temporary.setdefault("stop_policy", "hybrid_maker_then_hard_stop")
     temporary.setdefault("entry_execution_mode", "signal_price_minus_offset_maker")
+    temporary.setdefault("maker_order_time_in_force", "good_till_canceled")
     temporary.setdefault("stop_baseline_entry_price", "0.50")
     temporary.setdefault("signal_mode", "sticky_until_directional_win")
     temporary.setdefault("shadow_profile", "sticky_stop_40")
@@ -1188,7 +1194,13 @@ class LiveEngine:
         return changed
 
     def entry_price_performance(self) -> dict[str, Any]:
-        """Rebuild idempotent 40–49c entry and eventual-winner metrics."""
+        """Rebuild idempotent entry, winner, and initial-stop metrics.
+
+        ``initial_at_or_below_stop`` is a counterfactual eligibility measure,
+        not a claim that ten strategies ran. The separate actual rejection
+        counters only include records which this configured strategy refused
+        before order submission. Neither category is a directional skip.
+        """
 
         levels = range(
             int(self.config["shadow_entry_level_min_cents"]),
@@ -1200,14 +1212,34 @@ class LiveEngine:
         histogram: dict[str, int] = {}
         minimum_histogram: dict[str, int] = {}
         winners_at_or_below_40 = 0
+        initial_prices: list[int] = []
+        actual_stop_rejections: list[int] = []
+        rejection_reasons: dict[str, int] = {}
+        signals_without_initial_price = 0
         for record in self.state.get("markets", {}).values():
-            if not isinstance(record, dict) or record.get("initial_signal_price_cents") is None:
+            if not isinstance(record, dict) or not record.get("signal_side"):
                 continue
+            rejection = record.get("entry_rejection_quote", {})
+            initial_value = record.get("initial_signal_price_cents")
+            # Early v11 rejection records retained this exact price in their
+            # quote evidence even before the top-level field was added.
+            if initial_value is None and isinstance(rejection, dict):
+                initial_value = rejection.get("initial_signal_price_cents")
+            if initial_value is None:
+                signals_without_initial_price += 1
+                continue
+            initial_price = int(initial_value)
+            initial_prices.append(initial_price)
+            rejection_reason = str(rejection.get("reason") or "") if isinstance(rejection, dict) else ""
+            if rejection_reason:
+                rejection_reasons[rejection_reason] = rejection_reasons.get(rejection_reason, 0) + 1
+            if rejection_reason == "derived_limit_at_or_below_hybrid_hard_stop":
+                actual_stop_rejections.append(initial_price)
             outcome = record.get("settlement_outcome") or record.get("post_stop_settlement_outcome")
             is_winner = outcome in {"yes", "no"} and outcome == record.get("signal_side")
             if is_winner:
                 winners += 1
-                initial = int(record["initial_signal_price_cents"])
+                initial = initial_price
                 minimum = int(record.get("minimum_selected_price_cents") or initial)
                 drawdown = max(0, initial - minimum)
                 record["winner_max_drawdown_cents"] = drawdown
@@ -1238,12 +1270,55 @@ class LiveEngine:
             row["winner_simulated_fill_rate"] = row["winner_simulated_fills"] / winner_count if winner_count else None
             row["missed_winner_count"] = winner_count - row["winner_touches"]
             row["missed_winner_rate"] = row["missed_winner_count"] / winner_count if winner_count else None
+        captured = len(initial_prices)
+        stop_levels: dict[str, Any] = {}
+        for stop_cents in levels:
+            count = sum(price <= stop_cents for price in initial_prices)
+            stop_levels[str(stop_cents)] = {
+                "stop_cents": stop_cents,
+                "signals_with_initial_price": captured,
+                "initial_at_or_below_stop": count,
+                "would_skip_rate": count / captured if captured else None,
+            }
+        exact_initial = {
+            str(price): sum(value == price for value in initial_prices)
+            for price in levels
+        }
+        exact_actual_rejections = {
+            str(price): sum(value == price for value in actual_stop_rejections)
+            for price in levels
+        }
         summary = {
             "levels": output, "winning_settlements": winners,
             "winning_settlements_reached_40_or_lower": winners_at_or_below_40,
             "winning_settlements_stayed_above_40": winners - winners_at_or_below_40,
             "winner_drawdown_histogram_cents": dict(sorted(histogram.items(), key=lambda item: int(item[0]))),
             "winner_minimum_price_histogram_cents": dict(sorted(minimum_histogram.items(), key=lambda item: int(item[0]))),
+            "initial_stop_eligibility": {
+                "definition": "initial_selected_side_price_cents <= hypothetical_stop_cents",
+                "captured_initial_prices": captured,
+                "signals_without_initial_price": signals_without_initial_price,
+                "levels": stop_levels,
+                "exact_initial_price_counts_40_49": exact_initial,
+                "initial_prices_below_40": sum(value < 40 for value in initial_prices),
+                "initial_prices_above_49": sum(value > 49 for value in initial_prices),
+                "actual_strategy_stop_safety_rejections": len(actual_stop_rejections),
+                "actual_strategy_stop_safety_rejections_40_49": sum(
+                    40 <= value <= 49 for value in actual_stop_rejections
+                ),
+                "actual_strategy_stop_safety_rejections_below_40": sum(
+                    value < 40 for value in actual_stop_rejections
+                ),
+                "actual_strategy_stop_safety_rejections_above_49": sum(
+                    value > 49 for value in actual_stop_rejections
+                ),
+                "actual_rejection_initial_price_counts_40_49": exact_actual_rejections,
+                "actual_entry_rejection_reasons": dict(sorted(rejection_reasons.items())),
+                "actual_strategy_rule": (
+                    "reject before order submission when derived entry limit is at or below "
+                    f"the configured {int(self.config['hybrid_hard_stop_cents'])}c hard stop"
+                ),
+            },
             "updated_at": utc_now(),
         }
         self.state["entry_price_performance"] = summary
@@ -1276,6 +1351,32 @@ class LiveEngine:
             LOG.warning("MAX DRAWDOWN %sc: %d trades (%.2f%%)", bucket, count, 100 * count / winners if winners else 0)
         for bucket, count in summary["winner_minimum_price_histogram_cents"].items():
             LOG.warning("WINNER MINIMUM %sc: %d trades (%.2f%%)", bucket, count, 100 * count / winners if winners else 0)
+        eligibility = summary["initial_stop_eligibility"]
+        LOG.warning("============= INITIAL PRICE STOP ELIGIBILITY =============")
+        LOG.warning(
+            "Captured initial prices=%d | unavailable=%d | actual stop-safety no-entry=%d "
+            "(40-49c=%d below40c=%d above49c=%d)",
+            eligibility["captured_initial_prices"], eligibility["signals_without_initial_price"],
+            eligibility["actual_strategy_stop_safety_rejections"],
+            eligibility["actual_strategy_stop_safety_rejections_40_49"],
+            eligibility["actual_strategy_stop_safety_rejections_below_40"],
+            eligibility["actual_strategy_stop_safety_rejections_above_49"],
+        )
+        LOG.warning("STOP | INITIAL <= STOP | WOULD-BE NO-ENTRY RATE | EXACT INITIAL | ACTUAL SAFETY NO-ENTRY")
+        for level in range(49, 39, -1):
+            row = eligibility["levels"][str(level)]
+            rate = row["would_skip_rate"]
+            LOG.warning(
+                "%2sc | %15d | %21s | %13d | %22d",
+                level, row["initial_at_or_below_stop"],
+                "n/a" if rate is None else f"{100 * rate:.2f}%",
+                eligibility["exact_initial_price_counts_40_49"][str(level)],
+                eligibility["actual_rejection_initial_price_counts_40_49"][str(level)],
+            )
+        LOG.warning(
+            "NOTE | INITIAL<=STOP columns are counterfactual threshold counts; actual safety no-entry is "
+            "the configured rule. Neither is a directional skip or an unfilled GTC order."
+        )
 
     @staticmethod
     def average_filled_entry_price(record: dict[str, Any]) -> Decimal | None:
@@ -3063,11 +3164,12 @@ class LiveEngine:
             self.finish_entry_attempt(record, Decimal("0"), "entry_deadline_elapsed_before_submission")
             return
         client_id = deterministic_client_order_id(record["ticker"], side, "entry", self.config)
+        maker_tif = str(self.config["maker_order_time_in_force"])
         if self.dry_run:
             order = {
                 "order_id": None, "client_order_id": client_id, "ticker": record["ticker"], "side": side,
                 "quantity": format(quantity, "f"), "position_price": format(maker_price, "f"),
-                "time_in_force": "good_till_canceled", "post_only": True, "reduce_only": False,
+                "time_in_force": maker_tif, "post_only": True, "reduce_only": False,
                 "expiration_time": int(deadline), "fill_count": "0.00", "remaining_count": format(quantity, "f"),
                 "average_fill_price": None, "fees_paid": "0", "entry_phase": "maker",
                 "status": "shadow_resting", "shadow_execution": "conservative_public_trade_through",
@@ -3076,7 +3178,7 @@ class LiveEngine:
         else:
             order = await rest.create_order(
                 ticker=record["ticker"], side=side, position_price=float(maker_price), quantity=float(quantity),
-                tif="good_till_canceled", expiration_time=int(deadline), dry_run=False,
+                tif=maker_tif, expiration_time=int(deadline), dry_run=False,
                 order_key="signal-minus-offset-entry", post_only=True, client_order_id_override=client_id,
             )
             order["entry_phase"] = "maker"
@@ -3250,13 +3352,14 @@ class LiveEngine:
         maker_price = cents_price(int(record["hybrid_stop"]["maker_exit_cents"]))
         self.note_stop_trigger(record, executable_bid, trigger, quantity, shadow=self.dry_run)
         client_id = deterministic_client_order_id(record["ticker"], side, "hybrid-maker-exit", self.config)
+        maker_tif = str(self.config["maker_order_time_in_force"])
         if self.dry_run:
             order = {
                 "order_id": None, "client_order_id": client_id, "ticker": record["ticker"],
                 "side": side, "held_side": side, "order_type": "reduce_only_exit_maker",
                 "exit_phase": "maker_exit", "position_price": format(maker_price, "f"),
                 "quantity": format(quantity, "f"), "fill_count": "0.00", "remaining_count": format(quantity, "f"),
-                "average_fill_price": None, "fees_paid": "0", "time_in_force": "good_till_canceled",
+                "average_fill_price": None, "fees_paid": "0", "time_in_force": maker_tif,
                 "post_only": True, "reduce_only": True, "status": "shadow_resting", "submitted_at": utc_now(),
             }
         else:
@@ -3266,6 +3369,11 @@ class LiveEngine:
                 order_key="hybrid-maker-exit",
                 client_order_id_override=client_id,
             )
+            if order.get("time_in_force") != maker_tif:
+                record.setdefault("exit_orders", []).append(order)
+                self.trip("hybrid_maker_exit_time_in_force_mismatch")
+                self.transition(record, "RECONCILIATION_PENDING", "hybrid_maker_exit_time_in_force_mismatch")
+                return
             if order.get("status") in {"submit_failed", "paused"}:
                 record.setdefault("exit_orders", []).append(order)
                 record["hybrid_stop"]["maker_order_id"] = order.get("order_id")
@@ -3911,6 +4019,7 @@ class LiveEngine:
                 stop_latency = timing["stop_trigger_from_first_fill"]
                 shadow = self.shadow_metrics() if self.dry_run else {}
                 fees = self.fee_metrics()
+                eligibility = self.entry_price_performance()["initial_stop_eligibility"]
                 LOG.warning(
                     "HEARTBEAT | mode=%s ticker=%s state=%s base=%s exponent=%d target=%s "
                     "deficit=%s threshold=%s tracked=%d filled=%d zero=%d funding_failures=%d "
@@ -3918,7 +4027,8 @@ class LiveEngine:
                     "first_quote_lag=%s maker_limit=%s deadline_in=%s entry_fill_p50=%s "
                     "stop_from_fill_p50=%s shadow_balance=%s shadow_pnl=%s shadow_dd=%s "
                     "completed=%s stops=%s settlements=%s fees=%s hybrid_state=%s exit_class=%s "
-                    "entry_mode=%s active=%s breaker=%s",
+                    "entry_mode=%s maker_tif=%s initial_quotes=%s stop_safety_no_entry=%s "
+                    "active=%s breaker=%s",
                     "DRY_RUN" if self.dry_run else "LIVE",
                     active and active["ticker"],
                     record.get("status") if isinstance(record, dict) else None,
@@ -3936,6 +4046,8 @@ class LiveEngine:
                     fees["total_fees_paid"], record.get("hybrid_stop", {}).get("state") if isinstance(record, dict) else None,
                     record.get("exit_classification") if isinstance(record, dict) else None,
                     self.config["entry_execution_mode"],
+                    self.config["maker_order_time_in_force"], eligibility["captured_initial_prices"],
+                    eligibility["actual_strategy_stop_safety_rejections"],
                     self.state.get("active_market"), self.state["circuit_breaker"].get("blocked"),
                 )
                 self.last_heartbeat = time.monotonic()

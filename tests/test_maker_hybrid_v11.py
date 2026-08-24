@@ -89,7 +89,8 @@ class LiveHybridRest:
             "order_type": "reduce_only_exit_maker", "quantity": str(kwargs["quantity"]),
             "position_price": str(kwargs["economic_exit_price"]), "fill_count": "0.00",
             "remaining_count": str(kwargs["quantity"]), "average_fill_price": None, "fees_paid": "0",
-            "post_only": True, "reduce_only": True, "submitted_at": datetime.now(timezone.utc).isoformat(),
+            "post_only": True, "reduce_only": True, "time_in_force": "good_till_canceled",
+            "submitted_at": datetime.now(timezone.utc).isoformat(),
             "status": "resting",
         }
 
@@ -154,6 +155,7 @@ class MakerHybridV11Tests(unittest.TestCase):
             await engine.submit_entry(rest, feed, record, time.time())
             self.assertEqual((record["initial_signal_price_cents"], record["entry_limit_cents"]), (50, 49))
             self.assertTrue(record["entry_orders"][0]["post_only"])
+            self.assertEqual(record["entry_orders"][0]["time_in_force"], "good_till_canceled")
             feed.ask = Decimal("0.60")
             await engine.submit_entry(rest, feed, record, time.time())
             self.assertEqual(record["entry_limit_cents"], 49)
@@ -173,6 +175,26 @@ class MakerHybridV11Tests(unittest.TestCase):
         self.assertTrue(record["shadow_entry_levels"]["49"]["touched"])
         self.assertTrue(record["shadow_entry_levels"]["44"]["touched"])
         self.assertFalse(record["shadow_entry_levels"]["43"]["touched"])
+
+    def test_initial_price_stop_eligibility_and_actual_rejections_are_separate(self) -> None:
+        engine = self.engine()
+        for initial_cents in range(39, 51):
+            feed = BookFeed(format(Decimal(initial_cents) / Decimal("100"), "f"))
+            record = self.signal(engine, f"KXBTC15M-initial-{initial_cents}")
+            engine.freeze_initial_signal_price(feed, record, time.time())
+
+        eligibility = engine.entry_price_performance()["initial_stop_eligibility"]
+        self.assertEqual(eligibility["captured_initial_prices"], 12)
+        self.assertEqual(eligibility["signals_without_initial_price"], 0)
+        self.assertEqual(eligibility["levels"]["40"]["initial_at_or_below_stop"], 2)
+        self.assertEqual(eligibility["levels"]["45"]["initial_at_or_below_stop"], 7)
+        self.assertEqual(eligibility["levels"]["49"]["initial_at_or_below_stop"], 11)
+        self.assertEqual(eligibility["actual_strategy_stop_safety_rejections"], 7)
+        self.assertEqual(eligibility["actual_strategy_stop_safety_rejections_40_49"], 6)
+        self.assertEqual(eligibility["actual_strategy_stop_safety_rejections_below_40"], 1)
+        self.assertEqual(eligibility["exact_initial_price_counts_40_49"]["44"], 1)
+        self.assertEqual(eligibility["actual_rejection_initial_price_counts_40_49"]["45"], 1)
+        self.assertEqual(eligibility["actual_rejection_initial_price_counts_40_49"]["46"], 0)
 
     def test_limit_never_fills_and_winner_is_counted_as_missed_without_sizing_change(self) -> None:
         async def scenario():
