@@ -172,15 +172,41 @@ class MakerHybridV11Tests(unittest.TestCase):
         self.assertIn("OPENING ENTRY SNAPSHOT", output)
         self.assertIn("initial_selected_ask=52c", output)
         self.assertIn("entry_limit=51c", output)
+        self.assertIn("quantity=1.00", output)
+        self.assertIn("opening_entry_cost=$0.5100", output)
         self.assertIn("monitored=40c-49c", output)
         self.assertEqual(record["initial_signal_price_cents"], 52)
         self.assertEqual(record["entry_limit_cents"], 51)
+        self.assertEqual(record["opening_entry_quantity"], "1.00")
+        self.assertEqual(record["opening_entry_price"], "0.51")
+        self.assertEqual(record["opening_entry_cost"], "0.5100")
         self.assertIsNotNone(record["initial_signal_price_exchange_timestamp"])
         self.assertGreaterEqual(record["initial_signal_price_lag_seconds"], 0)
         restored = load_state(engine.state_path, engine.config)
         restored_record = restored["markets"][record["ticker"]]
         self.assertEqual(restored_record["initial_signal_price_cents"], 52)
         self.assertEqual(restored_record["entry_limit_cents"], 51)
+        self.assertEqual(restored_record["opening_entry_cost"], "0.5100")
+
+    def test_legacy_v11_checkpoint_backfills_opening_cost_without_changing_entry(self) -> None:
+        engine, feed = self.engine(), BookFeed("0.52")
+        record = self.signal(engine, "KXBTC15M-opening-cost-backfill")
+        self.assertEqual(engine.freeze_initial_signal_price(feed, record, time.time()), Decimal("0.51"))
+        immutable_entry = (record["initial_signal_price_cents"], record["entry_limit_cents"])
+        for key in (
+            "opening_entry_quantity", "opening_entry_price", "opening_entry_cost",
+            "opening_entry_cost_recorded_at",
+        ):
+            record.pop(key, None)
+
+        self.assertTrue(engine.update_entry_execution_summary(record))
+        self.assertEqual(
+            (record["initial_signal_price_cents"], record["entry_limit_cents"]),
+            immutable_entry,
+        )
+        self.assertEqual(record["opening_entry_quantity"], "1.00")
+        self.assertEqual(record["opening_entry_price"], "0.51")
+        self.assertEqual(record["opening_entry_cost"], "0.5100")
 
     def test_rejected_below_hard_stop_retains_initial_quote_and_analytics(self) -> None:
         engine, feed = self.engine(), BookFeed("0.44")
@@ -242,10 +268,16 @@ class MakerHybridV11Tests(unittest.TestCase):
             await engine.manage_entry(rest, feed, record, time.time())
             self.assertEqual(record["status"], "ENTRY_PARTIAL")
             self.assertEqual(record["actual_quantity"], "0.40")
+            self.assertEqual(record["requested_entry_cost"], "0.4900")
+            self.assertEqual(record["actual_entry_notional"], "0.1960")
+            self.assertEqual(record["actual_entry_fees"], "0")
+            self.assertEqual(record["actual_entry_cash_cost"], "0.1960")
             feed.add_trade(record["signal_side"], "0.48", "0.60")
             await engine.manage_entry(rest, feed, record, time.time())
             self.assertEqual(record["status"], "POSITION_OPEN")
             self.assertEqual(record["actual_quantity"], "1.00")
+            self.assertEqual(record["actual_entry_notional"], "0.4900")
+            self.assertEqual(record["actual_entry_cash_cost"], "0.4900")
         asyncio.run(scenario())
 
     def test_canceled_unfilled_order_is_not_a_loss(self) -> None:

@@ -79,6 +79,7 @@ ACTIVE_STATES = {
     "ENTRY_CANCEL_UNCONFIRMED", "RECONCILIATION_PENDING", "ACCOUNTING_RECONCILIATION_PENDING",
     "MAKER_EXIT_PENDING", "MAKER_EXIT_PARTIAL", "MAKER_EXIT_CANCEL_UNCONFIRMED", "HARD_STOP_PENDING",
 }
+ENTRY_NOTIONAL_QUANTUM = Decimal("0.0001")
 
 
 def configure_logging() -> None:
@@ -188,6 +189,21 @@ def cents_price(value: int) -> Decimal:
     if not 1 <= int(value) <= 99:
         raise ValueError("price cents must be between 1 and 99")
     return Decimal(int(value)) / Decimal("100")
+
+
+def exact_entry_notional(quantity: Decimal | str, price: Decimal | str) -> Decimal:
+    """Return the exact cash notional for two-decimal shares at a 1c tick.
+
+    Both operands are fixed point, so their product is exact to four decimal
+    places.  Rejecting any unexpected higher-precision value keeps opening
+    intent deterministic instead of silently rounding accounting data.
+    """
+
+    value = Decimal(str(quantity)) * Decimal(str(price))
+    fixed = value.quantize(ENTRY_NOTIONAL_QUANTUM)
+    if fixed != value:
+        raise ValueError("entry quantity and price must produce an exact four-decimal notional")
+    return fixed
 
 
 def assert_active_strategy_contract(value: dict[str, Any]) -> None:
@@ -957,6 +973,9 @@ class LiveEngine:
                 "other_entry_filled_quantity": "0.00",
                 "total_filled_quantity": "0.00",
                 "actual_weighted_average_entry_price": None,
+                "actual_entry_notional": "0",
+                "actual_entry_fees": "0",
+                "actual_entry_cash_cost": "0",
                 "maker_limit_order_ids": [],
                 "market_ioc_order_ids": [],
             },
@@ -975,6 +994,19 @@ class LiveEngine:
             "initial_signal_quote": None,
             "entry_limit_cents": None,
             "maker_entry_price": None,
+            # Opening intent and actual execution cost are deliberately
+            # separate.  The former is frozen from quantity * ask-minus-1c;
+            # the latter is rebuilt only from filled quantity, exchange fill
+            # price, and fees.
+            "opening_entry_quantity": format(quantity, "f"),
+            "opening_entry_price": None,
+            "opening_entry_cost": None,
+            "opening_entry_cost_recorded_at": None,
+            "requested_entry_cost": None,
+            "requested_entry_cost_recorded_at": None,
+            "actual_entry_notional": "0",
+            "actual_entry_fees": "0",
+            "actual_entry_cash_cost": "0",
             "reference_maker_entry_price": self.config["entry_price"],
             "maker_price_offset": self.config["maker_price_offset"],
             "shadow_entry_levels": {
@@ -1103,6 +1135,29 @@ class LiveEngine:
             float(self.config["max_stale_quote_seconds"]),
         )
 
+    @staticmethod
+    def ensure_opening_entry_cost(record: dict[str, Any]) -> bool:
+        """Backfill immutable opening intent for a checkpoint from older v11 code."""
+
+        if record.get("opening_entry_cost") is not None:
+            return False
+        if record.get("entry_limit_cents") is None or record.get("intended_quantity") is None:
+            return False
+        try:
+            limit_cents = int(record["entry_limit_cents"])
+            quantity = Decimal(str(record["intended_quantity"]))
+            entry_price = cents_price(limit_cents)
+            opening_cost = exact_entry_notional(quantity, entry_price)
+        except (ArithmeticError, TypeError, ValueError):
+            return False
+        record.update({
+            "opening_entry_quantity": format(quantity, "f"),
+            "opening_entry_price": format(entry_price, "f"),
+            "opening_entry_cost": format(opening_cost, "f"),
+            "opening_entry_cost_recorded_at": utc_now(),
+        })
+        return True
+
     def freeze_initial_signal_price(
         self, feed: KalshiLiveFeed, record: dict[str, Any], now: float,
     ) -> Decimal | None:
@@ -1114,6 +1169,13 @@ class LiveEngine:
 
         existing = record.get("initial_signal_price_cents")
         if existing is not None:
+            if self.ensure_opening_entry_cost(record):
+                self.audit(
+                    "opening_entry_cost_backfilled", ticker=record["ticker"],
+                    requested_quantity=record["opening_entry_quantity"],
+                    requested_price=record["opening_entry_price"],
+                    opening_entry_cost=record["opening_entry_cost"],
+                )
             return cents_price(int(record["entry_limit_cents"]))
         quote, reason = self.selected_book(feed, record)
         if quote is None:
@@ -1133,6 +1195,10 @@ class LiveEngine:
         exchange_timestamp = datetime.fromtimestamp(quote_epoch, timezone.utc).isoformat()
         quote_lag_seconds = round(max(0.0, quote_epoch - market_open_epoch), 6)
         observed_lag_seconds = round(max(0.0, now - market_open_epoch), 6)
+        intended_quantity = Decimal(str(record["intended_quantity"]))
+        opening_entry_price = cents_price(limit_cents)
+        opening_entry_cost = exact_entry_notional(intended_quantity, opening_entry_price)
+        cost_recorded_at = utc_now()
         # Freeze the source quote before validating whether the derived order
         # is admissible. A safely rejected/no-entry signal is still part of
         # the 40–49c path and missed-winner denominators and must remain fully
@@ -1147,6 +1213,10 @@ class LiveEngine:
             "initial_signal_price_observed_lag_seconds": observed_lag_seconds,
             "initial_signal_quote": quote,
             "entry_limit_cents": limit_cents,
+            "opening_entry_quantity": format(intended_quantity, "f"),
+            "opening_entry_price": format(opening_entry_price, "f"),
+            "opening_entry_cost": format(opening_entry_cost, "f"),
+            "opening_entry_cost_recorded_at": cost_recorded_at,
         })
         record["opening_quote_capture_deadline_epoch"] = self.opening_quote_capture_deadline(record)
         if 1 <= limit_cents <= 99:
@@ -1154,6 +1224,9 @@ class LiveEngine:
         self.audit(
             "initial_signal_price_frozen", ticker=record["ticker"], side=record["signal_side"],
             initial_signal_price_cents=initial_cents, entry_limit_cents=limit_cents,
+            requested_quantity=record["opening_entry_quantity"],
+            requested_price=record["opening_entry_price"],
+            opening_entry_cost=record["opening_entry_cost"],
             quote_timestamp=quote_epoch, quote_exchange_timestamp=exchange_timestamp,
             quote_lag_after_market_open_seconds=quote_lag_seconds,
             worker_observation_lag_after_market_open_seconds=observed_lag_seconds,
@@ -1167,10 +1240,12 @@ class LiveEngine:
         LOG.warning(
             "OPENING ENTRY SNAPSHOT | ticker=%s side=%s market_open_epoch=%.3f "
             "signal_at=%s quote_exchange_at=%s quote_lag=%.6fs observed_lag=%.6fs "
-            "initial_selected_ask=%sc entry_limit=%sc offset=%sc monitored=40c-49c",
+            "initial_selected_ask=%sc entry_limit=%sc quantity=%s opening_entry_cost=$%s "
+            "offset=%sc monitored=40c-49c",
             record["ticker"], str(record["signal_side"]).upper(), market_open_epoch,
             record.get("signal_timestamp"), exchange_timestamp, quote_lag_seconds,
             observed_lag_seconds, initial_cents, limit_cents,
+            record["opening_entry_quantity"], record["opening_entry_cost"],
             int(self.config["entry_limit_offset_cents"]),
         )
         if not 1 <= limit_cents <= 99:
@@ -1554,6 +1629,7 @@ class LiveEngine:
         callers to emit one audit/checkpoint update per fill change.
         """
 
+        opening_cost_backfilled = self.ensure_opening_entry_cost(record)
         buckets: dict[str, dict[str, Any]] = {
             "maker_limit": {"quantity": Decimal("0"), "cost": Decimal("0"), "priced_quantity": Decimal("0"), "order_ids": []},
             "market_ioc": {"quantity": Decimal("0"), "cost": Decimal("0"), "priced_quantity": Decimal("0"), "order_ids": []},
@@ -1589,6 +1665,13 @@ class LiveEngine:
         total_quantity = maker["quantity"] + ioc["quantity"] + other["quantity"]
         total_priced_quantity = maker["priced_quantity"] + ioc["priced_quantity"] + other["priced_quantity"]
         total_cost = maker["cost"] + ioc["cost"] + other["cost"]
+        total_fees = Decimal("0")
+        for order in record.get("entry_orders", []):
+            try:
+                if Decimal(str(order.get("fill_count") or "0")) > 0:
+                    total_fees += Decimal(str(order.get("fees_paid") or "0"))
+            except (ArithmeticError, TypeError, ValueError):
+                continue
 
         def average(bucket: dict[str, Any]) -> str | None:
             if bucket["quantity"] <= 0 or bucket["priced_quantity"] != bucket["quantity"]:
@@ -1620,12 +1703,22 @@ class LiveEngine:
                 format(total_cost / total_quantity, "f")
                 if total_quantity > 0 and total_priced_quantity == total_quantity else None
             ),
+            "actual_entry_notional": format(total_cost, "f"),
+            "actual_entry_fees": format(total_fees, "f"),
+            "actual_entry_cash_cost": format(total_cost + total_fees, "f"),
             "maker_limit_order_ids": maker["order_ids"],
             "market_ioc_order_ids": ioc["order_ids"],
         }
-        changed = summary != record.get("entry_execution_summary") or execution_type != record.get("entry_execution_type")
+        changed = (
+            opening_cost_backfilled
+            or summary != record.get("entry_execution_summary")
+            or execution_type != record.get("entry_execution_type")
+        )
         record["entry_execution_summary"] = summary
         record["entry_execution_type"] = execution_type
+        record["actual_entry_notional"] = summary["actual_entry_notional"]
+        record["actual_entry_fees"] = summary["actual_entry_fees"]
+        record["actual_entry_cash_cost"] = summary["actual_entry_cash_cost"]
         return changed
 
     def refresh_entry_execution_metrics(self) -> dict[str, Any]:
@@ -1730,6 +1823,11 @@ class LiveEngine:
             market_ioc_filled_quantity=summary["market_ioc_filled_quantity"],
             market_ioc_average_fill_price=summary["market_ioc_average_fill_price"],
             actual_weighted_average_entry_price=summary["actual_weighted_average_entry_price"],
+            actual_entry_notional=summary["actual_entry_notional"],
+            actual_entry_fees=summary["actual_entry_fees"],
+            actual_entry_cash_cost=summary["actual_entry_cash_cost"],
+            opening_entry_cost=record.get("opening_entry_cost"),
+            requested_entry_cost=record.get("requested_entry_cost"),
             maker_limit_fill_markets=aggregate["maker_limit_fill_markets"],
             market_ioc_fill_markets=aggregate["market_ioc_fill_markets"],
             mixed_entry_markets=aggregate["mixed_entry_markets"],
@@ -3277,7 +3375,9 @@ class LiveEngine:
         record["maker_entry_submission_attempted"] = True
         side = str(record["signal_side"])
         quantity = Decimal(str(record["intended_quantity"]))
-        required = quantity * maker_price
+        required = exact_entry_notional(quantity, maker_price)
+        record["requested_entry_cost"] = format(required, "f")
+        record["requested_entry_cost_recorded_at"] = utc_now()
         balance = self.shadow_available_cash() if self.dry_run else await rest.balance_decimal()
         if self.dry_run:
             metrics = self.shadow_metrics()
@@ -3341,6 +3441,8 @@ class LiveEngine:
             "entry_submitted", ticker=record["ticker"], side=side,
             initial_signal_price_cents=record["initial_signal_price_cents"],
             requested_price_cents=record["entry_limit_cents"], requested_quantity=format(quantity, "f"),
+            opening_entry_cost=record.get("opening_entry_cost"),
+            requested_entry_cost=record["requested_entry_cost"],
             client_order_id=client_id, exchange_order_id=order.get("order_id"), post_only=True,
             time_in_force=maker_tif, entry_order_lifetime=self.config["entry_order_lifetime"],
             shadow=self.dry_run,
