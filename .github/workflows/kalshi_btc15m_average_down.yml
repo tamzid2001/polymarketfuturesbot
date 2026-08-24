@@ -8,8 +8,9 @@ run-name: >-
   ${{ ((github.event_name == 'schedule' && vars.KALSHI_LIVE_ENABLED == 'true' && vars.KALSHI_SHADOW_ONLY != 'true') || (github.event_name == 'workflow_dispatch' && inputs.live_enabled && !inputs.dry_run && vars.KALSHI_LIVE_ENABLED == 'true' && vars.KALSHI_SHADOW_ONLY != 'true')) && 'LIVE' || format('DRY_RUN {0}', inputs.shadow_profile || 'sticky_stop_40') }}
 
 on:
-  schedule:
-    - cron: "*/5 * * * *"
+  # The separately serialized watchdog owns the five-minute recovery
+  # schedule. Keeping this long worker dispatch-only prevents a queue of
+  # redundant scheduled five-hour jobs behind the singleton concurrency key.
   workflow_dispatch:
     inputs:
       live_enabled:
@@ -23,15 +24,12 @@ on:
         type: boolean
         default: true
       shadow_profile:
-        description: "Isolated sticky-direction shadow stop profile. Each profile has its own state, audit ledger, drawdown, and recovery cycle."
+        description: "Canonical sticky-direction 40c research lane (the retired 30/20/10 lanes are disabled)."
         required: true
         type: choice
         default: sticky_stop_40
         options:
           - sticky_stop_40
-          - sticky_stop_30
-          - sticky_stop_20
-          - sticky_stop_10
       reconcile_only:
         description: "Authenticate and reconcile orders/positions only; never create an entry."
         required: true
@@ -43,17 +41,17 @@ on:
         type: boolean
         default: false
       entry_price:
-        description: "Historical/replay reference price only. v10 enters through a fresh selected-side protected IOC; blank keeps the persisted reference."
+        description: "Historical/replay reference only; v11 freezes the live signal ask and posts one cent below it."
         required: false
         type: string
         default: ""
       maker_price_offset:
-        description: "Archived-maker telemetry compatibility only; it never changes v10 market-IOC execution."
+        description: "Legacy telemetry field; active entry offset is the integer entry_limit_offset_cents input."
         required: false
         type: string
         default: ""
       opening_price_discovery_seconds:
-        description: "Archived maker telemetry compatibility only; v10 enters as soon as a fresh post-open executable book is available."
+        description: "Legacy telemetry field; v11 freezes the first fresh post-open selected-side ask."
         required: false
         type: string
         default: ""
@@ -63,7 +61,7 @@ on:
         type: string
         default: ""
       stop_price:
-        description: "Fixed executable stop floor. For shadow tests it must match the selected profile (40/30/20/10); blank selects that profile's fixed stop."
+        description: "Canonical 40c profile identity; the v11 executable hybrid levels are configured separately."
         required: false
         type: string
         default: ""
@@ -98,7 +96,7 @@ on:
         type: string
         default: ""
       entry_timeout_seconds:
-        description: "Maximum wait (1–60 seconds) for a fresh post-open executable book before the market is marked missed; v10 never posts a maker order."
+        description: "Maximum life (1–60 seconds) of the single post-only maker entry before its remainder is cancelled."
         required: false
         type: string
         default: ""
@@ -132,6 +130,26 @@ on:
         required: false
         type: string
         default: ""
+      entry_limit_offset_cents:
+        description: "Integer cents below the frozen initial selected-side ask (canonical value: 1)."
+        required: false
+        type: string
+        default: ""
+      hybrid_stop_trigger_cents:
+        description: "Selected-side executable bid that starts the maker exit (canonical value: 45)."
+        required: false
+        type: string
+        default: ""
+      hybrid_maker_exit_cents:
+        description: "Post-only reduce-only maker sale price after trigger (canonical value: 46)."
+        required: false
+        type: string
+        default: ""
+      hybrid_hard_stop_cents:
+        description: "Bid threshold that cancels the maker exit and IOC-exits only residual exposure (canonical value: 44)."
+        required: false
+        type: string
+        default: ""
       run_seconds:
         description: "Minimum worker duration. At expiry the worker exits only in the quiet middle 13 minutes of a market."
         required: false
@@ -142,7 +160,7 @@ on:
 # worker must never kill another worker mid-order; the next scheduled wakeup
 # waits and begins by exchange reconciliation.
 concurrency:
-  group: kalshi-kxbtc15m-${{ inputs.shadow_profile || 'sticky_stop_40' }}
+  group: kalshi-kxbtc15m-live
   cancel-in-progress: false
 
 permissions:
@@ -173,6 +191,7 @@ jobs:
           PYTHONPATH=. python -m unittest -v \
             tests.test_strategy_core \
             tests.test_live_execution \
+            tests.test_maker_hybrid_v11 \
             tests.test_reconciliation \
             tests.test_recovery_sizing \
             tests.test_execution_path_model \
@@ -181,7 +200,7 @@ jobs:
       - name: Assert canonical hybrid strategy contract
         run: |
           set -euo pipefail
-          python -c 'from kalshi_live_trader import ACTIVE_CONFIG_SCHEMA_VERSION, ACTIVE_STRATEGY_VERSION, load_config; c = load_config(__import__("pathlib").Path("selected_live_strategy.json")); assert c["strategy_version"] == ACTIVE_STRATEGY_VERSION; assert c["config_schema_version"] == ACTIVE_CONFIG_SCHEMA_VERSION; assert c["entry_execution_mode"] == "immediate_market_ioc"; assert c["recovery_multiplier"] == "1.01"; assert c["max_recovery_exponent"] == 0; print("CANONICAL_HYBRID_STRATEGY_CONTRACT=OK | entry=market_ioc recovery=1.01 exponent_limit=disabled")'
+          python -c 'from kalshi_live_trader import ACTIVE_CONFIG_SCHEMA_VERSION, ACTIVE_STRATEGY_VERSION, load_config; c = load_config(__import__("pathlib").Path("selected_live_strategy.json")); assert c["strategy_version"] == ACTIVE_STRATEGY_VERSION; assert c["config_schema_version"] == ACTIVE_CONFIG_SCHEMA_VERSION; assert c["entry_execution_mode"] == "signal_price_minus_offset_maker"; assert c["entry_limit_offset_cents"] == 1; assert c["stop_policy"] == "hybrid_maker_then_hard_stop"; assert (c["hybrid_stop_trigger_cents"], c["hybrid_maker_exit_cents"], c["hybrid_hard_stop_cents"]) == (45,46,44); assert c["shadow_profile"] == "sticky_stop_40"; assert c["recovery_multiplier"] == "1.01"; assert c["max_recovery_exponent"] == 0; print("CANONICAL_HYBRID_STRATEGY_CONTRACT=OK | entry=signal_ask_minus_1c_maker hybrid=45/46/44 profile=40 recovery=1.01")'
 
       - name: Write Kalshi RSA private key
         env:
@@ -227,41 +246,42 @@ jobs:
           PROVISIONAL_OUTCOME_THRESHOLD: ${{ inputs.provisional_outcome_threshold || '' }}
           STARTING_SHADOW_BALANCE: ${{ inputs.starting_shadow_balance || '' }}
           HANDOFF_GUARD_SECONDS: ${{ inputs.handoff_guard_seconds || '' }}
+          ENTRY_LIMIT_OFFSET_CENTS: ${{ inputs.entry_limit_offset_cents || '' }}
+          HYBRID_STOP_TRIGGER_CENTS: ${{ inputs.hybrid_stop_trigger_cents || '' }}
+          HYBRID_MAKER_EXIT_CENTS: ${{ inputs.hybrid_maker_exit_cents || '' }}
+          HYBRID_HARD_STOP_CENTS: ${{ inputs.hybrid_hard_stop_cents || '' }}
         run: |
           set -euo pipefail
           # Shadow runs have a fully separate ledger/state.  Reconciliation
           # intentionally reads the live state but still cannot submit an
           # entry because the Python worker receives --reconcile-only.
           if [ "$REQUESTED_LIVE" = "true" ] || [ "$RECONCILE_ONLY" = "true" ]; then
-            state_file=data/kalshi_live_market_ioc_v10_state.json
-            audit_file=data/kalshi_live_market_ioc_v10_audit.jsonl
+            state_file=data/kalshi_live_maker_hybrid_v11_state.json
+            audit_file=data/kalshi_live_maker_hybrid_v11_audit.jsonl
             profile_stop=""
           else
             case "$SHADOW_PROFILE" in
               sticky_stop_40) profile_stop=0.40 ;;
-              sticky_stop_30) profile_stop=0.30 ;;
-              sticky_stop_20) profile_stop=0.20 ;;
-              sticky_stop_10) profile_stop=0.10 ;;
               *) echo "::error::Unknown shadow profile: $SHADOW_PROFILE"; exit 2 ;;
             esac
             if [ -n "$STOP_PRICE" ] && [ "$STOP_PRICE" != "$profile_stop" ]; then
               echo "::error::stop_price must equal the selected shadow profile stop ($profile_stop)."
               exit 2
             fi
-            # v10 deliberately starts a separate namespace: it may not load
-            # v8/v9 maker/entry-adjusted-stop state or resurrect a stale
-            # synthetic cancellation record.
-            state_file="data/kalshi_shadow_market_ioc_v10_${SHADOW_PROFILE}_state.json"
-            audit_file="data/kalshi_shadow_market_ioc_v10_${SHADOW_PROFILE}_audit.jsonl"
+            # v11 deliberately starts a new namespace. Archived v10 IOC and
+            # 30/20/10 evidence remains immutable and cannot become live state.
+            state_file="data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_state.json"
+            audit_file="data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_audit.jsonl"
           fi
           args=(--config selected_live_strategy.json
                 --state-file "$state_file"
                 --audit-ledger "$audit_file"
+                --persist-config
                 --run-seconds "$RUN_SECONDS")
           if [ "$REQUESTED_LIVE" = "true" ] || [ "$RECONCILE_ONLY" = "true" ]; then
-            args+=(--persist-config)
+            args+=(--trading-mode live)
           else
-            args+=(--shadow-profile "$SHADOW_PROFILE" --stop-price "$profile_stop")
+            args+=(--shadow-profile "$SHADOW_PROFILE" --stop-price "$profile_stop" --trading-mode shadow)
           fi
           [ "$RECONCILE_ONLY" = "true" ] && args+=(--reconcile-only)
           [ "$RESET_STATE" = "true" ] && args+=(--reset-state)
@@ -283,6 +303,10 @@ jobs:
           [ -z "$PROVISIONAL_OUTCOME_THRESHOLD" ] || args+=(--provisional-outcome-threshold "$PROVISIONAL_OUTCOME_THRESHOLD")
           [ -z "$STARTING_SHADOW_BALANCE" ] || args+=(--starting-shadow-balance "$STARTING_SHADOW_BALANCE")
           [ -z "$HANDOFF_GUARD_SECONDS" ] || args+=(--handoff-guard-seconds "$HANDOFF_GUARD_SECONDS")
+          [ -z "$ENTRY_LIMIT_OFFSET_CENTS" ] || args+=(--entry-limit-offset-cents "$ENTRY_LIMIT_OFFSET_CENTS")
+          [ -z "$HYBRID_STOP_TRIGGER_CENTS" ] || args+=(--hybrid-stop-trigger-cents "$HYBRID_STOP_TRIGGER_CENTS")
+          [ -z "$HYBRID_MAKER_EXIT_CENTS" ] || args+=(--hybrid-maker-exit-cents "$HYBRID_MAKER_EXIT_CENTS")
+          [ -z "$HYBRID_HARD_STOP_CENTS" ] || args+=(--hybrid-hard-stop-cents "$HYBRID_HARD_STOP_CENTS")
           if [ "$REQUESTED_LIVE" = "true" ]; then
             python kalshi_live_trader.py "${args[@]}" --live-enabled
           else
@@ -294,9 +318,9 @@ jobs:
         run: |
           set -euo pipefail
           git add selected_live_strategy.json \
-            data/kalshi_live_market_ioc_v10_state.json data/kalshi_live_market_ioc_v10_audit.jsonl \
-            data/kalshi_shadow_strategy_state.json data/kalshi_shadow_strategy_audit.jsonl \
-            data/kalshi_shadow_market_ioc_v10_*_state.json data/kalshi_shadow_market_ioc_v10_*_audit.jsonl 2>/dev/null || true
+            data/kalshi_live_maker_hybrid_v11_state.json data/kalshi_live_maker_hybrid_v11_audit.jsonl \
+            data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_state.json \
+            data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_audit.jsonl 2>/dev/null || true
           if git diff --cached --quiet; then
             exit 0
           fi
@@ -323,9 +347,9 @@ jobs:
           set -euo pipefail
           [ "$RECONCILE_ONLY" = "true" ] && exit 0
           if [ "$REQUESTED_LIVE" = "true" ]; then
-            state_file=data/kalshi_live_market_ioc_v10_state.json
+            state_file=data/kalshi_live_maker_hybrid_v11_state.json
           else
-            state_file="data/kalshi_shadow_market_ioc_v10_${SHADOW_PROFILE}_state.json"
+            state_file=data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_state.json
           fi
           ready="$(python -c 'import json, pathlib; p=pathlib.Path("'"$state_file"'"); print(str(bool(json.loads(p.read_text()).get("handoff", {}).get("ready"))).lower() if p.exists() else "false")')"
           if [ "$ready" != "true" ]; then
@@ -353,11 +377,9 @@ jobs:
           name: kalshi-kxbtc15m-hybrid-${{ github.run_id }}
           path: |
             selected_live_strategy.json
-            data/kalshi_live_market_ioc_v10_state.json
-            data/kalshi_live_market_ioc_v10_audit.jsonl
-            data/kalshi_shadow_strategy_state.json
-            data/kalshi_shadow_strategy_audit.jsonl
-            data/kalshi_shadow_market_ioc_v10_*_state.json
-            data/kalshi_shadow_market_ioc_v10_*_audit.jsonl
+            data/kalshi_live_maker_hybrid_v11_state.json
+            data/kalshi_live_maker_hybrid_v11_audit.jsonl
+            data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_state.json
+            data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_audit.jsonl
           if-no-files-found: warn
           retention-days: 30

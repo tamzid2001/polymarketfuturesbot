@@ -23,9 +23,6 @@ on:
         default: sticky_stop_40
         options:
           - sticky_stop_40
-          - sticky_stop_30
-          - sticky_stop_20
-          - sticky_stop_10
       run_seconds:
         description: "Replacement worker duration before its next safe handoff."
         required: true
@@ -81,13 +78,13 @@ jobs:
             }
           fi
           if [[ "$title" == *"LIVE" ]]; then
-            state_file=data/kalshi_live_market_ioc_v10_state.json
+            state_file=data/kalshi_live_maker_hybrid_v11_state.json
           else
             expected_title="DRY_RUN $SHADOW_PROFILE"
             [[ "$title" == *"$expected_title"* ]] || {
               echo "::error::source title does not match requested shadow profile"; exit 2;
             }
-            state_file="data/kalshi_shadow_market_ioc_v10_${SHADOW_PROFILE}_state.json"
+            state_file=data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_state.json
           fi
           [ -f "$state_file" ] || { echo "::error::Missing durable state: $state_file"; exit 2; }
 
@@ -108,6 +105,8 @@ jobs:
               "SIGNAL_PENDING", "ENTRY_PENDING", "ENTRY_PARTIAL", "POSITION_OPEN",
               "STOP_PENDING", "SETTLEMENT_PENDING", "RECONCILIATION_PENDING",
               "ACCOUNTING_RECONCILIATION_PENDING", "ENTRY_CANCEL_UNCONFIRMED",
+              "MAKER_EXIT_PENDING", "MAKER_EXIT_PARTIAL", "MAKER_EXIT_CANCEL_UNCONFIRMED",
+              "HARD_STOP_PENDING",
           }
           active = [
               ticker for ticker, record in state.get("markets", {}).items()
