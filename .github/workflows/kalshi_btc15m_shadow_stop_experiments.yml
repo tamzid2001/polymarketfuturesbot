@@ -98,10 +98,15 @@ jobs:
           assert candidate["maker_order_time_in_force"] == "good_till_canceled"
           assert candidate["entry_order_lifetime"] == "until_filled_or_market_close"
           assert candidate["entry_limit_offset_cents"] == 1
+          assert candidate["signal_delay_seconds"] == 0
+          assert candidate["entry_timeout_seconds"] == 0
+          assert candidate["max_recovery_exponent"] == 0
           print(
               "SHADOW_STOP_CONTRACT=OK | "
               f"profile=sticky_stop_{cents} hard={cents}c "
-              f"trigger={cents + 1}c maker_exit={cents + 2}c live=false"
+              f"trigger={cents + 1}c maker_exit={cents + 2}c "
+              "signal_delay=0s entry=opening_ask_minus_1c tif=GTC "
+              "recovery_exponent_cap=disabled live=false"
           )
           PY
 
