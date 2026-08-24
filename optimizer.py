@@ -117,12 +117,14 @@ def export_selected_live_strategy(path: Path, row: dict[str, Any], *, selection_
     stop = row.get("stop_price")
     if stop in {None, "no_stop"}:
         raise ValueError("a live strategy export requires an explicit fixed stop")
-    if round(float(stop), 2) != 0.40:
-        raise ValueError("v11 production exports only the canonical sticky_stop_40 lane")
-    shadow_profile = "sticky_stop_40"
+    profile_by_stop = {0.40: "sticky_stop_40", 0.30: "sticky_stop_30", 0.20: "sticky_stop_20", 0.10: "sticky_stop_10"}
+    try:
+        shadow_profile = profile_by_stop[round(float(stop), 2)]
+    except KeyError as exc:
+        raise ValueError("a live strategy export requires a 40c, 30c, 20c, or 10c stop profile") from exc
     config = {
-        "config_schema_version": 11,
-        "strategy_version": "kxbtc15m-hybrid-live-v11",
+        "config_schema_version": 10,
+        "strategy_version": "kxbtc15m-hybrid-live-v10",
         "selection_basis": selection_basis,
         "series": "KXBTC15M",
         "signal_delay_seconds": 0,
@@ -130,16 +132,9 @@ def export_selected_live_strategy(path: Path, row: dict[str, Any], *, selection_
         "shadow_profile": shadow_profile,
         "entry_price": f"{float(row['entry_price']):.2f}",
         "stop_price": f"{float(stop):.2f}",
-        "stop_policy": "hybrid_maker_then_hard_stop",
-        "hybrid_stop_enabled": True,
-        "hybrid_stop_trigger_cents": 45,
-        "hybrid_maker_exit_cents": 46,
-        "hybrid_hard_stop_cents": 44,
+        "stop_policy": "fixed_profile_floor",
         "stop_baseline_entry_price": "0.50",
-        "entry_execution_mode": "signal_price_minus_offset_maker",
-        "maker_order_time_in_force": "good_till_canceled",
-        "entry_order_lifetime": "until_filled_or_market_close",
-        "entry_limit_offset_cents": 1,
+        "entry_execution_mode": "immediate_market_ioc",
         "starting_base": "1.00",
         "recovery_multiplier": f"{float(row['recovery_multiplier']):.2f}",
         "first_base_threshold": f"{float(row['first_base_threshold']):.2f}",
@@ -149,8 +144,7 @@ def export_selected_live_strategy(path: Path, row: dict[str, Any], *, selection_
         "starting_shadow_balance": "1000.00",
         "live_enabled": False,
         "dry_run": True,
-        "entry_timeout_seconds": 0,
-        "opening_quote_capture_seconds": 60,
+        "entry_timeout_seconds": 60,
         "opening_price_discovery_seconds": 3,
         "opening_quote_max_observations": 500,
         "maker_price_offset": "0.01",
@@ -164,16 +158,12 @@ def export_selected_live_strategy(path: Path, row: dict[str, Any], *, selection_
         "max_outcome_quote_age_seconds": 2.0,
         "max_stale_quote_seconds": 2.0,
         "durable_checkpoint_interval_seconds": 5.0,
-        "max_recovery_exponent": 0,
+        "max_recovery_exponent": 12,
         "max_recovery_cycle_loss": "50.00",
         "max_daily_realized_loss": "25.00",
         "max_api_failures": 5,
         "allow_capital_downsize": False,
-        "shadow_fill_model": "conservative_public_trade_through",
-        "shadow_entry_level_min_cents": 40,
-        "shadow_entry_level_max_cents": 49,
-        "shadow_entry_level_step_cents": 1,
-        "trading_mode": "shadow",
+        "shadow_fill_model": "fresh_displayed_top_of_book_ioc",
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n", encoding="utf-8")

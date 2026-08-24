@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import subprocess
 import tempfile
 import time
 import unittest
@@ -12,14 +11,11 @@ from pathlib import Path
 from unittest.mock import patch
 
 from audit_ledger import append_audit
-from live_checkpoint import MaterialCheckpointPublisher, publish_runtime_snapshot
-from kalshi_btc15m_average_down import KalshiLiveFeed
+from live_checkpoint import MaterialCheckpointPublisher
 from kalshi_live_trader import (
-    LiveEngine, ProvisionalOutcomeTracker, QuoteObservation, deterministic_client_order_id, epoch,
-    live_mode_allowed, load_config,
+    LiveEngine, ProvisionalOutcomeTracker, QuoteObservation, deterministic_client_order_id, live_mode_allowed, load_config,
 )
-from live_state import config_hash, default_state, load_state, save_state
-from strategy_core import sizing_state
+from live_state import default_state, load_state, save_state
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -35,25 +31,16 @@ class Feed:
         return {"yes": float(self.ask), "no": float(self.ask)}
 
     def executable_shadow_exit_quote(self, ticker: str, side: str, _quantity: float, _age: float):
-        observed = time.time()
-        return {
-            "economic_price": float(self.bid), "displayed_depth": float(self.depth),
-            "quote_id": f"test-exit:{self.ask}:{self.bid}:{observed}",
-            "source_server_timestamp": datetime.fromtimestamp(observed, timezone.utc).isoformat(),
-            "source_timestamp_ms": int(observed * 1000),
-            "received_at": datetime.fromtimestamp(observed, timezone.utc).isoformat(),
-        }, "test"
+        return {"economic_price": float(self.bid)}, "test"
 
     def executable_shadow_quote(self, ticker: str, side: str, _quantity: float, _age: float):
-        observed = time.time()
         return {
             "ticker": ticker, "side": side, "economic_price": float(self.ask),
             "displayed_depth": float(self.depth), "quote_id": f"test-book:{self.ask}:{self.bid}",
             "yes_bid": float(self.bid), "yes_ask": float(self.ask),
             "yes_bid_size": float(self.depth), "yes_ask_size": float(self.depth),
-            "source_server_timestamp": datetime.fromtimestamp(observed, timezone.utc).isoformat(),
-            "source_timestamp_ms": int(observed * 1000),
-            "received_at": datetime.fromtimestamp(observed, timezone.utc).isoformat(), "quote_age_seconds": 0.01,
+            "source_server_timestamp": "test", "source_timestamp_ms": 1,
+            "received_at": "test", "quote_age_seconds": 0.01,
         }, "executable_top_of_book"
 
     def public_trades_after(self, _ticker: str, _created):
@@ -168,89 +155,7 @@ class LiveExecutionTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "strategy version differs"):
             load_state(temporary, self.config)
 
-    def test_uncapped_recovery_exponent_migrates_without_reset_and_keeps_position_cap(self) -> None:
-        temporary = Path(tempfile.mkdtemp()) / "state.json"
-        legacy_config = dict(self.config, max_recovery_exponent=12)
-        state = default_state(legacy_config)
-        state["sizing"] = {
-            "base_share_count": "1.00", "recovery_exponent": 500,
-            "recovery_cycle_pnl": "-1.1494", "next_base_threshold": "350.00",
-        }
-        save_state(temporary, state)
-
-        migrated = load_state(temporary, self.config)
-        self.assertEqual(migrated["sizing"]["recovery_exponent"], 500)
-        self.assertEqual(migrated["sizing"]["recovery_cycle_pnl"], "-1.1494")
-        self.assertEqual(migrated["config_migrations"][-1]["kind"], "disable_recovery_exponent_breaker")
-
-        engine = LiveEngine(
-            self.config, migrated, temporary, temporary.with_suffix(".jsonl"), dry_run=True,
-        )
-        self.assertTrue(engine.circuit_allows_entry())
-        self.assertFalse(engine.state["circuit_breaker"]["blocked"])
-        self.assertEqual(
-            sizing_state(engine.current_parameters(), engine.state["sizing"]).prescribed_quantity(),
-            Decimal("100.00"),
-        )
-
-    def test_explicit_gtc_contract_migrates_only_the_exact_implicit_gtc_hash(self) -> None:
-        temporary = Path(tempfile.mkdtemp()) / "state.json"
-        implicit_gtc_config = dict(self.config)
-        implicit_gtc_config.pop("maker_order_time_in_force")
-        state = default_state(implicit_gtc_config)
-        state["sizing"] = {
-            "base_share_count": "1.00", "recovery_exponent": 7,
-            "recovery_cycle_pnl": "-0.42", "next_base_threshold": "350.00",
-        }
-        state["markets"] = {
-            "KXBTC15M-existing": {
-                "ticker": "KXBTC15M-existing", "status": "ZERO_FILL",
-                "initial_signal_price_cents": 42,
-            },
-        }
-        save_state(temporary, state)
-
-        migrated = load_state(temporary, self.config)
-        self.assertEqual(migrated["sizing"], state["sizing"])
-        self.assertEqual(migrated["markets"], state["markets"])
-        self.assertEqual(
-            migrated["config_migrations"][-1]["kind"],
-            "make_existing_gtc_order_contract_explicit",
-        )
-        self.assertEqual(migrated["config_hash"], config_hash(self.config))
-
-    def test_gtc_strategy_timeout_removal_migrates_exact_checkpoint_without_reset(self) -> None:
-        temporary = Path(tempfile.mkdtemp()) / "state.json"
-        bounded_config = dict(self.config)
-        bounded_config["entry_timeout_seconds"] = bounded_config.pop("opening_quote_capture_seconds")
-        bounded_config.pop("entry_order_lifetime")
-        state = default_state(bounded_config)
-        state["sizing"] = {
-            "base_share_count": "1.00", "recovery_exponent": 11,
-            "recovery_cycle_pnl": "-0.73", "next_base_threshold": "350.00",
-        }
-        state["markets"] = {
-            "KXBTC15M-resting": {
-                "ticker": "KXBTC15M-resting", "status": "ENTRY_PENDING",
-                "entry_deadline_epoch": 1_060,
-                "entry_orders": [{"remaining_count": "1.00", "time_in_force": "good_till_canceled"}],
-            },
-        }
-        save_state(temporary, state)
-
-        migrated = load_state(temporary, self.config)
-        self.assertEqual(migrated["sizing"], state["sizing"])
-        self.assertEqual(migrated["markets"], state["markets"])
-        self.assertEqual(migrated["config_migrations"][-1]["kind"], "remove_gtc_strategy_timeout")
-        self.assertEqual(migrated["config_hash"], config_hash(self.config))
-
-    def test_unrelated_configuration_change_still_fails_closed(self) -> None:
-        temporary = Path(tempfile.mkdtemp()) / "state.json"
-        save_state(temporary, default_state(self.config))
-        with self.assertRaisesRegex(RuntimeError, "configuration hash differs"):
-            load_state(temporary, dict(self.config, max_position="99.00"))
-
-    def test_discovery_preloads_api_successor_from_bounded_close_window(self) -> None:
+    def test_discovery_uses_status_open_and_preserves_api_predecessor(self) -> None:
         async def scenario() -> None:
             now = time.time()
 
@@ -267,19 +172,11 @@ class LiveExecutionTests(unittest.TestCase):
 
                 async def get_raw_json(self, path, params):
                     self.calls.append((path, params))
-                    self.assert_bounded(params)
-                    return {"markets": [
-                        market("KXBTC15M-prior", now - 930, now - 30, "finalized", "yes"),
-                        market("KXBTC15M-active", now - 30, now + 870, "active"),
-                        market("KXBTC15M-upcoming", now + 870, now + 1770, "initialized"),
-                    ]}
-
-                @staticmethod
-                def assert_bounded(params):
-                    assert "status" not in params
-                    assert params["min_close_ts"] <= now - 30
-                    assert params["max_close_ts"] >= now + 1770
-                    assert params["limit"] == 100
+                    if params["status"] == "open":
+                        return {"markets": [market("KXBTC15M-active", now - 30, now + 870, "active")]}
+                    if params["status"] == "settled":
+                        return {"markets": [market("KXBTC15M-prior", now - 930, now - 30, "finalized", "yes")]}
+                    raise AssertionError(params)
 
             engine = self.engine()
             rest = DiscoveryRest()
@@ -287,55 +184,9 @@ class LiveExecutionTests(unittest.TestCase):
             active = engine.active_market(now)
             self.assertEqual(active and active["ticker"], "KXBTC15M-active")
             self.assertEqual(engine.predecessor(active or {}) and engine.predecessor(active or {})["ticker"], "KXBTC15M-prior")
-            self.assertEqual(engine.successor(active or {}) and engine.successor(active or {})["ticker"], "KXBTC15M-upcoming")
-            self.assertEqual(len(rest.calls), 1)
+            self.assertEqual([params["status"] for _, params in rest.calls], ["open", "settled"])
+            self.assertEqual([params["limit"] for _, params in rest.calls], [10, 10])
         asyncio.run(scenario())
-
-    def test_millisecond_exchange_timestamp_and_price_only_quote_enable_provisional_signal(self) -> None:
-        boundary = 1_786_996_800.0
-        self.assertEqual(epoch(int((boundary - .2) * 1000)), boundary - .2)
-        self.assertEqual(epoch(str(int((boundary - .2) * 1000))), boundary - .2)
-        feed = KalshiLiveFeed(auth=None)
-        with patch("kalshi_btc15m_average_down.time.time", return_value=boundary - .2):
-            feed._handle(json.dumps({
-                "type": "ticker",
-                "msg": {
-                    "market_ticker": "prior", "yes_bid_dollars": "0.99",
-                    "yes_ask_dollars": "1.00", "ts_ms": int((boundary - .2) * 1000),
-                },
-            }))
-        self.assertIn("ticker_book", feed.quotes["prior"])
-        self.assertNotIn("complete_book", feed.quotes["prior"])
-        tracker = ProvisionalOutcomeTracker(Decimal(".99"), 5, 2)
-        tracker.observe_feed(feed, "prior")
-        inferred = tracker.infer("prior", boundary)
-        self.assertEqual(inferred and inferred["outcome"], "yes")
-        self.assertEqual(inferred and inferred["method"], "final_window_executable_bid_threshold")
-        self.assertAlmostEqual(inferred and inferred["quote_age_seconds"], .2, places=6)
-
-    def test_provisional_uses_only_threshold_hits_inside_configured_final_window(self) -> None:
-        boundary = 10_000.0
-        tracker = ProvisionalOutcomeTracker(Decimal(".99"), 5, 2)
-        tracker.observations["prior"] = [
-            QuoteObservation("prior", boundary - 5.01, boundary - 5.01, Decimal(".99"), Decimal(".01")),
-            QuoteObservation("prior", boundary - 4.9, boundary - 4.9, Decimal(".99"), Decimal(".01")),
-            # The final raw quote need not itself remain at 99c; the observed
-            # threshold hit anywhere in the declared final window is the fact.
-            QuoteObservation("prior", boundary - .1, boundary - .1, Decimal(".98"), Decimal(".02")),
-        ]
-        inferred = tracker.infer("prior", boundary)
-        self.assertEqual(inferred and inferred["outcome"], "yes")
-        self.assertEqual(inferred and inferred["observation_window_seconds"], 5)
-        self.assertEqual(inferred and inferred["qualifying_bid"], "0.99")
-        self.assertAlmostEqual(inferred and inferred["quote_age_seconds"], 4.9, places=6)
-
-        fifteen_seconds = ProvisionalOutcomeTracker(Decimal(".99"), 15, 2)
-        fifteen_seconds.observations["prior"] = [
-            QuoteObservation("prior", boundary - 14.9, boundary - 14.9, Decimal(".01"), Decimal(".99")),
-        ]
-        inferred_15 = fifteen_seconds.infer("prior", boundary)
-        self.assertEqual(inferred_15 and inferred_15["outcome"], "no")
-        self.assertEqual(inferred_15 and inferred_15["observation_window_seconds"], 15)
 
     def test_provisional_yes_and_no_and_inverse_signal(self) -> None:
         tracker = ProvisionalOutcomeTracker(Decimal("0.99"), 5, 2)
@@ -380,11 +231,7 @@ class LiveExecutionTests(unittest.TestCase):
     def test_provisional_rejects_stale_missing_and_conflicting_quotes(self) -> None:
         tracker = ProvisionalOutcomeTracker(Decimal(".99"), 5, 2)
         boundary = 1_000.0
-        # Inside the five-second decision window but delivered from a source
-        # timestamp more than two seconds old: reject as stale transport.
-        tracker.observations["prior"] = [QuoteObservation("prior", boundary - .2, boundary - 3, Decimal(".99"), Decimal(".01"))]
-        self.assertIsNone(tracker.infer("prior", boundary))
-        tracker.observations["prior"] = [QuoteObservation("prior", boundary - 5.01, boundary - 5.01, Decimal(".99"), Decimal(".01"))]
+        tracker.observations["prior"] = [QuoteObservation("prior", boundary - 3, boundary - 3, Decimal(".99"), Decimal(".01"))]
         self.assertIsNone(tracker.infer("prior", boundary))
         tracker.observations["prior"] = [QuoteObservation("prior", boundary - .2, boundary - .2, Decimal(".98"), Decimal(".02"))]
         self.assertIsNone(tracker.infer("prior", boundary))
@@ -514,7 +361,7 @@ class LiveExecutionTests(unittest.TestCase):
         # A repeated refresh after a runner restart cannot increment totals.
         self.assertEqual(engine.refresh_entry_execution_metrics(), metrics)
 
-    def test_v11_submits_one_signal_minus_one_cent_post_only_limit(self) -> None:
+    def test_v9_submits_one_immediate_protected_market_ioc(self) -> None:
         async def scenario() -> None:
             config = dict(self.config)
             directory = Path(tempfile.mkdtemp())
@@ -527,24 +374,22 @@ class LiveExecutionTests(unittest.TestCase):
             )
             await engine.submit_entry(rest, feed, record, 1_000)
             self.assertEqual(len(rest.calls), 1)
-            self.assertTrue(rest.calls[0]["post_only"])
-            self.assertEqual(rest.calls[0]["tif"], "good_till_canceled")
-            self.assertIsNone(rest.calls[0]["expiration_time"])
-            self.assertEqual(rest.calls[0]["position_price"], 0.59)
-            self.assertEqual(record["initial_signal_price_cents"], 60)
-            self.assertEqual(record["entry_limit_cents"], 59)
-            self.assertEqual(record["status"], "ENTRY_PENDING")
-            self.assertEqual(record["actual_quantity"], "0.00")
-            self.assertTrue(record["maker_entry_submission_attempted"])
-            self.assertEqual(record["entry_orders"][0]["entry_phase"], "maker")
-            self.assertEqual(record["entry_execution_type"], "none")
+            self.assertFalse(rest.calls[0]["post_only"])
+            self.assertEqual(rest.calls[0]["tif"], "immediate_or_cancel")
+            self.assertEqual(rest.calls[0]["position_price"], 0.60)
+            self.assertEqual(record["status"], "POSITION_OPEN")
+            self.assertEqual(record["actual_quantity"], "1.00")
+            self.assertTrue(record["market_entry_attempted"])
+            self.assertEqual(record["entry_orders"][0]["entry_phase"], "market_entry")
+            self.assertEqual(record["entry_execution_type"], "market_ioc")
             self.assertEqual(record["entry_execution_summary"]["maker_limit_filled_quantity"], "0")
-            self.assertEqual(record["entry_execution_summary"]["market_ioc_filled_quantity"], "0")
+            self.assertEqual(record["entry_execution_summary"]["market_ioc_filled_quantity"], "1.00")
+            self.assertEqual(record["entry_execution_summary"]["market_ioc_average_fill_price"], "0.6")
             self.assertEqual(engine.state["entry_execution_metrics"]["maker_limit_fill_markets"], 0)
-            self.assertEqual(engine.state["entry_execution_metrics"]["market_ioc_fill_markets"], 0)
+            self.assertEqual(engine.state["entry_execution_metrics"]["market_ioc_fill_markets"], 1)
         asyncio.run(scenario())
 
-    def test_v11_unconfirmed_maker_cancellation_blocks_all_replacement(self) -> None:
+    def test_v9_market_entry_does_not_attempt_maker_cancellation(self) -> None:
         async def scenario() -> None:
             config = dict(self.config)
             directory = Path(tempfile.mkdtemp())
@@ -557,11 +402,9 @@ class LiveExecutionTests(unittest.TestCase):
             )
             await engine.submit_entry(rest, feed, record, 1_000)
             self.assertEqual(len(rest.calls), 1)
-            await engine.manage_entry(rest, feed, record, 1_901)
-            self.assertEqual(record["status"], "ENTRY_CANCEL_UNCONFIRMED")
-            self.assertTrue(engine.state["circuit_breaker"]["blocked"])
-            self.assertEqual(record["entry_cancel_pending"]["next_action"], "finish_entry")
-            self.assertEqual(len(rest.calls), 1, "there is no IOC replacement in v11")
+            self.assertEqual(record["status"], "POSITION_OPEN")
+            self.assertFalse(engine.state["circuit_breaker"]["blocked"])
+            self.assertNotIn("entry_cancel_pending", record)
         asyncio.run(scenario())
 
     def test_archived_shadow_maker_without_exchange_id_cancels_locally(self) -> None:
@@ -589,38 +432,27 @@ class LiveExecutionTests(unittest.TestCase):
             self.assertFalse(engine.state["circuit_breaker"]["blocked"])
         asyncio.run(scenario())
 
-    def test_exit_residual_never_exceeds_actual_filled_entry(self) -> None:
-        engine = self.engine()
-        record = {
-            "actual_quantity": "1.00", "exit_orders": [
-                {"fill_count": "0.35"}, {"fill_count": "0.40"},
-            ],
-        }
-        self.assertEqual(engine.local_remaining_position(record), Decimal("0.25"))
-
-    def test_shadow_hybrid_hard_stop_is_non_resting_and_reduce_only(self) -> None:
+    def test_rejected_stop_ioc_retries_using_authoritative_residual_position(self) -> None:
         async def scenario() -> None:
-            engine = self.engine()
-            record = engine.set_signal(
-                {"ticker": "KXBTC15M-shadow-taker-stop", "open_epoch": 1_000, "close_epoch": 1_900},
-                {"outcome": "no", "ticker": "KXBTC15M-prior"},
-            )
-            record.update({"status": "POSITION_OPEN", "actual_quantity": "1.00", "entry_orders": [{
-                "entry_phase": "maker", "fill_count": "1.00", "remaining_count": "0",
-                "average_fill_price": "0.50", "fees_paid": "0",
-            }]})
+            config = dict(self.config)
+            directory = Path(tempfile.mkdtemp())
+            engine = LiveEngine(config, default_state(config), directory / "state", directory / "ledger", dry_run=False)
+            rest = StopRetryRest()
+            record = {
+                "ticker": "KXBTC15M-stop-retry", "signal_side": "yes", "status": "POSITION_OPEN",
+                "actual_quantity": "1.00", "entry_orders": [
+                    {"entry_phase": "maker", "fill_count": "1.00", "remaining_count": "0", "average_fill_price": "0.50", "fees_paid": "0"},
+                ], "exit_orders": [],
+            }
             engine.state["markets"][record["ticker"]] = record
             engine.state["active_market"] = record["ticker"]
-            feed = Feed("0.60", "0.44", "10")
-            await engine.start_hybrid_maker_exit(EntryRest(), feed, record, Decimal("0.45"), entries_confirmed=True)
-            await engine.manage_stop(EntryRest(), feed, record)
-            stop = record["exit_orders"][-1]
-            self.assertEqual(stop["order_type"], "reduce_only_exit_ioc")
-            self.assertEqual(stop["time_in_force"], "immediate_or_cancel")
-            self.assertFalse(stop["post_only"])
-            self.assertTrue(stop["reduce_only"])
+            await engine.close_at_stop(rest, record, Decimal("0.40"))
+            self.assertEqual(rest.exit_calls, 1)
+            self.assertEqual(record["status"], "STOP_PENDING")
+            await engine.close_at_stop(rest, record, Decimal("0.40"))
+            self.assertEqual(rest.exit_calls, 2, "a rejected IOC must not suppress the next flattening attempt")
+            await engine.manage_stop(rest, Feed("0.60", "0.40"), record)
             self.assertEqual(record["status"], "CLOSED")
-            self.assertEqual(record["exit_classification"], "HARD_STOP_ONLY")
         asyncio.run(scenario())
 
     def test_market_entry_refuses_a_40c_or_lower_selected_side(self) -> None:
@@ -634,11 +466,11 @@ class LiveExecutionTests(unittest.TestCase):
             )
             await engine.submit_entry(rest, feed, record, 1_000)
             self.assertEqual(record["status"], "ZERO_FILL")
-            self.assertEqual(record["entry_rejection_quote"]["reason"], "derived_limit_at_or_below_hybrid_hard_stop")
+            self.assertEqual(record["market_entry"]["reason"], "best_available_price_at_or_below_fixed_stop")
             self.assertEqual(engine.state["sizing"].get("recovery_exponent", 0), 0)
         asyncio.run(scenario())
 
-    def test_maker_limit_uses_immutable_fresh_selected_side_ask_minus_one(self) -> None:
+    def test_market_ioc_uses_the_fresh_selected_side_ask(self) -> None:
         async def scenario() -> None:
             directory = Path(tempfile.mkdtemp())
             engine = LiveEngine(dict(self.config), default_state(self.config), directory / "state", directory / "ledger", dry_run=False)
@@ -650,10 +482,9 @@ class LiveExecutionTests(unittest.TestCase):
             )
             await engine.submit_entry(rest, feed, record, 1_000.2)
             self.assertEqual(len(rest.calls), 1)
-            self.assertEqual(rest.calls[0]["position_price"], 0.51)
-            self.assertTrue(rest.calls[0]["post_only"])
-            self.assertEqual(record["initial_signal_price_cents"], 52)
-            self.assertEqual(record["entry_limit_cents"], 51)
+            self.assertEqual(rest.calls[0]["position_price"], 0.52)
+            self.assertFalse(rest.calls[0]["post_only"])
+            self.assertEqual(record["market_entry"]["best_available_price"], "0.52")
             samples = record["opening_quote_observations"]
             self.assertEqual(len(samples), 1)
             self.assertEqual(samples[0]["yes_bid"], "0.47")
@@ -664,9 +495,6 @@ class LiveExecutionTests(unittest.TestCase):
             # cannot rewrite the already-submitted IOC price.
             feed.ask = "0.70"
             engine.capture_opening_quote(feed, record, 1_004)
-            await engine.submit_entry(rest, feed, record, 1_004)
-            self.assertEqual(len(rest.calls), 1)
-            self.assertEqual(record["entry_limit_cents"], 51)
             self.assertEqual(Decimal(record["opening_quote_observations"][-1]["selected_best_ask"]), Decimal("0.70"))
             self.assertEqual(Decimal(record["opening_quote_capture"]["max_selected_best_ask"]), Decimal("0.70"))
             engine.capture_opening_quote(feed, record, 1_060)
@@ -691,49 +519,10 @@ class LiveExecutionTests(unittest.TestCase):
 
             feed.available = True
             await engine.submit_entry(rest, feed, record, 1_010)
-            self.assertEqual(record["status"], "ENTRY_PENDING")
+            self.assertEqual(record["status"], "POSITION_OPEN")
             self.assertEqual(rest.created, 1)
-            self.assertEqual(rest.calls[0]["position_price"], 0.53)
-            self.assertEqual(record["entry_orders"][0]["entry_phase"], "maker")
-        asyncio.run(scenario())
-
-    def test_preloaded_preopen_quote_cannot_be_used_for_market_entry(self) -> None:
-        async def scenario() -> None:
-            market_open = time.time()
-
-            class TimestampedFeed(Feed):
-                def __init__(self) -> None:
-                    super().__init__("0.54")
-                    self.quote_epoch = market_open - .2
-
-                def executable_shadow_quote(self, ticker: str, side: str, quantity: float, age: float):
-                    quote, state = super().executable_shadow_quote(ticker, side, quantity, age)
-                    quote["source_timestamp_ms"] = int(self.quote_epoch * 1000)
-                    quote["source_server_timestamp"] = datetime.fromtimestamp(
-                        self.quote_epoch, timezone.utc,
-                    ).isoformat()
-                    quote["received_at"] = quote["source_server_timestamp"]
-                    return quote, state
-
-            engine = self.engine()
-            feed = TimestampedFeed()
-            rest = EntryRest()
-            record = engine.set_signal(
-                {"ticker": "KXBTC15M-preloaded", "open_epoch": market_open, "close_epoch": market_open + 900},
-                {"outcome": "yes", "ticker": "KXBTC15M-prior"},
-            )
-            await engine.submit_entry(rest, feed, record, market_open + .05)
-            self.assertEqual(record["status"], "SIGNAL_PENDING")
-            self.assertFalse(record.get("maker_entry_submission_attempted", False))
-            self.assertEqual(record["initial_signal_price_wait_reason"], "preopen_or_unstamped_top_of_book")
-            self.assertEqual(record["opening_quote_observations"], [])
-
-            feed.quote_epoch = market_open + .1
-            await engine.submit_entry(rest, feed, record, market_open + .1)
-            self.assertEqual(record["status"], "ENTRY_PENDING")
-            self.assertEqual(record["entry_execution_type"], "none")
-            self.assertEqual(record["actual_quantity"], "0.00")
-            self.assertEqual(record["entry_limit_cents"], 53)
+            self.assertEqual(rest.calls[0]["position_price"], 0.54)
+            self.assertEqual(record["entry_orders"][0]["entry_phase"], "market_entry")
         asyncio.run(scenario())
 
     def test_market_entry_at_fixed_stop_is_a_zero_fill(self) -> None:
@@ -751,7 +540,7 @@ class LiveExecutionTests(unittest.TestCase):
             self.assertEqual(engine.state["sizing"].get("recovery_exponent", 0), 0)
         asyncio.run(scenario())
 
-    def test_v11_hybrid_trigger_is_fixed_at_45c_regardless_of_entry(self) -> None:
+    def test_v9_stop_is_fixed_at_40c_even_when_actual_entry_is_above_50c(self) -> None:
         async def scenario() -> None:
             class SettlementRest(EntryRest):
                 async def get_market(self, _ticker):
@@ -765,18 +554,16 @@ class LiveExecutionTests(unittest.TestCase):
             )
             high_entry.update({
                 "status": "POSITION_OPEN", "actual_quantity": "1.00",
-                "entry_orders": [{"entry_phase": "maker", "fill_count": "1.00", "remaining_count": "0", "average_fill_price": "0.52", "fees_paid": "0"}],
+                "entry_orders": [{"fill_count": "1.00", "average_fill_price": "0.52", "fees_paid": "0"}],
             })
             engine.state["active_market"] = high_entry["ticker"]
-            await engine.manage_stop(rest, Feed("0.60", "0.46"), high_entry)
+            await engine.manage_stop(rest, Feed("0.60", "0.41"), high_entry)
             self.assertEqual(high_entry["actual_average_entry_price"], "0.52")
-            self.assertEqual(high_entry["effective_stop_price"], "0.45")
-            self.assertEqual(high_entry["post_entry_stop_monitor"]["minimum_executable_bid"], "0.46")
+            self.assertEqual(high_entry["effective_stop_price"], "0.40")
+            self.assertEqual(high_entry["post_entry_stop_monitor"]["minimum_executable_bid"], "0.41")
             self.assertEqual(high_entry["status"], "POSITION_OPEN")
-            await engine.manage_stop(rest, Feed("0.60", "0.45"), high_entry)
-            self.assertEqual(high_entry["stop_trigger"]["effective_stop_price"], "0.45")
-            self.assertEqual(high_entry["status"], "MAKER_EXIT_PENDING")
-            await engine.manage_stop(rest, Feed("0.60", "0.44", "10"), high_entry)
+            await engine.manage_stop(rest, Feed("0.60", "0.40"), high_entry)
+            self.assertEqual(high_entry["stop_trigger"]["effective_stop_price"], "0.40")
             self.assertEqual(high_entry["status"], "CLOSED")
             completed = engine.state["sizing"]["completed_trade_count"]
             await engine.settle(rest, high_entry, 1_901)
@@ -790,11 +577,11 @@ class LiveExecutionTests(unittest.TestCase):
             )
             low_entry.update({
                 "status": "POSITION_OPEN", "actual_quantity": "1.00",
-                "entry_orders": [{"entry_phase": "maker", "fill_count": "1.00", "remaining_count": "0", "average_fill_price": "0.49", "fees_paid": "0"}],
+                "entry_orders": [{"fill_count": "1.00", "average_fill_price": "0.49", "fees_paid": "0"}],
             })
             engine.state["active_market"] = low_entry["ticker"]
-            await engine.manage_stop(rest, Feed("0.60", "0.46"), low_entry)
-            self.assertEqual(low_entry["effective_stop_price"], "0.45")
+            await engine.manage_stop(rest, Feed("0.60", "0.41"), low_entry)
+            self.assertEqual(low_entry["effective_stop_price"], "0.40")
             self.assertEqual(low_entry["status"], "POSITION_OPEN")
         asyncio.run(scenario())
 
@@ -803,10 +590,10 @@ class LiveExecutionTests(unittest.TestCase):
         engine.markets = [{"ticker": "KXBTC15M-current", "open_epoch": 1_000, "close_epoch": 1_900, "status": "active"}]
         engine.state["markets"]["KXBTC15M-current"] = {"ticker": "KXBTC15M-current", "status": "POSITION_OPEN"}
         self.assertFalse(engine.handoff_ready(1_059)[0])
-        self.assertFalse(engine.handoff_ready(1_060)[0])
+        self.assertTrue(engine.handoff_ready(1_060)[0])
         self.assertFalse(engine.handoff_ready(1_841)[0])
-        engine.state["markets"]["KXBTC15M-current"]["status"] = "CLOSED"
-        self.assertTrue(engine.handoff_ready(1_300)[0])
+        engine.state["markets"]["KXBTC15M-current"]["status"] = "ENTRY_PENDING"
+        self.assertFalse(engine.handoff_ready(1_300)[0])
 
     def test_audit_and_state_are_checkpointed_for_each_material_event(self) -> None:
         temporary = Path(tempfile.mkdtemp())
@@ -839,54 +626,6 @@ class LiveExecutionTests(unittest.TestCase):
         with patch.object(publisher, "publish_if_changed", return_value=True) as retry:
             self.assertTrue(publisher.publish_if_due())
         retry.assert_called_once_with("entry_fill_observed")
-
-    def test_runtime_checkpoint_ref_is_a_single_parentless_snapshot_and_main_is_unchanged(self) -> None:
-        temporary = Path(tempfile.mkdtemp())
-        remote = temporary / "remote.git"
-        work = temporary / "work"
-        subprocess.run(["git", "init", "--bare", str(remote)], check=True, capture_output=True)
-        subprocess.run(["git", "init", "-b", "main", str(work)], check=True, capture_output=True)
-        for key, value in (("user.name", "test"), ("user.email", "test@example.com")):
-            subprocess.run(["git", "-C", str(work), "config", key, value], check=True)
-        subprocess.run(["git", "-C", str(work), "remote", "add", "origin", str(remote)], check=True)
-        state = work / "state.json"
-        state.write_text('{"sequence":1}\n', encoding="utf-8")
-        subprocess.run(["git", "-C", str(work), "add", "state.json"], check=True)
-        subprocess.run(["git", "-C", str(work), "commit", "-m", "source"], check=True, capture_output=True)
-        subprocess.run(["git", "-C", str(work), "push", "-u", "origin", "main"], check=True, capture_output=True)
-        main_before = subprocess.check_output(["git", "-C", str(work), "rev-parse", "main"], text=True).strip()
-
-        self.assertTrue(publish_runtime_snapshot((state,), "first", root=work))
-        first = subprocess.check_output(
-            ["git", "--git-dir", str(remote), "rev-parse", "runtime-state"], text=True,
-        ).strip()
-        state.write_text('{"sequence":2}\n', encoding="utf-8")
-        self.assertTrue(publish_runtime_snapshot((state,), "second", root=work))
-        second = subprocess.check_output(
-            ["git", "--git-dir", str(remote), "rev-parse", "runtime-state"], text=True,
-        ).strip()
-
-        self.assertNotEqual(first, second)
-        self.assertEqual(
-            subprocess.check_output(
-                ["git", "--git-dir", str(remote), "rev-list", "--count", "runtime-state"], text=True,
-            ).strip(),
-            "1",
-        )
-        parents = subprocess.check_output(
-            ["git", "--git-dir", str(remote), "show", "-s", "--format=%P", "runtime-state"], text=True,
-        ).strip()
-        self.assertEqual(parents, "")
-        self.assertEqual(
-            subprocess.check_output(["git", "-C", str(work), "rev-parse", "main"], text=True).strip(),
-            main_before,
-        )
-        self.assertEqual(
-            subprocess.check_output(
-                ["git", "--git-dir", str(remote), "show", "runtime-state:state.json"], text=True,
-            ),
-            '{"sequence":2}\n',
-        )
 
     def test_entry_and_stop_latency_is_durable_and_observational(self) -> None:
         engine = self.engine()

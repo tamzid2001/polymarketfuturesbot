@@ -8,9 +8,8 @@ run-name: >-
   ${{ ((github.event_name == 'schedule' && vars.KALSHI_LIVE_ENABLED == 'true' && vars.KALSHI_SHADOW_ONLY != 'true') || (github.event_name == 'workflow_dispatch' && inputs.live_enabled && !inputs.dry_run && vars.KALSHI_LIVE_ENABLED == 'true' && vars.KALSHI_SHADOW_ONLY != 'true')) && 'LIVE' || format('DRY_RUN {0}', inputs.shadow_profile || 'sticky_stop_40') }}
 
 on:
-  # The separately serialized watchdog owns the five-minute recovery
-  # schedule. Keeping this long worker dispatch-only prevents a queue of
-  # redundant scheduled five-hour jobs behind the singleton concurrency key.
+  schedule:
+    - cron: "*/5 * * * *"
   workflow_dispatch:
     inputs:
       live_enabled:
@@ -24,12 +23,15 @@ on:
         type: boolean
         default: true
       shadow_profile:
-        description: "Canonical sticky-direction 40c research lane (the retired 30/20/10 lanes are disabled)."
+        description: "Isolated sticky-direction shadow stop profile. Each profile has its own state, audit ledger, drawdown, and recovery cycle."
         required: true
         type: choice
         default: sticky_stop_40
         options:
           - sticky_stop_40
+          - sticky_stop_30
+          - sticky_stop_20
+          - sticky_stop_10
       reconcile_only:
         description: "Authenticate and reconcile orders/positions only; never create an entry."
         required: true
@@ -40,13 +42,33 @@ on:
         required: true
         type: boolean
         default: false
+      entry_price:
+        description: "Historical/replay reference price only. v9 enters through a fresh selected-side protected IOC; blank keeps the persisted reference."
+        required: false
+        type: string
+        default: ""
+      maker_price_offset:
+        description: "Archived-maker telemetry compatibility only; it never changes v9 market-IOC execution."
+        required: false
+        type: string
+        default: ""
+      opening_price_discovery_seconds:
+        description: "Archived maker telemetry compatibility only; v9 enters as soon as a fresh executable book is available."
+        required: false
+        type: string
+        default: ""
       opening_quote_max_observations:
         description: "Maximum complete top-of-book quote observations retained during the one-minute entry window. Blank keeps persisted configuration."
         required: false
         type: string
         default: ""
       stop_price:
-        description: "Canonical 40c profile identity; the v11 executable hybrid levels are configured separately."
+        description: "Fixed executable stop floor. For shadow tests it must match the selected profile (40/30/20/10); blank selects that profile's fixed stop."
+        required: false
+        type: string
+        default: ""
+      stop_baseline_entry_price:
+        description: "Baseline for the entry-adjusted stop. Only 0.50 is accepted: fills at/below it retain the 40c floor."
         required: false
         type: string
         default: ""
@@ -75,8 +97,8 @@ on:
         required: false
         type: string
         default: ""
-      opening_quote_capture_seconds:
-        description: "Opening quote telemetry window (1–300 seconds); does not expire the GTC entry."
+      entry_timeout_seconds:
+        description: "Maximum wait (1–60 seconds) for a fresh executable book before the market is marked missed; v9 never posts a maker order."
         required: false
         type: string
         default: ""
@@ -86,12 +108,12 @@ on:
         type: string
         default: ""
       market_discovery_interval_seconds:
-        description: "Poll interval for bounded Kalshi previous/current/upcoming market discovery (0.25–10 seconds; default 1)."
+        description: "Poll interval for Kalshi status=open current-market discovery (0.25–10 seconds; default 1)."
         required: false
         type: string
         default: ""
       outcome_observation_seconds:
-        description: "Ending-market direction window in seconds (5 default; 15 supported); only a >=99c bid inside this window qualifies."
+        description: "Final-quote buffer duration for the provisional previous outcome."
         required: false
         type: string
         default: ""
@@ -110,26 +132,6 @@ on:
         required: false
         type: string
         default: ""
-      entry_limit_offset_cents:
-        description: "Integer cents below the frozen initial selected-side ask (canonical value: 1)."
-        required: false
-        type: string
-        default: ""
-      hybrid_stop_trigger_cents:
-        description: "Selected-side executable bid that starts the maker exit (canonical value: 45)."
-        required: false
-        type: string
-        default: ""
-      hybrid_maker_exit_cents:
-        description: "Post-only reduce-only maker sale price after trigger (canonical value: 46)."
-        required: false
-        type: string
-        default: ""
-      hybrid_hard_stop_cents:
-        description: "Bid threshold that cancels the maker exit and IOC-exits only residual exposure (canonical value: 44)."
-        required: false
-        type: string
-        default: ""
       run_seconds:
         description: "Minimum worker duration. At expiry the worker exits only in the quiet middle 13 minutes of a market."
         required: false
@@ -140,7 +142,7 @@ on:
 # worker must never kill another worker mid-order; the next scheduled wakeup
 # waits and begins by exchange reconciliation.
 concurrency:
-  group: kalshi-kxbtc15m-live
+  group: kalshi-kxbtc15m-${{ inputs.shadow_profile || 'sticky_stop_40' }}
   cancel-in-progress: false
 
 permissions:
@@ -154,28 +156,6 @@ jobs:
     timeout-minutes: 360
     steps:
       - uses: actions/checkout@v7
-
-      - name: Restore latest bounded runtime state
-        run: |
-          set -euo pipefail
-          runtime_ref=runtime-state
-          if git fetch --no-tags origin "refs/heads/$runtime_ref"; then
-            for path in \
-              selected_live_strategy.json \
-              data/kalshi_live_maker_hybrid_v11_state.json \
-              data/kalshi_live_maker_hybrid_v11_audit.jsonl \
-              data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_state.json \
-              data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_audit.jsonl; do
-              if git cat-file -e "FETCH_HEAD:$path" 2>/dev/null; then
-                mkdir -p "$(dirname "$path")"
-                git show "FETCH_HEAD:$path" > "$path.runtime"
-                mv "$path.runtime" "$path"
-              fi
-            done
-            echo "RUNTIME_STATE_RESTORED=runtime-state"
-          else
-            echo "RUNTIME_STATE_BOOTSTRAP=main_snapshot"
-          fi
 
       - uses: actions/setup-python@v6
         with:
@@ -193,7 +173,6 @@ jobs:
           PYTHONPATH=. python -m unittest -v \
             tests.test_strategy_core \
             tests.test_live_execution \
-            tests.test_maker_hybrid_v11 \
             tests.test_reconciliation \
             tests.test_recovery_sizing \
             tests.test_execution_path_model \
@@ -202,7 +181,7 @@ jobs:
       - name: Assert canonical hybrid strategy contract
         run: |
           set -euo pipefail
-          python -c 'from kalshi_live_trader import ACTIVE_CONFIG_SCHEMA_VERSION, ACTIVE_STRATEGY_VERSION, load_config; c = load_config(__import__("pathlib").Path("selected_live_strategy.json")); assert c["strategy_version"] == ACTIVE_STRATEGY_VERSION; assert c["config_schema_version"] == ACTIVE_CONFIG_SCHEMA_VERSION; assert c["entry_execution_mode"] == "signal_price_minus_offset_maker"; assert c["maker_order_time_in_force"] == "good_till_canceled"; assert c["entry_order_lifetime"] == "until_filled_or_market_close"; assert c["entry_timeout_seconds"] == 0; assert c["opening_quote_capture_seconds"] == 60; assert c["entry_limit_offset_cents"] == 1; assert c["stop_policy"] == "hybrid_maker_then_hard_stop"; assert (c["hybrid_stop_trigger_cents"], c["hybrid_maker_exit_cents"], c["hybrid_hard_stop_cents"]) == (45,46,44); assert c["shadow_profile"] == "sticky_stop_40"; assert c["recovery_multiplier"] == "1.01"; assert c["max_recovery_exponent"] == 0; print("CANONICAL_HYBRID_STRATEGY_CONTRACT=OK | entry=signal_ask_minus_1c maker_tif=GTC lifetime=until_fill_or_market_close hybrid=45/46/44 profile=40 recovery=1.01")'
+          python -c 'from kalshi_live_trader import ACTIVE_CONFIG_SCHEMA_VERSION, ACTIVE_STRATEGY_VERSION, load_config; c = load_config(__import__("pathlib").Path("selected_live_strategy.json")); assert c["strategy_version"] == ACTIVE_STRATEGY_VERSION; assert c["config_schema_version"] == ACTIVE_CONFIG_SCHEMA_VERSION; print("CANONICAL_HYBRID_STRATEGY_CONTRACT=OK")'
 
       - name: Write Kalshi RSA private key
         env:
@@ -225,83 +204,85 @@ jobs:
           KALSHI_LIVE_ENABLED: ${{ vars.KALSHI_LIVE_ENABLED || 'false' }}
           KALSHI_SHADOW_ONLY: ${{ vars.KALSHI_SHADOW_ONLY || 'true' }}
           KALSHI_CHECKPOINT_PUBLISH: "true"
-          KALSHI_RUNTIME_STATE_REF: "runtime-state"
           RUN_SECONDS: ${{ inputs.run_seconds || '18000' }}
           REQUESTED_LIVE: ${{ github.event_name == 'schedule' && vars.KALSHI_LIVE_ENABLED == 'true' && vars.KALSHI_SHADOW_ONLY != 'true' || github.event_name == 'workflow_dispatch' && inputs.live_enabled && !inputs.dry_run && vars.KALSHI_LIVE_ENABLED == 'true' && vars.KALSHI_SHADOW_ONLY != 'true' }}
           RECONCILE_ONLY: ${{ inputs.reconcile_only || false }}
           RESET_STATE: ${{ inputs.reset_state || false }}
           SHADOW_PROFILE: ${{ inputs.shadow_profile || 'sticky_stop_40' }}
+          ENTRY_PRICE: ${{ inputs.entry_price || '' }}
+          MAKER_PRICE_OFFSET: ${{ inputs.maker_price_offset || '' }}
+          OPENING_PRICE_DISCOVERY_SECONDS: ${{ inputs.opening_price_discovery_seconds || '' }}
           OPENING_QUOTE_MAX_OBSERVATIONS: ${{ inputs.opening_quote_max_observations || '' }}
           STOP_PRICE: ${{ inputs.stop_price || '' }}
+          STOP_BASELINE_ENTRY_PRICE: ${{ inputs.stop_baseline_entry_price || '' }}
           RECOVERY_MULTIPLIER: ${{ inputs.recovery_multiplier || '' }}
           FIRST_BASE_THRESHOLD: ${{ inputs.first_base_threshold || '' }}
           THRESHOLD_GROWTH_MULTIPLIER: ${{ inputs.threshold_growth_multiplier || '' }}
           BASE_INCREMENT: ${{ inputs.base_increment || '' }}
           MAX_POSITION: ${{ inputs.max_position || '' }}
-          OPENING_QUOTE_CAPTURE_SECONDS: ${{ inputs.opening_quote_capture_seconds || '' }}
+          ENTRY_TIMEOUT_SECONDS: ${{ inputs.entry_timeout_seconds || '' }}
           ENTRY_LATENESS_SECONDS: ${{ inputs.entry_lateness_seconds || '' }}
           MARKET_DISCOVERY_INTERVAL_SECONDS: ${{ inputs.market_discovery_interval_seconds || '' }}
           OUTCOME_OBSERVATION_SECONDS: ${{ inputs.outcome_observation_seconds || '' }}
           PROVISIONAL_OUTCOME_THRESHOLD: ${{ inputs.provisional_outcome_threshold || '' }}
           STARTING_SHADOW_BALANCE: ${{ inputs.starting_shadow_balance || '' }}
           HANDOFF_GUARD_SECONDS: ${{ inputs.handoff_guard_seconds || '' }}
-          ENTRY_LIMIT_OFFSET_CENTS: ${{ inputs.entry_limit_offset_cents || '' }}
-          HYBRID_STOP_TRIGGER_CENTS: ${{ inputs.hybrid_stop_trigger_cents || '' }}
-          HYBRID_MAKER_EXIT_CENTS: ${{ inputs.hybrid_maker_exit_cents || '' }}
-          HYBRID_HARD_STOP_CENTS: ${{ inputs.hybrid_hard_stop_cents || '' }}
         run: |
           set -euo pipefail
           # Shadow runs have a fully separate ledger/state.  Reconciliation
           # intentionally reads the live state but still cannot submit an
           # entry because the Python worker receives --reconcile-only.
           if [ "$REQUESTED_LIVE" = "true" ] || [ "$RECONCILE_ONLY" = "true" ]; then
-            state_file=data/kalshi_live_maker_hybrid_v11_state.json
-            audit_file=data/kalshi_live_maker_hybrid_v11_audit.jsonl
+            state_file=data/kalshi_live_market_ioc_v10_state.json
+            audit_file=data/kalshi_live_market_ioc_v10_audit.jsonl
             profile_stop=""
           else
             case "$SHADOW_PROFILE" in
               sticky_stop_40) profile_stop=0.40 ;;
+              sticky_stop_30) profile_stop=0.30 ;;
+              sticky_stop_20) profile_stop=0.20 ;;
+              sticky_stop_10) profile_stop=0.10 ;;
               *) echo "::error::Unknown shadow profile: $SHADOW_PROFILE"; exit 2 ;;
             esac
             if [ -n "$STOP_PRICE" ] && [ "$STOP_PRICE" != "$profile_stop" ]; then
               echo "::error::stop_price must equal the selected shadow profile stop ($profile_stop)."
               exit 2
             fi
-            # v11 deliberately starts a new namespace. Archived v10 IOC and
-            # 30/20/10 evidence remains immutable and cannot become live state.
-            state_file="data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_state.json"
-            audit_file="data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_audit.jsonl"
+            # v10 deliberately starts a separate namespace: it may not load
+            # v8/v9 maker/entry-adjusted-stop state or resurrect a stale
+            # synthetic cancellation record.
+            state_file="data/kalshi_shadow_market_ioc_v10_${SHADOW_PROFILE}_state.json"
+            audit_file="data/kalshi_shadow_market_ioc_v10_${SHADOW_PROFILE}_audit.jsonl"
           fi
           args=(--config selected_live_strategy.json
                 --state-file "$state_file"
                 --audit-ledger "$audit_file"
-                --persist-config
                 --run-seconds "$RUN_SECONDS")
           if [ "$REQUESTED_LIVE" = "true" ] || [ "$RECONCILE_ONLY" = "true" ]; then
-            args+=(--trading-mode live)
+            args+=(--persist-config)
           else
-            args+=(--shadow-profile "$SHADOW_PROFILE" --stop-price "$profile_stop" --trading-mode shadow)
+            args+=(--shadow-profile "$SHADOW_PROFILE" --stop-price "$profile_stop")
           fi
           [ "$RECONCILE_ONLY" = "true" ] && args+=(--reconcile-only)
           [ "$RESET_STATE" = "true" ] && args+=(--reset-state)
+          [ -z "$ENTRY_PRICE" ] || args+=(--entry-price "$ENTRY_PRICE")
+          [ -z "$MAKER_PRICE_OFFSET" ] || args+=(--maker-price-offset "$MAKER_PRICE_OFFSET")
+          [ -z "$OPENING_PRICE_DISCOVERY_SECONDS" ] || args+=(--opening-price-discovery-seconds "$OPENING_PRICE_DISCOVERY_SECONDS")
           [ -z "$OPENING_QUOTE_MAX_OBSERVATIONS" ] || args+=(--opening-quote-max-observations "$OPENING_QUOTE_MAX_OBSERVATIONS")
           [ -z "$STOP_PRICE" ] || args+=(--stop-price "$STOP_PRICE")
+          [ -z "$STOP_BASELINE_ENTRY_PRICE" ] || args+=(--stop-baseline-entry-price "$STOP_BASELINE_ENTRY_PRICE")
           [ -z "$RECOVERY_MULTIPLIER" ] || args+=(--recovery-multiplier "$RECOVERY_MULTIPLIER")
           [ -z "$FIRST_BASE_THRESHOLD" ] || args+=(--first-base-threshold "$FIRST_BASE_THRESHOLD")
           [ -z "$THRESHOLD_GROWTH_MULTIPLIER" ] || args+=(--threshold-growth-multiplier "$THRESHOLD_GROWTH_MULTIPLIER")
           [ -z "$BASE_INCREMENT" ] || args+=(--base-increment "$BASE_INCREMENT")
           [ -z "$MAX_POSITION" ] || args+=(--max-position "$MAX_POSITION")
-          [ -z "$OPENING_QUOTE_CAPTURE_SECONDS" ] || args+=(--opening-quote-capture-seconds "$OPENING_QUOTE_CAPTURE_SECONDS")
+          [ -z "$ENTRY_TIMEOUT_SECONDS" ] || args+=(--entry-timeout-seconds "$ENTRY_TIMEOUT_SECONDS")
           [ -z "$ENTRY_LATENESS_SECONDS" ] || args+=(--entry-lateness-seconds "$ENTRY_LATENESS_SECONDS")
           [ -z "$MARKET_DISCOVERY_INTERVAL_SECONDS" ] || args+=(--market-discovery-interval-seconds "$MARKET_DISCOVERY_INTERVAL_SECONDS")
           [ -z "$OUTCOME_OBSERVATION_SECONDS" ] || args+=(--outcome-observation-seconds "$OUTCOME_OBSERVATION_SECONDS")
           [ -z "$PROVISIONAL_OUTCOME_THRESHOLD" ] || args+=(--provisional-outcome-threshold "$PROVISIONAL_OUTCOME_THRESHOLD")
           [ -z "$STARTING_SHADOW_BALANCE" ] || args+=(--starting-shadow-balance "$STARTING_SHADOW_BALANCE")
           [ -z "$HANDOFF_GUARD_SECONDS" ] || args+=(--handoff-guard-seconds "$HANDOFF_GUARD_SECONDS")
-          [ -z "$ENTRY_LIMIT_OFFSET_CENTS" ] || args+=(--entry-limit-offset-cents "$ENTRY_LIMIT_OFFSET_CENTS")
-          [ -z "$HYBRID_STOP_TRIGGER_CENTS" ] || args+=(--hybrid-stop-trigger-cents "$HYBRID_STOP_TRIGGER_CENTS")
-          [ -z "$HYBRID_MAKER_EXIT_CENTS" ] || args+=(--hybrid-maker-exit-cents "$HYBRID_MAKER_EXIT_CENTS")
-          [ -z "$HYBRID_HARD_STOP_CENTS" ] || args+=(--hybrid-hard-stop-cents "$HYBRID_HARD_STOP_CENTS")
           if [ "$REQUESTED_LIVE" = "true" ]; then
             python kalshi_live_trader.py "${args[@]}" --live-enabled
           else
@@ -312,18 +293,22 @@ jobs:
         if: always()
         run: |
           set -euo pipefail
+          git add selected_live_strategy.json \
+            data/kalshi_live_market_ioc_v10_state.json data/kalshi_live_market_ioc_v10_audit.jsonl \
+            data/kalshi_shadow_strategy_state.json data/kalshi_shadow_strategy_audit.jsonl \
+            data/kalshi_shadow_market_ioc_v10_*_state.json data/kalshi_shadow_market_ioc_v10_*_audit.jsonl 2>/dev/null || true
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git commit -m "chore: checkpoint KXBTC15M hybrid state [skip ci]"
           for attempt in 1 2 3; do
-            if python live_checkpoint.py --reason end-of-run \
-              selected_live_strategy.json \
-              data/kalshi_live_maker_hybrid_v11_state.json \
-              data/kalshi_live_maker_hybrid_v11_audit.jsonl \
-              data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_state.json \
-              data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_audit.jsonl; then
+            if git pull --rebase --autostash origin main && git push origin HEAD:main; then
               exit 0
             fi
+            git rebase --abort 2>/dev/null || true
             sleep "$attempt"
           done
-          echo "::error::Unable to publish bounded runtime state after three retries."
+          echo "::error::Unable to publish durable live state after three retries."
           exit 1
 
       - name: Queue the next five-hour worker only after a safe handoff
@@ -338,9 +323,9 @@ jobs:
           set -euo pipefail
           [ "$RECONCILE_ONLY" = "true" ] && exit 0
           if [ "$REQUESTED_LIVE" = "true" ]; then
-            state_file=data/kalshi_live_maker_hybrid_v11_state.json
+            state_file=data/kalshi_live_market_ioc_v10_state.json
           else
-            state_file=data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_state.json
+            state_file="data/kalshi_shadow_market_ioc_v10_${SHADOW_PROFILE}_state.json"
           fi
           ready="$(python -c 'import json, pathlib; p=pathlib.Path("'"$state_file"'"); print(str(bool(json.loads(p.read_text()).get("handoff", {}).get("ready"))).lower() if p.exists() else "false")')"
           if [ "$ready" != "true" ]; then
@@ -368,9 +353,11 @@ jobs:
           name: kalshi-kxbtc15m-hybrid-${{ github.run_id }}
           path: |
             selected_live_strategy.json
-            data/kalshi_live_maker_hybrid_v11_state.json
-            data/kalshi_live_maker_hybrid_v11_audit.jsonl
-            data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_state.json
-            data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_audit.jsonl
+            data/kalshi_live_market_ioc_v10_state.json
+            data/kalshi_live_market_ioc_v10_audit.jsonl
+            data/kalshi_shadow_strategy_state.json
+            data/kalshi_shadow_strategy_audit.jsonl
+            data/kalshi_shadow_market_ioc_v10_*_state.json
+            data/kalshi_shadow_market_ioc_v10_*_audit.jsonl
           if-no-files-found: warn
           retention-days: 30
