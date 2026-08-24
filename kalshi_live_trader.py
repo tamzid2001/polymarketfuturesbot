@@ -941,6 +941,9 @@ class LiveEngine:
             "initial_signal_price_cents": None,
             "initial_signal_price": None,
             "initial_signal_price_timestamp": None,
+            "initial_signal_price_exchange_timestamp": None,
+            "initial_signal_price_lag_seconds": None,
+            "initial_signal_price_observed_lag_seconds": None,
             "initial_signal_quote": None,
             "entry_limit_cents": None,
             "maker_entry_price": None,
@@ -1098,6 +1101,10 @@ class LiveEngine:
             record["initial_signal_price_wait_reason"] = str(exc)
             return None
         limit_cents = initial_cents - int(self.config["entry_limit_offset_cents"])
+        market_open_epoch = float(record["market_open_epoch"])
+        exchange_timestamp = datetime.fromtimestamp(quote_epoch, timezone.utc).isoformat()
+        quote_lag_seconds = round(max(0.0, quote_epoch - market_open_epoch), 6)
+        observed_lag_seconds = round(max(0.0, now - market_open_epoch), 6)
         # Freeze the source quote before validating whether the derived order
         # is admissible. A safely rejected/no-entry signal is still part of
         # the 40–49c path and missed-winner denominators and must remain fully
@@ -1107,6 +1114,9 @@ class LiveEngine:
             "initial_signal_price": format(cents_price(initial_cents), "f"),
             "initial_signal_price_timestamp": utc_now(),
             "initial_signal_price_epoch": quote_epoch,
+            "initial_signal_price_exchange_timestamp": exchange_timestamp,
+            "initial_signal_price_lag_seconds": quote_lag_seconds,
+            "initial_signal_price_observed_lag_seconds": observed_lag_seconds,
             "initial_signal_quote": quote,
             "entry_limit_cents": limit_cents,
         })
@@ -1116,7 +1126,24 @@ class LiveEngine:
         self.audit(
             "initial_signal_price_frozen", ticker=record["ticker"], side=record["signal_side"],
             initial_signal_price_cents=initial_cents, entry_limit_cents=limit_cents,
-            quote_timestamp=quote_epoch, signal_timestamp=record.get("signal_timestamp"), quote=quote,
+            quote_timestamp=quote_epoch, quote_exchange_timestamp=exchange_timestamp,
+            quote_lag_after_market_open_seconds=quote_lag_seconds,
+            worker_observation_lag_after_market_open_seconds=observed_lag_seconds,
+            signal_timestamp=record.get("signal_timestamp"), quote=quote,
+            monitored_entry_levels_cents=list(range(
+                int(self.config["shadow_entry_level_min_cents"]),
+                int(self.config["shadow_entry_level_max_cents"]) + 1,
+                int(self.config["shadow_entry_level_step_cents"]),
+            )),
+        )
+        LOG.warning(
+            "OPENING ENTRY SNAPSHOT | ticker=%s side=%s market_open_epoch=%.3f "
+            "signal_at=%s quote_exchange_at=%s quote_lag=%.6fs observed_lag=%.6fs "
+            "initial_selected_ask=%sc entry_limit=%sc offset=%sc monitored=40c-49c",
+            record["ticker"], str(record["signal_side"]).upper(), market_open_epoch,
+            record.get("signal_timestamp"), exchange_timestamp, quote_lag_seconds,
+            observed_lag_seconds, initial_cents, limit_cents,
+            int(self.config["entry_limit_offset_cents"]),
         )
         if not 1 <= limit_cents <= 99:
             record["entry_rejection_quote"] = {
@@ -1244,6 +1271,10 @@ class LiveEngine:
         histogram: dict[str, int] = {}
         minimum_histogram: dict[str, int] = {}
         winners_at_or_below_40 = 0
+        actual_filled_eventual_winners = 0
+        realized_profitable_filled_trades = 0
+        lowest_actual_entry_eventual_winner: dict[str, Any] | None = None
+        lowest_actual_entry_realized_profitable: dict[str, Any] | None = None
         initial_prices: list[int] = []
         actual_stop_rejections: list[int] = []
         rejection_reasons: dict[str, int] = {}
@@ -1279,6 +1310,35 @@ class LiveEngine:
                 minimum_histogram[str(minimum)] = minimum_histogram.get(str(minimum), 0) + 1
                 if minimum <= 40:
                     winners_at_or_below_40 += 1
+                try:
+                    actual_quantity = Decimal(str(record.get("actual_quantity") or "0"))
+                    actual_entry = Decimal(str(record.get("actual_average_entry_price")))
+                except (ArithmeticError, TypeError, ValueError):
+                    actual_quantity = Decimal("0")
+                    actual_entry = Decimal("0")
+                if actual_quantity > 0 and Decimal("0") < actual_entry < Decimal("1"):
+                    actual_filled_eventual_winners += 1
+                    candidate = {
+                        "ticker": record.get("ticker"),
+                        "signal_side": record.get("signal_side"),
+                        "actual_average_entry_price": format(actual_entry, "f"),
+                        "actual_quantity": format(actual_quantity, "f"),
+                        "settlement_outcome": outcome,
+                        "realized_method": record.get("realized_method"),
+                        "realized_net_pnl": record.get("realized_net_pnl"),
+                    }
+                    current = lowest_actual_entry_eventual_winner
+                    if current is None or actual_entry < Decimal(str(current["actual_average_entry_price"])):
+                        lowest_actual_entry_eventual_winner = candidate
+                    try:
+                        realized_net_pnl = Decimal(str(record.get("realized_net_pnl") or "0"))
+                    except (ArithmeticError, TypeError, ValueError):
+                        realized_net_pnl = Decimal("0")
+                    if realized_net_pnl > 0:
+                        realized_profitable_filled_trades += 1
+                        profitable = lowest_actual_entry_realized_profitable
+                        if profitable is None or actual_entry < Decimal(str(profitable["actual_average_entry_price"])):
+                            lowest_actual_entry_realized_profitable = candidate
             for level in levels:
                 state = record.get("shadow_entry_levels", {}).get(str(level), {})
                 row = output.setdefault(str(level), {
@@ -1326,6 +1386,10 @@ class LiveEngine:
             "winning_settlements_stayed_above_40": winners - winners_at_or_below_40,
             "winner_drawdown_histogram_cents": dict(sorted(histogram.items(), key=lambda item: int(item[0]))),
             "winner_minimum_price_histogram_cents": dict(sorted(minimum_histogram.items(), key=lambda item: int(item[0]))),
+            "actual_filled_eventual_winners": actual_filled_eventual_winners,
+            "lowest_actual_entry_eventual_winner": lowest_actual_entry_eventual_winner,
+            "realized_profitable_filled_trades": realized_profitable_filled_trades,
+            "lowest_actual_entry_realized_profitable": lowest_actual_entry_realized_profitable,
             "initial_stop_eligibility": {
                 "definition": "initial_selected_side_price_cents <= hypothetical_stop_cents",
                 "captured_initial_prices": captured,
@@ -1383,6 +1447,23 @@ class LiveEngine:
             LOG.warning("MAX DRAWDOWN %sc: %d trades (%.2f%%)", bucket, count, 100 * count / winners if winners else 0)
         for bucket, count in summary["winner_minimum_price_histogram_cents"].items():
             LOG.warning("WINNER MINIMUM %sc: %d trades (%.2f%%)", bucket, count, 100 * count / winners if winners else 0)
+        eventual_low = summary.get("lowest_actual_entry_eventual_winner")
+        profitable_low = summary.get("lowest_actual_entry_realized_profitable")
+        LOG.warning(
+            "LOWEST FILLED EVENTUAL WINNER | count=%d ticker=%s side=%s actual_entry=%s qty=%s method=%s net_pnl=%s",
+            summary.get("actual_filled_eventual_winners", 0),
+            (eventual_low or {}).get("ticker"), (eventual_low or {}).get("signal_side"),
+            (eventual_low or {}).get("actual_average_entry_price"), (eventual_low or {}).get("actual_quantity"),
+            (eventual_low or {}).get("realized_method"), (eventual_low or {}).get("realized_net_pnl"),
+        )
+        LOG.warning(
+            "LOWEST REALIZED-PROFIT ENTRY | count=%d ticker=%s side=%s actual_entry=%s qty=%s method=%s net_pnl=%s",
+            summary.get("realized_profitable_filled_trades", 0),
+            (profitable_low or {}).get("ticker"), (profitable_low or {}).get("signal_side"),
+            (profitable_low or {}).get("actual_average_entry_price"),
+            (profitable_low or {}).get("actual_quantity"), (profitable_low or {}).get("realized_method"),
+            (profitable_low or {}).get("realized_net_pnl"),
+        )
         eligibility = summary["initial_stop_eligibility"]
         LOG.warning("============= INITIAL PRICE STOP ELIGIBILITY =============")
         LOG.warning(
@@ -3735,13 +3816,28 @@ class LiveEngine:
         if Decimal(str(record.get("actual_quantity") or "0")) == 0:
             record["exit_classification"] = "ENTRY_NOT_FILLED"
         summary = self.entry_price_performance()
+        level_status = " ".join(
+            f"{level}c:{'HIT' if record.get('shadow_entry_levels', {}).get(str(level), {}).get('touched') else 'MISS'}"
+            for level in range(49, 39, -1)
+        )
         self.audit(
             "settlement_analytics_finalized", ticker=record["ticker"], outcome=outcome, winner=winner,
             initial_signal_price_cents=initial, minimum_selected_price_cents=minimum,
+            entry_limit_cents=record.get("entry_limit_cents"),
+            actual_average_entry_price=record.get("actual_average_entry_price"),
+            actual_quantity=record.get("actual_quantity"),
             winner_max_drawdown_cents=drawdown if winner else None,
             stopped_then_eventual_winner=stopped_then_winner,
             shadow_entry_levels=record.get("shadow_entry_levels"),
             aggregate_winning_settlements=summary["winning_settlements"],
+        )
+        LOG.warning(
+            "SETTLEMENT PRICE PATH | ticker=%s side=%s outcome=%s winner=%s "
+            "initial_selected_ask=%sc entry_limit=%sc actual_entry=%s minimum_selected_ask=%sc "
+            "winner_max_drawdown=%s levels_40_49=[%s]",
+            record["ticker"], str(record.get("signal_side")).upper(), outcome.upper(), winner,
+            initial, record.get("entry_limit_cents"), record.get("actual_average_entry_price"), minimum,
+            f"{drawdown}c" if winner and drawdown is not None else "n/a", level_status,
         )
 
     def hybrid_stop_performance(self) -> dict[str, Any]:

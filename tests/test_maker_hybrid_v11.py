@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import tempfile
 import time
 import unittest
@@ -162,6 +163,25 @@ class MakerHybridV11Tests(unittest.TestCase):
             self.assertEqual(len(record["entry_orders"]), 1)
         asyncio.run(scenario())
 
+    def test_opening_snapshot_logs_and_checkpoints_exact_prices_and_exchange_lag(self) -> None:
+        engine, feed = self.engine(), BookFeed("0.52")
+        record = self.signal(engine, "KXBTC15M-opening-snapshot")
+        with self.assertLogs("kalshi_live_trader", level="WARNING") as captured:
+            self.assertEqual(engine.freeze_initial_signal_price(feed, record, time.time()), Decimal("0.51"))
+        output = "\n".join(captured.output)
+        self.assertIn("OPENING ENTRY SNAPSHOT", output)
+        self.assertIn("initial_selected_ask=52c", output)
+        self.assertIn("entry_limit=51c", output)
+        self.assertIn("monitored=40c-49c", output)
+        self.assertEqual(record["initial_signal_price_cents"], 52)
+        self.assertEqual(record["entry_limit_cents"], 51)
+        self.assertIsNotNone(record["initial_signal_price_exchange_timestamp"])
+        self.assertGreaterEqual(record["initial_signal_price_lag_seconds"], 0)
+        restored = load_state(engine.state_path, engine.config)
+        restored_record = restored["markets"][record["ticker"]]
+        self.assertEqual(restored_record["initial_signal_price_cents"], 52)
+        self.assertEqual(restored_record["entry_limit_cents"], 51)
+
     def test_rejected_below_hard_stop_retains_initial_quote_and_analytics(self) -> None:
         engine, feed = self.engine(), BookFeed("0.44")
         record = self.signal(engine, "KXBTC15M-rejected-low")
@@ -316,6 +336,54 @@ class MakerHybridV11Tests(unittest.TestCase):
         self.assertEqual(first["winner_max_drawdown_cents"], 7)
         self.assertEqual(second["winner_max_drawdown_cents"], 0)
         self.assertEqual(engine.entry_price_performance()["winner_drawdown_histogram_cents"], {"0": 1, "7": 1})
+
+    def test_winner_drawdown_and_40_to_49_path_are_durable_in_state_and_audit(self) -> None:
+        engine, feed = self.engine(), BookFeed("0.50")
+        record = self.signal(engine, "KXBTC15M-durable-winner-path")
+        engine.freeze_initial_signal_price(feed, record, time.time())
+        feed.ask = Decimal("0.43")
+        engine.observe_price_analytics(feed, record)
+        engine.finalize_settlement_analytics(record, record["signal_side"])
+
+        restored = load_state(engine.state_path, engine.config)
+        durable = restored["markets"][record["ticker"]]
+        self.assertEqual(durable["initial_signal_price_cents"], 50)
+        self.assertEqual(durable["minimum_selected_price_cents"], 43)
+        self.assertEqual(durable["winner_max_drawdown_cents"], 7)
+        self.assertTrue(durable["shadow_entry_levels"]["49"]["touched"])
+        self.assertFalse(durable["shadow_entry_levels"]["42"]["touched"])
+
+        events = [json.loads(line) for line in engine.ledger_path.read_text().splitlines()]
+        finalized = [event for event in events if event["event"] == "settlement_analytics_finalized"][-1]
+        self.assertEqual(finalized["initial_signal_price_cents"], 50)
+        self.assertEqual(finalized["minimum_selected_price_cents"], 43)
+        self.assertEqual(finalized["winner_max_drawdown_cents"], 7)
+        self.assertTrue(finalized["shadow_entry_levels"]["49"]["touched"])
+
+    def test_lowest_actual_entry_for_eventual_and_realized_winners_is_separate(self) -> None:
+        engine = self.engine()
+        stopped = self.filled_record(engine, "KXBTC15M-eventual-winner-41")
+        stopped.update({
+            "actual_average_entry_price": "0.41", "actual_quantity": "2.17",
+            "realized_method": "stop", "realized_net_pnl": "-0.0868",
+        })
+        engine.finalize_settlement_analytics(stopped, stopped["signal_side"])
+        profitable = self.filled_record(engine, "KXBTC15M-profitable-winner-42")
+        profitable.update({
+            "actual_average_entry_price": "0.42", "actual_quantity": "2.42",
+            "realized_method": "settlement", "realized_net_pnl": "1.4036",
+        })
+        engine.finalize_settlement_analytics(profitable, profitable["signal_side"])
+
+        summary = engine.entry_price_performance()
+        self.assertEqual(summary["actual_filled_eventual_winners"], 2)
+        self.assertEqual(
+            summary["lowest_actual_entry_eventual_winner"]["actual_average_entry_price"], "0.41",
+        )
+        self.assertEqual(summary["realized_profitable_filled_trades"], 1)
+        self.assertEqual(
+            summary["lowest_actual_entry_realized_profitable"]["actual_average_entry_price"], "0.42",
+        )
 
     def test_hybrid_maker_exit_full(self) -> None:
         async def scenario():
