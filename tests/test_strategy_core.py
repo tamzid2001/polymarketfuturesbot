@@ -184,6 +184,12 @@ class StrategyCoreTests(unittest.TestCase):
         self.assertIn("hybrid=45/46/44", worker)
         self.assertIn("kalshi_shadow_maker_hybrid_v11_sticky_stop_40", worker)
         self.assertIn("--persist-config", worker)
+        self.assertIn("RUNTIME_STATE_RESTORED=runtime-state", worker)
+        self.assertIn("python live_checkpoint.py --reason end-of-run", worker)
+        self.assertNotIn("git push origin HEAD:main", worker)
+        self.assertNotIn("chore: checkpoint KXBTC15M hybrid state", worker)
+        self.assertIn("RUNTIME_STATE_RESTORED=runtime-state", controlled)
+        self.assertIn("WATCHDOG MAINTENANCE HOLD", watchdog)
         self.assertNotIn("cron:", worker)
         self.assertIn('cron: "2-59/5 * * * *"', watchdog)
         workflow_input_count = len(__import__("re").findall(

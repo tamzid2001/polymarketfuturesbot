@@ -49,6 +49,24 @@ jobs:
           ref: main
           fetch-depth: 1
 
+      - name: Restore latest bounded runtime state
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin refs/heads/runtime-state
+          for path in \
+            selected_live_strategy.json \
+            data/kalshi_live_maker_hybrid_v11_state.json \
+            data/kalshi_live_maker_hybrid_v11_audit.jsonl \
+            data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_state.json \
+            data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_audit.jsonl; do
+            if git cat-file -e "FETCH_HEAD:$path" 2>/dev/null; then
+              mkdir -p "$(dirname "$path")"
+              git show "FETCH_HEAD:$path" > "$path.runtime"
+              mv "$path.runtime" "$path"
+            fi
+          done
+          echo "RUNTIME_STATE_RESTORED=runtime-state"
+
       - name: Validate source, live gates, state, and safe handoff window
         env:
           GH_TOKEN: ${{ github.token }}
@@ -59,7 +77,6 @@ jobs:
           SHADOW_ONLY_LOCK: ${{ vars.KALSHI_SHADOW_ONLY || 'true' }}
         run: |
           set -euo pipefail
-          git pull --ff-only origin main
           source_json="$(gh run view "$SOURCE_RUN_ID" --repo "$GITHUB_REPOSITORY" \
             --json workflowName,status,displayTitle,headSha)"
           workflow="$(jq -r '.workflowName' <<<"$source_json")"

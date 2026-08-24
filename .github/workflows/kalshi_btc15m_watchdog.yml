@@ -39,8 +39,13 @@ jobs:
           TRIGGER: ${{ github.event_name }}
           KALSHI_LIVE_ENABLED: ${{ vars.KALSHI_LIVE_ENABLED || 'false' }}
           KALSHI_SHADOW_ONLY: ${{ vars.KALSHI_SHADOW_ONLY || 'true' }}
+          KALSHI_MAINTENANCE_MODE: ${{ vars.KALSHI_MAINTENANCE_MODE || 'false' }}
         run: |
           set -euo pipefail
+          if [ "$KALSHI_MAINTENANCE_MODE" = "true" ]; then
+            echo "WATCHDOG MAINTENANCE HOLD | dispatch disabled for controlled repository maintenance."
+            exit 0
+          fi
           # A controlled restart cancels a live run before it queues its
           # reconciliation replacement. Give that replacement a brief window
           # to claim the singleton so a deliberate handoff never races a live

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import subprocess
 import tempfile
 import time
 import unittest
@@ -11,7 +12,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from audit_ledger import append_audit
-from live_checkpoint import MaterialCheckpointPublisher
+from live_checkpoint import MaterialCheckpointPublisher, publish_runtime_snapshot
 from kalshi_btc15m_average_down import KalshiLiveFeed
 from kalshi_live_trader import (
     LiveEngine, ProvisionalOutcomeTracker, QuoteObservation, deterministic_client_order_id, epoch,
@@ -838,6 +839,54 @@ class LiveExecutionTests(unittest.TestCase):
         with patch.object(publisher, "publish_if_changed", return_value=True) as retry:
             self.assertTrue(publisher.publish_if_due())
         retry.assert_called_once_with("entry_fill_observed")
+
+    def test_runtime_checkpoint_ref_is_a_single_parentless_snapshot_and_main_is_unchanged(self) -> None:
+        temporary = Path(tempfile.mkdtemp())
+        remote = temporary / "remote.git"
+        work = temporary / "work"
+        subprocess.run(["git", "init", "--bare", str(remote)], check=True, capture_output=True)
+        subprocess.run(["git", "init", "-b", "main", str(work)], check=True, capture_output=True)
+        for key, value in (("user.name", "test"), ("user.email", "test@example.com")):
+            subprocess.run(["git", "-C", str(work), "config", key, value], check=True)
+        subprocess.run(["git", "-C", str(work), "remote", "add", "origin", str(remote)], check=True)
+        state = work / "state.json"
+        state.write_text('{"sequence":1}\n', encoding="utf-8")
+        subprocess.run(["git", "-C", str(work), "add", "state.json"], check=True)
+        subprocess.run(["git", "-C", str(work), "commit", "-m", "source"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(work), "push", "-u", "origin", "main"], check=True, capture_output=True)
+        main_before = subprocess.check_output(["git", "-C", str(work), "rev-parse", "main"], text=True).strip()
+
+        self.assertTrue(publish_runtime_snapshot((state,), "first", root=work))
+        first = subprocess.check_output(
+            ["git", "--git-dir", str(remote), "rev-parse", "runtime-state"], text=True,
+        ).strip()
+        state.write_text('{"sequence":2}\n', encoding="utf-8")
+        self.assertTrue(publish_runtime_snapshot((state,), "second", root=work))
+        second = subprocess.check_output(
+            ["git", "--git-dir", str(remote), "rev-parse", "runtime-state"], text=True,
+        ).strip()
+
+        self.assertNotEqual(first, second)
+        self.assertEqual(
+            subprocess.check_output(
+                ["git", "--git-dir", str(remote), "rev-list", "--count", "runtime-state"], text=True,
+            ).strip(),
+            "1",
+        )
+        parents = subprocess.check_output(
+            ["git", "--git-dir", str(remote), "show", "-s", "--format=%P", "runtime-state"], text=True,
+        ).strip()
+        self.assertEqual(parents, "")
+        self.assertEqual(
+            subprocess.check_output(["git", "-C", str(work), "rev-parse", "main"], text=True).strip(),
+            main_before,
+        )
+        self.assertEqual(
+            subprocess.check_output(
+                ["git", "--git-dir", str(remote), "show", "runtime-state:state.json"], text=True,
+            ),
+            '{"sequence":2}\n',
+        )
 
     def test_entry_and_stop_latency_is_durable_and_observational(self) -> None:
         engine = self.engine()

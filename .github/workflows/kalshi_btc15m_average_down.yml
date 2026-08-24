@@ -155,6 +155,28 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - name: Restore latest bounded runtime state
+        run: |
+          set -euo pipefail
+          runtime_ref=runtime-state
+          if git fetch --no-tags origin "refs/heads/$runtime_ref"; then
+            for path in \
+              selected_live_strategy.json \
+              data/kalshi_live_maker_hybrid_v11_state.json \
+              data/kalshi_live_maker_hybrid_v11_audit.jsonl \
+              data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_state.json \
+              data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_audit.jsonl; do
+              if git cat-file -e "FETCH_HEAD:$path" 2>/dev/null; then
+                mkdir -p "$(dirname "$path")"
+                git show "FETCH_HEAD:$path" > "$path.runtime"
+                mv "$path.runtime" "$path"
+              fi
+            done
+            echo "RUNTIME_STATE_RESTORED=runtime-state"
+          else
+            echo "RUNTIME_STATE_BOOTSTRAP=main_snapshot"
+          fi
+
       - uses: actions/setup-python@v6
         with:
           python-version: "3.13"
@@ -203,6 +225,7 @@ jobs:
           KALSHI_LIVE_ENABLED: ${{ vars.KALSHI_LIVE_ENABLED || 'false' }}
           KALSHI_SHADOW_ONLY: ${{ vars.KALSHI_SHADOW_ONLY || 'true' }}
           KALSHI_CHECKPOINT_PUBLISH: "true"
+          KALSHI_RUNTIME_STATE_REF: "runtime-state"
           RUN_SECONDS: ${{ inputs.run_seconds || '18000' }}
           REQUESTED_LIVE: ${{ github.event_name == 'schedule' && vars.KALSHI_LIVE_ENABLED == 'true' && vars.KALSHI_SHADOW_ONLY != 'true' || github.event_name == 'workflow_dispatch' && inputs.live_enabled && !inputs.dry_run && vars.KALSHI_LIVE_ENABLED == 'true' && vars.KALSHI_SHADOW_ONLY != 'true' }}
           RECONCILE_ONLY: ${{ inputs.reconcile_only || false }}
@@ -289,22 +312,18 @@ jobs:
         if: always()
         run: |
           set -euo pipefail
-          git add selected_live_strategy.json \
-            data/kalshi_live_maker_hybrid_v11_state.json data/kalshi_live_maker_hybrid_v11_audit.jsonl \
-            data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_state.json \
-            data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_audit.jsonl 2>/dev/null || true
-          if git diff --cached --quiet; then
-            exit 0
-          fi
-          git commit -m "chore: checkpoint KXBTC15M hybrid state [skip ci]"
           for attempt in 1 2 3; do
-            if git pull --rebase --autostash origin main && git push origin HEAD:main; then
+            if python live_checkpoint.py --reason end-of-run \
+              selected_live_strategy.json \
+              data/kalshi_live_maker_hybrid_v11_state.json \
+              data/kalshi_live_maker_hybrid_v11_audit.jsonl \
+              data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_state.json \
+              data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_audit.jsonl; then
               exit 0
             fi
-            git rebase --abort 2>/dev/null || true
             sleep "$attempt"
           done
-          echo "::error::Unable to publish durable live state after three retries."
+          echo "::error::Unable to publish bounded runtime state after three retries."
           exit 1
 
       - name: Queue the next five-hour worker only after a safe handoff
