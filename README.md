@@ -88,6 +88,53 @@ The v8/v9/v10 files remain archived evidence. v11 starts in a separate namespace
 
 Forensic check of the archived v10 40¢ IOC shadow state (not live exchange execution and not a v11 maker result): it contains **214 shadow-executed IOC fills**, all with a later outcome, split into **105 eventual directional winners / 109 losers**. The lowest recorded shadow selected-side fill that later settled correctly was **41¢ NO**, 2.17 shares, in `KXBTC15M-26AUG181215-15`; that simulated position hit its stop and realized **-$0.0868**, so it is not labeled a profitable trade. The lowest recorded shadow entry with positive realized net P&L was **42¢ YES**, 2.42 shares, in `KXBTC15M-26AUG181500-00`; it was held to a YES settlement and realized **+$1.4036** in the archived shadow ledger. This distinction prevents “eventual directional winner” from being confused with “profitable after the stop policy,” or shadow execution from being confused with exchange fills.
 
+### Archived-ledger 45¢ stop / one-cent-lower entry counterfactual
+
+[`ledger_45c_counterfactual.py`](ledger_45c_counterfactual.py) replays those same 214 archived records under a dynamic maker entry equal to the first fresh post-open selected-side ask minus one cent and a fixed 45¢ exit. It uses the shared `strategy_core.py` recovery transitions with a $1,000 starting balance, 1.00 starting share, 1.01× recovery, $350 first base threshold, 1.01× threshold growth, +0.50 base step, and 100-share cap. Historical directional outcomes are never redrawn.
+
+This is a **fixed shadow-ledger settlement replay with observed/inferred execution and Monte Carlo late-path sensitivity**, not an exact fill reconstruction. The archived v10 file retained first-minute books and old 40¢ stop events, but not the complete later quote path or maker queue priority. A known old 40¢ path is therefore treated as an execution opportunity through any resting limit above 45¢ and as a known 45¢ crossing; this does not claim an exchange fill. For winner paths that never reached the old 40¢ stop, the base Monte Carlo uses the retained first-minute evidence: 26 of 50 touched the derived limit (52.00%), and 10 of those 26 subsequently showed an executable bid at or below 45¢ (38.46%). These two rates are explicit sensitivity proxies for the missing late path.
+
+| Retained evidence | Count |
+| --- | ---: |
+| Archived records with outcomes and opening books | 214 |
+| Directional winners / losers | 105 / 109 |
+| Derived entry above 45¢ and therefore eligible | 190 |
+| Rejected because derived entry was ≤45¢ | 24 |
+| Eligible directional winners / losers | 93 / 97 |
+| Known old-40¢ paths among eligible records | 140 (43 winners / 97 losers) |
+
+Gross, no-fee results over this 214-record window are:
+
+| 1.01× recovery execution assumption | Fills | Stops | Stopped eventual winners | P&L | Final $1,000 balance | Return | Max drawdown |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Strict first-minute trade-through | 161 | 150 | 53 | **-$10.3332** | $989.6668 | -1.0333% | $11.9477 |
+| First-minute executable-ask touch | 166 | 150 | 53 | **-$4.3909** | $995.6091 | -0.4391% | $6.0868 |
+| Optimistic: every eligible maker entry fills | 190 | 150 | 53 | **+$9.2446** | $1,009.2446 | +0.9245% | $1.0089 |
+
+The 10,000-replication base late-path sensitivity produced mean P&L **-$4.4887**, P5 **-$13.3196**, median **-$3.5660**, and P95 **+$1.5592**. That corresponds to a median ending balance of **$996.4340** and median return of **-0.3566%**. Median/P95 maximum drawdown was **$7.9667 / $15.3614**. No $1,000 funding failure occurred in these paths. A fixed-one-share control was also negative: median **-$2.9600** and P5/P95 **-$5.4900 / -$0.3300**.
+
+| Execution-cost sensitivity | MC runs | Mean P&L | Median P&L | P5 / P95 P&L |
+| --- | ---: | ---: | ---: | ---: |
+| Perfect 45¢ exit, no fee | 10,000 | -$4.4887 | **-$3.5660** | -$13.3196 / +$1.5592 |
+| Exit averages 44¢ | 5,000 | -$9.0336 | **-$9.2821** | -$17.9392 / +$0.1010 |
+| Exit averages 43¢ | 5,000 | -$13.6555 | **-$13.8912** | -$22.4218 / -$3.9426 |
+| Perfect 45¢ exit plus 1¢ cost per filled share | 5,000 | -$9.6458 | **-$9.9020** | -$18.2984 / -$0.3578 |
+
+The empirical base case is therefore negative in this small recent shadow window. The only profitable deterministic row assumes every eligible maker order fills and no additional unobserved winner is stopped, so it should not be used as the expectation. The principal drag is false stopping: the retained evidence already contains 53 correct-direction markets that crossed the stop path. The earlier archived 40¢ IOC shadow result of +$1.7803 is not directly comparable because both entry execution and stop policy changed.
+
+Reproduce the primary run with:
+
+```bash
+.venv/bin/python ledger_45c_counterfactual.py \
+  --state-file data/kalshi_shadow_market_ioc_v10_sticky_stop_40_state.json \
+  --stop-cents 45 \
+  --entry-offset-cents 1 \
+  --simulations 10000 \
+  --seed 20260823
+```
+
+Machine-readable evidence, scenario results, the summary, and the generated report are in [`reports/kalshi_45c_counterfactual/`](reports/kalshi_45c_counterfactual/). The adjacent `slippage_1c`, `slippage_2c`, and `fee_1c` report directories preserve the stress runs.
+
 ## Reconstructed historical directional results — prior inverse baseline
 
 The following snapshot was regenerated from Kalshi’s public settlement endpoints on **2026-08-08** using the prior `inverse_latest_settlement` rule. The cache is intentionally ignored by Git because it is downloaded source data; the exact retrieval commands are below. It is a reproducibility baseline, **not** the v11 sticky-direction/maker/hybrid-stop expected value.
