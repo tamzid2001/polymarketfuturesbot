@@ -131,6 +131,69 @@ class ReconciliationTests(unittest.TestCase):
             self.assertTrue(await engine.reconcile_startup(Rest(positions=[{"ticker": "OTHER", "position_fp": "5"}])))
         asyncio.run(scenario())
 
+    def test_partial_exit_restart_preserves_original_entry_quantity(self) -> None:
+        async def scenario():
+            engine = self.engine()
+            ticker = "KXBTC15M-partial-exit-restart"
+            entry_id = deterministic_client_order_id(ticker, "yes", "entry", engine.config)
+            exit_id = deterministic_client_order_id(ticker, "yes", "hybrid-maker-exit", engine.config)
+            engine.state["markets"][ticker] = {
+                "ticker": ticker, "signal_side": "yes", "status": "MAKER_EXIT_PARTIAL",
+                "actual_quantity": "1.00", "entry_orders": [{
+                    "client_order_id": entry_id, "entry_phase": "maker", "quantity": "1.00",
+                    "fill_count": "1.00", "remaining_count": "0", "average_fill_price": "0.49", "fees_paid": "0",
+                }],
+                "exit_orders": [{
+                    "client_order_id": exit_id, "exit_phase": "maker_exit", "quantity": "1.00",
+                    "fill_count": "0", "remaining_count": "1.00", "position_price": "0.46", "fees_paid": "0",
+                }],
+                "hybrid_stop": {"state": "MAKER_EXIT_PARTIAL"},
+            }
+            fills = [
+                {"fill_id": "entry", "ticker": ticker, "client_order_id": entry_id, "action": "buy", "count_fp": "1.00", "yes_price_dollars": "0.49"},
+                {"fill_id": "exit", "ticker": ticker, "client_order_id": exit_id, "action": "sell", "count_fp": "0.40", "yes_price_dollars": "0.46"},
+            ]
+            self.assertTrue(await engine.reconcile_startup(Rest(
+                positions=[{"ticker": ticker, "position_fp": "0.60"}], fills=fills,
+            )))
+            record = engine.state["markets"][ticker]
+            self.assertEqual(record["actual_quantity"], "1.00")
+            self.assertEqual(record["authoritative_open_quantity"], "0.60")
+            self.assertEqual(engine.local_remaining_position(record), Decimal("0.60"))
+        asyncio.run(scenario())
+
+    def test_flat_unknown_hard_stop_is_rebuilt_and_realized_once(self) -> None:
+        async def scenario():
+            engine = self.engine()
+            ticker = "KXBTC15M-flat-hard-stop-restart"
+            entry_id = deterministic_client_order_id(ticker, "yes", "entry", engine.config)
+            hard_id = deterministic_client_order_id(ticker, "yes", "hybrid-hard-stop-0", engine.config)
+            engine.state["markets"][ticker] = {
+                "ticker": ticker, "signal_side": "yes", "status": "HARD_STOP_PENDING",
+                "actual_quantity": "1.00", "entry_orders": [{
+                    "client_order_id": entry_id, "entry_phase": "maker", "quantity": "1.00",
+                    "fill_count": "1.00", "remaining_count": "0", "average_fill_price": "0.49", "fees_paid": "0",
+                }],
+                "exit_orders": [{
+                    "client_order_id": hard_id, "exit_phase": "hard_stop", "quantity": "1.00",
+                    "fill_count": "0", "remaining_count": "1.00", "position_price": "0.44", "fees_paid": "0",
+                }],
+                "hybrid_stop": {"state": "HARD_STOP_PENDING"},
+            }
+            fills = [
+                {"fill_id": "entry", "ticker": ticker, "client_order_id": entry_id, "action": "buy", "count_fp": "1.00", "yes_price_dollars": "0.49"},
+                {"fill_id": "hard", "ticker": ticker, "client_order_id": hard_id, "action": "sell", "count_fp": "1.00", "yes_price_dollars": "0.44"},
+            ]
+            self.assertTrue(await engine.reconcile_startup(Rest(fills=fills)))
+            record = engine.state["markets"][ticker]
+            self.assertEqual(record["status"], "CLOSED")
+            self.assertEqual(record["exit_classification"], "HARD_STOP_ONLY")
+            self.assertEqual(record["realized_net_pnl"], "-0.0500")
+            before = list(engine.state["processed_settlements"])
+            self.assertTrue(await engine.reconcile_startup(Rest(fills=fills)))
+            self.assertEqual(engine.state["processed_settlements"], before)
+        asyncio.run(scenario())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -2039,6 +2039,72 @@ class KalshiREST:
         )
         return record
 
+    async def create_reduce_only_maker_exit(
+        self, *, ticker: str, held_side: str, economic_exit_price: float, quantity: float,
+        expiration_time: int, dry_run: bool, order_key: str,
+        client_order_id_override: str | None = None,
+    ) -> dict[str, Any]:
+        """Rest a post-only, reduce-only GTC sale for only the held quantity.
+
+        The economic price is always expressed on the held YES/NO contract;
+        this adapter alone maps it to Kalshi's YES-side book representation.
+        Live callers must still reconcile cancellation and the authoritative
+        residual position before sending any hard-stop IOC.
+        """
+
+        if held_side not in {"yes", "no"}:
+            raise ValueError(f"Unsupported held side for maker exit: {held_side}")
+        quantity = share_quantity(quantity, "reduce-only maker exit quantity")
+        if not 0.0 < economic_exit_price < 1.0:
+            raise ValueError("A maker exit requires a valid limit price")
+        api_price = economic_exit_price if held_side == "yes" else 1.0 - economic_exit_price
+        book_side = BookSide.ASK if held_side == "yes" else BookSide.BID
+        record = {
+            "client_order_id": client_order_id_override or client_order_id(ticker, f"maker-reduce-{held_side}", order_key),
+            "ticker": ticker, "side": held_side, "held_side": held_side,
+            "order_type": "reduce_only_exit_maker", "exit_phase": "maker_exit",
+            "position_price": round(economic_exit_price, 4), "api_price": f"{api_price:.4f}",
+            "book_side": "ask" if held_side == "yes" else "bid", "quantity": round(quantity, 2),
+            "time_in_force": "good_till_canceled", "expiration_time": int(expiration_time),
+            "post_only": True, "reduce_only": True, "submitted_at": now_iso(),
+            "status": "dry_run" if dry_run else "submitting", "fill_count": 0.0,
+            "remaining_count": round(quantity, 2), "fees_paid": 0.0,
+        }
+        if dry_run:
+            return record
+        if self.trading_pause_active():
+            record["status"] = "paused"
+            record["error"] = self.pause_reason or "scheduled Kalshi trading pause"
+            return record
+        try:
+            response = await self.orders.create_order_v2(
+                ticker=ticker, side=book_side, count=f"{quantity:.2f}", price=record["api_price"],
+                time_in_force="good_till_canceled", expiration_time=int(expiration_time),
+                client_order_id=record["client_order_id"],
+                self_trade_prevention_type=SelfTradePreventionType.TAKER_AT_CROSS,
+                reduce_only=True, post_only=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            record["status"] = "paused" if pause_error(exc) else "submit_failed"
+            record["error"] = str(exc)
+            LOG.error("MAKER EXIT REJECTED | %s %s @ $%.4f: %s", ticker, held_side.upper(), economic_exit_price, exc)
+            return record
+        record["order_id"] = str(field(response, "order_id") or "") or None
+        record["fill_count"] = round(order_fill_count(response), 2)
+        remaining = order_remaining_count(response)
+        record["remaining_count"] = round(remaining if remaining is not None else quantity - record["fill_count"], 2)
+        record["average_fill_price"] = order_average_position_price(response, held_side, economic_exit_price)
+        record["fees_paid"] = order_fee_total(response)
+        record["status"] = classify_submission(
+            record["fill_count"], record["remaining_count"], quantity, "good_till_canceled",
+        )
+        LOG.warning(
+            "REDUCE-ONLY MAKER EXIT %s | %s %s @ $%.4f x %.2f fill=%.2f remaining=%.2f id=%s",
+            record["status"].upper(), ticker, held_side.upper(), economic_exit_price, quantity,
+            record["fill_count"], record["remaining_count"], record["order_id"] or "?",
+        )
+        return record
+
     async def refresh_order(self, record: dict[str, Any]) -> None:
         order_id = record.get("order_id")
         if not order_id or record.get("status") in {"dry_run", "submit_failed"}:
@@ -2131,7 +2197,18 @@ class KalshiREST:
             record["remaining_count"] = 0.0
             return True
         try:
-            await self.orders.cancel_order_v2(order_id)
+            response = await self.orders.cancel_order_v2(order_id)
+            canceled = field(response, "order") or response
+            if canceled is not None:
+                final_fill = order_fill_count(canceled)
+                if final_fill or float(record.get("fill_count") or 0.0) <= 0.004:
+                    record["fill_count"] = round(max(float(record.get("fill_count") or 0.0), final_fill), 2)
+                held_side = str(record.get("held_side") or record.get("side") or "")
+                if held_side in {"yes", "no"} and float(record.get("fill_count") or 0.0) > 0:
+                    record["average_fill_price"] = order_average_position_price(
+                        canceled, held_side, float(record.get("position_price") or 0.0),
+                    )
+                record["fees_paid"] = max(float(record.get("fees_paid") or 0.0), order_fee_total(canceled))
             record["status"] = "canceled"
             record["canceled_at"] = now_iso()
             record["remaining_count"] = 0.0

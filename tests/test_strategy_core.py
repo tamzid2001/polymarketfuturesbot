@@ -92,23 +92,27 @@ class StrategyCoreTests(unittest.TestCase):
         self.assertEqual(config["starting_base"], "1.00")
         self.assertEqual(config["base_increment"], "1.00")
         self.assertEqual(config["opening_price_discovery_seconds"], 3)
-        self.assertEqual(config["entry_execution_mode"], "immediate_market_ioc")
+        self.assertEqual(config["entry_execution_mode"], "signal_price_minus_offset_maker")
+        self.assertEqual(config["entry_limit_offset_cents"], 1)
         self.assertEqual(config["max_recovery_exponent"], 0)
-        self.assertEqual(config["stop_policy"], "fixed_profile_floor")
+        self.assertEqual(config["stop_policy"], "hybrid_maker_then_hard_stop")
+        self.assertEqual(
+            (config["hybrid_stop_trigger_cents"], config["hybrid_maker_exit_cents"], config["hybrid_hard_stop_cents"]),
+            (45, 46, 44),
+        )
         self.assertEqual(config["stop_baseline_entry_price"], "0.50")
         self.assertEqual(config["strategy_version"], ACTIVE_STRATEGY_VERSION)
         self.assertEqual(config["config_schema_version"], ACTIVE_CONFIG_SCHEMA_VERSION)
 
-    def test_optimizer_export_preserves_the_selected_stop_profile(self) -> None:
+    def test_optimizer_export_rejects_retired_stop_profiles(self) -> None:
         row = {
             "entry_price": .49, "stop_price": .20, "recovery_multiplier": 1.01,
             "first_base_threshold": 350, "threshold_growth_multiplier": 1.01, "base_increment": .50,
         }
         with TemporaryDirectory() as directory:
             path = Path(directory) / "selected_live_strategy.json"
-            config = export_selected_live_strategy(path, row, selection_basis="test")
-            self.assertEqual(load_config(path)["shadow_profile"], "sticky_stop_20")
-        self.assertEqual(config["stop_price"], "0.20")
+            with self.assertRaisesRegex(ValueError, "only the canonical sticky_stop_40"):
+                export_selected_live_strategy(path, row, selection_basis="test")
 
     def test_legacy_live_configuration_fails_closed(self) -> None:
         config = load_config(ROOT / "selected_live_strategy.json")
@@ -146,13 +150,25 @@ class StrategyCoreTests(unittest.TestCase):
         self.assertEqual(sticky_directional_prediction("yes", "no"), ("yes", "hold_after_directional_loss"))
         self.assertEqual(sticky_directional_prediction("yes", "yes"), ("no", "flip_after_directional_win"))
 
-    def test_shadow_stop_profiles_cannot_silently_reinterpret_a_stop(self) -> None:
+    def test_retired_shadow_stop_profiles_are_rejected(self) -> None:
         config = load_config(ROOT / "selected_live_strategy.json")
-        tested = load_config_from_value(dict(config, shadow_profile="sticky_stop_30", stop_price="0.30"))
-        self.assertEqual(tested["shadow_profile"], "sticky_stop_30")
-        self.assertEqual(tested["stop_price"], "0.30")
-        with self.assertRaisesRegex(ValueError, "requires stop_price"):
-            load_config_from_value(dict(config, shadow_profile="sticky_stop_30"))
+        with self.assertRaisesRegex(ValueError, "shadow_profile"):
+            load_config_from_value(dict(config, shadow_profile="sticky_stop_30", stop_price="0.30"))
+
+    def test_production_workflows_pin_v11_and_never_dispatch_retired_lanes(self) -> None:
+        worker = (ROOT / ".github/workflows/kalshi_btc15m_average_down.yml").read_text(encoding="utf-8")
+        watchdog = (ROOT / ".github/workflows/kalshi_btc15m_watchdog.yml").read_text(encoding="utf-8")
+        controlled = (ROOT / ".github/workflows/kalshi_btc15m_controlled_restart.yml").read_text(encoding="utf-8")
+        self.assertIn('entry_execution_mode"] == "signal_price_minus_offset_maker"', worker)
+        self.assertIn("hybrid=45/46/44", worker)
+        self.assertIn("kalshi_shadow_maker_hybrid_v11_sticky_stop_40", worker)
+        self.assertIn("--persist-config", worker)
+        self.assertNotIn("cron:", worker)
+        self.assertIn('cron: "2-59/5 * * * *"', watchdog)
+        for retired in ("sticky_stop_30", "sticky_stop_20", "sticky_stop_10"):
+            self.assertNotIn(retired, watchdog)
+            self.assertNotIn(retired, controlled)
+            self.assertNotIn(f"- {retired}", worker)
 
 
 if __name__ == "__main__":

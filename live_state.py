@@ -61,6 +61,10 @@ def default_state(config: dict[str, Any]) -> dict[str, Any]:
         # Rebuilt from individual market timing records; telemetry only, not
         # an input to sizing, funding, or realized P&L.
         "execution_timing_metrics": {},
+        # Idempotently rebuilt from durable per-market v11 analytics facts.
+        "entry_price_performance": {},
+        "hybrid_stop_performance": {},
+        "fee_metrics": {"entry_fees_paid": "0", "exit_fees_paid": "0", "total_fees_paid": "0"},
         "circuit_breaker": {"blocked": False, "reason": None, "triggered_at": None},
         "daily_realized": {},
         "shadow_metrics": {},

@@ -3,8 +3,8 @@ name: Kalshi KXBTC15M Hybrid Live Watchdog
 # A recovery safety net for the hybrid trader. Normal five-hour workers only
 # hand off in the middle 13 minutes of a KXBTC15M market. This workflow is a
 # recovery path for a failed/missing worker; it never bypasses the live gate.
-# While KALSHI_SHADOW_ONLY=true, each stop experiment has an isolated worker
-# lane so a healthy 40c run cannot hide a failed 30c/20c/10c experiment.
+# While KALSHI_SHADOW_ONLY=true, only the canonical sticky_stop_40 v11 lane is
+# maintained. Retired 30c/20c/10c experiments are never redispatched.
 on:
   schedule:
     # Avoid minute zero, when GitHub Actions is most likely to delay or drop
@@ -32,7 +32,7 @@ jobs:
       github.event.workflow_run.conclusion != 'success'
     runs-on: ubuntu-latest
     steps:
-      - name: Dispatch isolated shadow recoveries only when their lane is idle
+      - name: Dispatch the canonical lane only when it is idle
         env:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
@@ -53,12 +53,12 @@ jobs:
             --json databaseId,status,conclusion,updatedAt,displayTitle,event)"
 
           if [ "$KALSHI_SHADOW_ONLY" = "true" ]; then
-            for profile in sticky_stop_40 sticky_stop_30 sticky_stop_20 sticky_stop_10; do
+              profile=sticky_stop_40
               profile_runs="$(jq --arg title "DRY_RUN $profile" '[.[] | select((.displayTitle // "") | contains($title))]' <<<"$runs")"
               active="$(jq '[.[] | select(.status == "in_progress" or .status == "queued" or .status == "waiting")] | length' <<<"$profile_runs")"
               if [ "$active" -gt 0 ]; then
                 echo "WATCHDOG HOLD | profile=$profile active_or_queued=$active"
-                continue
+                exit 0
               fi
               latest="$(jq -c 'sort_by(.updatedAt // "") | last // {}' <<<"$profile_runs")"
               conclusion="$(jq -r '.conclusion // "none"' <<<"$latest")"
@@ -69,14 +69,13 @@ jobs:
                 age_seconds=$((now_epoch - completed_epoch))
                 if [ "$age_seconds" -lt 600 ]; then
                   echo "WATCHDOG WAIT | profile=$profile successful ${age_seconds}s ago; allowing handoff."
-                  continue
+                  exit 0
                 fi
               fi
               gh workflow run kalshi_btc15m_average_down.yml --repo "$REPOSITORY" --ref main \
                 -f live_enabled=false -f dry_run=true -f shadow_profile="$profile" \
                 -f reconcile_only=false -f reset_state=false -f run_seconds=18000
-              echo "WATCHDOG DISPATCHED | profile=$profile isolated shadow recovery queued."
-            done
+              echo "WATCHDOG DISPATCHED | profile=$profile canonical shadow recovery queued."
             exit 0
           fi
 
