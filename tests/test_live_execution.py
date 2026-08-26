@@ -74,6 +74,25 @@ class DelayedFreshBookFeed(Feed):
         return super().executable_shadow_quote(ticker, side, quantity, age) if self.available else (None, "missing_or_stale_book")
 
 
+class TimestampedFeed(Feed):
+    """Complete top of book with a deterministic exchange timestamp."""
+
+    def __init__(self, ask: str, observed_at: float, bid: str = "0.45", depth: str = "10.00") -> None:
+        super().__init__(ask, bid, depth)
+        self.observed_at = observed_at
+
+    def executable_shadow_quote(self, ticker: str, side: str, quantity: float, age: float):
+        quote, source = super().executable_shadow_quote(ticker, side, quantity, age)
+        observed = datetime.fromtimestamp(self.observed_at, timezone.utc).isoformat()
+        quote.update({
+            "quote_id": f"timestamped:{self.ask}:{self.bid}:{self.observed_at}",
+            "source_server_timestamp": observed,
+            "source_timestamp_ms": int(self.observed_at * 1000),
+            "received_at": observed,
+        })
+        return quote, source
+
+
 class EntryRest:
     def __init__(self, balance: str = "100.00") -> None:
         self.balance = Decimal(balance)
@@ -216,6 +235,26 @@ class LiveExecutionTests(unittest.TestCase):
         self.assertEqual(
             migrated["config_migrations"][-1]["kind"],
             "make_existing_gtc_order_contract_explicit",
+        )
+        self.assertEqual(migrated["config_hash"], config_hash(self.config))
+
+    def test_delayed_entry_analytics_config_migrates_without_resetting_state(self) -> None:
+        temporary = Path(tempfile.mkdtemp()) / "state.json"
+        prior_config = dict(self.config)
+        prior_config.pop("delayed_entry_tracking_enabled")
+        prior_config.pop("delayed_entry_threshold_cents")
+        state = default_state(prior_config)
+        state["sizing"] = {
+            "base_share_count": "1.00", "recovery_exponent": 7,
+            "recovery_cycle_pnl": "-0.88", "next_base_threshold": "350.00",
+        }
+        save_state(temporary, state)
+
+        migrated = load_state(temporary, self.config)
+        self.assertEqual(migrated["sizing"], state["sizing"])
+        self.assertEqual(
+            migrated["config_migrations"][-1]["kind"],
+            "enable_compact_full_market_delayed_entry_analytics",
         )
         self.assertEqual(migrated["config_hash"], config_hash(self.config))
 
@@ -721,6 +760,92 @@ class LiveExecutionTests(unittest.TestCase):
             engine.capture_opening_quote(feed, record, 1_060)
             self.assertIsNotNone(record["opening_quote_capture"]["completed_at"])
         asyncio.run(scenario())
+
+    def test_below_53_initial_quote_tracks_first_later_executable_ask_after_60_seconds(self) -> None:
+        engine = self.engine()
+        market_open = 1_800_000_000.0
+        feed = TimestampedFeed("0.52", market_open + 0.5, depth="4.25")
+        record = engine.set_signal(
+            {"ticker": "KXBTC15M-delayed-53", "open_epoch": market_open, "close_epoch": market_open + 900},
+            {"outcome": "no", "ticker": "KXBTC15M-prior"},
+        )
+        self.assertEqual(engine.freeze_initial_signal_price(feed, record, market_open + 0.5), Decimal("0.51"))
+        tracker = record["delayed_entry_tracking"]
+        self.assertTrue(tracker["eligible"])
+        self.assertEqual(tracker["status"], "WATCHING")
+
+        feed.ask = "0.54"
+        feed.observed_at = market_open + 65.25
+        self.assertTrue(engine.observe_price_analytics(feed, record))
+        self.assertEqual(tracker["status"], "THRESHOLD_REACHED")
+        self.assertEqual(tracker["first_entry_price_cents"], 54)
+        self.assertEqual(tracker["first_entry_after_open_seconds"], 65.25)
+        self.assertTrue(tracker["first_entry_after_opening_capture_window"])
+        self.assertEqual(tracker["displayed_ask_depth"], "4.25")
+        self.assertTrue(tracker["configured_quantity_fully_fillable"])
+        self.assertEqual(record["minimum_selected_price_cents"], 52)
+
+        engine.finalize_settlement_analytics(record, "yes")
+        self.assertEqual(tracker["status"], "SETTLED_WIN")
+        self.assertEqual(tracker["no_stop_gross_pnl_per_share"], "0.46")
+        summary = engine.delayed_entry_performance()
+        self.assertEqual(summary["entries_after_opening_capture_window"], 1)
+        self.assertEqual(summary["directional_wins"], 1)
+        self.assertEqual(summary["directional_losses"], 0)
+
+    def test_delayed_53_tracker_never_submits_a_second_live_order(self) -> None:
+        async def scenario() -> None:
+            directory = Path(tempfile.mkdtemp())
+            engine = LiveEngine(
+                dict(self.config), default_state(self.config),
+                directory / "state", directory / "ledger", dry_run=False,
+            )
+            rest = LiveFallbackRest()
+            market_open = 1_800_000_000.0
+            feed = TimestampedFeed("0.52", market_open + 0.5)
+            record = engine.set_signal(
+                {"ticker": "KXBTC15M-delayed-no-order", "open_epoch": market_open, "close_epoch": market_open + 900},
+                {"outcome": "no", "ticker": "KXBTC15M-prior"},
+            )
+            await engine.submit_entry(rest, feed, record, market_open + 0.5)
+            self.assertEqual(len(rest.calls), 1)
+            feed.ask = "0.55"
+            feed.observed_at = market_open + 500
+            engine.observe_price_analytics(feed, record)
+            self.assertEqual(len(rest.calls), 1)
+            self.assertTrue(record["delayed_entry_tracking"]["hypothetical_fill"])
+        asyncio.run(scenario())
+
+    def test_at_or_above_53_initial_quote_is_not_in_delayed_cohort(self) -> None:
+        engine = self.engine()
+        market_open = 1_800_000_000.0
+        feed = TimestampedFeed("0.53", market_open + 0.5)
+        record = engine.set_signal(
+            {"ticker": "KXBTC15M-not-delayed-53", "open_epoch": market_open, "close_epoch": market_open + 900},
+            {"outcome": "no", "ticker": "KXBTC15M-prior"},
+        )
+        engine.freeze_initial_signal_price(feed, record, market_open + 0.5)
+        tracker = record["delayed_entry_tracking"]
+        self.assertFalse(tracker["eligible"])
+        self.assertEqual(tracker["status"], "INELIGIBLE_INITIAL_AT_OR_ABOVE_THRESHOLD")
+
+    def test_delayed_tracker_persists_no_cross_without_claiming_a_fill(self) -> None:
+        engine = self.engine()
+        market_open = 1_800_000_000.0
+        feed = TimestampedFeed("0.50", market_open + 0.5)
+        record = engine.set_signal(
+            {"ticker": "KXBTC15M-delayed-no-cross", "open_epoch": market_open, "close_epoch": market_open + 900},
+            {"outcome": "no", "ticker": "KXBTC15M-prior"},
+        )
+        engine.freeze_initial_signal_price(feed, record, market_open + 0.5)
+        feed.ask = "0.52"
+        feed.observed_at = market_open + 899
+        engine.observe_price_analytics(feed, record)
+        engine.finalize_settlement_analytics(record, "no")
+        tracker = record["delayed_entry_tracking"]
+        self.assertEqual(tracker["status"], "NO_THRESHOLD_CROSS_OBSERVED")
+        self.assertFalse(tracker["hypothetical_fill"])
+        self.assertIsNone(tracker["no_stop_gross_pnl_per_share"])
 
     def test_delayed_first_fresh_book_enters_immediately_when_available(self) -> None:
         async def scenario() -> None:

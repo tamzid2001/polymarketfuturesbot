@@ -147,7 +147,7 @@ INTEGER_CONFIG_FIELDS = {
     "opening_price_discovery_seconds",
     "entry_limit_offset_cents", "shadow_entry_level_min_cents", "shadow_entry_level_max_cents",
     "shadow_entry_level_step_cents", "hybrid_stop_trigger_cents", "hybrid_maker_exit_cents",
-    "hybrid_hard_stop_cents", "opening_quote_capture_seconds",
+    "hybrid_hard_stop_cents", "opening_quote_capture_seconds", "delayed_entry_threshold_cents",
 }
 FLOAT_CONFIG_FIELDS = {
     "stop_poll_interval", "reconciliation_interval", "max_outcome_quote_age_seconds", "max_stale_quote_seconds",
@@ -303,6 +303,10 @@ def validate_entry_price_contract(value: dict[str, Any]) -> None:
         raise ValueError("maker_price_offset cannot be negative")
     if int(value["opening_quote_max_observations"]) < 1:
         raise ValueError("opening_quote_max_observations must be at least one")
+    if not _bool(value.get("delayed_entry_tracking_enabled", True)):
+        raise ValueError("the active analytics contract requires delayed_entry_tracking_enabled=true")
+    if int(value.get("delayed_entry_threshold_cents", 0)) != 53:
+        raise ValueError("the active analytics contract requires delayed_entry_threshold_cents=53")
 
 
 def validate_sizing_config(value: dict[str, Any]) -> None:
@@ -373,6 +377,11 @@ def load_config(path: Path) -> dict[str, Any]:
     value.setdefault("entry_timeout_seconds", 0)
     value.setdefault("entry_order_lifetime", "until_filled_or_market_close")
     value.setdefault("opening_quote_capture_seconds", 60)
+    # Detailed opening samples remain bounded to 60 seconds.  A separate
+    # compact tracker observes the first fresh executable ask >=53c through
+    # market close without retaining every full-book update.
+    value.setdefault("delayed_entry_tracking_enabled", True)
+    value.setdefault("delayed_entry_threshold_cents", 53)
     value.setdefault("entry_lateness_seconds", 60)
     value.setdefault("stop_poll_interval", 1.0)
     value.setdefault("reconciliation_interval", 5.0)
@@ -481,6 +490,8 @@ def load_config_from_value(value: dict[str, Any]) -> dict[str, Any]:
     temporary.setdefault("entry_timeout_seconds", 0)
     temporary.setdefault("entry_order_lifetime", "until_filled_or_market_close")
     temporary.setdefault("opening_quote_capture_seconds", 60)
+    temporary.setdefault("delayed_entry_tracking_enabled", True)
+    temporary.setdefault("delayed_entry_threshold_cents", 53)
     temporary.setdefault("entry_lateness_seconds", 60)
     temporary.setdefault("handoff_guard_seconds", 60)
     temporary.setdefault("opening_quote_max_observations", 500)
@@ -1052,6 +1063,33 @@ class LiveEngine:
                 "dropped_observation_count": 0,
                 "unavailable_quote_count": 0,
             },
+            # Analytics-only delayed entry lane.  It never submits an order
+            # or mutates primary sizing/P&L.  For signals whose first fresh
+            # selected-side ask is below 53c, retain only the first later
+            # executable ask >=53c (and its displayed depth) through market
+            # close.  This avoids an unbounded full-book checkpoint history.
+            "delayed_entry_tracking": {
+                "enabled": bool(self.config["delayed_entry_tracking_enabled"]),
+                "threshold_cents": int(self.config["delayed_entry_threshold_cents"]),
+                "status": "PENDING_INITIAL_PRICE",
+                "eligible": None,
+                "coverage_complete_from_initial_quote": True,
+                "threshold_reached": False,
+                "hypothetical_fill": False,
+                "first_entry_price_cents": None,
+                "first_entry_timestamp": None,
+                "first_entry_exchange_epoch": None,
+                "first_entry_after_open_seconds": None,
+                "first_entry_after_signal_seconds": None,
+                "first_entry_after_opening_capture_window": None,
+                "displayed_ask_depth": None,
+                "configured_quantity_fully_fillable": None,
+                "minimum_selected_ask_after_entry_cents": None,
+                "maximum_selected_ask_after_entry_cents": None,
+                "settlement_outcome": None,
+                "directional_winner": None,
+                "no_stop_gross_pnl_per_share": None,
+            },
             "opening_price_discovery": {
                 "window_seconds": int(self.config["opening_price_discovery_seconds"]),
                 "anchor_at": None,
@@ -1217,6 +1255,25 @@ class LiveEngine:
             "opening_entry_price": format(opening_entry_price, "f"),
             "opening_entry_cost": format(opening_entry_cost, "f"),
             "opening_entry_cost_recorded_at": cost_recorded_at,
+            # Seed the path minimum from the immutable first executable ask.
+            # This keeps drawdown analytics complete even when the next book
+            # event is the delayed >=53c observation rather than a duplicate
+            # of the opening quote.
+            "minimum_selected_price_cents": initial_cents,
+            "minimum_selected_price_timestamp": exchange_timestamp,
+        })
+        delayed = record.setdefault("delayed_entry_tracking", {})
+        threshold_cents = int(self.config["delayed_entry_threshold_cents"])
+        delayed.update({
+            "enabled": bool(self.config["delayed_entry_tracking_enabled"]),
+            "threshold_cents": threshold_cents,
+            "initial_signal_price_cents": initial_cents,
+            "eligible": bool(initial_cents < threshold_cents),
+            "status": "WATCHING" if initial_cents < threshold_cents else "INELIGIBLE_INITIAL_AT_OR_ABOVE_THRESHOLD",
+            "coverage_complete_from_initial_quote": True,
+            "coverage_started_at": utc_now(),
+            "coverage_started_exchange_epoch": quote_epoch,
+            "coverage_started_after_open_seconds": quote_lag_seconds,
         })
         record["opening_quote_capture_deadline_epoch"] = self.opening_quote_capture_deadline(record)
         if 1 <= limit_cents <= 99:
@@ -1277,6 +1334,48 @@ class LiveEngine:
         self.checkpoint("initial_signal_price_frozen")
         return cents_price(limit_cents)
 
+    def ensure_delayed_entry_tracking(
+        self, record: dict[str, Any], quote_epoch: float | None = None,
+    ) -> dict[str, Any] | None:
+        """Return/backfill the compact >=53c tracker for an active record.
+
+        Older v11 checkpoints did not have this analytics-only object.  They
+        can continue being managed safely, but their tracker is explicitly
+        marked as late-started so downstream analysis cannot mistake partial
+        quote coverage for complete history.
+        """
+
+        initial_raw = record.get("initial_signal_price_cents")
+        if initial_raw is None:
+            return None
+        threshold = int(self.config["delayed_entry_threshold_cents"])
+        tracker = record.get("delayed_entry_tracking")
+        if not isinstance(tracker, dict):
+            tracker = {}
+            record["delayed_entry_tracking"] = tracker
+        if tracker.get("status") not in {None, "PENDING_INITIAL_PRICE"}:
+            return tracker
+        initial = int(initial_raw)
+        started_epoch = quote_epoch or float(record.get("initial_signal_price_epoch") or 0)
+        open_epoch = float(record.get("market_open_epoch") or 0)
+        tracker.update({
+            "enabled": bool(self.config["delayed_entry_tracking_enabled"]),
+            "threshold_cents": threshold,
+            "initial_signal_price_cents": initial,
+            "eligible": bool(initial < threshold),
+            "status": "WATCHING" if initial < threshold else "INELIGIBLE_INITIAL_AT_OR_ABOVE_THRESHOLD",
+            "coverage_complete_from_initial_quote": False,
+            "coverage_started_at": utc_now(),
+            "coverage_started_exchange_epoch": started_epoch or None,
+            "coverage_started_after_open_seconds": (
+                round(max(0.0, started_epoch - open_epoch), 6) if started_epoch and open_epoch else None
+            ),
+            "migration_note": "tracker_added_after_signal; pre-migration threshold crosses are unknown",
+            "threshold_reached": False,
+            "hypothetical_fill": False,
+        })
+        return tracker
+
     def observe_price_analytics(self, feed: KalshiLiveFeed, record: dict[str, Any]) -> bool:
         """Update durable per-signal price-path facts from one fresh book.
 
@@ -1303,6 +1402,60 @@ class LiveEngine:
             return False
         changed = False
         duplicate_quote = bool(quote_id and quote_id == record.get("last_analytics_quote_id"))
+        delayed = self.ensure_delayed_entry_tracking(record, quote_epoch)
+        delayed_entry_recorded = False
+        if (
+            isinstance(delayed, dict)
+            and delayed.get("enabled")
+            and delayed.get("eligible")
+            and delayed.get("status") == "WATCHING"
+            and quote_epoch < float(record.get("market_close_epoch") or float("inf"))
+            and selected_ask_cents >= int(delayed["threshold_cents"])
+        ):
+            try:
+                displayed_depth = Decimal(str(quote.get("displayed_depth") or "0"))
+                intended_quantity = Decimal(str(record.get("intended_quantity") or "0"))
+            except (ArithmeticError, TypeError, ValueError):
+                displayed_depth = Decimal("0")
+                intended_quantity = Decimal("0")
+            if displayed_depth > 0:
+                open_epoch = float(record["market_open_epoch"])
+                signal_epoch = _iso_epoch(record.get("signal_timestamp"))
+                elapsed_open = round(max(0.0, quote_epoch - open_epoch), 6)
+                fillable_quantity = min(displayed_depth, intended_quantity) if intended_quantity > 0 else Decimal("0")
+                delayed.update({
+                    "status": "THRESHOLD_REACHED",
+                    "threshold_reached": True,
+                    "hypothetical_fill": True,
+                    "first_entry_price_cents": selected_ask_cents,
+                    "first_entry_price": format(cents_price(selected_ask_cents), "f"),
+                    "first_entry_timestamp": utc_now(),
+                    "first_entry_exchange_epoch": quote_epoch,
+                    "first_entry_exchange_timestamp": quote.get("source_server_timestamp"),
+                    "first_entry_quote_id": quote_id or None,
+                    "first_entry_after_open_seconds": elapsed_open,
+                    "first_entry_after_signal_seconds": _seconds_since(signal_epoch, quote_epoch),
+                    "first_entry_after_opening_capture_window": elapsed_open >= int(self.config["opening_quote_capture_seconds"]),
+                    "displayed_ask_depth": format(displayed_depth, "f"),
+                    "hypothetical_filled_quantity": format(fillable_quantity, "f"),
+                    "configured_quantity_fully_fillable": bool(
+                        intended_quantity > 0 and displayed_depth >= intended_quantity
+                    ),
+                    "execution_assumption": "fresh_executable_ask_with_displayed_depth_no_historical_order_claim",
+                    "minimum_selected_ask_after_entry_cents": selected_ask_cents,
+                    "maximum_selected_ask_after_entry_cents": selected_ask_cents,
+                })
+                delayed_entry_recorded = True
+                changed = True
+        elif isinstance(delayed, dict) and delayed.get("threshold_reached"):
+            prior_min = delayed.get("minimum_selected_ask_after_entry_cents")
+            prior_max = delayed.get("maximum_selected_ask_after_entry_cents")
+            if prior_min is None or selected_ask_cents < int(prior_min):
+                delayed["minimum_selected_ask_after_entry_cents"] = selected_ask_cents
+                changed = True
+            if prior_max is None or selected_ask_cents > int(prior_max):
+                delayed["maximum_selected_ask_after_entry_cents"] = selected_ask_cents
+                changed = True
         if not duplicate_quote:
             record["last_analytics_quote_id"] = quote_id or None
             record["last_analytics_quote_epoch"] = quote_epoch
@@ -1319,6 +1472,28 @@ class LiveEngine:
                         "touch_quote_id": quote_id or None, "touch_price_cents": selected_ask_cents,
                     })
                     changed = True
+
+        if delayed_entry_recorded:
+            self.audit(
+                "delayed_entry_threshold_reached", ticker=record["ticker"], side=record["signal_side"],
+                initial_signal_price_cents=record.get("initial_signal_price_cents"),
+                threshold_cents=delayed.get("threshold_cents"),
+                entry_price_cents=delayed.get("first_entry_price_cents"),
+                entry_after_open_seconds=delayed.get("first_entry_after_open_seconds"),
+                after_opening_capture_window=delayed.get("first_entry_after_opening_capture_window"),
+                displayed_ask_depth=delayed.get("displayed_ask_depth"),
+                configured_quantity_fully_fillable=delayed.get("configured_quantity_fully_fillable"),
+                coverage_complete_from_initial_quote=delayed.get("coverage_complete_from_initial_quote"),
+            )
+            LOG.warning(
+                "DELAYED >=53C ENTRY TRACKED | ticker=%s side=%s initial=%sc entry=%sc "
+                "after_open=%.3fs after_60s=%s depth=%s configured_qty_fillable=%s analytics_only=true",
+                record["ticker"], str(record["signal_side"]).upper(),
+                record.get("initial_signal_price_cents"), delayed.get("first_entry_price_cents"),
+                float(delayed.get("first_entry_after_open_seconds") or 0),
+                delayed.get("first_entry_after_opening_capture_window"), delayed.get("displayed_ask_depth"),
+                delayed.get("configured_quantity_fully_fillable"),
+            )
 
         try:
             signal_time = datetime.fromisoformat(str(record["signal_timestamp"]).replace("Z", "+00:00"))
@@ -1522,6 +1697,113 @@ class LiveEngine:
         }
         self.state["entry_price_performance"] = summary
         return summary
+
+    def delayed_entry_performance(self) -> dict[str, Any]:
+        """Rebuild the full-market >=53c analytics lane idempotently."""
+
+        threshold = int(self.config["delayed_entry_threshold_cents"])
+        eligible = complete_coverage = partial_coverage = threshold_reached = 0
+        before_window = after_window = fully_fillable = resolved = wins = losses = 0
+        gross_pnl = Decimal("0")
+        timings: list[float] = []
+        entry_buckets: dict[str, int] = {}
+        for record in self.state.get("markets", {}).values():
+            if not isinstance(record, dict):
+                continue
+            tracker = record.get("delayed_entry_tracking")
+            if not isinstance(tracker, dict) or not tracker.get("eligible"):
+                continue
+            eligible += 1
+            if tracker.get("coverage_complete_from_initial_quote"):
+                complete_coverage += 1
+            else:
+                partial_coverage += 1
+            if not tracker.get("threshold_reached"):
+                continue
+            threshold_reached += 1
+            after = bool(tracker.get("first_entry_after_opening_capture_window"))
+            after_window += int(after)
+            before_window += int(not after)
+            fully_fillable += int(bool(tracker.get("configured_quantity_fully_fillable")))
+            timing = tracker.get("first_entry_after_open_seconds")
+            if timing is not None:
+                timings.append(float(timing))
+            entry_cents = tracker.get("first_entry_price_cents")
+            if entry_cents is not None:
+                text = str(int(entry_cents))
+                entry_buckets[text] = entry_buckets.get(text, 0) + 1
+            winner = tracker.get("directional_winner")
+            pnl = tracker.get("no_stop_gross_pnl_per_share")
+            if winner is None or pnl is None:
+                continue
+            resolved += 1
+            wins += int(bool(winner))
+            losses += int(not bool(winner))
+            gross_pnl += Decimal(str(pnl))
+
+        timings.sort()
+
+        def percentile(probability: float) -> float | None:
+            if not timings:
+                return None
+            index = int(round((len(timings) - 1) * probability))
+            return round(timings[index], 6)
+
+        output = {
+            "analytics_only": True,
+            "entry_rule": (
+                f"initial selected-side ask below {threshold}c; first later fresh executable ask "
+                f"at or above {threshold}c through market close"
+            ),
+            "threshold_cents": threshold,
+            "eligible_below_threshold_signals": eligible,
+            "complete_coverage_signals": complete_coverage,
+            "partial_legacy_coverage_signals": partial_coverage,
+            "threshold_reached": threshold_reached,
+            "threshold_reach_rate": threshold_reached / eligible if eligible else None,
+            "entries_within_opening_capture_window": before_window,
+            "entries_after_opening_capture_window": after_window,
+            "configured_quantity_fully_fillable": fully_fillable,
+            "resolved_entries": resolved,
+            "directional_wins": wins,
+            "directional_losses": losses,
+            "directional_win_rate": wins / resolved if resolved else None,
+            "gross_no_stop_pnl_per_share_total": format(gross_pnl, "f"),
+            "gross_no_stop_ev_per_resolved_entry": (
+                format(gross_pnl / resolved, "f") if resolved else None
+            ),
+            "entry_price_buckets_cents": dict(sorted(entry_buckets.items(), key=lambda item: int(item[0]))),
+            "entry_after_open_seconds_p50": percentile(0.50),
+            "entry_after_open_seconds_p90": percentile(0.90),
+            "entry_after_open_seconds_max": max(timings) if timings else None,
+            "updated_at": utc_now(),
+        }
+        self.state["delayed_entry_performance"] = output
+        return output
+
+    def log_delayed_entry_performance(self) -> None:
+        result = self.delayed_entry_performance()
+        rate = result["directional_win_rate"]
+        hit_rate = result["threshold_reach_rate"]
+        LOG.warning("================ FULL-MARKET DELAYED >=53C ANALYTICS ================")
+        LOG.warning(
+            "eligible_below53=%d complete_coverage=%d partial_legacy_coverage=%d reached=%d "
+            "reach_rate=%s within60s=%d after60s=%d fully_fillable=%d resolved=%d W/L=%d/%d "
+            "WR=%s gross_no_stop_pnl_per_share=%s EV_per_entry=%s entry_p50=%s entry_p90=%s entry_max=%s",
+            result["eligible_below_threshold_signals"], result["complete_coverage_signals"],
+            result["partial_legacy_coverage_signals"], result["threshold_reached"],
+            "n/a" if hit_rate is None else f"{100 * hit_rate:.2f}%",
+            result["entries_within_opening_capture_window"],
+            result["entries_after_opening_capture_window"],
+            result["configured_quantity_fully_fillable"], result["resolved_entries"],
+            result["directional_wins"], result["directional_losses"],
+            "n/a" if rate is None else f"{100 * rate:.2f}%",
+            result["gross_no_stop_pnl_per_share_total"],
+            result["gross_no_stop_ev_per_resolved_entry"],
+            result["entry_after_open_seconds_p50"], result["entry_after_open_seconds_p90"],
+            result["entry_after_open_seconds_max"],
+        )
+        LOG.warning("DELAYED ENTRY PRICE BUCKETS | %s", result["entry_price_buckets_cents"])
 
     def log_entry_price_performance(self) -> None:
         summary = self.entry_price_performance()
@@ -3939,6 +4221,23 @@ class LiveEngine:
             "stopped_then_eventual_winner": stopped_then_winner,
             "analytics_settlement_finalized": True, "analytics_settlement_finalized_at": utc_now(),
         })
+        delayed = record.get("delayed_entry_tracking")
+        if isinstance(delayed, dict) and delayed.get("eligible"):
+            delayed.update({
+                "settlement_outcome": outcome,
+                "directional_winner": winner,
+                "settlement_finalized_at": utc_now(),
+            })
+            entry_cents = delayed.get("first_entry_price_cents")
+            if delayed.get("threshold_reached") and entry_cents is not None:
+                entry_price = cents_price(int(entry_cents))
+                gross_pnl = Decimal("1") - entry_price if winner else -entry_price
+                delayed.update({
+                    "status": "SETTLED_WIN" if winner else "SETTLED_LOSS",
+                    "no_stop_gross_pnl_per_share": format(gross_pnl, "f"),
+                })
+            else:
+                delayed["status"] = "NO_THRESHOLD_CROSS_OBSERVED"
         if stopped_then_winner:
             proceeds, _ = self.exit_proceeds(record)
             quantity = Decimal(str(record.get("actual_quantity") or "0"))
@@ -3946,6 +4245,7 @@ class LiveEngine:
         if Decimal(str(record.get("actual_quantity") or "0")) == 0:
             record["exit_classification"] = "ENTRY_NOT_FILLED"
         summary = self.entry_price_performance()
+        delayed_summary = self.delayed_entry_performance()
         level_status = " ".join(
             f"{level}c:{'HIT' if record.get('shadow_entry_levels', {}).get(str(level), {}).get('touched') else 'MISS'}"
             for level in range(49, 39, -1)
@@ -3960,6 +4260,10 @@ class LiveEngine:
             stopped_then_eventual_winner=stopped_then_winner,
             shadow_entry_levels=record.get("shadow_entry_levels"),
             aggregate_winning_settlements=summary["winning_settlements"],
+            delayed_entry_tracking=record.get("delayed_entry_tracking"),
+            delayed_entry_resolved=delayed_summary["resolved_entries"],
+            delayed_entry_directional_wins=delayed_summary["directional_wins"],
+            delayed_entry_directional_losses=delayed_summary["directional_losses"],
         )
         LOG.warning(
             "SETTLEMENT PRICE PATH | ticker=%s side=%s outcome=%s winner=%s "
@@ -4272,6 +4576,7 @@ class LiveEngine:
                 shadow = self.shadow_metrics() if self.dry_run else {}
                 fees = self.fee_metrics()
                 eligibility = self.entry_price_performance()["initial_stop_eligibility"]
+                delayed_metrics = self.delayed_entry_performance()
                 LOG.warning(
                     "HEARTBEAT | mode=%s ticker=%s state=%s base=%s exponent=%d target=%s "
                     "deficit=%s threshold=%s tracked=%d filled=%d zero=%d funding_failures=%d "
@@ -4280,7 +4585,8 @@ class LiveEngine:
                     "stop_from_fill_p50=%s shadow_balance=%s shadow_pnl=%s shadow_dd=%s "
                     "completed=%s stops=%s settlements=%s fees=%s hybrid_state=%s exit_class=%s "
                     "entry_mode=%s maker_tif=%s entry_lifetime=%s initial_quotes=%s stop_safety_no_entry=%s "
-                    "active=%s breaker=%s",
+                    "delayed53_eligible=%s delayed53_reached=%s delayed53_after60=%s "
+                    "delayed53_resolved=%s delayed53_wl=%s/%s active=%s breaker=%s",
                     "DRY_RUN" if self.dry_run else "LIVE",
                     active and active["ticker"],
                     record.get("status") if isinstance(record, dict) else None,
@@ -4301,11 +4607,17 @@ class LiveEngine:
                     self.config["maker_order_time_in_force"], self.config["entry_order_lifetime"],
                     eligibility["captured_initial_prices"],
                     eligibility["actual_strategy_stop_safety_rejections"],
+                    delayed_metrics["eligible_below_threshold_signals"],
+                    delayed_metrics["threshold_reached"],
+                    delayed_metrics["entries_after_opening_capture_window"],
+                    delayed_metrics["resolved_entries"],
+                    delayed_metrics["directional_wins"], delayed_metrics["directional_losses"],
                     self.state.get("active_market"), self.state["circuit_breaker"].get("blocked"),
                 )
                 self.last_heartbeat = time.monotonic()
             if time.monotonic() - self.last_analytics_log >= 300:
                 self.log_entry_price_performance()
+                self.log_delayed_entry_performance()
                 self.log_hybrid_stop_performance()
                 self.last_analytics_log = time.monotonic()
             elapsed = time.monotonic() - start
@@ -4316,6 +4628,7 @@ class LiveEngine:
                     self.audit("safe_handoff_ready", **details, elapsed_seconds=round(elapsed, 3))
                     self.checkpoint("safe_handoff_ready")
                     self.log_entry_price_performance()
+                    self.log_delayed_entry_performance()
                     self.log_hybrid_stop_performance()
                     LOG.warning(
                         "SAFE HANDOFF READY | ticker=%s elapsed=%.1fs window=%s..%s; queuing may proceed.",
@@ -4401,6 +4714,15 @@ async def async_main(args: argparse.Namespace) -> int:
         LOG.warning(
             "CONFIG MIGRATION | GTC strategy timeout removed; entries now rest until fill, "
             "confirmed risk cancellation, or market close; preserved exponent=%s deficit=%s markets=%d",
+            state.get("sizing", {}).get("recovery_exponent", 0),
+            state.get("sizing", {}).get("recovery_cycle_pnl", "0"),
+            len(state.get("markets", {})),
+        )
+    if migrations and migrations[-1].get("kind") == "enable_compact_full_market_delayed_entry_analytics":
+        LOG.warning(
+            "CONFIG MIGRATION | full-market delayed >=53c analytics enabled; preserved "
+            "base=%s exponent=%s deficit=%s markets=%d; legacy records remain partial coverage",
+            state.get("sizing", {}).get("base_share_count", "1.00"),
             state.get("sizing", {}).get("recovery_exponent", 0),
             state.get("sizing", {}).get("recovery_cycle_pnl", "0"),
             len(state.get("markets", {})),
