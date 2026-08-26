@@ -97,6 +97,8 @@ class StrategyCoreTests(unittest.TestCase):
         self.assertEqual(config["entry_order_lifetime"], "until_filled_or_market_close")
         self.assertEqual(config["entry_timeout_seconds"], 0)
         self.assertEqual(config["opening_quote_capture_seconds"], 60)
+        self.assertTrue(config["delayed_entry_tracking_enabled"])
+        self.assertEqual(config["delayed_entry_threshold_cents"], 53)
         self.assertEqual(config["entry_limit_offset_cents"], 1)
         self.assertEqual(config["max_recovery_exponent"], 0)
         self.assertEqual(config["stop_policy"], "hybrid_maker_then_hard_stop")
@@ -179,6 +181,13 @@ class StrategyCoreTests(unittest.TestCase):
             load_config_from_value(dict(config, signal_delay_seconds=1))
         with self.assertRaisesRegex(ValueError, "max_recovery_exponent must be 0"):
             load_config_from_value(dict(config, max_recovery_exponent=12))
+
+    def test_active_config_requires_full_market_delayed_53_analytics(self) -> None:
+        config = load_config(ROOT / "selected_live_strategy.json")
+        with self.assertRaisesRegex(ValueError, "delayed_entry_tracking_enabled"):
+            load_config_from_value(dict(config, delayed_entry_tracking_enabled=False))
+        with self.assertRaisesRegex(ValueError, "delayed_entry_threshold_cents=53"):
+            load_config_from_value(dict(config, delayed_entry_threshold_cents=54))
 
     def test_v9_fixed_stop_is_not_adjusted_by_actual_entry_price(self) -> None:
         floor = Decimal("0.40")

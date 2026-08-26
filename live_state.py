@@ -111,6 +111,7 @@ def default_state(config: dict[str, Any]) -> dict[str, Any]:
         "execution_timing_metrics": {},
         # Idempotently rebuilt from durable per-market v11 analytics facts.
         "entry_price_performance": {},
+        "delayed_entry_performance": {},
         "hybrid_stop_performance": {},
         "fee_metrics": {"entry_fees_paid": "0", "exit_fees_paid": "0", "total_fees_paid": "0"},
         "circuit_breaker": {"blocked": False, "reason": None, "triggered_at": None},
@@ -185,6 +186,18 @@ def load_state(path: Path, config: dict[str, Any]) -> dict[str, Any]:
                 config_hash(bounded_implicit_gtc_config),
             }
         )
+        # Adding the compact full-market >=53c tracker changes only durable
+        # analytics. It does not reinterpret an order, fill, position, P&L,
+        # recovery cycle, or stop. Accept exactly the prior configuration
+        # hash with these two new declarative fields absent.
+        pre_delayed_entry_analytics_config = dict(config)
+        pre_delayed_entry_analytics_config.pop("delayed_entry_tracking_enabled", None)
+        pre_delayed_entry_analytics_config.pop("delayed_entry_threshold_cents", None)
+        is_delayed_entry_analytics_migration = (
+            bool(config.get("delayed_entry_tracking_enabled"))
+            and int(config.get("delayed_entry_threshold_cents", 0)) == 53
+            and value.get("config_hash") == config_hash(pre_delayed_entry_analytics_config)
+        )
         prior_snapshot = value.get("active_config_snapshot")
         changed_fields: set[str] = set()
         if isinstance(prior_snapshot, dict):
@@ -206,6 +219,7 @@ def load_state(path: Path, config: dict[str, Any]) -> dict[str, Any]:
             is_uncapped_migration,
             is_explicit_gtc_migration,
             is_persistent_gtc_migration,
+            is_delayed_entry_analytics_migration,
             is_reviewed_tuning,
         )):
             raise RuntimeError("live state configuration hash differs from active configuration; fail closed")
@@ -240,6 +254,16 @@ def load_state(path: Path, config: dict[str, Any]) -> dict[str, Any]:
                 "previous_config_hash": value.get("config_hash"),
                 "config_hash": expected_hash,
                 "policy": "preserve_existing_state_and_apply_unbounded_lifetime_to_open_and_future_gtc_entries",
+            })
+        if is_delayed_entry_analytics_migration:
+            migrations.append({
+                "at": utc_now(),
+                "kind": "enable_compact_full_market_delayed_entry_analytics",
+                "delayed_entry_tracking_enabled": True,
+                "delayed_entry_threshold_cents": 53,
+                "previous_config_hash": value.get("config_hash"),
+                "config_hash": expected_hash,
+                "policy": "preserve_all_execution_and_accounting_state; new records receive complete analytics coverage",
             })
         if is_reviewed_tuning:
             migrations.append({
