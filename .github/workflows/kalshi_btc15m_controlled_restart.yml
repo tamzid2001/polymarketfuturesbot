@@ -114,14 +114,58 @@ jobs:
               "HARD_STOP_PENDING",
           }
           active = [
-              ticker for ticker, record in state.get("markets", {}).items()
+              (ticker, record) for ticker, record in state.get("markets", {}).items()
               if isinstance(record, dict) and record.get("status") in active_statuses
           ]
           if str(state.get("current_position", "0")) not in {"0", "0.0", "0.00"}:
               raise SystemExit("persisted position is not flat; refusing controlled restart")
-          if state.get("current_order_id") or active:
-              raise SystemExit(f"persisted order/active state exists; refusing controlled restart: {active}")
-          print("CONTROLLED_RESTART_PREFLIGHT=FLAT")
+          if state.get("current_order_id"):
+              raise SystemExit("persisted current_order_id exists; refusing controlled restart")
+
+          breaker_blocked = bool(state.get("circuit_breaker", {}).get("blocked"))
+
+          def nonzero(value):
+              try:
+                  return abs(float(value or 0)) > 1e-9
+              except (TypeError, ValueError):
+                  return True
+
+          def has_order_work(record):
+              if record.get("current_order_id") or nonzero(record.get("actual_quantity")):
+                  return True
+              for key in ("entry_orders", "exit_orders"):
+                  for order in record.get(key, []):
+                      if not isinstance(order, dict):
+                          return True
+                      if nonzero(order.get("remaining_count")):
+                          return True
+                      if order.get("order_id") and str(order.get("status") or "").lower() in {
+                          "resting", "pending", "open", "unknown", "submit_failed",
+                      }:
+                          return True
+              return False
+
+          unsafe = []
+          safe_blocked_signals = []
+          for ticker, record in active:
+              # A latched circuit breaker can deliberately leave the current
+              # market in SIGNAL_PENDING while observational analytics keep
+              # running. It is safe to hand off only when both global and
+              # per-market state prove there is no order or exposure.
+              if (
+                  record.get("status") == "SIGNAL_PENDING"
+                  and breaker_blocked
+                  and not has_order_work(record)
+              ):
+                  safe_blocked_signals.append(ticker)
+              else:
+                  unsafe.append(ticker)
+          if unsafe:
+              raise SystemExit(f"persisted order/active state exists; refusing controlled restart: {unsafe}")
+          print(
+              "CONTROLLED_RESTART_PREFLIGHT=FLAT "
+              f"observational_signal_pending={safe_blocked_signals}"
+          )
           PY
 
       - name: Remove queued replacement for the source lane

@@ -173,6 +173,246 @@ class LiveExecutionTests(unittest.TestCase):
         config["starting_shadow_balance"] = shadow_balance
         return LiveEngine(config, default_state(config), temporary / "state.json", temporary / "audit.jsonl", dry_run=True)
 
+    def test_price_only_feed_retains_earliest_post_open_selected_ask_without_depth(self) -> None:
+        feed = KalshiLiveFeed(auth=None)
+        ticker = "KXBTC15M-first-price-only"
+        feed.set_tickers([ticker])
+        opened = time.time() + 10
+        feed.subscription_started_epoch[ticker] = opened - 30
+        feed._handle(json.dumps({
+            "type": "ticker",
+            "msg": {
+                "market_ticker": ticker,
+                "yes_bid_dollars": "0.56", "yes_ask_dollars": "0.57",
+                "ts_ms": int((opened + 0.125) * 1000),
+            },
+        }))
+        # A later full-depth message must not replace the first price-only
+        # opening reference.
+        feed._handle(json.dumps({
+            "type": "ticker",
+            "msg": {
+                "market_ticker": ticker,
+                "yes_bid_dollars": "0.61", "yes_ask_dollars": "0.62",
+                "yes_bid_size_fp": "20.00", "yes_ask_size_fp": "20.00",
+                "ts_ms": int((opened + 8.5) * 1000),
+            },
+        }))
+        quote, reason = feed.first_post_open_price_quote(ticker, "yes", opened)
+        self.assertEqual(reason, "first_post_open_selected_side_price")
+        self.assertIsNotNone(quote)
+        assert quote is not None
+        self.assertEqual(quote["economic_price"], 0.57)
+        self.assertEqual(quote["selected_best_bid"], 0.56)
+        self.assertFalse(quote["displayed_depth_available"])
+        self.assertIsNone(quote["displayed_depth"])
+        self.assertTrue(quote["coverage_complete_from_market_open"])
+        self.assertAlmostEqual(quote["selected_component_epoch"], opened + 0.125, delta=0.0011)
+
+    def test_first_selected_side_component_does_not_wait_for_opposite_price(self) -> None:
+        feed = KalshiLiveFeed(auth=None)
+        ticker = "KXBTC15M-first-single-component"
+        feed.set_tickers([ticker])
+        opened = time.time() + 10
+        feed.subscription_started_epoch[ticker] = opened - 10
+        # Kalshi ticker updates may contain only the component that changed.
+        # The opening YES ask is still the selected-side executable price even
+        # though a YES bid has not arrived in this socket session yet.
+        feed._handle(json.dumps({
+            "type": "ticker", "msg": {
+                "market_ticker": ticker, "yes_ask_dollars": "0.58",
+                "ts_ms": int((opened + 0.05) * 1000),
+            },
+        }))
+        feed._handle(json.dumps({
+            "type": "ticker", "msg": {
+                "market_ticker": ticker, "yes_bid_dollars": "0.60",
+                "yes_ask_dollars": "0.61", "ts_ms": int((opened + 1.0) * 1000),
+            },
+        }))
+
+        quote, reason = feed.first_post_open_price_quote(ticker, "yes", opened)
+        self.assertEqual(reason, "first_post_open_selected_side_price")
+        self.assertIsNotNone(quote)
+        assert quote is not None
+        self.assertEqual(quote["economic_price"], 0.58)
+        self.assertIsNone(quote["selected_best_bid"])
+        self.assertAlmostEqual(quote["selected_component_epoch"], opened + 0.05, delta=0.0011)
+
+    def test_no_side_opening_ask_uses_first_fresh_yes_bid_component(self) -> None:
+        feed = KalshiLiveFeed(auth=None)
+        ticker = "KXBTC15M-first-no-price"
+        feed.set_tickers([ticker])
+        opened = time.time() + 10
+        feed.subscription_started_epoch[ticker] = opened - 5
+        # Cache a pre-open ask, then update only YES bid after open. The NO
+        # executable ask is 1 - YES bid and is immediately fresh.
+        feed._handle(json.dumps({
+            "type": "ticker", "msg": {
+                "market_ticker": ticker, "yes_bid_dollars": "0.44",
+                "yes_ask_dollars": "0.46", "ts_ms": int((opened - 1) * 1000),
+            },
+        }))
+        feed._handle(json.dumps({
+            "type": "ticker", "msg": {
+                "market_ticker": ticker, "yes_bid_dollars": "0.47",
+                "ts_ms": int((opened + 0.2) * 1000),
+            },
+        }))
+        quote, _ = feed.first_post_open_price_quote(ticker, "no", opened)
+        self.assertIsNotNone(quote)
+        assert quote is not None
+        self.assertEqual(quote["economic_price"], 0.53)
+        self.assertAlmostEqual(quote["selected_component_epoch"], opened + 0.2, delta=0.0011)
+
+    def test_post_open_subscription_is_persisted_as_partial_and_cannot_seed_entry(self) -> None:
+        feed = KalshiLiveFeed(auth=None)
+        ticker = "KXBTC15M-partial-opening-price"
+        feed.set_tickers([ticker])
+        opened = time.time() - 20
+        feed.subscription_started_epoch[ticker] = opened + 10
+        feed._handle(json.dumps({
+            "type": "ticker", "msg": {
+                "market_ticker": ticker, "yes_bid_dollars": "0.54", "yes_ask_dollars": "0.55",
+                "ts_ms": int((opened + 10.1) * 1000),
+            },
+        }))
+        engine = self.engine()
+        record = engine.set_signal(
+            {"ticker": ticker, "open_epoch": opened, "close_epoch": opened + 900},
+            {"outcome": "no", "ticker": "KXBTC15M-prior"},
+        )
+        reference = engine.capture_opening_price_reference(feed, record, opened + 10.2)
+        self.assertIsNotNone(reference)
+        assert reference is not None
+        self.assertFalse(reference["coverage_complete_from_market_open"])
+        self.assertEqual(record["opening_price_reference_status"], "PARTIAL")
+        self.assertIsNone(engine.freeze_initial_signal_price(feed, record, opened + 10.3))
+        self.assertEqual(record["initial_signal_price_wait_reason"], "partial_opening_price_coverage")
+        self.assertFalse(record["delayed_entry_tracking"]["coverage_complete_from_initial_quote"])
+
+    def test_first_60_second_cross_activates_independent_ladder_and_tracks_all_rungs(self) -> None:
+        feed = KalshiLiveFeed(auth=None)
+        ticker = "KXBTC15M-opening-cross-ladder"
+        feed.set_tickers([ticker])
+        opened = time.time() - 100
+        feed.subscription_started_epoch[ticker] = opened - 10
+
+        def price(at: float, bid: str, ask: str) -> None:
+            feed._handle(json.dumps({
+                "type": "ticker", "msg": {
+                    "market_ticker": ticker, "yes_bid_dollars": bid,
+                    "yes_ask_dollars": ask, "ts_ms": int(at * 1000),
+                },
+            }))
+
+        price(opened + 1, "0.51", "0.52")
+        price(opened + 5, "0.54", "0.55")
+        price(opened + 10, "0.48", "0.49")
+        price(opened + 20, "0.38", "0.39")
+        price(opened + 30, "0.28", "0.29")
+        price(opened + 40, "0.18", "0.19")
+        price(opened + 50, "0.08", "0.09")
+        # Outside the trigger window: it may update an active ladder path but
+        # cannot create the >=56c threshold cohort.
+        price(opened + 61, "0.59", "0.60")
+        feed.public_trades[ticker] = [
+            {
+                "trade_id": f"trade-{index}", "ticker": ticker, "yes_price": value,
+                "no_price": None, "count": quantity,
+                "source_server_timestamp": datetime.fromtimestamp(opened + seconds, timezone.utc).isoformat(),
+                "received_at": datetime.fromtimestamp(opened + seconds, timezone.utc).isoformat(),
+            }
+            for index, (seconds, value, quantity) in enumerate((
+                (11, "0.49", "1.00"), (21, "0.39", "2.00"),
+                (31, "0.29", "4.00"), (41, "0.19", "8.00"),
+                (51, "0.09", "16.00"),
+            ), start=1)
+        ]
+        engine = self.engine()
+        engine.state["circuit_breaker"] = {
+            "blocked": True, "reason": "test_entry_breaker",
+            "triggered_at": datetime.now(timezone.utc).isoformat(),
+        }
+        record = engine.set_signal(
+            {"ticker": ticker, "open_epoch": opened, "close_epoch": opened + 900},
+            {"outcome": "no", "ticker": "KXBTC15M-prior"},
+        )
+        engine.capture_opening_price_reference(feed, record, opened + 1)
+        self.assertTrue(engine.observe_opening_cross_ladder(feed, record, opened + 62))
+        tracker = record["opening_cross_ladder"]
+        self.assertEqual(sorted(tracker["triggered"]), ["53", "54", "55"])
+        self.assertTrue(tracker["window_complete"])
+        for threshold in (53, 54, 55):
+            lane = tracker["triggered"][str(threshold)]
+            for level in (50, 40, 30, 20, 10):
+                self.assertTrue(lane["rungs"][str(level)]["touched"])
+                self.assertTrue(lane["rungs"][str(level)]["simulated_full_fill"])
+        engine.finalize_settlement_analytics(record, "yes")
+        self.assertEqual(tracker["triggered"]["53"]["gross_no_stop_pnl"], "25.300")
+        summary = engine.opening_cross_ladder_performance()["thresholds"]
+        self.assertEqual(summary["53"]["threshold_crosses_first_60_seconds"], 1)
+        self.assertEqual(summary["53"]["directional_wins"], 1)
+        self.assertEqual(summary["56"]["threshold_crosses_first_60_seconds"], 0)
+
+    def test_opening_cross_ladder_is_shadow_only(self) -> None:
+        temporary = Path(tempfile.mkdtemp())
+        live_engine = LiveEngine(
+            dict(self.config), default_state(self.config), temporary / "state.json",
+            temporary / "audit.jsonl", dry_run=False,
+        )
+        ticker = "KXBTC15M-no-live-cross-ladder"
+        opened = time.time() - 5
+        record = live_engine.set_signal(
+            {"ticker": ticker, "open_epoch": opened, "close_epoch": opened + 900},
+            {"outcome": "no", "ticker": "KXBTC15M-prior"},
+        )
+        feed = KalshiLiveFeed(auth=None)
+        feed.set_tickers([ticker])
+        feed.subscription_started_epoch[ticker] = opened - 10
+        feed._handle(json.dumps({
+            "type": "ticker", "msg": {
+                "market_ticker": ticker, "yes_bid_dollars": "0.54",
+                "yes_ask_dollars": "0.55", "ts_ms": int((opened + 1) * 1000),
+            },
+        }))
+
+        self.assertIsNone(record["opening_cross_ladder"])
+        self.assertFalse(live_engine.observe_opening_cross_ladder(feed, record, opened + 2))
+        self.assertIsNone(record["opening_cross_ladder"])
+
+    def test_cross_ladder_public_trade_volume_is_not_reused_across_rungs(self) -> None:
+        feed = KalshiLiveFeed(auth=None)
+        ticker = "KXBTC15M-ladder-volume-allocation"
+        feed.set_tickers([ticker])
+        opened = time.time() - 100
+        feed.subscription_started_epoch[ticker] = opened - 5
+        for seconds, bid, ask in ((1, "0.54", "0.55"), (10, "0.08", "0.09")):
+            feed._handle(json.dumps({
+                "type": "ticker", "msg": {
+                    "market_ticker": ticker, "yes_bid_dollars": bid,
+                    "yes_ask_dollars": ask, "ts_ms": int((opened + seconds) * 1000),
+                },
+            }))
+        trade_time = datetime.fromtimestamp(opened + 11, timezone.utc).isoformat()
+        feed.public_trades[ticker] = [{
+            "trade_id": "single-16-share-print", "ticker": ticker,
+            "yes_price": "0.09", "no_price": None, "count": "16.00",
+            "source_server_timestamp": trade_time, "received_at": trade_time,
+        }]
+        engine = self.engine()
+        record = engine.set_signal(
+            {"ticker": ticker, "open_epoch": opened, "close_epoch": opened + 900},
+            {"outcome": "no", "ticker": "KXBTC15M-prior"},
+        )
+        engine.capture_opening_price_reference(feed, record, opened + 1)
+        engine.observe_opening_cross_ladder(feed, record, opened + 12)
+        rungs = record["opening_cross_ladder"]["triggered"]["53"]["rungs"]
+        self.assertEqual([rungs[str(level)]["simulated_filled_quantity"] for level in (50, 40, 30, 20, 10)], [
+            "1.00", "2.00", "4.00", "8.00", "1.00",
+        ])
+        self.assertFalse(rungs["10"]["simulated_full_fill"])
+
     def test_persistent_shadow_only_lock_blocks_live_mode(self) -> None:
         self.assertFalse(live_mode_allowed(True, True, True, False))
         self.assertFalse(live_mode_allowed(True, True, False, True))
@@ -384,6 +624,7 @@ class LiveExecutionTests(unittest.TestCase):
         self.assertEqual(epoch(int((boundary - .2) * 1000)), boundary - .2)
         self.assertEqual(epoch(str(int((boundary - .2) * 1000))), boundary - .2)
         feed = KalshiLiveFeed(auth=None)
+        feed.set_tickers(["prior"])
         with patch("kalshi_btc15m_average_down.time.time", return_value=boundary - .2):
             feed._handle(json.dumps({
                 "type": "ticker",

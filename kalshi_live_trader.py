@@ -66,6 +66,20 @@ ORDER_PREFIX = "kxbtc15m-hybrid-v1-"
 # configuration; it fails closed before it can submit an order.
 ACTIVE_STRATEGY_VERSION = "kxbtc15m-hybrid-live-v11"
 ACTIVE_CONFIG_SCHEMA_VERSION = 11
+# Operational release guard used by the production workflow.  Version 3 means
+# opening entry prices come from the buffered price-only stream, not the first
+# later complete-depth book.  This can advance without reinterpreting recovery
+# accounting in an existing v11 state file.
+OPENING_PRICE_CAPTURE_CONTRACT_VERSION = 3
+OPENING_CROSS_LADDER_TRIGGER_LEVELS = tuple(range(53, 60))
+OPENING_CROSS_LADDER_TRIGGER_WINDOW_SECONDS = 60
+OPENING_CROSS_LADDER_RUNGS: tuple[tuple[int, Decimal], ...] = (
+    (50, Decimal("1.00")),
+    (40, Decimal("2.00")),
+    (30, Decimal("4.00")),
+    (20, Decimal("8.00")),
+    (10, Decimal("16.00")),
+)
 MARKET_DISCOVERY_LOOKBACK_SECONDS = 3_600
 MARKET_DISCOVERY_LOOKAHEAD_SECONDS = 3_600
 TERMINAL_STATES = {"CLOSED", "ZERO_FILL", "FUNDING_FAILURE", "MISSED_SIGNAL", "ERROR_RECONCILIATION"}
@@ -1003,6 +1017,11 @@ class LiveEngine:
             "initial_signal_price_lag_seconds": None,
             "initial_signal_price_observed_lag_seconds": None,
             "initial_signal_quote": None,
+            # Immutable price-only opening evidence.  It is captured from the
+            # pre-subscribed WebSocket independently of later displayed-depth
+            # evidence, so a slow size update cannot redefine the cohort.
+            "opening_price_reference": None,
+            "opening_price_reference_status": "PENDING",
             "entry_limit_cents": None,
             "maker_entry_price": None,
             # Opening intent and actual execution cost are deliberately
@@ -1063,6 +1082,25 @@ class LiveEngine:
                 "dropped_observation_count": 0,
                 "unavailable_quote_count": 0,
             },
+            "opening_cross_ladder": ({
+                "analytics_only": True,
+                "execution_mode": "shadow_only_no_exchange_orders",
+                "trigger_window_seconds": OPENING_CROSS_LADDER_TRIGGER_WINDOW_SECONDS,
+                "trigger_levels_cents": list(OPENING_CROSS_LADDER_TRIGGER_LEVELS),
+                "rung_quantities": {
+                    str(level): format(quantity, "f")
+                    for level, quantity in OPENING_CROSS_LADDER_RUNGS
+                },
+                "price_observations": [],
+                "price_observation_count": 0,
+                "dropped_price_observation_count": 0,
+                "triggered": {},
+                "window_complete": False,
+                "coverage_complete": None,
+                "coverage_note": None,
+                "last_processed_quote_id": None,
+                "feed_session_token": None,
+            } if self.dry_run else None),
             # Analytics-only delayed entry lane.  It never submits an order
             # or mutates primary sizing/P&L.  For signals whose first fresh
             # selected-side ask is below 53c, retain only the first later
@@ -1073,7 +1111,7 @@ class LiveEngine:
                 "threshold_cents": int(self.config["delayed_entry_threshold_cents"]),
                 "status": "PENDING_INITIAL_PRICE",
                 "eligible": None,
-                "coverage_complete_from_initial_quote": True,
+                "coverage_complete_from_initial_quote": False,
                 "threshold_reached": False,
                 "hypothetical_fill": False,
                 "first_entry_price_cents": None,
@@ -1166,7 +1204,7 @@ class LiveEngine:
         return Decimal(str(quote["economic_price"])) if quote else None
 
     def selected_book(self, feed: KalshiLiveFeed, record: dict[str, Any]) -> tuple[dict[str, Any] | None, str]:
-        """Return one fresh complete book for the immutable signal and analytics paths."""
+        """Return one fresh complete book for depth-sensitive analytics/fills/stops."""
 
         return feed.executable_shadow_quote(
             record["ticker"], str(record["signal_side"]), 0.0,
@@ -1196,6 +1234,125 @@ class LiveEngine:
         })
         return True
 
+    def capture_opening_price_reference(
+        self, feed: KalshiLiveFeed, record: dict[str, Any], now: float,
+    ) -> dict[str, Any] | None:
+        """Persist the earliest post-open selected-side ask without requiring depth.
+
+        Production feeds retain price-only WebSocket history from the upcoming
+        market subscription.  Displayed depth remains a separate evidence
+        stream and is never inferred here.  A worker that subscribed after the
+        market opened may retain a partial reference for audit/analytics, but
+        it cannot present that delayed price as complete opening coverage.
+        """
+
+        existing = record.get("opening_price_reference")
+        if isinstance(existing, dict):
+            return existing
+        opened = float(record["market_open_epoch"])
+        if now < opened:
+            return None
+        first_quote = getattr(feed, "first_post_open_price_quote", None)
+        if callable(first_quote):
+            quote, reason = first_quote(record["ticker"], str(record["signal_side"]), opened)
+        else:
+            # Execution adapters used by tests and offline replay predate the
+            # buffered feed API. They still provide an explicitly timestamped
+            # complete book; production always takes the branch above.
+            if record.get("opening_quote_observations"):
+                record["opening_price_reference_status"] = "PARTIAL_LEGACY_CAPTURE_ONLY"
+                record["opening_price_reference_wait_reason"] = (
+                    "legacy checkpoint has earlier complete-book observations but no price-only history"
+                )
+                return None
+            quote, reason = self.selected_book(feed, record)
+            if quote is not None:
+                quote = dict(quote)
+                quote.setdefault("coverage_complete_from_market_open", True)
+                quote.setdefault("coverage_status", "COMPLETE_TIMESTAMPED_ADAPTER")
+                quote.setdefault("source", "timestamped_complete_book_adapter")
+                quote.setdefault("displayed_depth_available", True)
+        if quote is None:
+            record["opening_price_reference_status"] = "WAITING"
+            record["opening_price_reference_wait_reason"] = reason
+            return None
+        quote_epoch = epoch(quote.get("selected_component_epoch")) or executable_quote_epoch(quote)
+        if quote_epoch is None or quote_epoch < opened:
+            record["opening_price_reference_status"] = "WAITING"
+            record["opening_price_reference_wait_reason"] = "preopen_or_unstamped_top_of_book"
+            return None
+        try:
+            selected_ask_cents = price_to_cents(
+                str(quote["economic_price"]), "opening selected-side ask",
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            record["opening_price_reference_status"] = "WAITING"
+            record["opening_price_reference_wait_reason"] = str(exc)
+            return None
+        coverage_complete = bool(quote.get("coverage_complete_from_market_open"))
+        quote_lag = round(max(0.0, quote_epoch - opened), 6)
+        observed_lag = round(max(0.0, now - opened), 6)
+        received_epoch = epoch(quote.get("received_epoch")) or _iso_epoch(quote.get("received_at"))
+        reference = {
+            "ticker": record["ticker"],
+            "selected_side": str(record["signal_side"]),
+            "selected_side_ask_cents": selected_ask_cents,
+            "selected_side_ask": format(cents_price(selected_ask_cents), "f"),
+            "selected_side_bid": quote.get("selected_best_bid"),
+            "yes_bid": quote.get("yes_bid"),
+            "yes_ask": quote.get("yes_ask"),
+            "quote_id": quote.get("quote_id") or None,
+            "source": quote.get("source") or "kalshi_websocket_price_only_top_of_book",
+            "selected_component_epoch": quote_epoch,
+            "selected_component_timestamp": datetime.fromtimestamp(quote_epoch, timezone.utc).isoformat(),
+            "received_epoch": received_epoch,
+            "received_at": quote.get("received_at"),
+            "quote_lag_after_market_open_seconds": quote_lag,
+            "worker_observation_lag_after_market_open_seconds": observed_lag,
+            "subscription_started_epoch": quote.get("subscription_started_epoch"),
+            "coverage_complete_from_market_open": coverage_complete,
+            "coverage_status": quote.get("coverage_status") or (
+                "COMPLETE" if coverage_complete else "PARTIAL"
+            ),
+            "displayed_depth_available": bool(quote.get("displayed_depth_available", False)),
+            "displayed_depth": quote.get("displayed_depth"),
+            "captured_at": utc_now(),
+        }
+        record["opening_price_reference"] = reference
+        record["opening_price_reference_status"] = (
+            "COMPLETE" if coverage_complete else "PARTIAL"
+        )
+        record.pop("opening_price_reference_wait_reason", None)
+        capture = record.setdefault("opening_quote_capture", {})
+        capture["first_price_capture_lag_seconds"] = quote_lag
+        capture["first_price_observed_lag_seconds"] = observed_lag
+        capture["first_price_quote_id"] = reference["quote_id"]
+        capture["first_price_source"] = reference["source"]
+        capture["first_price_coverage_status"] = reference["coverage_status"]
+        capture["first_price_depth_available"] = reference["displayed_depth_available"]
+        self.ensure_delayed_entry_tracking(
+            record, quote_epoch, selected_ask_cents, str(reference["quote_id"] or "") or None,
+        )
+        self.audit(
+            "opening_price_reference_captured", ticker=record["ticker"],
+            side=record["signal_side"], selected_side_ask_cents=selected_ask_cents,
+            quote_lag_after_market_open_seconds=quote_lag,
+            worker_observation_lag_after_market_open_seconds=observed_lag,
+            coverage_complete_from_market_open=coverage_complete,
+            coverage_status=reference["coverage_status"], source=reference["source"],
+            displayed_depth_available=reference["displayed_depth_available"],
+            quote_id=reference["quote_id"],
+        )
+        LOG.warning(
+            "FIRST OPEN PRICE | ticker=%s side=%s ask=%sc exchange_lag=%.6fs "
+            "worker_lag=%.6fs coverage=%s depth_available=%s source=%s",
+            record["ticker"], str(record["signal_side"]).upper(), selected_ask_cents,
+            quote_lag, observed_lag, reference["coverage_status"],
+            reference["displayed_depth_available"], reference["source"],
+        )
+        self.checkpoint("opening_price_reference_captured")
+        return reference
+
     def freeze_initial_signal_price(
         self, feed: KalshiLiveFeed, record: dict[str, Any], now: float,
     ) -> Decimal | None:
@@ -1215,24 +1372,26 @@ class LiveEngine:
                     opening_entry_cost=record["opening_entry_cost"],
                 )
             return cents_price(int(record["entry_limit_cents"]))
-        quote, reason = self.selected_book(feed, record)
-        if quote is None:
-            record["initial_signal_price_wait_reason"] = reason
+        reference = self.capture_opening_price_reference(feed, record, now)
+        if reference is None:
+            record["initial_signal_price_wait_reason"] = record.get(
+                "opening_price_reference_wait_reason", "opening_price_reference_unavailable",
+            )
             return None
-        quote_epoch = executable_quote_epoch(quote)
-        if quote_epoch is None or quote_epoch < float(record["market_open_epoch"]):
-            record["initial_signal_price_wait_reason"] = "preopen_or_unstamped_top_of_book"
+        if not reference.get("coverage_complete_from_market_open"):
+            record["initial_signal_price_wait_reason"] = "partial_opening_price_coverage"
             return None
         try:
-            initial_cents = price_to_cents(str(quote["economic_price"]), "initial selected-side ask")
-        except (KeyError, ValueError) as exc:
+            initial_cents = int(reference["selected_side_ask_cents"])
+            quote_epoch = float(reference["selected_component_epoch"])
+        except (KeyError, TypeError, ValueError) as exc:
             record["initial_signal_price_wait_reason"] = str(exc)
             return None
         limit_cents = initial_cents - int(self.config["entry_limit_offset_cents"])
         market_open_epoch = float(record["market_open_epoch"])
-        exchange_timestamp = datetime.fromtimestamp(quote_epoch, timezone.utc).isoformat()
-        quote_lag_seconds = round(max(0.0, quote_epoch - market_open_epoch), 6)
-        observed_lag_seconds = round(max(0.0, now - market_open_epoch), 6)
+        exchange_timestamp = str(reference["selected_component_timestamp"])
+        quote_lag_seconds = float(reference["quote_lag_after_market_open_seconds"])
+        observed_lag_seconds = float(reference["worker_observation_lag_after_market_open_seconds"])
         intended_quantity = Decimal(str(record["intended_quantity"]))
         opening_entry_price = cents_price(limit_cents)
         opening_entry_cost = exact_entry_notional(intended_quantity, opening_entry_price)
@@ -1249,7 +1408,7 @@ class LiveEngine:
             "initial_signal_price_exchange_timestamp": exchange_timestamp,
             "initial_signal_price_lag_seconds": quote_lag_seconds,
             "initial_signal_price_observed_lag_seconds": observed_lag_seconds,
-            "initial_signal_quote": quote,
+            "initial_signal_quote": reference,
             "entry_limit_cents": limit_cents,
             "opening_entry_quantity": format(intended_quantity, "f"),
             "opening_entry_price": format(opening_entry_price, "f"),
@@ -1287,7 +1446,7 @@ class LiveEngine:
             quote_timestamp=quote_epoch, quote_exchange_timestamp=exchange_timestamp,
             quote_lag_after_market_open_seconds=quote_lag_seconds,
             worker_observation_lag_after_market_open_seconds=observed_lag_seconds,
-            signal_timestamp=record.get("signal_timestamp"), quote=quote,
+            signal_timestamp=record.get("signal_timestamp"), quote=reference,
             monitored_entry_levels_cents=list(range(
                 int(self.config["shadow_entry_level_min_cents"]),
                 int(self.config["shadow_entry_level_max_cents"]) + 1,
@@ -1360,72 +1519,74 @@ class LiveEngine:
         if tracker.get("status") not in {None, "PENDING_INITIAL_PRICE"}:
             return tracker
         initial_raw = record.get("initial_signal_price_cents")
-        initial_from_opening_capture = False
+        initial_source = "frozen_strategy_entry_reference" if initial_raw is not None else None
+        reference = record.get("opening_price_reference")
+        reference_used = False
         earliest_opening_quote: tuple[float, int] | None = None
         if initial_raw is None:
-            # A restarted worker may inherit compact opening observations even
-            # though the old worker never initialized this tracker.  Preserve
-            # the true first observed executable ask as the cohort baseline;
-            # using only the post-restart quote would silently reclassify a
-            # below-threshold market as an opening >=53c market.
-            for observation in record.get("opening_quote_observations", []):
-                if not isinstance(observation, dict):
-                    continue
-                try:
-                    observation_cents = price_to_cents(
-                        str(observation["selected_best_ask"]),
-                        "stored opening selected-side ask",
-                    )
-                    source_ms = observation.get("source_timestamp_ms")
-                    observation_epoch = (
-                        float(source_ms) / 1000
-                        if source_ms is not None
-                        else float(observation.get("captured_epoch") or 0)
-                    )
-                except (KeyError, TypeError, ValueError):
-                    continue
-                candidate = (observation_epoch, observation_cents)
-                if earliest_opening_quote is None or candidate[0] < earliest_opening_quote[0]:
-                    earliest_opening_quote = candidate
-            if earliest_opening_quote is not None:
-                initial_raw = earliest_opening_quote[1]
-                initial_from_opening_capture = True
+            reference_is_complete = bool(
+                isinstance(reference, dict)
+                and reference.get("coverage_complete_from_market_open")
+            )
+            if reference_is_complete and reference.get("selected_side_ask_cents") is not None:
+                initial_raw = reference["selected_side_ask_cents"]
+                reference_used = True
+                initial_source = "immutable_price_only_opening_reference"
             else:
-                initial_raw = observed_ask_cents
+                # Backward compatibility only: an old checkpoint may contain
+                # complete-depth opening observations but no price reference.
+                # Keep its earliest captured ask while explicitly retaining
+                # partial coverage; do not fabricate a true opening quote.
+                for observation in record.get("opening_quote_observations", []):
+                    if not isinstance(observation, dict):
+                        continue
+                    try:
+                        observation_cents = price_to_cents(
+                            str(observation["selected_best_ask"]),
+                            "stored opening selected-side ask",
+                        )
+                        source_ms = observation.get("source_timestamp_ms")
+                        observation_epoch = (
+                            float(source_ms) / 1000
+                            if source_ms is not None
+                            else float(observation.get("captured_epoch") or 0)
+                        )
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    candidate = (observation_epoch, observation_cents)
+                    if earliest_opening_quote is None or candidate[0] < earliest_opening_quote[0]:
+                        earliest_opening_quote = candidate
+                if earliest_opening_quote is not None:
+                    initial_raw = earliest_opening_quote[1]
+                    initial_source = "legacy_first_captured_complete_book"
+                elif isinstance(reference, dict) and reference.get("selected_side_ask_cents") is not None:
+                    initial_raw = reference["selected_side_ask_cents"]
+                    reference_used = True
+                    initial_source = "partial_price_only_opening_reference"
+                else:
+                    initial_raw = observed_ask_cents
+                    if initial_raw is not None:
+                        initial_source = "late_observed_complete_book"
         if initial_raw is None:
             return tracker
         threshold = int(self.config["delayed_entry_threshold_cents"])
         initial = int(initial_raw)
-        started_epoch = quote_epoch or float(record.get("initial_signal_price_epoch") or 0)
+        if reference_used:
+            started_epoch = float(reference.get("selected_component_epoch") or 0)
+        elif record.get("initial_signal_price_epoch") is not None:
+            started_epoch = float(record["initial_signal_price_epoch"])
+        elif earliest_opening_quote is not None:
+            started_epoch = earliest_opening_quote[0]
+        else:
+            started_epoch = float(quote_epoch or 0)
         open_epoch = float(record.get("market_open_epoch") or 0)
         complete_coverage = bool(
-            tracker.get("coverage_complete_from_initial_quote")
-            if existing_tracker
-            else False
+            isinstance(reference, dict)
+            and reference_used
+            and reference.get("coverage_complete_from_market_open")
         )
-        # ``set_signal`` from the prior release created a pending tracker even
-        # when a latched breaker prevented the entry path from ever freezing a
-        # quote.  If the record already contains an earlier opening-book event,
-        # a quote first seen after restart cannot honestly be called complete
-        # from the initial quote.  The ordinary new-record path captures and
-        # observes the same first quote in one loop and remains complete.
-        if record.get("initial_signal_price_cents") is None:
-            for observation in record.get("opening_quote_observations", []):
-                if not isinstance(observation, dict):
-                    continue
-                prior_id = str(observation.get("quote_id") or "")
-                prior_epoch_ms = observation.get("source_timestamp_ms")
-                try:
-                    prior_epoch = float(prior_epoch_ms) / 1000 if prior_epoch_ms is not None else float(
-                        observation.get("captured_epoch") or 0
-                    )
-                except (TypeError, ValueError):
-                    continue
-                if prior_epoch < float(started_epoch or 0) and (
-                    not observed_quote_id or prior_id != observed_quote_id
-                ):
-                    complete_coverage = False
-                    break
+        if record.get("initial_signal_price_cents") is not None and isinstance(reference, dict):
+            complete_coverage = bool(reference.get("coverage_complete_from_market_open"))
         tracker.update({
             "enabled": bool(self.config["delayed_entry_tracking_enabled"]),
             "threshold_cents": threshold,
@@ -1433,6 +1594,7 @@ class LiveEngine:
             "eligible": bool(initial < threshold),
             "status": "WATCHING" if initial < threshold else "INELIGIBLE_INITIAL_AT_OR_ABOVE_THRESHOLD",
             "coverage_complete_from_initial_quote": complete_coverage,
+            "initial_quote_source": initial_source,
             "coverage_started_at": utc_now(),
             "coverage_started_exchange_epoch": started_epoch or None,
             "coverage_started_after_open_seconds": (
@@ -1442,14 +1604,256 @@ class LiveEngine:
             "hypothetical_fill": False,
         })
         if not complete_coverage:
-            tracker["migration_note"] = "tracker_added_after_signal; pre-migration threshold crosses are unknown"
-        elif record.get("initial_signal_price_cents") is None:
-            tracker["initial_quote_source"] = (
-                "opening_quote_capture_first_fresh_executable_ask"
-                if initial_from_opening_capture
-                else "analytics_first_fresh_executable_ask_while_entry_blocked"
+            tracker["migration_note"] = (
+                "tracker_added_after_signal; pre-migration threshold crosses are unknown; "
+                "opening coverage is partial and pre-subscription price events are unknown"
             )
+        else:
+            tracker.pop("migration_note", None)
         return tracker
+
+    def observe_opening_cross_ladder(
+        self, feed: KalshiLiveFeed, record: dict[str, Any], now: float,
+    ) -> bool:
+        """Track shadow 53–59c triggers and one conservative five-rung ladder.
+
+        Trigger prices are observed only in the first 60 seconds. Once a
+        threshold activates, its independent counterfactual ladder remains
+        under observation through market close/settlement. Price-only asks
+        establish touches. Simulated fills require subsequent public trade
+        volume, allocated once across the 50/40/30/20/10 orders in descending
+        price priority; no queue priority is claimed and no exchange order is
+        ever submitted by this analytics lane.
+        """
+
+        if not self.dry_run:
+            return False
+        tracker = record.get("opening_cross_ladder")
+        if not isinstance(tracker, dict):
+            tracker = {
+                "analytics_only": True,
+                "execution_mode": "shadow_only_no_exchange_orders",
+                "trigger_window_seconds": OPENING_CROSS_LADDER_TRIGGER_WINDOW_SECONDS,
+                "trigger_levels_cents": list(OPENING_CROSS_LADDER_TRIGGER_LEVELS),
+                "rung_quantities": {
+                    str(level): format(quantity, "f")
+                    for level, quantity in OPENING_CROSS_LADDER_RUNGS
+                },
+                "price_observations": [], "price_observation_count": 0,
+                "dropped_price_observation_count": 0, "triggered": {},
+                "window_complete": False, "coverage_complete": None,
+                "coverage_note": "migrated active record; earlier price-only events may be unavailable",
+                "last_processed_quote_id": None, "feed_session_token": None,
+            }
+            record["opening_cross_ladder"] = tracker
+        getter = getattr(feed, "selected_price_quotes_between", None)
+        if not callable(getter):
+            return False
+        opened = float(record["market_open_epoch"])
+        closed = float(record["market_close_epoch"])
+        window_end = min(closed, opened + OPENING_CROSS_LADDER_TRIGGER_WINDOW_SECONDS)
+        quotes = getter(record["ticker"], str(record["signal_side"]), opened, min(now, closed))
+        changed = False
+        reference = record.get("opening_price_reference")
+        if tracker.get("coverage_complete") is None and isinstance(reference, dict):
+            tracker["coverage_complete"] = bool(reference.get("coverage_complete_from_market_open"))
+            tracker["coverage_note"] = reference.get("coverage_status")
+            changed = True
+        feed_token = str(getattr(feed, "session_token", "") or "")
+        prior_token = str(tracker.get("feed_session_token") or "")
+        if prior_token and feed_token and prior_token != feed_token and now < closed:
+            tracker["coverage_complete"] = False
+            tracker["coverage_note"] = "worker_or_websocket_session_changed_during_market"
+            tracker["continuity_gap_count"] = int(tracker.get("continuity_gap_count", 0)) + 1
+            tracker["last_processed_quote_id"] = None
+            changed = True
+        if feed_token:
+            tracker["feed_session_token"] = feed_token
+
+        last_id = str(tracker.get("last_processed_quote_id") or "")
+        start_index = 0
+        if last_id:
+            for index, item in enumerate(quotes):
+                if str(item.get("quote_id") or "") == last_id:
+                    start_index = index + 1
+                    break
+            else:
+                tracker["coverage_complete"] = False
+                tracker["coverage_note"] = "prior_price_quote_not_present_after_feed_restart"
+                tracker["continuity_gap_count"] = int(tracker.get("continuity_gap_count", 0)) + 1
+                changed = True
+
+        observations = tracker.setdefault("price_observations", [])
+        observation_ids = {
+            str(item.get("quote_id") or "") for item in observations if isinstance(item, dict)
+        }
+        triggered = tracker.setdefault("triggered", {})
+        newly_triggered: list[int] = []
+        newly_touched: list[str] = []
+        max_observations = int(self.config["opening_quote_max_observations"])
+        for quote in quotes[start_index:]:
+            quote_id = str(quote.get("quote_id") or "")
+            try:
+                quote_epoch = float(quote["selected_component_epoch"])
+                ask_cents = price_to_cents(str(quote["economic_price"]), "ladder selected-side ask")
+            except (KeyError, TypeError, ValueError):
+                continue
+            if quote_epoch <= window_end:
+                tracker["price_observation_count"] = int(tracker.get("price_observation_count", 0)) + 1
+                if (not quote_id or quote_id not in observation_ids) and len(observations) < max_observations:
+                    observations.append({
+                        "quote_id": quote_id or None,
+                        "selected_side_ask_cents": ask_cents,
+                        "selected_side_bid": quote.get("selected_best_bid"),
+                        "selected_component_epoch": quote_epoch,
+                        "selected_component_timestamp": datetime.fromtimestamp(
+                            quote_epoch, timezone.utc,
+                        ).isoformat(),
+                        "elapsed_after_open_seconds": round(max(0.0, quote_epoch - opened), 6),
+                        "source": quote.get("source"),
+                        "displayed_depth_available": False,
+                    })
+                    if quote_id:
+                        observation_ids.add(quote_id)
+                    changed = True
+                elif quote_id not in observation_ids:
+                    tracker["dropped_price_observation_count"] = int(
+                        tracker.get("dropped_price_observation_count", 0)
+                    ) + 1
+                prior_max = tracker.get("maximum_ask_cents_first_60_seconds")
+                prior_min = tracker.get("minimum_ask_cents_first_60_seconds")
+                if prior_max is None or ask_cents > int(prior_max):
+                    tracker["maximum_ask_cents_first_60_seconds"] = ask_cents
+                    changed = True
+                if prior_min is None or ask_cents < int(prior_min):
+                    tracker["minimum_ask_cents_first_60_seconds"] = ask_cents
+                    changed = True
+                for threshold in OPENING_CROSS_LADDER_TRIGGER_LEVELS:
+                    key = str(threshold)
+                    if ask_cents < threshold or key in triggered:
+                        continue
+                    triggered[key] = {
+                        "trigger_cents": threshold,
+                        "trigger_observed_ask_cents": ask_cents,
+                        "trigger_quote_id": quote_id or None,
+                        "trigger_exchange_epoch": quote_epoch,
+                        "trigger_exchange_timestamp": datetime.fromtimestamp(
+                            quote_epoch, timezone.utc,
+                        ).isoformat(),
+                        "trigger_after_open_seconds": round(max(0.0, quote_epoch - opened), 6),
+                        "coverage_complete": bool(tracker.get("coverage_complete")),
+                        "status": "ACTIVE",
+                        "rungs": {
+                            str(level): {
+                                "price_cents": level, "requested_quantity": format(quantity, "f"),
+                                "touched": False, "touch_timestamp": None,
+                                "simulated_filled_quantity": "0.00", "simulated_full_fill": False,
+                                "first_fill_timestamp": None, "final_fill_timestamp": None,
+                            }
+                            for level, quantity in OPENING_CROSS_LADDER_RUNGS
+                        },
+                        "settlement_outcome": None, "directional_winner": None,
+                        "gross_no_stop_pnl": None,
+                    }
+                    newly_triggered.append(threshold)
+                    changed = True
+            for threshold_text, lane in triggered.items():
+                if quote_epoch < float(lane.get("trigger_exchange_epoch") or float("inf")):
+                    continue
+                for level_text, rung in lane.get("rungs", {}).items():
+                    level = int(level_text)
+                    if ask_cents <= level and not rung.get("touched"):
+                        rung.update({
+                            "touched": True,
+                            "touch_timestamp": datetime.fromtimestamp(quote_epoch, timezone.utc).isoformat(),
+                            "touch_quote_id": quote_id or None,
+                            "touch_observed_ask_cents": ask_cents,
+                            "touch_evidence": "price_only_executable_selected_side_ask",
+                        })
+                        newly_touched.append(f">={threshold_text}c:{level}c")
+                        changed = True
+            tracker["last_processed_quote_id"] = quote_id or tracker.get("last_processed_quote_id")
+
+        # Rebuild each counterfactual ladder's public-trade allocation from
+        # scratch so retries/restarts are deterministic and idempotent.
+        side = str(record["signal_side"])
+        for lane in triggered.values():
+            trigger_epoch = float(lane["trigger_exchange_epoch"])
+            try:
+                events = feed.public_trades_after(
+                    record["ticker"], datetime.fromtimestamp(trigger_epoch, timezone.utc),
+                )
+            except (AttributeError, TypeError, ValueError):
+                events = []
+            allocations = {
+                str(level): {"quantity": Decimal("0"), "first": None, "last": None}
+                for level, _ in OPENING_CROSS_LADDER_RUNGS
+            }
+            for event in events:
+                try:
+                    event_cents = price_to_cents(str(event[f"{side}_price"]), "ladder public trade price")
+                    available = Decimal(str(event.get("count") or "0"))
+                except (KeyError, ArithmeticError, TypeError, ValueError):
+                    continue
+                if available <= 0:
+                    continue
+                for level, requested in OPENING_CROSS_LADDER_RUNGS:
+                    if event_cents > level or available <= 0:
+                        continue
+                    bucket = allocations[str(level)]
+                    remaining = requested - bucket["quantity"]
+                    if remaining <= 0:
+                        continue
+                    allocated = min(remaining, available)
+                    if allocated <= 0:
+                        continue
+                    bucket["quantity"] += allocated
+                    bucket["first"] = bucket["first"] or event.get("source_server_timestamp") or event.get("received_at")
+                    bucket["last"] = event.get("source_server_timestamp") or event.get("received_at")
+                    available -= allocated
+            for level, requested in OPENING_CROSS_LADDER_RUNGS:
+                rung = lane["rungs"][str(level)]
+                allocation = allocations[str(level)]
+                prior_quantity = Decimal(str(rung.get("simulated_filled_quantity") or "0"))
+                filled_quantity = allocation["quantity"]
+                if filled_quantity != prior_quantity:
+                    rung.update({
+                        "simulated_filled_quantity": format(filled_quantity, "f"),
+                        "simulated_full_fill": filled_quantity >= requested,
+                        "first_fill_timestamp": allocation["first"],
+                        "final_fill_timestamp": allocation["last"] if filled_quantity >= requested else None,
+                        "fill_assumption": (
+                            "post_trigger_public_trade_volume_allocated_once_across_descending_limits_"
+                            "without_queue_priority"
+                        ),
+                    })
+                    changed = True
+
+        if now >= window_end and not tracker.get("window_complete"):
+            tracker["window_complete"] = True
+            tracker["window_completed_at"] = utc_now()
+            changed = True
+        if changed:
+            self.audit(
+                "opening_cross_ladder_updated", ticker=record["ticker"],
+                side=record["signal_side"], analytics_only=True,
+                entry_circuit_breaker_ignored_for_observation=True,
+                newly_triggered_thresholds=newly_triggered,
+                newly_touched_rungs=newly_touched,
+                price_observation_count=tracker.get("price_observation_count"),
+                coverage_complete=tracker.get("coverage_complete"),
+                coverage_note=tracker.get("coverage_note"),
+                triggered=triggered,
+            )
+            if newly_triggered or newly_touched:
+                LOG.warning(
+                    "OPENING CROSS LADDER | ticker=%s side=%s triggers=%s touches=%s "
+                    "coverage=%s analytics_only=true breaker_independent=true",
+                    record["ticker"], side.upper(), newly_triggered, newly_touched,
+                    tracker.get("coverage_note"),
+                )
+            self.checkpoint("opening_cross_ladder_updated")
+        return changed
 
     def observe_price_analytics(self, feed: KalshiLiveFeed, record: dict[str, Any]) -> bool:
         """Update durable per-signal price-path facts from one fresh book.
@@ -1459,9 +1863,10 @@ class LiveEngine:
         a quote touch alone is never called a fill.
         """
 
+        ladder_changed = self.observe_opening_cross_ladder(feed, record, time.time())
         quote, _ = self.selected_book(feed, record)
         if quote is None:
-            return False
+            return ladder_changed
         quote_id = str(quote.get("quote_id") or "")
         quote_epoch = executable_quote_epoch(quote)
         observation_floor = float(
@@ -1471,6 +1876,10 @@ class LiveEngine:
         )
         if quote_epoch is None or quote_epoch < observation_floor:
             return False
+        if not isinstance(record.get("opening_price_reference"), dict):
+            self.capture_opening_price_reference(
+                feed, record, max(float(record.get("market_open_epoch") or 0), quote_epoch),
+            )
         last_epoch = float(record.get("last_analytics_quote_epoch") or 0)
         if quote_epoch < last_epoch:
             return False
@@ -1478,7 +1887,7 @@ class LiveEngine:
             selected_ask_cents = price_to_cents(str(quote["economic_price"]), "selected-side analytics ask")
         except (KeyError, ValueError):
             return False
-        changed = False
+        changed = ladder_changed
         duplicate_quote = bool(quote_id and quote_id == record.get("last_analytics_quote_id"))
         delayed = self.ensure_delayed_entry_tracking(
             record, quote_epoch, selected_ask_cents, quote_id or None,
@@ -1884,6 +2293,120 @@ class LiveEngine:
             result["entry_after_open_seconds_max"],
         )
         LOG.warning("DELAYED ENTRY PRICE BUCKETS | %s", result["entry_price_buckets_cents"])
+
+    def opening_cross_ladder_performance(self) -> dict[str, Any]:
+        """Rebuild 53–59c first-minute trigger and ladder results idempotently."""
+
+        output: dict[str, Any] = {}
+        for threshold in OPENING_CROSS_LADDER_TRIGGER_LEVELS:
+            monitored = complete = partial = crossed = resolved = wins = losses = 0
+            gross_pnl = Decimal("0")
+            rung_rows = {
+                str(level): {
+                    "price_cents": level, "requested_quantity": format(quantity, "f"),
+                    "touches": 0, "full_fills": 0, "partial_fills": 0,
+                    "simulated_filled_quantity": "0",
+                }
+                for level, quantity in OPENING_CROSS_LADDER_RUNGS
+            }
+            for record in self.state.get("markets", {}).values():
+                if not isinstance(record, dict):
+                    continue
+                tracker = record.get("opening_cross_ladder")
+                if not isinstance(tracker, dict):
+                    continue
+                monitored += 1
+                if tracker.get("coverage_complete"):
+                    complete += 1
+                else:
+                    partial += 1
+                lane = tracker.get("triggered", {}).get(str(threshold))
+                if not isinstance(lane, dict):
+                    continue
+                crossed += 1
+                winner = lane.get("directional_winner")
+                pnl = lane.get("gross_no_stop_pnl")
+                if winner is not None and pnl is not None:
+                    resolved += 1
+                    wins += int(bool(winner))
+                    losses += int(not bool(winner))
+                    gross_pnl += Decimal(str(pnl))
+                for level, requested in OPENING_CROSS_LADDER_RUNGS:
+                    rung = lane.get("rungs", {}).get(str(level), {})
+                    row = rung_rows[str(level)]
+                    quantity = Decimal(str(rung.get("simulated_filled_quantity") or "0"))
+                    row["touches"] += int(bool(rung.get("touched")))
+                    row["full_fills"] += int(quantity >= requested)
+                    row["partial_fills"] += int(Decimal("0") < quantity < requested)
+                    row["simulated_filled_quantity"] = format(
+                        Decimal(str(row["simulated_filled_quantity"])) + quantity, "f",
+                    )
+            output[str(threshold)] = {
+                "trigger_cents": threshold,
+                "monitored_markets": monitored,
+                "complete_coverage_markets": complete,
+                "partial_coverage_markets": partial,
+                "threshold_crosses_first_60_seconds": crossed,
+                "threshold_cross_rate": crossed / monitored if monitored else None,
+                "resolved_crosses": resolved,
+                "directional_wins": wins,
+                "directional_losses": losses,
+                "directional_win_rate": wins / resolved if resolved else None,
+                "gross_no_stop_pnl": format(gross_pnl, "f"),
+                "gross_no_stop_ev_per_resolved_cross": (
+                    format(gross_pnl / resolved, "f") if resolved else None
+                ),
+                "rungs": rung_rows,
+            }
+        summary = {
+            "analytics_only": True,
+            "trigger_window_seconds": OPENING_CROSS_LADDER_TRIGGER_WINDOW_SECONDS,
+            "trigger_levels_cents": list(OPENING_CROSS_LADDER_TRIGGER_LEVELS),
+            "rung_quantities": {
+                str(level): format(quantity, "f") for level, quantity in OPENING_CROSS_LADDER_RUNGS
+            },
+            "touch_evidence": "price_only_executable_selected_side_ask_at_or_below_rung",
+            "fill_assumption": (
+                "post_trigger_public_trade_volume_allocated_once_across_descending_limits_"
+                "without_queue_priority"
+            ),
+            "entry_circuit_breakers_affect_observation": False,
+            "thresholds": output,
+            "updated_at": utc_now(),
+        }
+        self.state["opening_cross_ladder_performance"] = summary
+        return summary
+
+    def log_opening_cross_ladder_performance(self) -> None:
+        summary = self.opening_cross_ladder_performance()
+        LOG.warning("================ FIRST-60S 53-59C CROSS LADDER ================")
+        LOG.warning(
+            "TRIGGER | MARKETS | COMPLETE | PARTIAL | CROSSES | CROSS RATE | RESOLVED | W/L | WR | GROSS PNL"
+        )
+        for threshold in OPENING_CROSS_LADDER_TRIGGER_LEVELS:
+            row = summary["thresholds"][str(threshold)]
+            cross_rate = row["threshold_cross_rate"]
+            win_rate = row["directional_win_rate"]
+            LOG.warning(
+                ">=%sc | %7d | %8d | %7d | %7d | %s | %8d | %d/%d | %s | $%s",
+                threshold, row["monitored_markets"], row["complete_coverage_markets"],
+                row["partial_coverage_markets"], row["threshold_crosses_first_60_seconds"],
+                "n/a" if cross_rate is None else f"{100 * cross_rate:.2f}%",
+                row["resolved_crosses"], row["directional_wins"], row["directional_losses"],
+                "n/a" if win_rate is None else f"{100 * win_rate:.2f}%",
+                row["gross_no_stop_pnl"],
+            )
+            LOG.warning(
+                ">=%sc LADDER | %s",
+                threshold,
+                " | ".join(
+                    f"{level}c x{format(quantity, 'f')}:"
+                    f"touch={row['rungs'][str(level)]['touches']} "
+                    f"full={row['rungs'][str(level)]['full_fills']} "
+                    f"partial={row['rungs'][str(level)]['partial_fills']}"
+                    for level, quantity in OPENING_CROSS_LADDER_RUNGS
+                ),
+            )
 
     def log_entry_price_performance(self) -> None:
         summary = self.entry_price_performance()
@@ -2581,6 +3104,7 @@ class LiveEngine:
         observation = {
             "captured_at": utc_now(), "captured_epoch": now,
             "elapsed_after_open_seconds": round(max(0.0, now - start), 6),
+            "exchange_elapsed_after_open_seconds": round(max(0.0, quote_epoch - start), 6),
             "quote_id": quote_id or None, "source": "kalshi_websocket_complete_top_of_book",
             "source_server_timestamp": quote.get("source_server_timestamp"),
             "source_timestamp_ms": quote.get("source_timestamp_ms"), "received_at": quote.get("received_at"),
@@ -2598,8 +3122,23 @@ class LiveEngine:
             "post_only_would_cross": None,
         }
         observations.append(observation)
+        price_reference = record.get("opening_price_reference")
+        reference_epoch = (
+            float(price_reference.get("selected_component_epoch") or 0)
+            if isinstance(price_reference, dict) else 0.0
+        )
         capture.update({
             "started_at": capture.get("started_at") or utc_now(), "first_capture_lag_seconds": capture.get("first_capture_lag_seconds", observation["elapsed_after_open_seconds"]),
+            "first_depth_capture_lag_seconds": capture.get(
+                "first_depth_capture_lag_seconds", observation["exchange_elapsed_after_open_seconds"],
+            ),
+            "first_depth_observed_lag_seconds": capture.get(
+                "first_depth_observed_lag_seconds", observation["elapsed_after_open_seconds"],
+            ),
+            "first_depth_after_price_seconds": capture.get(
+                "first_depth_after_price_seconds",
+                round(max(0.0, quote_epoch - reference_epoch), 6) if reference_epoch else None,
+            ),
             # The first usable book, not a wall-clock moment before the feed
             # was ready, anchors the short maximum-price discovery sample.
             "discovery_anchor_at": capture.get("discovery_anchor_at") or observation["captured_at"],
@@ -2614,6 +3153,16 @@ class LiveEngine:
             self.audit(
                 "opening_quote_capture_started", ticker=record["ticker"], side=side,
                 maker_price_offset=record.get("maker_price_offset"),
+                first_depth_exchange_lag_seconds=capture.get("first_depth_capture_lag_seconds"),
+                first_depth_worker_lag_seconds=capture.get("first_depth_observed_lag_seconds"),
+                first_depth_after_price_seconds=capture.get("first_depth_after_price_seconds"),
+            )
+            LOG.warning(
+                "FIRST DISPLAYED DEPTH | ticker=%s side=%s selected_ask=%s depth=%s "
+                "exchange_lag=%ss after_first_price=%ss quote_id=%s",
+                record["ticker"], side.upper(), observation["selected_best_ask"],
+                observation["selected_ask_size"], capture.get("first_depth_capture_lag_seconds"),
+                capture.get("first_depth_after_price_seconds"), observation["quote_id"],
             )
             self.checkpoint("opening_quote_capture_started")
 
@@ -3811,7 +4360,14 @@ class LiveEngine:
         )
 
     async def submit_entry(self, rest: KalshiREST, feed: KalshiLiveFeed, record: dict[str, Any], now: float) -> None:
-        if record.get("status") != "SIGNAL_PENDING" or not self.circuit_allows_entry():
+        if record.get("status") != "SIGNAL_PENDING":
+            return
+        # Opening-price evidence is observational and remains active even
+        # while a persistent circuit breaker correctly blocks new exposure.
+        # This keeps the shadow ledger useful without weakening the breaker.
+        self.capture_opening_price_reference(feed, record, now)
+        self.capture_opening_quote(feed, record, now)
+        if not self.circuit_allows_entry():
             return
         if now > float(record["market_open_epoch"]) + int(self.config["entry_lateness_seconds"]):
             self.transition(record, "MISSED_SIGNAL", "entry_lateness_exceeded")
@@ -3819,7 +4375,6 @@ class LiveEngine:
         # v11 has one reviewed entry contract.  Retained legacy functions are
         # unreachable because configuration validation and this hard branch
         # both reject every older execution mode.
-        self.capture_opening_quote(feed, record, now)
         if self.config["entry_execution_mode"] != "signal_price_minus_offset_maker":
             self.trip("unsupported_entry_execution_mode")
             return
@@ -4318,6 +4873,30 @@ class LiveEngine:
                 })
             else:
                 delayed["status"] = "NO_THRESHOLD_CROSS_OBSERVED"
+        opening_ladder = record.get("opening_cross_ladder")
+        if isinstance(opening_ladder, dict):
+            opening_ladder["settlement_outcome"] = outcome
+            opening_ladder["directional_winner"] = winner
+            opening_ladder["settlement_finalized_at"] = utc_now()
+            for lane in opening_ladder.get("triggered", {}).values():
+                filled_quantity = Decimal("0")
+                entry_cost = Decimal("0")
+                for level, _ in OPENING_CROSS_LADDER_RUNGS:
+                    rung = lane.get("rungs", {}).get(str(level), {})
+                    quantity = Decimal(str(rung.get("simulated_filled_quantity") or "0"))
+                    filled_quantity += quantity
+                    entry_cost += quantity * cents_price(level)
+                payout = filled_quantity if winner else Decimal("0")
+                lane.update({
+                    "settlement_outcome": outcome,
+                    "directional_winner": winner,
+                    "simulated_filled_quantity": format(filled_quantity, "f"),
+                    "simulated_entry_cost": format(entry_cost, "f"),
+                    "simulated_settlement_payout": format(payout, "f"),
+                    "gross_no_stop_pnl": format(payout - entry_cost, "f"),
+                    "status": "SETTLED_WIN" if winner else "SETTLED_LOSS",
+                    "settlement_finalized_at": utc_now(),
+                })
         if stopped_then_winner:
             proceeds, _ = self.exit_proceeds(record)
             quantity = Decimal(str(record.get("actual_quantity") or "0"))
@@ -4326,6 +4905,7 @@ class LiveEngine:
             record["exit_classification"] = "ENTRY_NOT_FILLED"
         summary = self.entry_price_performance()
         delayed_summary = self.delayed_entry_performance()
+        ladder_summary = self.opening_cross_ladder_performance()
         level_status = " ".join(
             f"{level}c:{'HIT' if record.get('shadow_entry_levels', {}).get(str(level), {}).get('touched') else 'MISS'}"
             for level in range(49, 39, -1)
@@ -4344,6 +4924,8 @@ class LiveEngine:
             delayed_entry_resolved=delayed_summary["resolved_entries"],
             delayed_entry_directional_wins=delayed_summary["directional_wins"],
             delayed_entry_directional_losses=delayed_summary["directional_losses"],
+            opening_cross_ladder=record.get("opening_cross_ladder"),
+            opening_cross_ladder_summary=ladder_summary,
         )
         LOG.warning(
             "SETTLEMENT PRICE PATH | ticker=%s side=%s outcome=%s winner=%s "
@@ -4631,6 +5213,7 @@ class LiveEngine:
                     # Quotes update analytics but never rewrite the frozen
                     # signal-side initial price or its derived limit. This
                     # continues after a stop until official settlement.
+                    self.capture_opening_price_reference(feed, current_record, now)
                     self.capture_opening_quote(feed, current_record, now)
                     self.observe_price_analytics(feed, current_record)
                     if time.monotonic() - self.last_stop_poll >= float(self.config["stop_poll_interval"]):
@@ -4661,7 +5244,8 @@ class LiveEngine:
                     "HEARTBEAT | mode=%s ticker=%s state=%s base=%s exponent=%d target=%s "
                     "deficit=%s threshold=%s tracked=%d filled=%d zero=%d funding_failures=%d "
                     "missed=%d maker_fills=%d ioc_fills=%d mixed=%d opening_quotes=%s "
-                    "first_quote_lag=%s maker_limit=%s gtc_market_close_in=%s entry_fill_p50=%s "
+                    "first_price_quote_lag=%s first_depth_quote_lag=%s opening_price_coverage=%s "
+                    "maker_limit=%s gtc_market_close_in=%s entry_fill_p50=%s "
                     "stop_from_fill_p50=%s shadow_balance=%s shadow_pnl=%s shadow_dd=%s "
                     "completed=%s stops=%s settlements=%s fees=%s hybrid_state=%s exit_class=%s "
                     "entry_mode=%s maker_tif=%s entry_lifetime=%s initial_quotes=%s stop_safety_no_entry=%s "
@@ -4676,7 +5260,9 @@ class LiveEngine:
                     execution["zero_fill_markets"], execution["funding_failure_markets"],
                     execution["missed_signal_markets"], execution["maker_limit_fill_markets"],
                     execution["market_ioc_fill_markets"], execution["mixed_entry_markets"],
-                    capture.get("observation_count"), capture.get("first_capture_lag_seconds"),
+                    capture.get("observation_count"), capture.get("first_price_capture_lag_seconds"),
+                    capture.get("first_depth_capture_lag_seconds"),
+                    capture.get("first_price_coverage_status"),
                     record.get("maker_entry_price") if isinstance(record, dict) else None,
                     gtc_market_close_in, entry_latency.get("median_seconds"), stop_latency.get("median_seconds"),
                     shadow.get("balance"), self.state.get("cumulative_realized_pnl"), shadow.get("max_drawdown"),
@@ -4698,6 +5284,7 @@ class LiveEngine:
             if time.monotonic() - self.last_analytics_log >= 300:
                 self.log_entry_price_performance()
                 self.log_delayed_entry_performance()
+                self.log_opening_cross_ladder_performance()
                 self.log_hybrid_stop_performance()
                 self.last_analytics_log = time.monotonic()
             elapsed = time.monotonic() - start
@@ -4709,6 +5296,7 @@ class LiveEngine:
                     self.checkpoint("safe_handoff_ready")
                     self.log_entry_price_performance()
                     self.log_delayed_entry_performance()
+                    self.log_opening_cross_ladder_performance()
                     self.log_hybrid_stop_performance()
                     LOG.warning(
                         "SAFE HANDOFF READY | ticker=%s elapsed=%.1fs window=%s..%s; queuing may proceed.",
@@ -4764,7 +5352,11 @@ async def async_main(args: argparse.Namespace) -> int:
         raise SystemExit(
             f"configuration trading_mode={config['trading_mode']} does not match guarded runtime mode={expected_mode}"
         )
-    LOG.warning("MODE=%s | strategy=%s config_hash=%s", "LIVE" if live else "DRY_RUN", config["strategy_version"], config_hash(config)[:12])
+    LOG.warning(
+        "MODE=%s | strategy=%s config_hash=%s opening_price_capture_contract=v%s",
+        "LIVE" if live else "DRY_RUN", config["strategy_version"], config_hash(config)[:12],
+        OPENING_PRICE_CAPTURE_CONTRACT_VERSION,
+    )
     api_key = os.getenv("KALSHI_API_KEY_ID", "")
     pem_path = Path(os.getenv("KALSHI_PEM_PATH", "kalshi_private_key.pem"))
     if not api_key or not pem_path.exists():
