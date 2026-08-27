@@ -1335,45 +1335,62 @@ class LiveEngine:
         return cents_price(limit_cents)
 
     def ensure_delayed_entry_tracking(
-        self, record: dict[str, Any], quote_epoch: float | None = None,
+        self,
+        record: dict[str, Any],
+        quote_epoch: float | None = None,
+        observed_ask_cents: int | None = None,
     ) -> dict[str, Any] | None:
         """Return/backfill the compact >=53c tracker for an active record.
 
         Older v11 checkpoints did not have this analytics-only object.  They
         can continue being managed safely, but their tracker is explicitly
         marked as late-started so downstream analysis cannot mistake partial
-        quote coverage for complete history.
+        quote coverage for complete history.  New records may initialize this
+        tracker from their first fresh book even when a persistent circuit
+        breaker correctly prevents the primary order path from freezing an
+        execution price.
         """
 
-        initial_raw = record.get("initial_signal_price_cents")
-        if initial_raw is None:
-            return None
-        threshold = int(self.config["delayed_entry_threshold_cents"])
-        tracker = record.get("delayed_entry_tracking")
+        existing_tracker = isinstance(record.get("delayed_entry_tracking"), dict)
+        tracker = record.get("delayed_entry_tracking") if existing_tracker else {}
         if not isinstance(tracker, dict):
             tracker = {}
-            record["delayed_entry_tracking"] = tracker
+        record["delayed_entry_tracking"] = tracker
         if tracker.get("status") not in {None, "PENDING_INITIAL_PRICE"}:
             return tracker
+        initial_raw = record.get("initial_signal_price_cents")
+        if initial_raw is None:
+            initial_raw = observed_ask_cents
+        if initial_raw is None:
+            return tracker
+        threshold = int(self.config["delayed_entry_threshold_cents"])
         initial = int(initial_raw)
         started_epoch = quote_epoch or float(record.get("initial_signal_price_epoch") or 0)
         open_epoch = float(record.get("market_open_epoch") or 0)
+        complete_coverage = bool(
+            tracker.get("coverage_complete_from_initial_quote")
+            if existing_tracker
+            else False
+        )
         tracker.update({
             "enabled": bool(self.config["delayed_entry_tracking_enabled"]),
             "threshold_cents": threshold,
             "initial_signal_price_cents": initial,
             "eligible": bool(initial < threshold),
             "status": "WATCHING" if initial < threshold else "INELIGIBLE_INITIAL_AT_OR_ABOVE_THRESHOLD",
-            "coverage_complete_from_initial_quote": False,
+            "coverage_complete_from_initial_quote": complete_coverage,
             "coverage_started_at": utc_now(),
             "coverage_started_exchange_epoch": started_epoch or None,
             "coverage_started_after_open_seconds": (
                 round(max(0.0, started_epoch - open_epoch), 6) if started_epoch and open_epoch else None
             ),
-            "migration_note": "tracker_added_after_signal; pre-migration threshold crosses are unknown",
             "threshold_reached": False,
             "hypothetical_fill": False,
         })
+        if not complete_coverage:
+            tracker["migration_note"] = "tracker_added_after_signal; pre-migration threshold crosses are unknown"
+        elif record.get("initial_signal_price_cents") is None:
+            tracker["initial_quote_source"] = "analytics_first_fresh_executable_ask_while_entry_blocked"
         return tracker
 
     def observe_price_analytics(self, feed: KalshiLiveFeed, record: dict[str, Any]) -> bool:
@@ -1384,14 +1401,17 @@ class LiveEngine:
         a quote touch alone is never called a fill.
         """
 
-        if record.get("initial_signal_price_cents") is None:
-            return False
         quote, _ = self.selected_book(feed, record)
         if quote is None:
             return False
         quote_id = str(quote.get("quote_id") or "")
         quote_epoch = executable_quote_epoch(quote)
-        if quote_epoch is None or quote_epoch < float(record.get("initial_signal_price_epoch") or 0):
+        observation_floor = float(
+            record.get("initial_signal_price_epoch")
+            or record.get("market_open_epoch")
+            or 0
+        )
+        if quote_epoch is None or quote_epoch < observation_floor:
             return False
         last_epoch = float(record.get("last_analytics_quote_epoch") or 0)
         if quote_epoch < last_epoch:
@@ -1402,7 +1422,7 @@ class LiveEngine:
             return False
         changed = False
         duplicate_quote = bool(quote_id and quote_id == record.get("last_analytics_quote_id"))
-        delayed = self.ensure_delayed_entry_tracking(record, quote_epoch)
+        delayed = self.ensure_delayed_entry_tracking(record, quote_epoch, selected_ask_cents)
         delayed_entry_recorded = False
         if (
             isinstance(delayed, dict)
@@ -1476,7 +1496,7 @@ class LiveEngine:
         if delayed_entry_recorded:
             self.audit(
                 "delayed_entry_threshold_reached", ticker=record["ticker"], side=record["signal_side"],
-                initial_signal_price_cents=record.get("initial_signal_price_cents"),
+                initial_signal_price_cents=delayed.get("initial_signal_price_cents"),
                 threshold_cents=delayed.get("threshold_cents"),
                 entry_price_cents=delayed.get("first_entry_price_cents"),
                 entry_after_open_seconds=delayed.get("first_entry_after_open_seconds"),
@@ -1489,7 +1509,7 @@ class LiveEngine:
                 "DELAYED >=53C ENTRY TRACKED | ticker=%s side=%s initial=%sc entry=%sc "
                 "after_open=%.3fs after_60s=%s depth=%s configured_qty_fillable=%s analytics_only=true",
                 record["ticker"], str(record["signal_side"]).upper(),
-                record.get("initial_signal_price_cents"), delayed.get("first_entry_price_cents"),
+                delayed.get("initial_signal_price_cents"), delayed.get("first_entry_price_cents"),
                 float(delayed.get("first_entry_after_open_seconds") or 0),
                 delayed.get("first_entry_after_opening_capture_window"), delayed.get("displayed_ask_depth"),
                 delayed.get("configured_quantity_fully_fillable"),
