@@ -413,6 +413,55 @@ class LiveExecutionTests(unittest.TestCase):
         ])
         self.assertFalse(rungs["10"]["simulated_full_fill"])
 
+    def test_cross_ladder_fill_cursor_survives_feed_restart_without_erasing_or_reusing_volume(self) -> None:
+        ticker = "KXBTC15M-ladder-restart-cursor"
+        opened = time.time() - 100
+        first_feed = KalshiLiveFeed(auth=None)
+        first_feed.set_tickers([ticker])
+        first_feed.subscription_started_epoch[ticker] = opened - 5
+        first_feed._handle(json.dumps({
+            "type": "ticker", "msg": {
+                "market_ticker": ticker, "yes_bid_dollars": "0.54",
+                "yes_ask_dollars": "0.55", "ts_ms": int((opened + 1) * 1000),
+            },
+        }))
+        first_trade_time = datetime.fromtimestamp(opened + 2, timezone.utc).isoformat()
+        first_feed.public_trades[ticker] = [{
+            "trade_id": "before-restart-49", "ticker": ticker,
+            "yes_price": "0.49", "no_price": None, "count": "1.00",
+            "source_server_timestamp": first_trade_time, "received_at": first_trade_time,
+        }]
+        engine = self.engine()
+        record = engine.set_signal(
+            {"ticker": ticker, "open_epoch": opened, "close_epoch": opened + 900},
+            {"outcome": "no", "ticker": "KXBTC15M-prior"},
+        )
+        engine.capture_opening_price_reference(first_feed, record, opened + 1)
+        engine.observe_opening_cross_ladder(first_feed, record, opened + 3)
+        rungs = record["opening_cross_ladder"]["triggered"]["53"]["rungs"]
+        self.assertEqual(rungs["50"]["simulated_filled_quantity"], "1.00")
+
+        # A replacement worker has a new feed session and no old in-memory
+        # trades. Existing fills remain durable; only the new 39c print may
+        # allocate volume, and a repeated observation is idempotent.
+        replacement_feed = KalshiLiveFeed(auth=None)
+        replacement_feed.set_tickers([ticker])
+        replacement_feed.subscription_started_epoch[ticker] = opened + 10
+        engine.observe_opening_cross_ladder(replacement_feed, record, opened + 11)
+        self.assertEqual(rungs["50"]["simulated_filled_quantity"], "1.00")
+        second_trade_time = datetime.fromtimestamp(opened + 12, timezone.utc).isoformat()
+        replacement_feed.public_trades[ticker] = [{
+            "trade_id": "after-restart-39", "ticker": ticker,
+            "yes_price": "0.39", "no_price": None, "count": "2.00",
+            "source_server_timestamp": second_trade_time, "received_at": second_trade_time,
+        }]
+        engine.observe_opening_cross_ladder(replacement_feed, record, opened + 13)
+        self.assertEqual(rungs["50"]["simulated_filled_quantity"], "1.00")
+        self.assertEqual(rungs["40"]["simulated_filled_quantity"], "2.00")
+        self.assertEqual(rungs["30"]["simulated_filled_quantity"], "0.00")
+        engine.observe_opening_cross_ladder(replacement_feed, record, opened + 14)
+        self.assertEqual(rungs["40"]["simulated_filled_quantity"], "2.00")
+
     def test_persistent_shadow_only_lock_blocks_live_mode(self) -> None:
         self.assertFalse(live_mode_allowed(True, True, True, False))
         self.assertFalse(live_mode_allowed(True, True, False, True))
