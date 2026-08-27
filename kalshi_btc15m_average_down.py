@@ -305,6 +305,23 @@ def timestamp_epoch(raw: Any) -> int | None:
         return None
 
 
+def quote_timestamp_epoch(raw: Any) -> float | None:
+    """Parse subsecond ticker timestamps, including Kalshi's millisecond form."""
+
+    if raw in (None, ""):
+        return None
+    numeric = as_float(raw)
+    if numeric is not None:
+        return numeric / 1000.0 if abs(numeric) > 10_000_000_000 else numeric
+    try:
+        parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.timestamp()
+    except ValueError:
+        return None
+
+
 def market_is_tradeable(market: Any) -> bool:
     """Trade only in the actual open window, never during an active pre-open."""
     open_time = timestamp_epoch(field(market, "open_time"))
@@ -906,6 +923,17 @@ class KalshiLiveFeed:
         self.desired_tickers: set[str] = set()
         self.subscribed_tickers: set[str] = set()
         self.quotes: dict[str, dict[str, Any]] = {}
+        # Price history is deliberately separate from ``complete_book``.
+        # Kalshi frequently publishes a fresh bid/ask without displayed size;
+        # that is sufficient to freeze the strategy's opening price, but it
+        # is never sufficient evidence of fillable depth.  Keeping the first
+        # price update lets a pre-subscribed worker retain the actual first
+        # selected-side quote after open instead of whatever full-depth book
+        # happens to arrive seconds later.
+        self.price_books: dict[str, list[dict[str, Any]]] = {}
+        self.subscription_started_epoch: dict[str, float] = {}
+        self.session_generation = 0
+        self.session_token = uuid.uuid4().hex
         self.public_trades: dict[str, list[dict[str, Any]]] = {}
         self.connected = False
         self.message_count = 0
@@ -921,9 +949,157 @@ class KalshiLiveFeed:
             # executable for a newly watched ticker.
             for ticker in desired - self.desired_tickers:
                 self.quotes.pop(ticker, None)
+                self.price_books.pop(ticker, None)
+                self.subscription_started_epoch.pop(ticker, None)
                 self.public_trades.pop(ticker, None)
+                if ticker in self.subscribed_tickers:
+                    # The socket may still carry this ticker from an earlier
+                    # rolling window. Re-adding it is only partial coverage
+                    # from this new watch period, never continuous pre-open
+                    # evidence inherited from the earlier subscription.
+                    self.subscription_started_epoch[ticker] = time.time()
+            for ticker in set(self.price_books) - desired:
+                self.price_books.pop(ticker, None)
+                self.subscription_started_epoch.pop(ticker, None)
             self.desired_tickers = desired
             self._wake.set()
+
+    def first_post_open_price_quote(
+        self, ticker: str, side: str, market_open_epoch: float,
+    ) -> tuple[dict[str, Any] | None, str]:
+        """Return the earliest selected-side ask received at/after market open.
+
+        The selected YES ask comes from ``yes_ask``; the selected NO ask is
+        ``1 - yes_bid``.  Only that price component must be fresh after open,
+        so an unrelated stale component cannot delay entry-price capture.
+        Displayed size is intentionally absent: fills/stops continue to use
+        the stricter complete-book and public-trade evidence paths.
+        """
+
+        normalized_side = str(side).lower()
+        if normalized_side not in {"yes", "no"}:
+            return None, "invalid_side"
+        try:
+            opened = float(market_open_epoch)
+        except (TypeError, ValueError):
+            return None, "invalid_market_open"
+        for book in self.price_books.get(ticker, []):
+            component = "yes_ask" if normalized_side == "yes" else "yes_bid"
+            if book.get(f"{component}_updated") is False:
+                continue
+            component_source = book.get(f"{component}_source_timestamp")
+            component_received = as_float(book.get(f"{component}_received_epoch"))
+            component_epoch = quote_timestamp_epoch(component_source)
+            if component_epoch is None:
+                component_epoch = component_received
+            if component_epoch is None or component_epoch < opened:
+                continue
+            yes_bid = as_float(book.get("yes_bid"))
+            yes_ask = as_float(book.get("yes_ask"))
+            selected_ask = yes_ask if normalized_side == "yes" else (
+                1.0 - yes_bid if yes_bid is not None else None
+            )
+            selected_bid = yes_bid if normalized_side == "yes" else (
+                1.0 - yes_ask if yes_ask is not None else None
+            )
+            if selected_ask is None:
+                continue
+            if not (0.0 < selected_ask < 1.0):
+                continue
+            selected_bid_value = (
+                round(selected_bid, 4)
+                if selected_bid is not None and 0.0 < selected_bid <= selected_ask else None
+            )
+            subscribed_at = self.subscription_started_epoch.get(ticker)
+            complete_from_open = subscribed_at is not None and subscribed_at <= opened
+            return {
+                "quote_id": str(book.get("quote_id") or ""),
+                "ticker": ticker,
+                "side": normalized_side,
+                "economic_price": round(selected_ask, 4),
+                "selected_best_bid": selected_bid_value,
+                "yes_bid": round(yes_bid, 4) if yes_bid is not None else None,
+                "yes_ask": round(yes_ask, 4) if yes_ask is not None else None,
+                "yes_bid_component_epoch": book.get("yes_bid_component_epoch"),
+                "yes_ask_component_epoch": book.get("yes_ask_component_epoch"),
+                "selected_component_epoch": component_epoch,
+                "source_server_timestamp": book.get("source_server_timestamp"),
+                "source_timestamp_ms": book.get("source_timestamp_ms"),
+                "received_epoch": book.get("received_epoch"),
+                "received_at": book.get("received_at"),
+                "subscription_started_epoch": subscribed_at,
+                "coverage_complete_from_market_open": complete_from_open,
+                "coverage_status": (
+                    "COMPLETE_PREOPEN_SUBSCRIPTION"
+                    if complete_from_open else "PARTIAL_SUBSCRIPTION_STARTED_AFTER_OPEN"
+                ),
+                "displayed_depth_available": False,
+                "displayed_depth": None,
+                "source": "kalshi_websocket_price_only_top_of_book",
+            }, "first_post_open_selected_side_price"
+        return None, "first_post_open_selected_side_price_unavailable"
+
+    def selected_price_quotes_between(
+        self, ticker: str, side: str, start_epoch: float, end_epoch: float,
+    ) -> list[dict[str, Any]]:
+        """Return every fresh selected-side price component in an event window.
+
+        This is price-path evidence only.  It contains no displayed size and
+        therefore cannot by itself establish a simulated or live fill.
+        """
+
+        normalized_side = str(side).lower()
+        if normalized_side not in {"yes", "no"}:
+            return []
+        component = "yes_ask" if normalized_side == "yes" else "yes_bid"
+        output: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for book in self.price_books.get(ticker, []):
+            if book.get(f"{component}_updated") is False:
+                continue
+            component_epoch = quote_timestamp_epoch(book.get(f"{component}_source_timestamp"))
+            if component_epoch is None:
+                component_epoch = as_float(book.get(f"{component}_received_epoch"))
+            if component_epoch is None or not float(start_epoch) <= component_epoch <= float(end_epoch):
+                continue
+            yes_bid = as_float(book.get("yes_bid"))
+            yes_ask = as_float(book.get("yes_ask"))
+            selected_ask = yes_ask if normalized_side == "yes" else (
+                1.0 - yes_bid if yes_bid is not None else None
+            )
+            selected_bid = yes_bid if normalized_side == "yes" else (
+                1.0 - yes_ask if yes_ask is not None else None
+            )
+            if selected_ask is None or not 0.0 < selected_ask < 1.0:
+                continue
+            quote_id = str(book.get("quote_id") or "")
+            if quote_id and quote_id in seen:
+                continue
+            if quote_id:
+                seen.add(quote_id)
+            output.append({
+                "quote_id": quote_id or None,
+                "ticker": ticker,
+                "side": normalized_side,
+                "economic_price": round(selected_ask, 4),
+                "selected_best_bid": (
+                    round(selected_bid, 4)
+                    if selected_bid is not None and 0.0 < selected_bid <= selected_ask else None
+                ),
+                "selected_component_epoch": component_epoch,
+                "received_epoch": book.get("received_epoch"),
+                "received_at": book.get("received_at"),
+                "source_server_timestamp": book.get("source_server_timestamp"),
+                "source_timestamp_ms": book.get("source_timestamp_ms"),
+                "ticker_sequence": book.get("ticker_sequence"),
+                "session_generation": book.get("session_generation"),
+                "displayed_depth_available": False,
+                "source": "kalshi_websocket_price_only_top_of_book",
+            })
+        output.sort(key=lambda item: (
+            float(item["selected_component_epoch"]), int(item.get("ticker_sequence") or 0),
+        ))
+        return output
 
     def executable_asks(self, ticker: str) -> dict[str, float | None] | None:
         """Return current YES/NO executable asks from a fresh ticker update."""
@@ -1089,6 +1265,9 @@ class KalshiLiveFeed:
             "cmd": "subscribe",
             "params": {"channels": ["ticker", "trade"], "market_tickers": sorted(tickers)},
         })
+        subscribed_at = time.time()
+        for ticker in tickers:
+            self.subscription_started_epoch.setdefault(ticker, subscribed_at)
         self.subscribed_tickers.update(tickers)
         LOG.info("WS SUBSCRIBE | tickers=%s", ",".join(sorted(tickers)))
 
@@ -1115,6 +1294,8 @@ class KalshiLiveFeed:
         if message_type == "trade":
             message = payload.get("msg") or {}
             ticker = str(message.get("market_ticker") or message.get("ticker") or "")
+            if ticker not in self.desired_tickers:
+                return
             trade_id = str(message.get("trade_id") or "")
             source_time = field(message, "ts_ms", "created_time", "time", "ts")
             count = as_float(field(message, "count_fp", "count"))
@@ -1141,7 +1322,7 @@ class KalshiLiveFeed:
             return
         message = payload.get("msg") or {}
         ticker = str(message.get("market_ticker") or message.get("ticker") or "")
-        if not ticker:
+        if not ticker or ticker not in self.desired_tickers:
             return
         quote = self.quotes.setdefault(ticker, {})
         yes_bid = as_float(message.get("yes_bid_dollars", message.get("yes_bid")))
@@ -1165,13 +1346,13 @@ class KalshiLiveFeed:
         # not displayed size.  Reconstruct the latest bid/ask state with
         # component timestamps so a final price-only ticker update is not
         # discarded merely because it omitted depth fields.
-        if (yes_bid is not None or yes_ask is not None) and quote.get("yes_bid") is not None and quote.get("yes_ask") is not None:
+        if yes_bid is not None or yes_ask is not None:
             ticker_sequence = int(quote.get("ticker_sequence") or 0) + 1
             quote["ticker_sequence"] = ticker_sequence
-            quote["ticker_book"] = {
+            ticker_book = {
                 "quote_id": f"{ticker}:ticker:{ticker_sequence}:{received_at}",
-                "yes_bid": quote["yes_bid"],
-                "yes_ask": quote["yes_ask"],
+                "yes_bid": quote.get("yes_bid"),
+                "yes_ask": quote.get("yes_ask"),
                 "yes_bid_received_epoch": quote.get("yes_bid_received_epoch"),
                 "yes_ask_received_epoch": quote.get("yes_ask_received_epoch"),
                 "yes_bid_source_timestamp": quote.get("yes_bid_source_timestamp"),
@@ -1180,7 +1361,28 @@ class KalshiLiveFeed:
                 "received_at": received_at,
                 "source_server_timestamp": source_server_timestamp,
                 "source_timestamp_ms": source_timestamp_ms,
+                "session_generation": self.session_generation,
+                "yes_bid_updated": yes_bid is not None,
+                "yes_ask_updated": yes_ask is not None,
+                "ticker_sequence": ticker_sequence,
             }
+            ticker_book["yes_bid_component_epoch"] = (
+                quote_timestamp_epoch(ticker_book.get("yes_bid_source_timestamp"))
+                or ticker_book.get("yes_bid_received_epoch")
+            )
+            ticker_book["yes_ask_component_epoch"] = (
+                quote_timestamp_epoch(ticker_book.get("yes_ask_source_timestamp"))
+                or ticker_book.get("yes_ask_received_epoch")
+            )
+            history = self.price_books.setdefault(ticker, [])
+            history.append(ticker_book)
+            if len(history) > 5000:
+                del history[:-5000]
+            # Outcome inference needs a coherent two-sided state, while first
+            # quote capture only needs the freshly updated selected-side ask.
+            # Do not make the latter wait for the opposite component.
+            if ticker_book.get("yes_bid") is not None and ticker_book.get("yes_ask") is not None:
+                quote["ticker_book"] = dict(ticker_book)
         # Preserve only a *complete snapshot* for executable-shadow fills.
         # Delta updates and last-trade-only messages are useful operational
         # signals, but cannot establish a displayed, executable quote.
@@ -1227,10 +1429,14 @@ class KalshiLiveFeed:
                 async with aiohttp.ClientSession() as session:
                     async with session.ws_connect(self.url, headers=headers, heartbeat=10) as ws:
                         self.connected = True
+                        self.session_generation += 1
+                        self.session_token = uuid.uuid4().hex
                         self.subscribed_tickers.clear()
                         # New socket, new market-data sequence: do not reuse a
                         # quote that was received before this subscription.
                         self.quotes.clear()
+                        self.price_books.clear()
+                        self.subscription_started_epoch.clear()
                         self.public_trades.clear()
                         LOG.info("WS CONNECTED | %s", self.url)
                         await self._session_loop(ws)
