@@ -15,8 +15,9 @@ from audit_ledger import append_audit
 from live_checkpoint import MaterialCheckpointPublisher, publish_runtime_snapshot
 from kalshi_btc15m_average_down import KalshiLiveFeed
 from kalshi_live_trader import (
-    LiveEngine, ProvisionalOutcomeTracker, QuoteObservation, deterministic_client_order_id, epoch,
-    live_mode_allowed, load_config,
+    BTC_TARGET_CAPTURE_CONTRACT_VERSION, LiveEngine, ProvisionalOutcomeTracker, QuoteObservation,
+    btc_target_metadata, deterministic_client_order_id, epoch, live_mode_allowed, load_config,
+    market_metadata,
 )
 from live_state import config_hash, default_state, load_state, save_state
 from strategy_core import sizing_state
@@ -172,6 +173,66 @@ class LiveExecutionTests(unittest.TestCase):
         config = dict(self.config)
         config["starting_shadow_balance"] = shadow_balance
         return LiveEngine(config, default_state(config), temporary / "state.json", temporary / "audit.jsonl", dry_run=True)
+
+    def test_market_metadata_preserves_exchange_btc_target_without_ticker_parsing(self) -> None:
+        metadata = market_metadata({
+            "ticker": "KXBTC15M-do-not-parse-me",
+            "open_time": "2026-08-27T20:00:00Z",
+            "close_time": "2026-08-27T20:15:00Z",
+            "status": "active",
+            "title": "BTC price up in next 15 mins?",
+            "yes_sub_title": "Target Price: $80,019.40",
+            "no_sub_title": "Target price: TBD",
+            "floor_strike": 80019.4,
+            "strike_type": "greater_or_equal",
+        })
+        self.assertIsNotNone(metadata)
+        assert metadata is not None
+        self.assertEqual(metadata["btc_target_capture_version"], BTC_TARGET_CAPTURE_CONTRACT_VERSION)
+        self.assertEqual(metadata["btc_target_price"], "80019.4")
+        self.assertEqual(metadata["btc_target_price_display"], "$80,019.40")
+        self.assertEqual(metadata["btc_target_source"], "floor_strike")
+        self.assertEqual(metadata["btc_target_comparison"], "greater_or_equal")
+        self.assertEqual(metadata["btc_target_status"], "AVAILABLE")
+
+    def test_btc_target_subtitle_fallback_and_unavailable_state_are_explicit(self) -> None:
+        fallback = btc_target_metadata({
+            "yes_sub_title": "Target Price: $81,234.56", "strike_type": "greater_or_equal",
+        })
+        self.assertEqual(fallback["btc_target_price"], "81234.56")
+        self.assertEqual(fallback["btc_target_price_display"], "$81,234.56")
+        self.assertEqual(fallback["btc_target_source"], "yes_sub_title")
+        unavailable = btc_target_metadata({"ticker": "KXBTC15M-contains-no-reliable-target"})
+        self.assertEqual(unavailable["btc_target_status"], "UNAVAILABLE")
+        self.assertIsNone(unavailable["btc_target_price"])
+
+    def test_signal_and_triggered_ladder_persist_the_same_btc_target(self) -> None:
+        ticker = "KXBTC15M-target-persistence"
+        opened = time.time() - 10
+        feed = KalshiLiveFeed(auth=None)
+        feed.set_tickers([ticker])
+        feed.subscription_started_epoch[ticker] = opened - 5
+        feed._handle(json.dumps({
+            "type": "ticker", "msg": {
+                "market_ticker": ticker, "yes_bid_dollars": "0.54", "yes_ask_dollars": "0.55",
+                "ts_ms": int((opened + 1) * 1000),
+            },
+        }))
+        engine = self.engine()
+        record = engine.set_signal({
+            "ticker": ticker, "open_epoch": opened, "close_epoch": opened + 900,
+            "floor_strike": "80123.45", "strike_type": "greater_or_equal",
+            "yes_sub_title": "Target Price: $80,123.45",
+        }, {"outcome": "no", "ticker": "KXBTC15M-prior"})
+        engine.capture_opening_price_reference(feed, record, opened + 1)
+        self.assertTrue(engine.observe_opening_cross_ladder(feed, record, opened + 2))
+        self.assertEqual(record["btc_target_price"], "80123.45")
+        self.assertEqual(record["opening_cross_ladder"]["btc_target_price"], "80123.45")
+        self.assertEqual(
+            record["opening_cross_ladder"]["triggered"]["53"]["btc_target_price"], "80123.45",
+        )
+        audit_rows = [json.loads(line) for line in engine.ledger_path.read_text(encoding="utf-8").splitlines()]
+        self.assertTrue(any(row.get("btc_target_price") == "80123.45" for row in audit_rows))
 
     def test_price_only_feed_retains_earliest_post_open_selected_ask_without_depth(self) -> None:
         feed = KalshiLiveFeed(auth=None)

@@ -16,6 +16,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from dataclasses import dataclass
@@ -71,6 +72,18 @@ ACTIVE_CONFIG_SCHEMA_VERSION = 11
 # later complete-depth book.  This can advance without reinterpreting recovery
 # accounting in an existing v11 state file.
 OPENING_PRICE_CAPTURE_CONTRACT_VERSION = 3
+BTC_TARGET_CAPTURE_CONTRACT_VERSION = 1
+BTC_TARGET_RECORD_FIELDS = (
+    "btc_target_capture_version",
+    "btc_target_status",
+    "btc_target_price",
+    "btc_target_price_display",
+    "btc_target_source",
+    "btc_target_comparison",
+    "btc_target_yes_sub_title",
+    "btc_target_no_sub_title",
+    "market_title",
+)
 OPENING_CROSS_LADDER_TRIGGER_LEVELS = tuple(range(53, 60))
 OPENING_CROSS_LADDER_TRIGGER_WINDOW_SECONDS = 60
 OPENING_CROSS_LADDER_RUNGS: tuple[tuple[int, Decimal], ...] = (
@@ -590,6 +603,52 @@ def executable_quote_epoch(quote: dict[str, Any]) -> float | None:
     )
 
 
+def btc_target_metadata(market: Any) -> dict[str, Any]:
+    """Extract the exchange-provided KXBTC15M BTC comparison target exactly.
+
+    Numeric strike fields are authoritative.  The YES/NO subtitle is only a
+    fallback for API representations that omit those structured fields; the
+    ticker is never parsed or used to invent a target.
+    """
+
+    yes_label = str(field(market, "yes_sub_title") or "") or None
+    no_label = str(field(market, "no_sub_title") or "") or None
+    target: Decimal | None = None
+    source: str | None = None
+    for name in ("floor_strike", "cap_strike", "functional_strike"):
+        raw = field(market, name)
+        if raw in (None, ""):
+            continue
+        try:
+            candidate = Decimal(str(raw).replace(",", "").replace("$", "").strip())
+        except (ArithmeticError, ValueError):
+            continue
+        if candidate.is_finite() and candidate > 0:
+            target, source = candidate, name
+            break
+    if target is None:
+        for name, label in (("yes_sub_title", yes_label), ("no_sub_title", no_label)):
+            match = re.search(r"\$\s*([0-9][0-9,]*(?:\.[0-9]+)?)", label or "")
+            if match is None:
+                continue
+            candidate = Decimal(match.group(1).replace(",", ""))
+            if candidate.is_finite() and candidate > 0:
+                target, source = candidate, name
+                break
+    comparison = str(field(market, "strike_type") or "").strip() or None
+    return {
+        "btc_target_capture_version": BTC_TARGET_CAPTURE_CONTRACT_VERSION,
+        "btc_target_status": "AVAILABLE" if target is not None else "UNAVAILABLE",
+        "btc_target_price": format(target, "f") if target is not None else None,
+        "btc_target_price_display": f"${target:,.2f}" if target is not None else None,
+        "btc_target_source": source,
+        "btc_target_comparison": comparison,
+        "btc_target_yes_sub_title": yes_label,
+        "btc_target_no_sub_title": no_label,
+        "market_title": str(field(market, "title") or "") or None,
+    }
+
+
 def market_metadata(market: Any) -> dict[str, Any] | None:
     ticker = str(field(market, "ticker") or "")
     opened = epoch(field(market, "open_time", "open_ts", "open_ts_ms"))
@@ -599,6 +658,7 @@ def market_metadata(market: Any) -> dict[str, Any] | None:
     return {
         "ticker": ticker, "open_epoch": opened, "close_epoch": closed,
         "status": str(field(market, "status") or "").lower(), "raw": market,
+        **btc_target_metadata(market),
     }
 
 
@@ -943,8 +1003,44 @@ class LiveEngine:
 
     def set_signal(self, market: dict[str, Any], provisional: dict[str, Any]) -> dict[str, Any]:
         ticker = market["ticker"]
+        target_details = btc_target_metadata(market.get("raw", market))
+        # ``market_metadata`` already normalized these fields. Prefer that
+        # preserved representation when present so every consumer sees the
+        # same exact Decimal string and source label.
+        for key in tuple(target_details):
+            if key in market:
+                target_details[key] = market[key]
         record = self.state["markets"].get(ticker)
         if isinstance(record, dict):
+            if (
+                record.get("btc_target_capture_version") != BTC_TARGET_CAPTURE_CONTRACT_VERSION
+                or (
+                    record.get("btc_target_status") != "AVAILABLE"
+                    and target_details.get("btc_target_status") == "AVAILABLE"
+                )
+            ):
+                record.update(target_details)
+                ladder = record.get("opening_cross_ladder")
+                if isinstance(ladder, dict):
+                    ladder.update(target_details)
+                    for lane in ladder.get("triggered", {}).values():
+                        if isinstance(lane, dict):
+                            lane.update(target_details)
+                self.audit(
+                    "btc_target_backfilled", ticker=ticker,
+                    btc_target_price=record.get("btc_target_price"),
+                    btc_target_price_display=record.get("btc_target_price_display"),
+                    btc_target_comparison=record.get("btc_target_comparison"),
+                    btc_target_source=record.get("btc_target_source"),
+                    btc_target_status=record.get("btc_target_status"),
+                )
+                LOG.warning(
+                    "BTC TARGET BACKFILLED | ticker=%s target=%s comparison=%s source=%s status=%s",
+                    ticker, record.get("btc_target_price_display"),
+                    record.get("btc_target_comparison"), record.get("btc_target_source"),
+                    record.get("btc_target_status"),
+                )
+                self.checkpoint("btc_target_backfilled")
             return record
         source = str(provisional["outcome"])
         signal_state = self.state.setdefault("directional_signal_state", {
@@ -974,6 +1070,7 @@ class LiveEngine:
         record = {
             "ticker": ticker,
             "market_open_epoch": market["open_epoch"], "market_close_epoch": market["close_epoch"],
+            **target_details,
             "source_market_ticker": provisional["ticker"], "provisional_outcome": source,
             "provisional_outcome_details": provisional, "signal_side": side,
             "signal_mode": self.config["signal_mode"], "prior_signal_side": prior_side,
@@ -1085,6 +1182,7 @@ class LiveEngine:
             "opening_cross_ladder": ({
                 "analytics_only": True,
                 "execution_mode": "shadow_only_no_exchange_orders",
+                **target_details,
                 "trigger_window_seconds": OPENING_CROSS_LADDER_TRIGGER_WINDOW_SECONDS,
                 "trigger_levels_cents": list(OPENING_CROSS_LADDER_TRIGGER_LEVELS),
                 "rung_quantities": {
@@ -1173,6 +1271,11 @@ class LiveEngine:
             provisional_qualifying_bid=provisional.get("qualifying_bid"),
             prior_signal_side=prior_side, directional_transition=directional_transition,
             prediction=side, intended_quantity=format(quantity, "f"),
+            btc_target_price=record.get("btc_target_price"),
+            btc_target_price_display=record.get("btc_target_price_display"),
+            btc_target_comparison=record.get("btc_target_comparison"),
+            btc_target_source=record.get("btc_target_source"),
+            btc_target_status=record.get("btc_target_status"),
         )
         observation_window = provisional.get("observation_window_seconds")
         observation_window_label = f"{observation_window}s" if observation_window is not None else "n/a"
@@ -1185,9 +1288,11 @@ class LiveEngine:
             provisional.get("quote_age_seconds"),
         )
         LOG.warning(
-            "NEW MARKET SIGNAL | ticker=%s source=%s provisional=%s prior_side=%s transition=%s prediction=%s qty=%s entry_mode=%s hybrid=%sc/%sc/%sc",
+            "NEW MARKET SIGNAL | ticker=%s source=%s provisional=%s prior_side=%s transition=%s "
+            "prediction=%s btc_target=%s comparison=%s qty=%s entry_mode=%s hybrid=%sc/%sc/%sc",
             ticker, provisional["ticker"], source.upper(), prior_side and prior_side.upper(), directional_transition,
-            side.upper(), quantity, self.config["entry_execution_mode"], self.config["hybrid_stop_trigger_cents"],
+            side.upper(), record.get("btc_target_price_display"), record.get("btc_target_comparison"),
+            quantity, self.config["entry_execution_mode"], self.config["hybrid_stop_trigger_cents"],
             self.config["hybrid_maker_exit_cents"], self.config["hybrid_hard_stop_cents"],
         )
         self.checkpoint("signal_created")
@@ -1633,6 +1738,10 @@ class LiveEngine:
             tracker = {
                 "analytics_only": True,
                 "execution_mode": "shadow_only_no_exchange_orders",
+                **{
+                    key: record.get(key)
+                    for key in BTC_TARGET_RECORD_FIELDS
+                },
                 "trigger_window_seconds": OPENING_CROSS_LADDER_TRIGGER_WINDOW_SECONDS,
                 "trigger_levels_cents": list(OPENING_CROSS_LADDER_TRIGGER_LEVELS),
                 "rung_quantities": {
@@ -1735,6 +1844,10 @@ class LiveEngine:
                     triggered[key] = {
                         "trigger_cents": threshold,
                         "trigger_observed_ask_cents": ask_cents,
+                        **{
+                            field_name: record.get(field_name)
+                            for field_name in BTC_TARGET_RECORD_FIELDS
+                        },
                         "trigger_quote_id": quote_id or None,
                         "trigger_exchange_epoch": quote_epoch,
                         "trigger_exchange_timestamp": datetime.fromtimestamp(
@@ -1878,6 +1991,10 @@ class LiveEngine:
             self.audit(
                 "opening_cross_ladder_updated", ticker=record["ticker"],
                 side=record["signal_side"], analytics_only=True,
+                btc_target_price=record.get("btc_target_price"),
+                btc_target_price_display=record.get("btc_target_price_display"),
+                btc_target_comparison=record.get("btc_target_comparison"),
+                btc_target_source=record.get("btc_target_source"),
                 entry_circuit_breaker_ignored_for_observation=True,
                 newly_triggered_thresholds=newly_triggered,
                 newly_touched_rungs=newly_touched,
@@ -1888,9 +2005,11 @@ class LiveEngine:
             )
             if newly_triggered or newly_touched:
                 LOG.warning(
-                    "OPENING CROSS LADDER | ticker=%s side=%s triggers=%s touches=%s "
+                    "OPENING CROSS LADDER | ticker=%s side=%s btc_target=%s comparison=%s "
+                    "triggers=%s touches=%s "
                     "coverage=%s analytics_only=true breaker_independent=true",
-                    record["ticker"], side.upper(), newly_triggered, newly_touched,
+                    record["ticker"], side.upper(), record.get("btc_target_price_display"),
+                    record.get("btc_target_comparison"), newly_triggered, newly_touched,
                     tracker.get("coverage_note"),
                 )
             self.checkpoint("opening_cross_ladder_updated")
@@ -4953,6 +5072,10 @@ class LiveEngine:
         )
         self.audit(
             "settlement_analytics_finalized", ticker=record["ticker"], outcome=outcome, winner=winner,
+            btc_target_price=record.get("btc_target_price"),
+            btc_target_price_display=record.get("btc_target_price_display"),
+            btc_target_comparison=record.get("btc_target_comparison"),
+            btc_target_source=record.get("btc_target_source"),
             initial_signal_price_cents=initial, minimum_selected_price_cents=minimum,
             entry_limit_cents=record.get("entry_limit_cents"),
             actual_average_entry_price=record.get("actual_average_entry_price"),
@@ -4969,10 +5092,12 @@ class LiveEngine:
             opening_cross_ladder_summary=ladder_summary,
         )
         LOG.warning(
-            "SETTLEMENT PRICE PATH | ticker=%s side=%s outcome=%s winner=%s "
+            "SETTLEMENT PRICE PATH | ticker=%s side=%s btc_target=%s comparison=%s outcome=%s winner=%s "
             "initial_selected_ask=%sc entry_limit=%sc actual_entry=%s minimum_selected_ask=%sc "
             "winner_max_drawdown=%s levels_40_49=[%s]",
-            record["ticker"], str(record.get("signal_side")).upper(), outcome.upper(), winner,
+            record["ticker"], str(record.get("signal_side")).upper(),
+            record.get("btc_target_price_display"), record.get("btc_target_comparison"),
+            outcome.upper(), winner,
             initial, record.get("entry_limit_cents"), record.get("actual_average_entry_price"), minimum,
             f"{drawdown}c" if winner and drawdown is not None else "n/a", level_status,
         )
@@ -5282,7 +5407,8 @@ class LiveEngine:
                 eligibility = self.entry_price_performance()["initial_stop_eligibility"]
                 delayed_metrics = self.delayed_entry_performance()
                 LOG.warning(
-                    "HEARTBEAT | mode=%s ticker=%s state=%s base=%s exponent=%d target=%s "
+                    "HEARTBEAT | mode=%s ticker=%s state=%s btc_target=%s comparison=%s "
+                    "base=%s exponent=%d target=%s "
                     "deficit=%s threshold=%s tracked=%d filled=%d zero=%d funding_failures=%d "
                     "missed=%d maker_fills=%d ioc_fills=%d mixed=%d opening_quotes=%s "
                     "first_price_quote_lag=%s first_depth_quote_lag=%s opening_price_coverage=%s "
@@ -5295,6 +5421,8 @@ class LiveEngine:
                     "DRY_RUN" if self.dry_run else "LIVE",
                     active and active["ticker"],
                     record.get("status") if isinstance(record, dict) else None,
+                    record.get("btc_target_price_display") if isinstance(record, dict) else None,
+                    record.get("btc_target_comparison") if isinstance(record, dict) else None,
                     sizing.base_share_count, sizing.recovery_exponent, sizing.prescribed_quantity(),
                     sizing.recovery_cycle_pnl, sizing.next_base_threshold,
                     execution["tracked_markets"], execution["markets_with_entry_fill"],
