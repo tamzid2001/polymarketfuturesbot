@@ -847,6 +847,43 @@ class LiveExecutionTests(unittest.TestCase):
         self.assertFalse(tracker["hypothetical_fill"])
         self.assertIsNone(tracker["no_stop_gross_pnl_per_share"])
 
+    def test_delayed_tracker_keeps_complete_quote_coverage_while_entry_breaker_is_latched(self) -> None:
+        engine = self.engine()
+        engine.state["circuit_breaker"] = {
+            "blocked": True,
+            "reason": "max_daily_realized_loss",
+            "triggered_at": datetime.now(timezone.utc).isoformat(),
+        }
+        market_open = 1_800_000_000.0
+        feed = TimestampedFeed("0.52", market_open + 1.25, depth="3.00")
+        record = engine.set_signal(
+            {"ticker": "KXBTC15M-delayed-breaker", "open_epoch": market_open, "close_epoch": market_open + 900},
+            {"outcome": "no", "ticker": "KXBTC15M-prior"},
+        )
+
+        # The primary execution reference remains unset because no entry path
+        # ran, while the independent research tracker starts from the first
+        # fresh executable quote and retains complete coverage.
+        self.assertTrue(engine.observe_price_analytics(feed, record))
+        tracker = record["delayed_entry_tracking"]
+        self.assertIsNone(record["initial_signal_price_cents"])
+        self.assertEqual(tracker["initial_signal_price_cents"], 52)
+        self.assertTrue(tracker["eligible"])
+        self.assertTrue(tracker["coverage_complete_from_initial_quote"])
+        self.assertEqual(tracker["status"], "WATCHING")
+
+        feed.ask = "0.54"
+        feed.observed_at = market_open + 75.5
+        self.assertTrue(engine.observe_price_analytics(feed, record))
+        self.assertEqual(tracker["status"], "THRESHOLD_REACHED")
+        self.assertEqual(tracker["first_entry_price_cents"], 54)
+        self.assertTrue(tracker["first_entry_after_opening_capture_window"])
+        engine.finalize_settlement_analytics(record, "yes")
+        summary = engine.delayed_entry_performance()
+        self.assertEqual(summary["complete_coverage_signals"], 1)
+        self.assertEqual(summary["partial_legacy_coverage_signals"], 0)
+        self.assertEqual(summary["directional_wins"], 1)
+
     def test_delayed_first_fresh_book_enters_immediately_when_available(self) -> None:
         async def scenario() -> None:
             config = dict(self.config)
