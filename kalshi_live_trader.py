@@ -1339,6 +1339,7 @@ class LiveEngine:
         record: dict[str, Any],
         quote_epoch: float | None = None,
         observed_ask_cents: int | None = None,
+        observed_quote_id: str | None = None,
     ) -> dict[str, Any] | None:
         """Return/backfill the compact >=53c tracker for an active record.
 
@@ -1359,8 +1360,38 @@ class LiveEngine:
         if tracker.get("status") not in {None, "PENDING_INITIAL_PRICE"}:
             return tracker
         initial_raw = record.get("initial_signal_price_cents")
+        initial_from_opening_capture = False
+        earliest_opening_quote: tuple[float, int] | None = None
         if initial_raw is None:
-            initial_raw = observed_ask_cents
+            # A restarted worker may inherit compact opening observations even
+            # though the old worker never initialized this tracker.  Preserve
+            # the true first observed executable ask as the cohort baseline;
+            # using only the post-restart quote would silently reclassify a
+            # below-threshold market as an opening >=53c market.
+            for observation in record.get("opening_quote_observations", []):
+                if not isinstance(observation, dict):
+                    continue
+                try:
+                    observation_cents = price_to_cents(
+                        str(observation["selected_best_ask"]),
+                        "stored opening selected-side ask",
+                    )
+                    source_ms = observation.get("source_timestamp_ms")
+                    observation_epoch = (
+                        float(source_ms) / 1000
+                        if source_ms is not None
+                        else float(observation.get("captured_epoch") or 0)
+                    )
+                except (KeyError, TypeError, ValueError):
+                    continue
+                candidate = (observation_epoch, observation_cents)
+                if earliest_opening_quote is None or candidate[0] < earliest_opening_quote[0]:
+                    earliest_opening_quote = candidate
+            if earliest_opening_quote is not None:
+                initial_raw = earliest_opening_quote[1]
+                initial_from_opening_capture = True
+            else:
+                initial_raw = observed_ask_cents
         if initial_raw is None:
             return tracker
         threshold = int(self.config["delayed_entry_threshold_cents"])
@@ -1372,6 +1403,29 @@ class LiveEngine:
             if existing_tracker
             else False
         )
+        # ``set_signal`` from the prior release created a pending tracker even
+        # when a latched breaker prevented the entry path from ever freezing a
+        # quote.  If the record already contains an earlier opening-book event,
+        # a quote first seen after restart cannot honestly be called complete
+        # from the initial quote.  The ordinary new-record path captures and
+        # observes the same first quote in one loop and remains complete.
+        if record.get("initial_signal_price_cents") is None:
+            for observation in record.get("opening_quote_observations", []):
+                if not isinstance(observation, dict):
+                    continue
+                prior_id = str(observation.get("quote_id") or "")
+                prior_epoch_ms = observation.get("source_timestamp_ms")
+                try:
+                    prior_epoch = float(prior_epoch_ms) / 1000 if prior_epoch_ms is not None else float(
+                        observation.get("captured_epoch") or 0
+                    )
+                except (TypeError, ValueError):
+                    continue
+                if prior_epoch < float(started_epoch or 0) and (
+                    not observed_quote_id or prior_id != observed_quote_id
+                ):
+                    complete_coverage = False
+                    break
         tracker.update({
             "enabled": bool(self.config["delayed_entry_tracking_enabled"]),
             "threshold_cents": threshold,
@@ -1390,7 +1444,11 @@ class LiveEngine:
         if not complete_coverage:
             tracker["migration_note"] = "tracker_added_after_signal; pre-migration threshold crosses are unknown"
         elif record.get("initial_signal_price_cents") is None:
-            tracker["initial_quote_source"] = "analytics_first_fresh_executable_ask_while_entry_blocked"
+            tracker["initial_quote_source"] = (
+                "opening_quote_capture_first_fresh_executable_ask"
+                if initial_from_opening_capture
+                else "analytics_first_fresh_executable_ask_while_entry_blocked"
+            )
         return tracker
 
     def observe_price_analytics(self, feed: KalshiLiveFeed, record: dict[str, Any]) -> bool:
@@ -1422,7 +1480,9 @@ class LiveEngine:
             return False
         changed = False
         duplicate_quote = bool(quote_id and quote_id == record.get("last_analytics_quote_id"))
-        delayed = self.ensure_delayed_entry_tracking(record, quote_epoch, selected_ask_cents)
+        delayed = self.ensure_delayed_entry_tracking(
+            record, quote_epoch, selected_ask_cents, quote_id or None,
+        )
         delayed_entry_recorded = False
         if (
             isinstance(delayed, dict)

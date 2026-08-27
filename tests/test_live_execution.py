@@ -884,6 +884,26 @@ class LiveExecutionTests(unittest.TestCase):
         self.assertEqual(summary["partial_legacy_coverage_signals"], 0)
         self.assertEqual(summary["directional_wins"], 1)
 
+    def test_delayed_tracker_marks_pre_restart_quote_gap_as_partial(self) -> None:
+        engine = self.engine()
+        market_open = 1_800_000_000.0
+        record = engine.set_signal(
+            {"ticker": "KXBTC15M-delayed-restart-gap", "open_epoch": market_open, "close_epoch": market_open + 900},
+            {"outcome": "no", "ticker": "KXBTC15M-prior"},
+        )
+        record["opening_quote_observations"] = [{
+            "quote_id": "pre-restart-quote",
+            "source_timestamp_ms": int((market_open + 5) * 1000),
+            "selected_best_ask": "0.50",
+        }]
+        feed = TimestampedFeed("0.54", market_open + 200, depth="3.00")
+
+        self.assertTrue(engine.observe_price_analytics(feed, record))
+        tracker = record["delayed_entry_tracking"]
+        self.assertTrue(tracker["threshold_reached"])
+        self.assertFalse(tracker["coverage_complete_from_initial_quote"])
+        self.assertIn("pre-migration threshold crosses are unknown", tracker["migration_note"])
+
     def test_delayed_first_fresh_book_enters_immediately_when_available(self) -> None:
         async def scenario() -> None:
             config = dict(self.config)
