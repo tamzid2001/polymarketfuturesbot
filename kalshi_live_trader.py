@@ -1743,6 +1743,10 @@ class LiveEngine:
                         "trigger_after_open_seconds": round(max(0.0, quote_epoch - opened), 6),
                         "coverage_complete": bool(tracker.get("coverage_complete")),
                         "status": "ACTIVE",
+                        "public_trade_cursor_version": 1,
+                        "public_trade_feed_session_token": None,
+                        "last_processed_public_trade_id": None,
+                        "public_trade_events_processed": 0,
                         "rungs": {
                             str(level): {
                                 "price_cents": level, "requested_quantity": format(quantity, "f"),
@@ -1774,8 +1778,10 @@ class LiveEngine:
                         changed = True
             tracker["last_processed_quote_id"] = quote_id or tracker.get("last_processed_quote_id")
 
-        # Rebuild each counterfactual ladder's public-trade allocation from
-        # scratch so retries/restarts are deterministic and idempotent.
+        # Advance each counterfactual ladder from a durable public-trade
+        # cursor.  Filled quantities are cumulative facts and must never be
+        # rebuilt downward merely because a WebSocket/worker restart cleared
+        # the in-memory trade buffer.
         side = str(record["signal_side"])
         for lane in triggered.values():
             trigger_epoch = float(lane["trigger_exchange_epoch"])
@@ -1785,11 +1791,46 @@ class LiveEngine:
                 )
             except (AttributeError, TypeError, ValueError):
                 events = []
+            feed_session_token = str(getattr(feed, "session_token", "") or "")
+            prior_session_token = str(lane.get("public_trade_feed_session_token") or "")
+            last_trade_id = str(lane.get("last_processed_public_trade_id") or "")
+            start_event_index = 0
+            if last_trade_id and prior_session_token == feed_session_token:
+                for index, event in enumerate(events):
+                    if str(event.get("trade_id") or "") == last_trade_id:
+                        start_event_index = index + 1
+                        break
+                else:
+                    # The bounded feed buffer may have rolled past the cursor.
+                    # Its remaining events are newer and can be consumed once.
+                    if events:
+                        lane["public_trade_cursor_gap_count"] = int(
+                            lane.get("public_trade_cursor_gap_count", 0)
+                        ) + 1
+            elif last_trade_id and prior_session_token != feed_session_token:
+                # A new feed session starts with an empty trade buffer, so all
+                # events now present are post-reconnect and therefore new.
+                start_event_index = 0
+                last_trade_id = ""
+                lane["last_processed_public_trade_id"] = None
+            lane["public_trade_feed_session_token"] = feed_session_token
             allocations = {
-                str(level): {"quantity": Decimal("0"), "first": None, "last": None}
+                str(level): {
+                    "quantity": Decimal(str(
+                        lane.get("rungs", {}).get(str(level), {}).get("simulated_filled_quantity") or "0"
+                    )),
+                    "first": lane.get("rungs", {}).get(str(level), {}).get("first_fill_timestamp"),
+                    "last": lane.get("rungs", {}).get(str(level), {}).get("last_fill_timestamp"),
+                }
                 for level, _ in OPENING_CROSS_LADDER_RUNGS
             }
-            for event in events:
+            for event in events[start_event_index:]:
+                trade_id = str(event.get("trade_id") or "")
+                if trade_id:
+                    lane["last_processed_public_trade_id"] = trade_id
+                lane["public_trade_events_processed"] = int(
+                    lane.get("public_trade_events_processed", 0)
+                ) + 1
                 try:
                     event_cents = price_to_cents(str(event[f"{side}_price"]), "ladder public trade price")
                     available = Decimal(str(event.get("count") or "0"))
