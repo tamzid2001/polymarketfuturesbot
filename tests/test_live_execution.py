@@ -745,6 +745,16 @@ class LiveExecutionTests(unittest.TestCase):
             # the per-market endpoint every discovery interval.
             await engine.discover(rest)
             self.assertEqual(len(rest.detail_calls), 3)
+            # A marker from the list-only v1 implementation is not accepted
+            # as proof of the v2 detail-enrichment contract.
+            for item in engine.markets:
+                item["btc_target_capture_version"] = 1
+            await engine.discover(rest)
+            self.assertEqual(len(rest.detail_calls), 6)
+            self.assertTrue(all(
+                item["btc_target_capture_version"] == BTC_TARGET_CAPTURE_CONTRACT_VERSION
+                for item in engine.markets
+            ))
         asyncio.run(scenario())
 
     def test_millisecond_exchange_timestamp_and_price_only_quote_enable_provisional_signal(self) -> None:
