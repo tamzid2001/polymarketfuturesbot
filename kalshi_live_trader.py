@@ -76,6 +76,7 @@ OPENING_PRICE_CAPTURE_CONTRACT_VERSION = 3
 # the bounded list response omits strike metadata. A list-only v1 worker must
 # fail the workflow guard instead of silently restoring UNAVAILABLE targets.
 BTC_TARGET_CAPTURE_CONTRACT_VERSION = 2
+DELAYED_ENTRY_LADDER_CONTRACT_VERSION = 1
 BTC_TARGET_RECORD_FIELDS = (
     "btc_target_capture_version",
     "btc_target_status",
@@ -1279,6 +1280,7 @@ class LiveEngine:
             # close.  This avoids an unbounded full-book checkpoint history.
             "delayed_entry_tracking": {
                 "enabled": bool(self.config["delayed_entry_tracking_enabled"]),
+                "ladder_contract_version": DELAYED_ENTRY_LADDER_CONTRACT_VERSION,
                 "threshold_cents": int(self.config["delayed_entry_threshold_cents"]),
                 "status": "PENDING_INITIAL_PRICE",
                 "eligible": None,
@@ -1298,6 +1300,10 @@ class LiveEngine:
                 "settlement_outcome": None,
                 "directional_winner": None,
                 "no_stop_gross_pnl_per_share": None,
+                # Created only when the delayed >=53c entry actually
+                # activates. It is analytics-only and can never create an
+                # exchange order or change primary sizing/accounting state.
+                "ladder": None,
             },
             "opening_price_discovery": {
                 "window_seconds": int(self.config["opening_price_discovery_seconds"]),
@@ -1964,97 +1970,12 @@ class LiveEngine:
                         changed = True
             tracker["last_processed_quote_id"] = quote_id or tracker.get("last_processed_quote_id")
 
-        # Advance each counterfactual ladder from a durable public-trade
-        # cursor.  Filled quantities are cumulative facts and must never be
-        # rebuilt downward merely because a WebSocket/worker restart cleared
-        # the in-memory trade buffer.
+        # Both the first-60 and delayed-entry cohorts use this exact durable
+        # fill allocator. This prevents their ladder fill semantics from
+        # drifting apart in later releases.
         side = str(record["signal_side"])
         for lane in triggered.values():
-            trigger_epoch = float(lane["trigger_exchange_epoch"])
-            try:
-                events = feed.public_trades_after(
-                    record["ticker"], datetime.fromtimestamp(trigger_epoch, timezone.utc),
-                )
-            except (AttributeError, TypeError, ValueError):
-                events = []
-            feed_session_token = str(getattr(feed, "session_token", "") or "")
-            prior_session_token = str(lane.get("public_trade_feed_session_token") or "")
-            last_trade_id = str(lane.get("last_processed_public_trade_id") or "")
-            start_event_index = 0
-            if last_trade_id and prior_session_token == feed_session_token:
-                for index, event in enumerate(events):
-                    if str(event.get("trade_id") or "") == last_trade_id:
-                        start_event_index = index + 1
-                        break
-                else:
-                    # The bounded feed buffer may have rolled past the cursor.
-                    # Its remaining events are newer and can be consumed once.
-                    if events:
-                        lane["public_trade_cursor_gap_count"] = int(
-                            lane.get("public_trade_cursor_gap_count", 0)
-                        ) + 1
-            elif last_trade_id and prior_session_token != feed_session_token:
-                # A new feed session starts with an empty trade buffer, so all
-                # events now present are post-reconnect and therefore new.
-                start_event_index = 0
-                last_trade_id = ""
-                lane["last_processed_public_trade_id"] = None
-            lane["public_trade_feed_session_token"] = feed_session_token
-            allocations = {
-                str(level): {
-                    "quantity": Decimal(str(
-                        lane.get("rungs", {}).get(str(level), {}).get("simulated_filled_quantity") or "0"
-                    )),
-                    "first": lane.get("rungs", {}).get(str(level), {}).get("first_fill_timestamp"),
-                    "last": lane.get("rungs", {}).get(str(level), {}).get("last_fill_timestamp"),
-                }
-                for level, _ in OPENING_CROSS_LADDER_RUNGS
-            }
-            for event in events[start_event_index:]:
-                trade_id = str(event.get("trade_id") or "")
-                if trade_id:
-                    lane["last_processed_public_trade_id"] = trade_id
-                lane["public_trade_events_processed"] = int(
-                    lane.get("public_trade_events_processed", 0)
-                ) + 1
-                try:
-                    event_cents = price_to_cents(str(event[f"{side}_price"]), "ladder public trade price")
-                    available = Decimal(str(event.get("count") or "0"))
-                except (KeyError, ArithmeticError, TypeError, ValueError):
-                    continue
-                if available <= 0:
-                    continue
-                for level, requested in OPENING_CROSS_LADDER_RUNGS:
-                    if event_cents > level or available <= 0:
-                        continue
-                    bucket = allocations[str(level)]
-                    remaining = requested - bucket["quantity"]
-                    if remaining <= 0:
-                        continue
-                    allocated = min(remaining, available)
-                    if allocated <= 0:
-                        continue
-                    bucket["quantity"] += allocated
-                    bucket["first"] = bucket["first"] or event.get("source_server_timestamp") or event.get("received_at")
-                    bucket["last"] = event.get("source_server_timestamp") or event.get("received_at")
-                    available -= allocated
-            for level, requested in OPENING_CROSS_LADDER_RUNGS:
-                rung = lane["rungs"][str(level)]
-                allocation = allocations[str(level)]
-                prior_quantity = Decimal(str(rung.get("simulated_filled_quantity") or "0"))
-                filled_quantity = allocation["quantity"]
-                if filled_quantity != prior_quantity:
-                    rung.update({
-                        "simulated_filled_quantity": format(filled_quantity, "f"),
-                        "simulated_full_fill": filled_quantity >= requested,
-                        "first_fill_timestamp": allocation["first"],
-                        "final_fill_timestamp": allocation["last"] if filled_quantity >= requested else None,
-                        "fill_assumption": (
-                            "post_trigger_public_trade_volume_allocated_once_across_descending_limits_"
-                            "without_queue_priority"
-                        ),
-                    })
-                    changed = True
+            changed = self.advance_shadow_ladder_fills(feed, record, lane) or changed
 
         if now >= window_end and not tracker.get("window_complete"):
             tracker["window_complete"] = True
@@ -2088,6 +2009,206 @@ class LiveEngine:
             self.checkpoint("opening_cross_ladder_updated")
         return changed
 
+    def advance_shadow_ladder_fills(
+        self, feed: KalshiLiveFeed, record: dict[str, Any], lane: dict[str, Any],
+    ) -> bool:
+        """Advance one analytics ladder using durable public-trade evidence.
+
+        Public volume is consumed once in descending limit-price priority.
+        This deliberately claims neither queue priority nor an exchange fill;
+        it is the shared deterministic shadow assumption for opening and
+        delayed cohorts.
+        """
+
+        trigger_epoch = float(lane["trigger_exchange_epoch"])
+        try:
+            events = feed.public_trades_after(
+                record["ticker"], datetime.fromtimestamp(trigger_epoch, timezone.utc),
+            )
+        except (AttributeError, TypeError, ValueError):
+            events = []
+        feed_session_token = str(getattr(feed, "session_token", "") or "")
+        prior_session_token = str(lane.get("public_trade_feed_session_token") or "")
+        last_trade_id = str(lane.get("last_processed_public_trade_id") or "")
+        start_event_index = 0
+        if last_trade_id and prior_session_token == feed_session_token:
+            for index, event in enumerate(events):
+                if str(event.get("trade_id") or "") == last_trade_id:
+                    start_event_index = index + 1
+                    break
+            else:
+                # The bounded feed buffer may have rolled past the cursor.
+                # Its remaining events are newer and can be consumed once.
+                if events:
+                    lane["public_trade_cursor_gap_count"] = int(
+                        lane.get("public_trade_cursor_gap_count", 0)
+                    ) + 1
+        elif last_trade_id and prior_session_token != feed_session_token:
+            # A new feed session starts with an empty trade buffer, so all
+            # events now present are post-reconnect and therefore new.
+            start_event_index = 0
+            lane["last_processed_public_trade_id"] = None
+        lane["public_trade_feed_session_token"] = feed_session_token
+        allocations = {
+            str(level): {
+                "quantity": Decimal(str(
+                    lane.get("rungs", {}).get(str(level), {}).get("simulated_filled_quantity") or "0"
+                )),
+                "first": lane.get("rungs", {}).get(str(level), {}).get("first_fill_timestamp"),
+                "last": lane.get("rungs", {}).get(str(level), {}).get("last_fill_timestamp"),
+            }
+            for level, _ in OPENING_CROSS_LADDER_RUNGS
+        }
+        changed = False
+        side = str(record["signal_side"])
+        for event in events[start_event_index:]:
+            trade_id = str(event.get("trade_id") or "")
+            if trade_id:
+                lane["last_processed_public_trade_id"] = trade_id
+            lane["public_trade_events_processed"] = int(
+                lane.get("public_trade_events_processed", 0)
+            ) + 1
+            try:
+                event_cents = price_to_cents(str(event[f"{side}_price"]), "ladder public trade price")
+                available = Decimal(str(event.get("count") or "0"))
+            except (KeyError, ArithmeticError, TypeError, ValueError):
+                continue
+            if available <= 0:
+                continue
+            for level, requested in OPENING_CROSS_LADDER_RUNGS:
+                if event_cents > level or available <= 0:
+                    continue
+                bucket = allocations[str(level)]
+                remaining = requested - bucket["quantity"]
+                if remaining <= 0:
+                    continue
+                allocated = min(remaining, available)
+                if allocated <= 0:
+                    continue
+                bucket["quantity"] += allocated
+                bucket["first"] = (
+                    bucket["first"] or event.get("source_server_timestamp") or event.get("received_at")
+                )
+                bucket["last"] = event.get("source_server_timestamp") or event.get("received_at")
+                available -= allocated
+        for level, requested in OPENING_CROSS_LADDER_RUNGS:
+            rung = lane["rungs"][str(level)]
+            allocation = allocations[str(level)]
+            prior_quantity = Decimal(str(rung.get("simulated_filled_quantity") or "0"))
+            filled_quantity = allocation["quantity"]
+            if filled_quantity != prior_quantity:
+                rung.update({
+                    "simulated_filled_quantity": format(filled_quantity, "f"),
+                    "simulated_full_fill": filled_quantity >= requested,
+                    "first_fill_timestamp": allocation["first"],
+                    "final_fill_timestamp": allocation["last"] if filled_quantity >= requested else None,
+                    "fill_assumption": (
+                        "post_trigger_public_trade_volume_allocated_once_across_descending_limits_"
+                        "without_queue_priority"
+                    ),
+                })
+                changed = True
+        return changed
+
+    def observe_delayed_entry_ladder(
+        self, feed: KalshiLiveFeed, record: dict[str, Any], delayed: dict[str, Any], now: float,
+    ) -> bool:
+        """Track the 50/40/30/20/10 ladder after a delayed >=53c entry.
+
+        The activation quote is the already-frozen delayed entry event. Quote
+        touches and public-trade evidence are then collected through market
+        close. The object is analytics-only in both shadow and live workers.
+        """
+
+        lane = delayed.get("ladder")
+        if not isinstance(lane, dict):
+            return False
+        getter = getattr(feed, "selected_price_quotes_between", None)
+        if not callable(getter):
+            return False
+        trigger_epoch = float(lane["trigger_exchange_epoch"])
+        closed = float(record["market_close_epoch"])
+        quotes = getter(
+            record["ticker"], str(record["signal_side"]), trigger_epoch, min(now, closed),
+        )
+        changed = False
+        feed_token = str(getattr(feed, "session_token", "") or "")
+        prior_token = str(lane.get("quote_feed_session_token") or "")
+        if prior_token and feed_token and prior_token != feed_token and now < closed:
+            lane["coverage_complete"] = False
+            lane["coverage_note"] = "worker_or_websocket_session_changed_after_delayed_entry"
+            lane["quote_continuity_gap_count"] = int(lane.get("quote_continuity_gap_count", 0)) + 1
+            lane["last_processed_quote_id"] = None
+            changed = True
+        if feed_token:
+            lane["quote_feed_session_token"] = feed_token
+
+        last_id = str(lane.get("last_processed_quote_id") or "")
+        start_index = 0
+        if last_id:
+            for index, item in enumerate(quotes):
+                if str(item.get("quote_id") or "") == last_id:
+                    start_index = index + 1
+                    break
+            else:
+                if quotes:
+                    lane["coverage_complete"] = False
+                    lane["coverage_note"] = "prior_delayed_ladder_quote_not_present_after_feed_restart"
+                    lane["quote_continuity_gap_count"] = int(
+                        lane.get("quote_continuity_gap_count", 0)
+                    ) + 1
+                    changed = True
+
+        newly_touched: list[int] = []
+        for quote in quotes[start_index:]:
+            quote_id = str(quote.get("quote_id") or "")
+            try:
+                quote_epoch = float(quote["selected_component_epoch"])
+                ask_cents = price_to_cents(
+                    str(quote["economic_price"]), "delayed ladder selected-side ask",
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+            if quote_epoch < trigger_epoch:
+                continue
+            lane["price_events_processed"] = int(lane.get("price_events_processed", 0)) + 1
+            for level_text, rung in lane.get("rungs", {}).items():
+                level = int(level_text)
+                if ask_cents <= level and not rung.get("touched"):
+                    rung.update({
+                        "touched": True,
+                        "touch_timestamp": datetime.fromtimestamp(quote_epoch, timezone.utc).isoformat(),
+                        "touch_quote_id": quote_id or None,
+                        "touch_observed_ask_cents": ask_cents,
+                        "touch_evidence": "price_only_executable_selected_side_ask",
+                    })
+                    newly_touched.append(level)
+                    changed = True
+            lane["last_processed_quote_id"] = quote_id or lane.get("last_processed_quote_id")
+        fills_changed = self.advance_shadow_ladder_fills(feed, record, lane)
+        changed = fills_changed or changed
+        if changed:
+            self.audit(
+                "delayed_entry_ladder_updated",
+                ticker=record["ticker"], side=record["signal_side"], analytics_only=True,
+                ladder_contract_version=DELAYED_ENTRY_LADDER_CONTRACT_VERSION,
+                delayed_entry_price_cents=delayed.get("first_entry_price_cents"),
+                newly_touched_rungs=sorted(set(newly_touched), reverse=True),
+                fills_changed=fills_changed,
+                coverage_complete=lane.get("coverage_complete"),
+                coverage_note=lane.get("coverage_note"),
+                rungs=lane.get("rungs"),
+            )
+            if newly_touched or fills_changed:
+                LOG.warning(
+                    "DELAYED ENTRY LADDER | ticker=%s side=%s delayed_entry=%sc touches=%s "
+                    "fills_changed=%s coverage=%s analytics_only=true",
+                    record["ticker"], str(record["signal_side"]).upper(),
+                    delayed.get("first_entry_price_cents"), sorted(set(newly_touched), reverse=True),
+                    fills_changed, lane.get("coverage_note"),
+                )
+        return changed
+
     def observe_price_analytics(self, feed: KalshiLiveFeed, record: dict[str, Any]) -> bool:
         """Update durable per-signal price-path facts from one fresh book.
 
@@ -2096,10 +2217,19 @@ class LiveEngine:
         a quote touch alone is never called a fill.
         """
 
-        ladder_changed = self.observe_opening_cross_ladder(feed, record, time.time())
+        observed_now = time.time()
+        ladder_changed = self.observe_opening_cross_ladder(feed, record, observed_now)
+        existing_delayed = record.get("delayed_entry_tracking")
+        delayed_ladder_changed = bool(
+            isinstance(existing_delayed, dict)
+            and existing_delayed.get("threshold_reached")
+            and self.observe_delayed_entry_ladder(feed, record, existing_delayed, observed_now)
+        )
         quote, _ = self.selected_book(feed, record)
         if quote is None:
-            return ladder_changed
+            if ladder_changed or delayed_ladder_changed:
+                self.checkpoint("price_analytics_updated")
+            return ladder_changed or delayed_ladder_changed
         quote_id = str(quote.get("quote_id") or "")
         quote_epoch = executable_quote_epoch(quote)
         observation_floor = float(
@@ -2120,7 +2250,7 @@ class LiveEngine:
             selected_ask_cents = price_to_cents(str(quote["economic_price"]), "selected-side analytics ask")
         except (KeyError, ValueError):
             return False
-        changed = ladder_changed
+        changed = ladder_changed or delayed_ladder_changed
         duplicate_quote = bool(quote_id and quote_id == record.get("last_analytics_quote_id"))
         delayed = self.ensure_delayed_entry_tracking(
             record, quote_epoch, selected_ask_cents, quote_id or None,
@@ -2166,6 +2296,51 @@ class LiveEngine:
                     "execution_assumption": "fresh_executable_ask_with_displayed_depth_no_historical_order_claim",
                     "minimum_selected_ask_after_entry_cents": selected_ask_cents,
                     "maximum_selected_ask_after_entry_cents": selected_ask_cents,
+                    "ladder_contract_version": DELAYED_ENTRY_LADDER_CONTRACT_VERSION,
+                    "ladder": {
+                        "contract_version": DELAYED_ENTRY_LADDER_CONTRACT_VERSION,
+                        "analytics_only": True,
+                        "execution_mode": "shadow_only_no_exchange_orders",
+                        **{
+                            field_name: record.get(field_name)
+                            for field_name in BTC_TARGET_RECORD_FIELDS
+                        },
+                        "trigger_cents": int(delayed["threshold_cents"]),
+                        "trigger_observed_ask_cents": selected_ask_cents,
+                        "trigger_quote_id": quote_id or None,
+                        "trigger_exchange_epoch": quote_epoch,
+                        "trigger_exchange_timestamp": quote.get("source_server_timestamp"),
+                        "trigger_after_open_seconds": elapsed_open,
+                        "coverage_complete": bool(delayed.get("coverage_complete_from_initial_quote")),
+                        "coverage_note": (
+                            "complete_from_initial_quote"
+                            if delayed.get("coverage_complete_from_initial_quote")
+                            else "partial_legacy_or_restart_coverage"
+                        ),
+                        "quote_feed_session_token": None,
+                        "last_processed_quote_id": None,
+                        "price_events_processed": 0,
+                        "public_trade_cursor_version": 1,
+                        "public_trade_feed_session_token": None,
+                        "last_processed_public_trade_id": None,
+                        "public_trade_events_processed": 0,
+                        "rungs": {
+                            str(level): {
+                                "price_cents": level,
+                                "requested_quantity": format(quantity, "f"),
+                                "touched": False,
+                                "touch_timestamp": None,
+                                "simulated_filled_quantity": "0.00",
+                                "simulated_full_fill": False,
+                                "first_fill_timestamp": None,
+                                "final_fill_timestamp": None,
+                            }
+                            for level, quantity in OPENING_CROSS_LADDER_RUNGS
+                        },
+                        "settlement_outcome": None,
+                        "directional_winner": None,
+                        "gross_no_stop_pnl": None,
+                    },
                 })
                 delayed_entry_recorded = True
                 changed = True
@@ -2178,6 +2353,10 @@ class LiveEngine:
             if prior_max is None or selected_ask_cents > int(prior_max):
                 delayed["maximum_selected_ask_after_entry_cents"] = selected_ask_cents
                 changed = True
+        if isinstance(delayed, dict) and delayed.get("threshold_reached"):
+            changed = self.observe_delayed_entry_ladder(
+                feed, record, delayed, quote_epoch,
+            ) or changed
         if not duplicate_quote:
             record["last_analytics_quote_id"] = quote_id or None
             record["last_analytics_quote_epoch"] = quote_epoch
@@ -2429,6 +2608,35 @@ class LiveEngine:
         gross_pnl = Decimal("0")
         timings: list[float] = []
         entry_buckets: dict[str, int] = {}
+        cohort_rows: dict[str, dict[str, Any]] = {
+            str(cohort_threshold): {
+                "minimum_delayed_entry_cents": cohort_threshold,
+                "entries": 0,
+                "complete_coverage_entries": 0,
+                "partial_coverage_entries": 0,
+                "complete_resolved_entries": 0,
+                "directional_wins": 0,
+                "directional_losses": 0,
+                "gross_no_stop_direct_entry_pnl_per_share": Decimal("0"),
+                "ladder_tracked_entries": 0,
+                "legacy_entries_without_ladder": 0,
+                "ladder_resolved_entries": 0,
+                "gross_no_stop_ladder_pnl": Decimal("0"),
+                "rungs": {
+                    str(level): {
+                        "price_cents": level,
+                        "requested_quantity": format(quantity, "f"),
+                        "touches": 0,
+                        "full_fills": 0,
+                        "partial_fills": 0,
+                        "simulated_filled_quantity": Decimal("0"),
+                        "gross_no_stop_pnl": Decimal("0"),
+                    }
+                    for level, quantity in OPENING_CROSS_LADDER_RUNGS
+                },
+            }
+            for cohort_threshold in OPENING_CROSS_LADDER_TRIGGER_LEVELS
+        }
         for record in self.state.get("markets", {}).values():
             if not isinstance(record, dict):
                 continue
@@ -2456,6 +2664,49 @@ class LiveEngine:
                 entry_buckets[text] = entry_buckets.get(text, 0) + 1
             winner = tracker.get("directional_winner")
             pnl = tracker.get("no_stop_gross_pnl_per_share")
+            for cohort_threshold in OPENING_CROSS_LADDER_TRIGGER_LEVELS:
+                if entry_cents is None or int(entry_cents) < cohort_threshold:
+                    continue
+                cohort = cohort_rows[str(cohort_threshold)]
+                cohort["entries"] += 1
+                complete = bool(tracker.get("coverage_complete_from_initial_quote"))
+                cohort["complete_coverage_entries"] += int(complete)
+                cohort["partial_coverage_entries"] += int(not complete)
+                ladder = tracker.get("ladder")
+                if isinstance(ladder, dict):
+                    cohort["ladder_tracked_entries"] += 1
+                    for level, requested in OPENING_CROSS_LADDER_RUNGS:
+                        rung = ladder.get("rungs", {}).get(str(level), {})
+                        row = cohort["rungs"][str(level)]
+                        quantity = Decimal(str(rung.get("simulated_filled_quantity") or "0"))
+                        row["touches"] += int(bool(rung.get("touched")))
+                        row["full_fills"] += int(quantity >= requested)
+                        row["partial_fills"] += int(Decimal("0") < quantity < requested)
+                        row["simulated_filled_quantity"] += quantity
+                else:
+                    cohort["legacy_entries_without_ladder"] += 1
+                # Published cohort W/L and P&L intentionally use only records
+                # whose quote coverage began with the immutable opening
+                # reference. Partial legacy records remain visible above but
+                # cannot contaminate the complete-data result.
+                if not complete or winner is None or pnl is None:
+                    continue
+                cohort["complete_resolved_entries"] += 1
+                cohort["directional_wins"] += int(bool(winner))
+                cohort["directional_losses"] += int(not bool(winner))
+                cohort["gross_no_stop_direct_entry_pnl_per_share"] += Decimal(str(pnl))
+                if not isinstance(ladder, dict) or ladder.get("gross_no_stop_pnl") is None:
+                    continue
+                cohort["ladder_resolved_entries"] += 1
+                cohort["gross_no_stop_ladder_pnl"] += Decimal(str(ladder["gross_no_stop_pnl"]))
+                for level, _ in OPENING_CROSS_LADDER_RUNGS:
+                    rung = ladder.get("rungs", {}).get(str(level), {})
+                    quantity = Decimal(str(rung.get("simulated_filled_quantity") or "0"))
+                    rung_pnl = (
+                        quantity * (Decimal("1") - cents_price(level))
+                        if winner else -quantity * cents_price(level)
+                    )
+                    cohort["rungs"][str(level)]["gross_no_stop_pnl"] += rung_pnl
             if winner is None or pnl is None:
                 continue
             resolved += 1
@@ -2470,6 +2721,40 @@ class LiveEngine:
                 return None
             index = int(round((len(timings) - 1) * probability))
             return round(timings[index], 6)
+
+        serialized_cohorts: dict[str, dict[str, Any]] = {}
+        for cohort_threshold, cohort in cohort_rows.items():
+            cohort_resolved = int(cohort["complete_resolved_entries"])
+            ladder_resolved = int(cohort["ladder_resolved_entries"])
+            direct_pnl = Decimal(cohort["gross_no_stop_direct_entry_pnl_per_share"])
+            ladder_pnl = Decimal(cohort["gross_no_stop_ladder_pnl"])
+            rung_output: dict[str, dict[str, Any]] = {}
+            for level, row in cohort["rungs"].items():
+                rung_output[level] = {
+                    **row,
+                    "simulated_filled_quantity": format(
+                        Decimal(row["simulated_filled_quantity"]), "f",
+                    ),
+                    "gross_no_stop_pnl": format(Decimal(row["gross_no_stop_pnl"]), "f"),
+                }
+            serialized_cohorts[cohort_threshold] = {
+                **{key: value for key, value in cohort.items() if key not in {
+                    "rungs", "gross_no_stop_direct_entry_pnl_per_share", "gross_no_stop_ladder_pnl",
+                }},
+                "directional_win_rate": (
+                    int(cohort["directional_wins"]) / cohort_resolved if cohort_resolved else None
+                ),
+                "gross_no_stop_direct_entry_pnl_per_share": format(direct_pnl, "f"),
+                "gross_no_stop_direct_entry_ev": (
+                    format(direct_pnl / cohort_resolved, "f") if cohort_resolved else None
+                ),
+                "gross_no_stop_ladder_pnl": format(ladder_pnl, "f"),
+                "gross_no_stop_ladder_ev": (
+                    format(ladder_pnl / ladder_resolved, "f") if ladder_resolved else None
+                ),
+                "gross_no_stop_direct_plus_ladder_pnl": format(direct_pnl + ladder_pnl, "f"),
+                "rungs": rung_output,
+            }
 
         output = {
             "analytics_only": True,
@@ -2495,6 +2780,13 @@ class LiveEngine:
                 format(gross_pnl / resolved, "f") if resolved else None
             ),
             "entry_price_buckets_cents": dict(sorted(entry_buckets.items(), key=lambda item: int(item[0]))),
+            "cohorts": serialized_cohorts,
+            "ladder_contract_version": DELAYED_ENTRY_LADDER_CONTRACT_VERSION,
+            "ladder_fill_assumption": (
+                "post_trigger_public_trade_volume_allocated_once_across_descending_limits_"
+                "without_queue_priority"
+            ),
+            "legacy_delayed_entries_are_not_backfilled_as_ladder_fills": True,
             "entry_after_open_seconds_p50": percentile(0.50),
             "entry_after_open_seconds_p90": percentile(0.90),
             "entry_after_open_seconds_max": max(timings) if timings else None,
@@ -2526,6 +2818,38 @@ class LiveEngine:
             result["entry_after_open_seconds_max"],
         )
         LOG.warning("DELAYED ENTRY PRICE BUCKETS | %s", result["entry_price_buckets_cents"])
+        LOG.warning("================ DELAYED-ENTRY COHORT LADDERS ================")
+        LOG.warning(
+            "COHORT | ENTRIES | COMPLETE | PARTIAL | RESOLVED | W/L | WR | DIRECT PNL | "
+            "LADDER TRACKED/RESOLVED | LADDER PNL | COMBINED"
+        )
+        for threshold in OPENING_CROSS_LADDER_TRIGGER_LEVELS:
+            row = result["cohorts"][str(threshold)]
+            win_rate = row["directional_win_rate"]
+            LOG.warning(
+                ">=%sc | %d | %d | %d | %d | %d/%d | %s | $%s | %d/%d | $%s | $%s",
+                threshold, row["entries"], row["complete_coverage_entries"],
+                row["partial_coverage_entries"], row["complete_resolved_entries"],
+                row["directional_wins"], row["directional_losses"],
+                "n/a" if win_rate is None else f"{100 * win_rate:.2f}%",
+                row["gross_no_stop_direct_entry_pnl_per_share"],
+                row["ladder_tracked_entries"], row["ladder_resolved_entries"],
+                row["gross_no_stop_ladder_pnl"],
+                row["gross_no_stop_direct_plus_ladder_pnl"],
+            )
+            LOG.warning(
+                "DELAYED >=%sc LADDER | %s | legacy_without_ladder=%d",
+                threshold,
+                " | ".join(
+                    f"{level}c x{format(quantity, 'f')}:"
+                    f"touch={row['rungs'][str(level)]['touches']} "
+                    f"full={row['rungs'][str(level)]['full_fills']} "
+                    f"partial={row['rungs'][str(level)]['partial_fills']} "
+                    f"pnl=${row['rungs'][str(level)]['gross_no_stop_pnl']}"
+                    for level, quantity in OPENING_CROSS_LADDER_RUNGS
+                ),
+                row["legacy_entries_without_ladder"],
+            )
 
     def opening_cross_ladder_performance(self) -> dict[str, Any]:
         """Rebuild 53–59c first-minute trigger and ladder results idempotently."""
@@ -5106,6 +5430,26 @@ class LiveEngine:
                 })
             else:
                 delayed["status"] = "NO_THRESHOLD_CROSS_OBSERVED"
+            delayed_ladder = delayed.get("ladder")
+            if isinstance(delayed_ladder, dict):
+                filled_quantity = Decimal("0")
+                entry_cost = Decimal("0")
+                for level, _ in OPENING_CROSS_LADDER_RUNGS:
+                    rung = delayed_ladder.get("rungs", {}).get(str(level), {})
+                    quantity = Decimal(str(rung.get("simulated_filled_quantity") or "0"))
+                    filled_quantity += quantity
+                    entry_cost += quantity * cents_price(level)
+                payout = filled_quantity if winner else Decimal("0")
+                delayed_ladder.update({
+                    "settlement_outcome": outcome,
+                    "directional_winner": winner,
+                    "simulated_filled_quantity": format(filled_quantity, "f"),
+                    "simulated_entry_cost": format(entry_cost, "f"),
+                    "simulated_settlement_payout": format(payout, "f"),
+                    "gross_no_stop_pnl": format(payout - entry_cost, "f"),
+                    "status": "SETTLED_WIN" if winner else "SETTLED_LOSS",
+                    "settlement_finalized_at": utc_now(),
+                })
         opening_ladder = record.get("opening_cross_ladder")
         if isinstance(opening_ladder, dict):
             opening_ladder["settlement_outcome"] = outcome

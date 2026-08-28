@@ -98,6 +98,58 @@ class TimestampedFeed(Feed):
         return quote, source
 
 
+class DelayedLadderFeed(TimestampedFeed):
+    """Deterministic quote/trade buffers for delayed-ladder tests."""
+
+    def __init__(self, ask: str, observed_at: float, bid: str = "0.45", depth: str = "40.00") -> None:
+        super().__init__(ask, observed_at, bid, depth)
+        self.price_events: list[dict] = []
+        self.trade_events: list[dict] = []
+        self.session_token = "delayed-ladder-session-1"
+        self.complete_book_available = True
+        self.push_price(ask, observed_at)
+
+    def executable_shadow_quote(self, ticker: str, side: str, quantity: float, age: float):
+        if not self.complete_book_available:
+            return None, "complete_depth_temporarily_unavailable"
+        return super().executable_shadow_quote(ticker, side, quantity, age)
+
+    def push_price(self, ask: str, observed_at: float) -> None:
+        self.ask = ask
+        self.observed_at = observed_at
+        self.price_events.append({
+            "quote_id": f"delayed-price:{ask}:{observed_at}",
+            "economic_price": ask,
+            "selected_best_bid": self.bid,
+            "selected_component_epoch": observed_at,
+            "source": "deterministic_test_price_only",
+        })
+
+    def push_trade(self, price: str, quantity: str, observed_at: float, side: str = "yes") -> None:
+        timestamp = datetime.fromtimestamp(observed_at, timezone.utc).isoformat()
+        self.trade_events.append({
+            "trade_id": f"delayed-trade:{price}:{quantity}:{observed_at}",
+            f"{side}_price": price,
+            f"{'no' if side == 'yes' else 'yes'}_price": None,
+            "count": quantity,
+            "source_server_timestamp": timestamp,
+            "received_at": timestamp,
+        })
+
+    def selected_price_quotes_between(self, _ticker: str, _side: str, start: float, end: float):
+        return [
+            dict(event) for event in self.price_events
+            if start <= float(event["selected_component_epoch"]) <= end
+        ]
+
+    def public_trades_after(self, _ticker: str, created: datetime):
+        created_epoch = created.timestamp()
+        return [
+            dict(event) for event in self.trade_events
+            if datetime.fromisoformat(event["source_server_timestamp"]).timestamp() > created_epoch
+        ]
+
+
 class EntryRest:
     def __init__(self, balance: str = "100.00") -> None:
         self.balance = Decimal(balance)
@@ -1193,6 +1245,68 @@ class LiveExecutionTests(unittest.TestCase):
         self.assertEqual(summary["entries_after_opening_capture_window"], 1)
         self.assertEqual(summary["directional_wins"], 1)
         self.assertEqual(summary["directional_losses"], 0)
+
+    def test_delayed_entry_activates_persistent_public_trade_ladder(self) -> None:
+        engine = self.engine()
+        market_open = 1_800_000_000.0
+        feed = DelayedLadderFeed("0.52", market_open + 0.5)
+        record = engine.set_signal(
+            {"ticker": "KXBTC15M-delayed-ladder", "open_epoch": market_open, "close_epoch": market_open + 900},
+            {"outcome": "no", "ticker": "KXBTC15M-prior"},
+        )
+        self.assertEqual(engine.freeze_initial_signal_price(feed, record, market_open + 0.5), Decimal("0.51"))
+
+        feed.push_price("0.54", market_open + 65)
+        self.assertTrue(engine.observe_price_analytics(feed, record))
+        tracker = record["delayed_entry_tracking"]
+        self.assertEqual(tracker["first_entry_price_cents"], 54)
+        self.assertEqual(tracker["ladder"]["contract_version"], 1)
+
+        for seconds, price, quantity in (
+            (70, "0.49", "1.00"),
+            (80, "0.39", "2.00"),
+            (90, "0.29", "4.00"),
+            (100, "0.19", "8.00"),
+            (110, "0.09", "16.00"),
+        ):
+            feed.push_price(price, market_open + seconds)
+            feed.push_trade(price, quantity, market_open + seconds + 0.1)
+            self.assertTrue(engine.observe_price_analytics(feed, record))
+
+        lane = tracker["ladder"]
+        for level in (50, 40, 30, 20, 10):
+            rung = lane["rungs"][str(level)]
+            self.assertTrue(rung["touched"])
+            self.assertTrue(rung["simulated_full_fill"])
+        engine.finalize_settlement_analytics(record, "yes")
+        self.assertEqual(lane["gross_no_stop_pnl"], "25.300")
+        cohorts = engine.delayed_entry_performance()["cohorts"]
+        self.assertEqual(cohorts["53"]["complete_resolved_entries"], 1)
+        self.assertEqual(cohorts["54"]["complete_resolved_entries"], 1)
+        self.assertEqual(cohorts["55"]["complete_resolved_entries"], 0)
+        self.assertEqual(cohorts["54"]["ladder_resolved_entries"], 1)
+        self.assertEqual(cohorts["54"]["gross_no_stop_ladder_pnl"], "25.300")
+        self.assertEqual(cohorts["54"]["rungs"]["10"]["gross_no_stop_pnl"], "14.400")
+
+    def test_delayed_ladder_keeps_consuming_price_only_events_without_complete_depth(self) -> None:
+        engine = self.engine()
+        market_open = time.time() - 100
+        feed = DelayedLadderFeed("0.52", market_open + 0.5)
+        record = engine.set_signal(
+            {"ticker": "KXBTC15M-delayed-price-only", "open_epoch": market_open, "close_epoch": market_open + 900},
+            {"outcome": "no", "ticker": "KXBTC15M-prior"},
+        )
+        engine.freeze_initial_signal_price(feed, record, market_open + 0.5)
+        feed.push_price("0.54", market_open + 65)
+        self.assertTrue(engine.observe_price_analytics(feed, record))
+
+        feed.complete_book_available = False
+        feed.push_price("0.49", market_open + 70)
+        feed.push_trade("0.49", "1.00", market_open + 70.1)
+        self.assertTrue(engine.observe_price_analytics(feed, record))
+        rung = record["delayed_entry_tracking"]["ladder"]["rungs"]["50"]
+        self.assertTrue(rung["touched"])
+        self.assertEqual(rung["simulated_filled_quantity"], "1.00")
 
     def test_delayed_53_tracker_never_submits_a_second_live_order(self) -> None:
         async def scenario() -> None:
