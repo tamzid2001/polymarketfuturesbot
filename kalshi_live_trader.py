@@ -980,12 +980,20 @@ class LiveEngine:
                     key: item.get(key) for key in BTC_TARGET_RECORD_FIELDS
                 }
                 for item in self.markets
-                if isinstance(item, dict) and item.get("btc_target_status") == "AVAILABLE"
+                if (
+                    isinstance(item, dict)
+                    and item.get("btc_target_status") == "AVAILABLE"
+                    and item.get("btc_target_capture_version") == BTC_TARGET_CAPTURE_CONTRACT_VERSION
+                )
             }
             known_targets.update({
                 str(ticker): {key: record.get(key) for key in BTC_TARGET_RECORD_FIELDS}
                 for ticker, record in self.state.get("markets", {}).items()
-                if isinstance(record, dict) and record.get("btc_target_status") == "AVAILABLE"
+                if (
+                    isinstance(record, dict)
+                    and record.get("btc_target_status") == "AVAILABLE"
+                    and record.get("btc_target_capture_version") == BTC_TARGET_CAPTURE_CONTRACT_VERSION
+                )
             })
             get_market = getattr(rest, "get_market", None)
 
