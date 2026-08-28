@@ -238,6 +238,7 @@ class StrategyCoreTests(unittest.TestCase):
         self.assertIn('entry_timeout_seconds"] == 0', worker)
         self.assertIn("OPENING_PRICE_CAPTURE_CONTRACT_VERSION == 3", worker)
         self.assertIn("BTC_TARGET_CAPTURE_CONTRACT_VERSION == 2", worker)
+        self.assertIn("DELAYED_ENTRY_LADDER_CONTRACT_VERSION == 1", worker)
         self.assertIn("opening_price=first_price_only_post_open contract=v3", worker)
         self.assertIn("btc_target=exchange_market_detail contract=v2", worker)
         self.assertIn("cross_ladder=53-59c:50x1,40x2,30x4,20x8,10x16", worker)
