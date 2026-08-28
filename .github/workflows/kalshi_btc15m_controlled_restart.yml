@@ -40,20 +40,42 @@ jobs:
       - name: Restore latest bounded runtime state
         run: |
           set -euo pipefail
-          git fetch --no-tags origin refs/heads/runtime-state
+          runtime_ref=runtime-state-kxbtc15m
+          legacy_runtime_ref=runtime-state
+          set +e
+          git ls-remote --exit-code --heads origin "refs/heads/$runtime_ref" >/dev/null
+          runtime_ref_status=$?
+          set -e
+          if [ "$runtime_ref_status" -eq 0 ]; then
+            git fetch --no-tags origin "refs/heads/$runtime_ref"
+            restore_sha="$(git rev-parse FETCH_HEAD)"
+            git show "$restore_sha:.kxbtc15m-runtime-state.json" | jq -e \
+              '.schema_version == 1 and .owner == "kalshi-kxbtc15m" and .runtime_ref == "runtime-state-kxbtc15m" and (.paths | type == "array") and (.paths == (.paths | sort))' >/dev/null
+            echo "RUNTIME_STATE_OWNER=kalshi-kxbtc15m"
+            echo "RUNTIME_STATE_RESTORED=$runtime_ref"
+          elif [ "$runtime_ref_status" -eq 2 ]; then
+            git fetch --no-tags origin "refs/heads/$legacy_runtime_ref"
+            restore_sha="$(git rev-parse FETCH_HEAD)"
+            git cat-file -e "$restore_sha:data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_state.json" || {
+              echo "::error::Legacy runtime ref does not contain canonical KXBTC15M state"; exit 2;
+            }
+            echo "RUNTIME_STATE_MIGRATION_SOURCE=$legacy_runtime_ref"
+          else
+            echo "::error::Unable to determine canonical runtime ref status; refusing legacy fallback"
+            exit 2
+          fi
           for path in \
             selected_live_strategy.json \
             data/kalshi_live_maker_hybrid_v11_state.json \
             data/kalshi_live_maker_hybrid_v11_audit.jsonl \
             data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_state.json \
             data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_audit.jsonl; do
-            if git cat-file -e "FETCH_HEAD:$path" 2>/dev/null; then
+            if git cat-file -e "$restore_sha:$path" 2>/dev/null; then
               mkdir -p "$(dirname "$path")"
-              git show "FETCH_HEAD:$path" > "$path.runtime"
+              git show "$restore_sha:$path" > "$path.runtime"
               mv "$path.runtime" "$path"
             fi
           done
-          echo "RUNTIME_STATE_RESTORED=runtime-state"
 
       - name: Validate source, live gates, state, and safe handoff window
         env:

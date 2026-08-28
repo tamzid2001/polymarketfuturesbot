@@ -2,23 +2,66 @@
 
 The local atomic state file remains the immediate checkpoint.  When running in
 GitHub Actions this publisher narrows the runner-loss window by force-updating
-one parentless snapshot on the dedicated ``runtime-state`` ref. Main never
-receives checkpoint commits, and the runtime ref never develops history. It
-never blocks order management: a publish failure is recorded for the next
-reconciliation/handoff to repair.
+one parentless snapshot on the dedicated ``runtime-state-kxbtc15m`` ref. Main
+never receives checkpoint commits, and the runtime ref never develops history.
+The snapshot contains only explicitly supplied KXBTC15M durable paths plus an
+ownership manifest; unrelated files from the source checkout cannot leak into
+the branch. It never blocks order management: a publish failure is recorded for
+the next reconciliation/handoff to repair.
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
 import os
+import re
 import subprocess
 import tempfile
 import time
 from pathlib import Path
 
 
-DEFAULT_RUNTIME_STATE_REF = "runtime-state"
+DEFAULT_RUNTIME_STATE_REF = "runtime-state-kxbtc15m"
+RUNTIME_STATE_OWNER = "kalshi-kxbtc15m"
+RUNTIME_STATE_MANIFEST = ".kxbtc15m-runtime-state.json"
+_ALLOWED_RUNTIME_STATE_REF = re.compile(
+    r"runtime-state-(?:kxbtc15m|stop-(?:10|20|25|30|35))\Z"
+)
+_CANONICAL_RUNTIME_PATHS = frozenset({
+    "selected_live_strategy.json",
+    "data/kalshi_live_maker_hybrid_v11_state.json",
+    "data/kalshi_live_maker_hybrid_v11_audit.jsonl",
+    "data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_state.json",
+    "data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_audit.jsonl",
+})
+
+
+def validate_runtime_ref(runtime_ref: str) -> str:
+    """Restrict checkpoint writes to KXBTC15M-owned runtime namespaces."""
+
+    if not _ALLOWED_RUNTIME_STATE_REF.fullmatch(runtime_ref):
+        raise ValueError(f"runtime ref is not KXBTC15M-owned: {runtime_ref!r}")
+    return runtime_ref
+
+
+def validate_runtime_paths(runtime_ref: str, relative_paths: list[str]) -> None:
+    """Reject any path not owned by the selected KXBTC15M state lane."""
+
+    if runtime_ref == DEFAULT_RUNTIME_STATE_REF:
+        allowed = _CANONICAL_RUNTIME_PATHS
+    else:
+        stop_cents = runtime_ref.rsplit("-", 1)[-1]
+        allowed = frozenset({
+            "selected_live_strategy.json",
+            f"data/kalshi_shadow_maker_hybrid_v11_sticky_stop_{stop_cents}_state.json",
+            f"data/kalshi_shadow_maker_hybrid_v11_sticky_stop_{stop_cents}_audit.jsonl",
+        })
+    unexpected = sorted(set(relative_paths) - allowed)
+    if unexpected:
+        raise ValueError(
+            f"runtime ref {runtime_ref!r} received non-owned durable paths: {unexpected}"
+        )
 
 
 def _run(
@@ -37,12 +80,14 @@ def publish_runtime_snapshot(
 ) -> bool:
     """Publish one root snapshot with an exact lease; never extend Git history."""
 
+    runtime_ref = validate_runtime_ref(runtime_ref)
     if root is None:
         root = Path(_run(["git", "rev-parse", "--show-toplevel"], root=Path.cwd()).stdout.strip())
     root = root.resolve()
     relative = [str(path.resolve().relative_to(root)) for path in paths if path.exists()]
     if not relative:
         return False
+    validate_runtime_paths(runtime_ref, relative)
     remote_ref = f"refs/heads/{runtime_ref}"
     prior = _run(
         ["git", "ls-remote", "--heads", "origin", remote_ref], root=root,
@@ -54,9 +99,10 @@ def publish_runtime_snapshot(
     os.unlink(index_name)
     environment = dict(os.environ, GIT_INDEX_FILE=index_name)
     try:
-        # Start from the checked-out code snapshot so the runtime ref remains
-        # self-describing, then replace only the durable strategy-owned paths.
-        _run(["git", "read-tree", "HEAD"], root=root, environment=environment)
+        # A runtime branch is durable data, not another copy of the repository.
+        # Starting empty prevents unrelated tracked files (including another
+        # bot's state.json) from being mistaken for KXBTC15M-owned state.
+        _run(["git", "read-tree", "--empty"], root=root, environment=environment)
         for relative_path in relative:
             blob = _run(
                 ["git", "hash-object", "-w", "--", relative_path], root=root,
@@ -65,6 +111,27 @@ def publish_runtime_snapshot(
                 ["git", "update-index", "--add", "--cacheinfo", f"100644,{blob},{relative_path}"],
                 root=root, environment=environment,
             )
+        manifest = json.dumps(
+            {
+                "schema_version": 1,
+                "owner": RUNTIME_STATE_OWNER,
+                "runtime_ref": runtime_ref,
+                "paths": sorted(relative),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ) + "\n"
+        manifest_blob = _run(
+            ["git", "hash-object", "-w", "--stdin"], root=root,
+            input_text=manifest,
+        ).stdout.strip()
+        _run(
+            [
+                "git", "update-index", "--add", "--cacheinfo",
+                f"100644,{manifest_blob},{RUNTIME_STATE_MANIFEST}",
+            ],
+            root=root, environment=environment,
+        )
         tree = _run(["git", "write-tree"], root=root, environment=environment).stdout.strip()
         commit = _run(
             ["git", "commit-tree", tree], root=root, environment=environment,
@@ -76,7 +143,7 @@ def publish_runtime_snapshot(
             root=root, environment=environment, check=False,
         )
         if pushed.returncode:
-            raise RuntimeError("runtime-state push failed")
+            raise RuntimeError(f"runtime-state push failed for {runtime_ref}")
     finally:
         try:
             os.unlink(index_name)

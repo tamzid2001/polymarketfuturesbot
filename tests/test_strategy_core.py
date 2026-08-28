@@ -251,15 +251,24 @@ class StrategyCoreTests(unittest.TestCase):
         self.assertIn('--first-base-threshold "$PROFIT_THRESHOLD"', worker)
         self.assertIn('--base-increment "$SHARES_ADDED_AFTER_PROFIT_THRESHOLD"', worker)
         self.assertIn('--hybrid-hard-stop-cents "$MAX_STOP_LOSS_CENTS"', worker)
-        self.assertIn("RUNTIME_STATE_RESTORED=runtime-state", worker)
-        self.assertIn("python live_checkpoint.py --reason end-of-run", worker)
+        self.assertIn("RUNTIME_STATE_RESTORED=$runtime_ref", worker)
+        self.assertIn("runtime_ref=runtime-state-kxbtc15m", worker)
+        self.assertIn("legacy_runtime_ref=runtime-state", worker)
+        self.assertIn("RUNTIME_STATE_OWNER=kalshi-kxbtc15m", worker)
+        self.assertIn(
+            "python live_checkpoint.py --reason end-of-run --runtime-ref runtime-state-kxbtc15m",
+            worker,
+        )
         self.assertLess(
             trader.index("state = load_state(args.state_file, config)"),
             trader.index("if args.persist_config:", trader.index("async def async_main")),
         )
         self.assertNotIn("git push origin HEAD:main", worker)
         self.assertNotIn("chore: checkpoint KXBTC15M hybrid state", worker)
-        self.assertIn("RUNTIME_STATE_RESTORED=runtime-state", controlled)
+        self.assertIn("RUNTIME_STATE_RESTORED=$runtime_ref", controlled)
+        self.assertIn("runtime_ref=runtime-state-kxbtc15m", controlled)
+        self.assertIn("legacy_runtime_ref=runtime-state", controlled)
+        self.assertIn("RUNTIME_STATE_OWNER=kalshi-kxbtc15m", controlled)
         self.assertIn('record.get("status") == "SIGNAL_PENDING"', controlled)
         self.assertIn("and breaker_blocked", controlled)
         self.assertIn("and not has_order_work(record)", controlled)

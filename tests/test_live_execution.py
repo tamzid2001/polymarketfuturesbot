@@ -12,7 +12,11 @@ from pathlib import Path
 from unittest.mock import patch
 
 from audit_ledger import append_audit
-from live_checkpoint import MaterialCheckpointPublisher, publish_runtime_snapshot
+from live_checkpoint import (
+    DEFAULT_RUNTIME_STATE_REF, RUNTIME_STATE_MANIFEST, RUNTIME_STATE_OWNER,
+    MaterialCheckpointPublisher, publish_runtime_snapshot, validate_runtime_paths,
+    validate_runtime_ref,
+)
 from kalshi_btc15m_average_down import KalshiLiveFeed
 from kalshi_live_trader import (
     BTC_TARGET_CAPTURE_CONTRACT_VERSION, LiveEngine, ProvisionalOutcomeTracker, QuoteObservation,
@@ -1477,32 +1481,38 @@ class LiveExecutionTests(unittest.TestCase):
         for key, value in (("user.name", "test"), ("user.email", "test@example.com")):
             subprocess.run(["git", "-C", str(work), "config", key, value], check=True)
         subprocess.run(["git", "-C", str(work), "remote", "add", "origin", str(remote)], check=True)
-        state = work / "state.json"
+        state = work / "data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_state.json"
+        state.parent.mkdir(parents=True)
         state.write_text('{"sequence":1}\n', encoding="utf-8")
-        subprocess.run(["git", "-C", str(work), "add", "state.json"], check=True)
+        unrelated = work / "unrelated.txt"
+        unrelated.write_text("must not enter runtime snapshot\n", encoding="utf-8")
+        subprocess.run([
+            "git", "-C", str(work), "add",
+            "data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_state.json", "unrelated.txt",
+        ], check=True)
         subprocess.run(["git", "-C", str(work), "commit", "-m", "source"], check=True, capture_output=True)
         subprocess.run(["git", "-C", str(work), "push", "-u", "origin", "main"], check=True, capture_output=True)
         main_before = subprocess.check_output(["git", "-C", str(work), "rev-parse", "main"], text=True).strip()
 
         self.assertTrue(publish_runtime_snapshot((state,), "first", root=work))
         first = subprocess.check_output(
-            ["git", "--git-dir", str(remote), "rev-parse", "runtime-state"], text=True,
+            ["git", "--git-dir", str(remote), "rev-parse", DEFAULT_RUNTIME_STATE_REF], text=True,
         ).strip()
         state.write_text('{"sequence":2}\n', encoding="utf-8")
         self.assertTrue(publish_runtime_snapshot((state,), "second", root=work))
         second = subprocess.check_output(
-            ["git", "--git-dir", str(remote), "rev-parse", "runtime-state"], text=True,
+            ["git", "--git-dir", str(remote), "rev-parse", DEFAULT_RUNTIME_STATE_REF], text=True,
         ).strip()
 
         self.assertNotEqual(first, second)
         self.assertEqual(
             subprocess.check_output(
-                ["git", "--git-dir", str(remote), "rev-list", "--count", "runtime-state"], text=True,
+                ["git", "--git-dir", str(remote), "rev-list", "--count", DEFAULT_RUNTIME_STATE_REF], text=True,
             ).strip(),
             "1",
         )
         parents = subprocess.check_output(
-            ["git", "--git-dir", str(remote), "show", "-s", "--format=%P", "runtime-state"], text=True,
+            ["git", "--git-dir", str(remote), "show", "-s", "--format=%P", DEFAULT_RUNTIME_STATE_REF], text=True,
         ).strip()
         self.assertEqual(parents, "")
         self.assertEqual(
@@ -1511,9 +1521,47 @@ class LiveExecutionTests(unittest.TestCase):
         )
         self.assertEqual(
             subprocess.check_output(
-                ["git", "--git-dir", str(remote), "show", "runtime-state:state.json"], text=True,
+                [
+                    "git", "--git-dir", str(remote), "show",
+                    f"{DEFAULT_RUNTIME_STATE_REF}:data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_state.json",
+                ], text=True,
             ),
             '{"sequence":2}\n',
+        )
+        tree_paths = subprocess.check_output(
+            ["git", "--git-dir", str(remote), "ls-tree", "-r", "--name-only", DEFAULT_RUNTIME_STATE_REF],
+            text=True,
+        ).splitlines()
+        self.assertEqual(tree_paths, [
+            RUNTIME_STATE_MANIFEST,
+            "data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_state.json",
+        ])
+        manifest = json.loads(subprocess.check_output(
+            [
+                "git", "--git-dir", str(remote), "show",
+                f"{DEFAULT_RUNTIME_STATE_REF}:{RUNTIME_STATE_MANIFEST}",
+            ],
+            text=True,
+        ))
+        self.assertEqual(manifest["owner"], RUNTIME_STATE_OWNER)
+        self.assertEqual(manifest["runtime_ref"], DEFAULT_RUNTIME_STATE_REF)
+        self.assertEqual(
+            manifest["paths"],
+            ["data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_state.json"],
+        )
+
+    def test_runtime_checkpoint_rejects_non_kxbtc15m_ref(self) -> None:
+        with self.assertRaisesRegex(ValueError, "not KXBTC15M-owned"):
+            validate_runtime_ref("runtime-state")
+        with self.assertRaisesRegex(ValueError, "not KXBTC15M-owned"):
+            validate_runtime_ref("main")
+        self.assertEqual(validate_runtime_ref("runtime-state-kxbtc15m"), "runtime-state-kxbtc15m")
+        self.assertEqual(validate_runtime_ref("runtime-state-stop-20"), "runtime-state-stop-20")
+        with self.assertRaisesRegex(ValueError, "non-owned durable paths"):
+            validate_runtime_paths("runtime-state-kxbtc15m", ["state.json"])
+        validate_runtime_paths(
+            "runtime-state-kxbtc15m",
+            ["data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_state.json"],
         )
 
     def test_entry_and_stop_latency_is_durable_and_observational(self) -> None:
