@@ -749,12 +749,30 @@ class LiveExecutionTests(unittest.TestCase):
             # as proof of the v2 detail-enrichment contract.
             for item in engine.markets:
                 item["btc_target_capture_version"] = 1
+            legacy_record = {
+                "ticker": "KXBTC15M-active", "btc_target_capture_version": 1,
+                "btc_target_status": "AVAILABLE", "btc_target_price": "80276.37",
+                "btc_target_comparison": "greater_or_equal",
+                "opening_cross_ladder": {"triggered": {"53": {}}},
+            }
+            engine.state["markets"]["KXBTC15M-active"] = legacy_record
             await engine.discover(rest)
             self.assertEqual(len(rest.detail_calls), 6)
             self.assertTrue(all(
                 item["btc_target_capture_version"] == BTC_TARGET_CAPTURE_CONTRACT_VERSION
                 for item in engine.markets
             ))
+            self.assertEqual(
+                legacy_record["btc_target_capture_version"], BTC_TARGET_CAPTURE_CONTRACT_VERSION,
+            )
+            self.assertEqual(
+                legacy_record["opening_cross_ladder"]["triggered"]["53"]["btc_target_price"],
+                "80276.37",
+            )
+            self.assertFalse(engine.backfill_btc_target(
+                legacy_record, btc_target_metadata({}), reason="test_unavailable_lookup",
+            ))
+            self.assertEqual(legacy_record["btc_target_price"], "80276.37")
         asyncio.run(scenario())
 
     def test_millisecond_exchange_timestamp_and_price_only_quote_enable_provisional_signal(self) -> None:

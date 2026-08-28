@@ -944,6 +944,50 @@ class LiveEngine:
             self.trip("max_daily_realized_loss")
         return not self.state["circuit_breaker"].get("blocked")
 
+    def backfill_btc_target(
+        self, record: dict[str, Any], target_details: dict[str, Any], *, reason: str,
+    ) -> bool:
+        """Upgrade target telemetry without altering any trading decision.
+
+        An unavailable lookup can never erase an older valid strike.  The
+        signal side, order state, sizing, and P&L fields are intentionally
+        outside ``BTC_TARGET_RECORD_FIELDS`` and therefore immutable here.
+        """
+
+        if target_details.get("btc_target_status") != "AVAILABLE":
+            return False
+        if (
+            record.get("btc_target_capture_version") == BTC_TARGET_CAPTURE_CONTRACT_VERSION
+            and record.get("btc_target_status") == "AVAILABLE"
+            and record.get("btc_target_price") == target_details.get("btc_target_price")
+            and record.get("btc_target_comparison") == target_details.get("btc_target_comparison")
+        ):
+            return False
+        record.update({key: target_details.get(key) for key in BTC_TARGET_RECORD_FIELDS})
+        ladder = record.get("opening_cross_ladder")
+        if isinstance(ladder, dict):
+            ladder.update({key: target_details.get(key) for key in BTC_TARGET_RECORD_FIELDS})
+            for lane in ladder.get("triggered", {}).values():
+                if isinstance(lane, dict):
+                    lane.update({key: target_details.get(key) for key in BTC_TARGET_RECORD_FIELDS})
+        self.audit(
+            "btc_target_backfilled", ticker=record.get("ticker"), reason=reason,
+            btc_target_price=record.get("btc_target_price"),
+            btc_target_price_display=record.get("btc_target_price_display"),
+            btc_target_comparison=record.get("btc_target_comparison"),
+            btc_target_source=record.get("btc_target_source"),
+            btc_target_status=record.get("btc_target_status"),
+            btc_target_capture_version=record.get("btc_target_capture_version"),
+        )
+        LOG.warning(
+            "BTC TARGET BACKFILLED | ticker=%s target=%s comparison=%s source=%s "
+            "status=%s contract=v%s reason=%s",
+            record.get("ticker"), record.get("btc_target_price_display"),
+            record.get("btc_target_comparison"), record.get("btc_target_source"),
+            record.get("btc_target_status"), record.get("btc_target_capture_version"), reason,
+        )
+        return True
+
     async def discover(self, rest: KalshiREST) -> None:
         """Discover the previous, current, and upcoming exchange markets.
 
@@ -1020,6 +1064,10 @@ class LiveEngine:
                     known_targets[str(item["ticker"])] = details
 
             await asyncio.gather(*(enrich_target(item) for item in candidates))
+            for item in candidates:
+                record = self.state.get("markets", {}).get(item["ticker"])
+                if isinstance(record, dict):
+                    self.backfill_btc_target(record, item, reason="authoritative_market_discovery")
             # Keep a narrow rolling window: one predecessor and the nearby
             # initialized successors are enough for signal causality and
             # pre-subscription.  Bounded retention prevents an old API page
@@ -1065,35 +1113,7 @@ class LiveEngine:
                 target_details[key] = market[key]
         record = self.state["markets"].get(ticker)
         if isinstance(record, dict):
-            if (
-                record.get("btc_target_capture_version") != BTC_TARGET_CAPTURE_CONTRACT_VERSION
-                or (
-                    record.get("btc_target_status") != "AVAILABLE"
-                    and target_details.get("btc_target_status") == "AVAILABLE"
-                )
-            ):
-                record.update(target_details)
-                ladder = record.get("opening_cross_ladder")
-                if isinstance(ladder, dict):
-                    ladder.update(target_details)
-                    for lane in ladder.get("triggered", {}).values():
-                        if isinstance(lane, dict):
-                            lane.update(target_details)
-                self.audit(
-                    "btc_target_backfilled", ticker=ticker,
-                    btc_target_price=record.get("btc_target_price"),
-                    btc_target_price_display=record.get("btc_target_price_display"),
-                    btc_target_comparison=record.get("btc_target_comparison"),
-                    btc_target_source=record.get("btc_target_source"),
-                    btc_target_status=record.get("btc_target_status"),
-                )
-                LOG.warning(
-                    "BTC TARGET BACKFILLED | ticker=%s target=%s comparison=%s source=%s status=%s",
-                    ticker, record.get("btc_target_price_display"),
-                    record.get("btc_target_comparison"), record.get("btc_target_source"),
-                    record.get("btc_target_status"),
-                )
-                self.checkpoint("btc_target_backfilled")
+            self.backfill_btc_target(record, target_details, reason="signal_reconciliation")
             return record
         source = str(provisional["outcome"])
         signal_state = self.state.setdefault("directional_signal_state", {
