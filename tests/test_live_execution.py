@@ -702,6 +702,7 @@ class LiveExecutionTests(unittest.TestCase):
             class DiscoveryRest:
                 def __init__(self) -> None:
                     self.calls = []
+                    self.detail_calls = []
 
                 async def get_raw_json(self, path, params):
                     self.calls.append((path, params))
@@ -711,6 +712,14 @@ class LiveExecutionTests(unittest.TestCase):
                         market("KXBTC15M-active", now - 30, now + 870, "active"),
                         market("KXBTC15M-upcoming", now + 870, now + 1770, "initialized"),
                     ]}
+
+                async def get_market(self, ticker):
+                    self.detail_calls.append(ticker)
+                    return {
+                        "ticker": ticker, "floor_strike": "80276.37",
+                        "strike_type": "greater_or_equal",
+                        "yes_sub_title": "Target Price: $80,276.37",
+                    }
 
                 @staticmethod
                 def assert_bounded(params):
@@ -727,6 +736,15 @@ class LiveExecutionTests(unittest.TestCase):
             self.assertEqual(engine.predecessor(active or {}) and engine.predecessor(active or {})["ticker"], "KXBTC15M-prior")
             self.assertEqual(engine.successor(active or {}) and engine.successor(active or {})["ticker"], "KXBTC15M-upcoming")
             self.assertEqual(len(rest.calls), 1)
+            self.assertCountEqual(rest.detail_calls, [
+                "KXBTC15M-prior", "KXBTC15M-active", "KXBTC15M-upcoming",
+            ])
+            self.assertEqual(active and active["btc_target_price"], "80276.37")
+            self.assertEqual(active and active["btc_target_source"], "floor_strike")
+            # A second refresh reuses captured targets instead of hammering
+            # the per-market endpoint every discovery interval.
+            await engine.discover(rest)
+            self.assertEqual(len(rest.detail_calls), 3)
         asyncio.run(scenario())
 
     def test_millisecond_exchange_timestamp_and_price_only_quote_enable_provisional_signal(self) -> None:

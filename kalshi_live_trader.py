@@ -72,7 +72,10 @@ ACTIVE_CONFIG_SCHEMA_VERSION = 11
 # later complete-depth book.  This can advance without reinterpreting recovery
 # accounting in an existing v11 state file.
 OPENING_PRICE_CAPTURE_CONTRACT_VERSION = 3
-BTC_TARGET_CAPTURE_CONTRACT_VERSION = 1
+# v2 requires enrichment from Kalshi's authoritative per-market endpoint when
+# the bounded list response omits strike metadata. A list-only v1 worker must
+# fail the workflow guard instead of silently restoring UNAVAILABLE targets.
+BTC_TARGET_CAPTURE_CONTRACT_VERSION = 2
 BTC_TARGET_RECORD_FIELDS = (
     "btc_target_capture_version",
     "btc_target_status",
@@ -966,6 +969,49 @@ class LiveEngine:
                 market_metadata(value)
                 for value in window_payload.get("markets", []) if isinstance(value, dict)
             ]
+            candidates = [item for item in candidates if item is not None]
+            # Kalshi's bounded market-list payload can omit strike metadata
+            # even though the authoritative per-market endpoint exposes it.
+            # Reuse already captured targets first, then enrich only unknown
+            # tickers concurrently. This keeps boundary discovery fast and
+            # never guesses an underlying BTC target from the ticker.
+            known_targets = {
+                str(item.get("ticker")): {
+                    key: item.get(key) for key in BTC_TARGET_RECORD_FIELDS
+                }
+                for item in self.markets
+                if isinstance(item, dict) and item.get("btc_target_status") == "AVAILABLE"
+            }
+            known_targets.update({
+                str(ticker): {key: record.get(key) for key in BTC_TARGET_RECORD_FIELDS}
+                for ticker, record in self.state.get("markets", {}).items()
+                if isinstance(record, dict) and record.get("btc_target_status") == "AVAILABLE"
+            })
+            get_market = getattr(rest, "get_market", None)
+
+            async def enrich_target(item: dict[str, Any]) -> None:
+                if item.get("btc_target_status") == "AVAILABLE":
+                    return
+                cached = known_targets.get(str(item["ticker"]))
+                if cached is not None:
+                    item.update(cached)
+                    return
+                if not callable(get_market):
+                    return
+                try:
+                    detailed = await get_market(item["ticker"])
+                except Exception as exc:  # target telemetry cannot authorize trading
+                    LOG.warning(
+                        "BTC TARGET LOOKUP FAILED | ticker=%s error_type=%s",
+                        item["ticker"], type(exc).__name__,
+                    )
+                    return
+                details = btc_target_metadata(detailed)
+                item.update(details)
+                if details["btc_target_status"] == "AVAILABLE":
+                    known_targets[str(item["ticker"])] = details
+
+            await asyncio.gather(*(enrich_target(item) for item in candidates))
             # Keep a narrow rolling window: one predecessor and the nearby
             # initialized successors are enough for signal causality and
             # pre-subscription.  Bounded retention prevents an old API page
@@ -976,8 +1022,7 @@ class LiveEngine:
             }
             retained.update({
                 item["ticker"]: item for item in candidates
-                if item is not None
-                and item["close_epoch"] >= now - MARKET_DISCOVERY_LOOKBACK_SECONDS
+                if item["close_epoch"] >= now - MARKET_DISCOVERY_LOOKBACK_SECONDS
                 and item["open_epoch"] <= now + MARKET_DISCOVERY_LOOKAHEAD_SECONDS
             })
             self.markets = sorted(retained.values(), key=lambda item: item["open_epoch"])
