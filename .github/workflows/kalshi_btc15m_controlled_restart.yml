@@ -1,0 +1,230 @@
+name: Controlled Restart — Kalshi KXBTC15M Hybrid
+
+# Manual, serialized handoff onto the current main branch. The source lane
+# must be flat and inside the same middle-13-minute safety window used by the
+# worker's automatic handoff. The replacement always starts with authoritative
+# reconciliation and never resets state.
+on:
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: "Running KXBTC15M hybrid Actions run to replace."
+        required: true
+        type: string
+      target_live:
+        description: "Request live mode; both repository live gates must already permit it."
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: kalshi-kxbtc15m-live-controlled-restart
+  cancel-in-progress: false
+
+jobs:
+  handoff:
+    runs-on: ubuntu-latest
+    environment: Kalshi
+    timeout-minutes: 12
+    steps:
+      - name: Checkout current main code and durable state
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 1
+
+      - name: Restore latest bounded runtime state
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin refs/heads/runtime-state
+          for path in \
+            selected_live_strategy.json \
+            data/kalshi_live_maker_hybrid_v11_state.json \
+            data/kalshi_live_maker_hybrid_v11_audit.jsonl \
+            data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_state.json \
+            data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_audit.jsonl; do
+            if git cat-file -e "FETCH_HEAD:$path" 2>/dev/null; then
+              mkdir -p "$(dirname "$path")"
+              git show "FETCH_HEAD:$path" > "$path.runtime"
+              mv "$path.runtime" "$path"
+            fi
+          done
+          echo "RUNTIME_STATE_RESTORED=runtime-state"
+
+      - name: Validate source, live gates, state, and safe handoff window
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          TARGET_LIVE: ${{ inputs.target_live }}
+          SHADOW_PROFILE: "sticky_stop_40"
+          LIVE_GATE: ${{ vars.KALSHI_LIVE_ENABLED || 'false' }}
+          SHADOW_ONLY_LOCK: ${{ vars.KALSHI_SHADOW_ONLY || 'true' }}
+        run: |
+          set -euo pipefail
+          source_json="$(gh run view "$SOURCE_RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            --json workflowName,status,displayTitle,headSha)"
+          workflow="$(jq -r '.workflowName' <<<"$source_json")"
+          source_status="$(jq -r '.status' <<<"$source_json")"
+          title="$(jq -r '.displayTitle' <<<"$source_json")"
+          [ "$workflow" = "Kalshi KXBTC15M Hybrid Live" ] || {
+            echo "::error::source_run_id is not a KXBTC15M hybrid worker"; exit 2;
+          }
+          [ "$source_status" = "in_progress" ] || {
+            echo "::error::source worker must be in_progress, got $source_status"; exit 2;
+          }
+
+          if [ "$TARGET_LIVE" = "true" ]; then
+            [ "$LIVE_GATE" = "true" ] && [ "$SHADOW_ONLY_LOCK" != "true" ] || {
+              echo "::error::Live handoff requires KALSHI_LIVE_ENABLED=true and KALSHI_SHADOW_ONLY=false"; exit 2;
+            }
+          fi
+          if [[ "$title" == *"LIVE" ]]; then
+            state_file=data/kalshi_live_maker_hybrid_v11_state.json
+          else
+            expected_title="DRY_RUN $SHADOW_PROFILE"
+            [[ "$title" == *"$expected_title"* ]] || {
+              echo "::error::source title does not match requested shadow profile"; exit 2;
+            }
+            state_file=data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_state.json
+          fi
+          [ -f "$state_file" ] || { echo "::error::Missing durable state: $state_file"; exit 2; }
+
+          # Never stop a manager at a boundary or while its persisted state
+          # reports exposure/order work. A replacement can then reconcile from
+          # a flat, fsynced checkpoint without an unmanaged-risk interval.
+          phase=$(( $(date -u +%s) % 900 ))
+          [ "$phase" -ge 60 ] && [ "$phase" -le 840 ] || {
+            echo "::error::Controlled restart is allowed only 1–14 minutes into the current market"; exit 2;
+          }
+          python - "$state_file" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          state = json.loads(pathlib.Path(sys.argv[1]).read_text())
+          active_statuses = {
+              "SIGNAL_PENDING", "ENTRY_PENDING", "ENTRY_PARTIAL", "POSITION_OPEN",
+              "STOP_PENDING", "SETTLEMENT_PENDING", "RECONCILIATION_PENDING",
+              "ACCOUNTING_RECONCILIATION_PENDING", "ENTRY_CANCEL_UNCONFIRMED",
+              "MAKER_EXIT_PENDING", "MAKER_EXIT_PARTIAL", "MAKER_EXIT_CANCEL_UNCONFIRMED",
+              "HARD_STOP_PENDING",
+          }
+          active = [
+              (ticker, record) for ticker, record in state.get("markets", {}).items()
+              if isinstance(record, dict) and record.get("status") in active_statuses
+          ]
+          if str(state.get("current_position", "0")) not in {"0", "0.0", "0.00"}:
+              raise SystemExit("persisted position is not flat; refusing controlled restart")
+          if state.get("current_order_id"):
+              raise SystemExit("persisted current_order_id exists; refusing controlled restart")
+
+          breaker_blocked = bool(state.get("circuit_breaker", {}).get("blocked"))
+
+          def nonzero(value):
+              try:
+                  return abs(float(value or 0)) > 1e-9
+              except (TypeError, ValueError):
+                  return True
+
+          def has_order_work(record):
+              if record.get("current_order_id") or nonzero(record.get("actual_quantity")):
+                  return True
+              for key in ("entry_orders", "exit_orders"):
+                  for order in record.get(key, []):
+                      if not isinstance(order, dict):
+                          return True
+                      if nonzero(order.get("remaining_count")):
+                          return True
+                      if order.get("order_id") and str(order.get("status") or "").lower() in {
+                          "resting", "pending", "open", "unknown", "submit_failed",
+                      }:
+                          return True
+              return False
+
+          unsafe = []
+          safe_blocked_signals = []
+          for ticker, record in active:
+              # A latched circuit breaker can deliberately leave the current
+              # market in SIGNAL_PENDING while observational analytics keep
+              # running. It is safe to hand off only when both global and
+              # per-market state prove there is no order or exposure.
+              if (
+                  record.get("status") == "SIGNAL_PENDING"
+                  and breaker_blocked
+                  and not has_order_work(record)
+              ):
+                  safe_blocked_signals.append(ticker)
+              else:
+                  unsafe.append(ticker)
+          if unsafe:
+              raise SystemExit(f"persisted order/active state exists; refusing controlled restart: {unsafe}")
+          print(
+              "CONTROLLED_RESTART_PREFLIGHT=FLAT "
+              f"observational_signal_pending={safe_blocked_signals}"
+          )
+          PY
+
+      - name: Remove queued replacement for the source lane
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          TARGET_LIVE: ${{ inputs.target_live }}
+          SHADOW_PROFILE: "sticky_stop_40"
+        run: |
+          set -euo pipefail
+          source_title="$(gh run view "$SOURCE_RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            --json displayTitle --jq '.displayTitle')"
+          if [ "$TARGET_LIVE" = "true" ]; then
+            target_title="LIVE"
+          else
+            target_title="DRY_RUN $SHADOW_PROFILE"
+          fi
+          runs="$(gh run list --repo "$GITHUB_REPOSITORY" \
+            --workflow kalshi_btc15m_average_down.yml --limit 100 \
+            --json databaseId,status,displayTitle)"
+          jq -r --arg source "$SOURCE_RUN_ID" --arg source_title "$source_title" --arg target_title "$target_title" '
+            .[]
+            | select((.databaseId|tostring) != $source)
+            | select(.status == "queued" or .status == "pending" or .status == "waiting")
+            | select(((.displayTitle // "") | contains($source_title)) or ((.displayTitle // "") | contains($target_title)))
+            | .databaseId
+          ' <<<"$runs" | while read -r run_id; do
+            [ -z "$run_id" ] || gh run cancel "$run_id" --repo "$GITHUB_REPOSITORY"
+          done
+
+      - name: Stop only the validated source worker
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+        run: |
+          set -euo pipefail
+          gh run cancel "$SOURCE_RUN_ID" --repo "$GITHUB_REPOSITORY"
+          for attempt in $(seq 1 12); do
+            run_state="$(gh run view "$SOURCE_RUN_ID" --repo "$GITHUB_REPOSITORY" --json status --jq '.status')"
+            echo "SOURCE RUN STATUS | attempt=$attempt status=$run_state"
+            [ "$run_state" = "completed" ] && exit 0
+            sleep 5
+          done
+          echo "::error::Source worker did not stop within 60 seconds; refusing overlap"
+          exit 1
+
+      - name: Dispatch current main with preserved state
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_LIVE: ${{ inputs.target_live }}
+          SHADOW_PROFILE: "sticky_stop_40"
+        run: |
+          set -euo pipefail
+          if [ "$TARGET_LIVE" = "true" ]; then
+            gh workflow run kalshi_btc15m_average_down.yml --repo "$GITHUB_REPOSITORY" --ref main \
+              -f live_enabled=true -f reconcile_only=false
+            echo "CONTROLLED HANDOFF QUEUED | target=LIVE ref=main reconciliation_required=true"
+          else
+            gh workflow run kalshi_btc15m_average_down.yml --repo "$GITHUB_REPOSITORY" --ref main \
+              -f live_enabled=false -f reconcile_only=false
+            echo "CONTROLLED HANDOFF QUEUED | target=DRY_RUN profile=$SHADOW_PROFILE ref=main"
+          fi

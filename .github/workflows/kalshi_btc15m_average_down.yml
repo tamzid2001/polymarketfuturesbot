@@ -1,0 +1,270 @@
+name: Kalshi KXBTC15M Hybrid Live
+
+# The watchdog only keeps a worker available. The Python worker maintains the
+# WebSocket and reacts to Kalshi's market timestamps at each boundary; it does
+# not assume a cron invocation occurred at exactly a 15-minute open.
+run-name: >-
+  Kalshi KXBTC15M Hybrid —
+  ${{ (inputs.live_enabled && vars.KALSHI_LIVE_ENABLED == 'true' && vars.KALSHI_SHADOW_ONLY != 'true') && 'LIVE' || 'DRY_RUN sticky_stop_40' }}
+
+on:
+  # The separately serialized watchdog owns the five-minute recovery
+  # schedule. Keeping this long worker dispatch-only prevents a queue of
+  # redundant scheduled five-hour jobs behind the singleton concurrency key.
+  workflow_dispatch:
+    inputs:
+      live_enabled:
+        description: "Permit real orders only when repository variable KALSHI_LIVE_ENABLED is also true."
+        required: true
+        type: boolean
+        default: false
+      reconcile_only:
+        description: "Authenticate and reconcile orders/positions only; never create an entry."
+        required: true
+        type: boolean
+        default: false
+      initial_shares:
+        description: "Initial two-decimal shares for a brand-new strategy state. Blank preserves the durable setting."
+        required: false
+        type: string
+        default: ""
+      scaling_multiplier:
+        description: "Recovery and geometric threshold multiplier (for example 1.01). Blank preserves the durable setting."
+        required: false
+        type: string
+        default: ""
+      profit_threshold:
+        description: "Realized net profit required for the first permanent share increase. Blank preserves the durable setting."
+        required: false
+        type: string
+        default: ""
+      shares_added_after_profit_threshold:
+        description: "Two-decimal shares permanently added whenever the current profit threshold is crossed."
+        required: false
+        type: string
+        default: ""
+      max_stop_loss_cents:
+        description: "Hard-stop price from 40c through 49c; maker trigger/exit remain 1c/2c higher."
+        required: false
+        type: string
+        default: ""
+
+# Serialized runs are intentional.  Cancel-in-progress is false because a new
+# worker must never kill another worker mid-order; the next scheduled wakeup
+# waits and begins by exchange reconciliation.
+concurrency:
+  group: kalshi-kxbtc15m-live
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  trade:
+    runs-on: ubuntu-latest
+    environment: Kalshi
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Restore latest bounded runtime state
+        run: |
+          set -euo pipefail
+          runtime_ref=runtime-state
+          if git fetch --no-tags origin "refs/heads/$runtime_ref"; then
+            for path in \
+              selected_live_strategy.json \
+              data/kalshi_live_maker_hybrid_v11_state.json \
+              data/kalshi_live_maker_hybrid_v11_audit.jsonl \
+              data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_state.json \
+              data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_audit.jsonl; do
+              if git cat-file -e "FETCH_HEAD:$path" 2>/dev/null; then
+                mkdir -p "$(dirname "$path")"
+                git show "FETCH_HEAD:$path" > "$path.runtime"
+                mv "$path.runtime" "$path"
+              fi
+            done
+            echo "RUNTIME_STATE_RESTORED=runtime-state"
+          else
+            echo "RUNTIME_STATE_BOOTSTRAP=main_snapshot"
+          fi
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install production dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements_kalshi_settlement_trader.txt
+
+      - name: Verify shared live strategy engine
+        run: |
+          set -euo pipefail
+          python -m py_compile strategy_core.py live_state.py audit_ledger.py kalshi_live_trader.py optimizer.py
+          PYTHONPATH=. python -m unittest -v \
+            tests.test_strategy_core \
+            tests.test_live_execution \
+            tests.test_maker_hybrid_v11 \
+            tests.test_reconciliation \
+            tests.test_recovery_sizing \
+            tests.test_execution_path_model \
+            tests.test_historical_replay
+
+      - name: Assert canonical hybrid strategy contract
+        run: |
+          set -euo pipefail
+          python -c 'from decimal import Decimal; from kalshi_live_trader import ACTIVE_CONFIG_SCHEMA_VERSION, ACTIVE_STRATEGY_VERSION, BTC_TARGET_CAPTURE_CONTRACT_VERSION, OPENING_CROSS_LADDER_RUNGS, OPENING_CROSS_LADDER_TRIGGER_LEVELS, OPENING_PRICE_CAPTURE_CONTRACT_VERSION, load_config; c = load_config(__import__("pathlib").Path("selected_live_strategy.json")); assert c["strategy_version"] == ACTIVE_STRATEGY_VERSION; assert c["config_schema_version"] == ACTIVE_CONFIG_SCHEMA_VERSION; assert OPENING_PRICE_CAPTURE_CONTRACT_VERSION == 3; assert BTC_TARGET_CAPTURE_CONTRACT_VERSION == 2; assert OPENING_CROSS_LADDER_TRIGGER_LEVELS == tuple(range(53, 60)); assert [(p, str(q)) for p, q in OPENING_CROSS_LADDER_RUNGS] == [(50, "1.00"), (40, "2.00"), (30, "4.00"), (20, "8.00"), (10, "16.00")]; assert c["entry_execution_mode"] == "signal_price_minus_offset_maker"; assert c["maker_order_time_in_force"] == "good_till_canceled"; assert c["entry_order_lifetime"] == "until_filled_or_market_close"; assert c["entry_timeout_seconds"] == 0; assert c["opening_quote_capture_seconds"] == 60; assert c["delayed_entry_tracking_enabled"] is True; assert c["delayed_entry_threshold_cents"] == 53; assert c["entry_limit_offset_cents"] == 1; assert c["stop_policy"] == "hybrid_maker_then_hard_stop"; assert 1 <= c["hybrid_hard_stop_cents"] <= c["hybrid_stop_trigger_cents"] < c["hybrid_maker_exit_cents"] <= 99; assert c["shadow_profile"] == "sticky_stop_40"; assert Decimal(c["starting_base"]) > 0; assert Decimal(c["starting_base"]) <= Decimal(c["max_position"]); assert c["max_recovery_exponent"] == 0; print("CANONICAL_HYBRID_STRATEGY_CONTRACT=OK | opening_price=first_price_only_post_open contract=v3 btc_target=exchange_market_detail contract=v2 cross_ladder=53-59c:50x1,40x2,30x4,20x8,10x16 shadow_only breaker_independent=true entry=signal_ask_minus_1c maker_tif=GTC lifetime=until_fill_or_market_close delayed53=through_market_close hybrid=validated_configurable sizing=validated_configurable profile=40")'
+
+      - name: Write Kalshi RSA private key
+        env:
+          KALSHI_PRIVATE_KEY: ${{ secrets.KALSHI_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          umask 077
+          printf '%s\n' "$KALSHI_PRIVATE_KEY" > kalshi_private_key.pem
+
+      - name: Configure durable-state publisher
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Run KXBTC15M hybrid worker
+        env:
+          KALSHI_API_KEY_ID: ${{ secrets.KALSHI_PROD_API_KEY }}
+          KALSHI_PEM_PATH: kalshi_private_key.pem
+          KALSHI_DEMO: "false"
+          KALSHI_LIVE_ENABLED: ${{ vars.KALSHI_LIVE_ENABLED || 'false' }}
+          KALSHI_SHADOW_ONLY: ${{ vars.KALSHI_SHADOW_ONLY || 'true' }}
+          KALSHI_CHECKPOINT_PUBLISH: "true"
+          KALSHI_RUNTIME_STATE_REF: "runtime-state"
+          RUN_SECONDS: "18000"
+          REQUESTED_LIVE: ${{ inputs.live_enabled && vars.KALSHI_LIVE_ENABLED == 'true' && vars.KALSHI_SHADOW_ONLY != 'true' }}
+          RECONCILE_ONLY: ${{ inputs.reconcile_only || false }}
+          SHADOW_PROFILE: "sticky_stop_40"
+          INITIAL_SHARES: ${{ inputs.initial_shares || '' }}
+          SCALING_MULTIPLIER: ${{ inputs.scaling_multiplier || '' }}
+          PROFIT_THRESHOLD: ${{ inputs.profit_threshold || '' }}
+          SHARES_ADDED_AFTER_PROFIT_THRESHOLD: ${{ inputs.shares_added_after_profit_threshold || '' }}
+          MAX_STOP_LOSS_CENTS: ${{ inputs.max_stop_loss_cents || '' }}
+        run: |
+          set -euo pipefail
+          # Shadow runs have a fully separate ledger/state.  Reconciliation
+          # intentionally reads the live state but still cannot submit an
+          # entry because the Python worker receives --reconcile-only.
+          if [ "$REQUESTED_LIVE" = "true" ] || [ "$RECONCILE_ONLY" = "true" ]; then
+            state_file=data/kalshi_live_maker_hybrid_v11_state.json
+            audit_file=data/kalshi_live_maker_hybrid_v11_audit.jsonl
+            profile_stop=""
+          else
+            case "$SHADOW_PROFILE" in
+              sticky_stop_40) profile_stop=0.40 ;;
+              *) echo "::error::Unknown shadow profile: $SHADOW_PROFILE"; exit 2 ;;
+            esac
+            # v11 deliberately starts a new namespace. Archived v10 IOC and
+            # 30/20/10 evidence remains immutable and cannot become live state.
+            state_file="data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_state.json"
+            audit_file="data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_audit.jsonl"
+          fi
+          args=(--config selected_live_strategy.json
+                --state-file "$state_file"
+                --audit-ledger "$audit_file"
+                --persist-config
+                --run-seconds "$RUN_SECONDS")
+          if [ "$REQUESTED_LIVE" = "true" ] || [ "$RECONCILE_ONLY" = "true" ]; then
+            args+=(--trading-mode live)
+          else
+            args+=(--shadow-profile "$SHADOW_PROFILE" --stop-price "$profile_stop" --trading-mode shadow)
+          fi
+          [ "$RECONCILE_ONLY" = "true" ] && args+=(--reconcile-only)
+          [ -z "$INITIAL_SHARES" ] || args+=(--starting-base "$INITIAL_SHARES")
+          if [ -n "$SCALING_MULTIPLIER" ]; then
+            args+=(--recovery-multiplier "$SCALING_MULTIPLIER")
+            args+=(--threshold-growth-multiplier "$SCALING_MULTIPLIER")
+          fi
+          [ -z "$PROFIT_THRESHOLD" ] || args+=(--first-base-threshold "$PROFIT_THRESHOLD")
+          [ -z "$SHARES_ADDED_AFTER_PROFIT_THRESHOLD" ] || args+=(--base-increment "$SHARES_ADDED_AFTER_PROFIT_THRESHOLD")
+          if [ -n "$MAX_STOP_LOSS_CENTS" ]; then
+            [[ "$MAX_STOP_LOSS_CENTS" =~ ^[0-9]+$ ]] || {
+              echo "::error::max_stop_loss_cents must be an integer from 40 through 49"; exit 2;
+            }
+            [ "$MAX_STOP_LOSS_CENTS" -ge 40 ] && [ "$MAX_STOP_LOSS_CENTS" -le 49 ] || {
+              echo "::error::max_stop_loss_cents must be an integer from 40 through 49"; exit 2;
+            }
+            args+=(--hybrid-hard-stop-cents "$MAX_STOP_LOSS_CENTS")
+            args+=(--hybrid-stop-trigger-cents "$((MAX_STOP_LOSS_CENTS + 1))")
+            args+=(--hybrid-maker-exit-cents "$((MAX_STOP_LOSS_CENTS + 2))")
+          fi
+          if [ "$REQUESTED_LIVE" = "true" ]; then
+            python kalshi_live_trader.py "${args[@]}" --live-enabled
+          else
+            python kalshi_live_trader.py "${args[@]}" --dry-run
+          fi
+
+      - name: Persist state, audit ledger, and chosen configuration
+        if: always()
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if python live_checkpoint.py --reason end-of-run \
+              selected_live_strategy.json \
+              data/kalshi_live_maker_hybrid_v11_state.json \
+              data/kalshi_live_maker_hybrid_v11_audit.jsonl \
+              data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_state.json \
+              data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_audit.jsonl; then
+              exit 0
+            fi
+            sleep "$attempt"
+          done
+          echo "::error::Unable to publish bounded runtime state after three retries."
+          exit 1
+
+      - name: Queue the next five-hour worker only after a safe handoff
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          REQUESTED_LIVE: ${{ inputs.live_enabled && vars.KALSHI_LIVE_ENABLED == 'true' && vars.KALSHI_SHADOW_ONLY != 'true' }}
+          RECONCILE_ONLY: ${{ inputs.reconcile_only || false }}
+          SHADOW_PROFILE: "sticky_stop_40"
+        run: |
+          set -euo pipefail
+          [ "$RECONCILE_ONLY" = "true" ] && exit 0
+          if [ "$REQUESTED_LIVE" = "true" ]; then
+            state_file=data/kalshi_live_maker_hybrid_v11_state.json
+          else
+            state_file=data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_state.json
+          fi
+          ready="$(python -c 'import json, pathlib; p=pathlib.Path("'"$state_file"'"); print(str(bool(json.loads(p.read_text()).get("handoff", {}).get("ready"))).lower() if p.exists() else "false")')"
+          if [ "$ready" != "true" ]; then
+            echo "HANDOFF NOT QUEUED | no persisted safe-handoff marker."
+            exit 0
+          fi
+          if [ "$REQUESTED_LIVE" = "true" ]; then
+            gh workflow run kalshi_btc15m_average_down.yml --repo "$REPOSITORY" --ref main \
+              -f live_enabled=true -f reconcile_only=false
+          else
+            gh workflow run kalshi_btc15m_average_down.yml --repo "$REPOSITORY" --ref main \
+              -f live_enabled=false -f reconcile_only=false
+          fi
+          echo "SAFE HANDOFF QUEUED | next serialized five-hour worker requested."
+
+      - name: Remove private key
+        if: always()
+        run: |
+          rm -f kalshi_private_key.pem
+
+      - name: Upload safe execution evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kalshi-kxbtc15m-hybrid-${{ github.run_id }}
+          path: |
+            selected_live_strategy.json
+            data/kalshi_live_maker_hybrid_v11_state.json
+            data/kalshi_live_maker_hybrid_v11_audit.jsonl
+            data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_state.json
+            data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_audit.jsonl
+          if-no-files-found: warn
+          retention-days: 30

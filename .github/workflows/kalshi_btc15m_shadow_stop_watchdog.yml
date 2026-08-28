@@ -1,0 +1,57 @@
+name: Kalshi KXBTC15M Shadow Stop Watchdog
+
+# Recovery-only dispatcher for the five shadow comparison lanes. The worker
+# remains responsible for exchange-event timing and safe five-hour handoffs.
+on:
+  schedule:
+    - cron: "4-59/5 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: kalshi-kxbtc15m-shadow-stop-watchdog
+  cancel-in-progress: false
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  ensure-shadow-stop-runners:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch each missing shadow-only lane
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          KALSHI_MAINTENANCE_MODE: ${{ vars.KALSHI_MAINTENANCE_MODE || 'false' }}
+        run: |
+          set -euo pipefail
+          if [ "$KALSHI_MAINTENANCE_MODE" = "true" ]; then
+            echo "SHADOW STOP WATCHDOG MAINTENANCE HOLD | dispatch disabled."
+            exit 0
+          fi
+          runs="$(gh run list --repo "$REPOSITORY" \
+            --workflow kalshi_btc15m_shadow_stop_experiments.yml --limit 100 \
+            --json databaseId,status,conclusion,updatedAt,displayTitle)"
+          for stop_cents in 10 20 25 30 35; do
+            title="stop_${stop_cents}"
+            profile_runs="$(jq --arg title "$title" '[.[] | select((.displayTitle // "") | contains($title))]' <<<"$runs")"
+            active="$(jq '[.[] | select(.status == "in_progress" or .status == "queued" or .status == "waiting")] | length' <<<"$profile_runs")"
+            if [ "$active" -gt 0 ]; then
+              echo "SHADOW STOP WATCHDOG HOLD | stop=${stop_cents}c active_or_queued=$active"
+              continue
+            fi
+            latest="$(jq -c 'sort_by(.updatedAt // "") | last // {}' <<<"$profile_runs")"
+            conclusion="$(jq -r '.conclusion // "none"' <<<"$latest")"
+            completed="$(jq -r '.updatedAt // ""' <<<"$latest")"
+            if [ "$conclusion" = "success" ] && [ -n "$completed" ]; then
+              age_seconds=$(( $(date -u +%s) - $(date -u -d "$completed" +%s) ))
+              if [ "$age_seconds" -lt 600 ]; then
+                echo "SHADOW STOP WATCHDOG WAIT | stop=${stop_cents}c successful ${age_seconds}s ago."
+                continue
+              fi
+            fi
+            gh workflow run kalshi_btc15m_shadow_stop_experiments.yml \
+              --repo "$REPOSITORY" --ref main -f stop_cents="$stop_cents"
+            echo "SHADOW STOP WATCHDOG DISPATCHED | stop=${stop_cents}c"
+          done

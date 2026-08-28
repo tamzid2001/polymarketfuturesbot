@@ -1,0 +1,59 @@
+name: Kalshi Cross-Signal Streak Backtest
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: "Backtest run ID whose artifact contains prophet_ml_backtest_rows.csv."
+        required: true
+        default: "29698207476"
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  cross-signal-streak-backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+
+      - name: Setup Python 3.13
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements_kalshi_ledger_analysis.txt
+
+      - name: Run Offline Tests
+        run: python test_kalshi_cross_signal_streak_backtest.py
+
+      - name: Download Backtest Artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+        run: |
+          gh run download "$SOURCE_RUN_ID" -R "${{ github.repository }}" \
+            -n "kalshi-btc15m-backtest-$SOURCE_RUN_ID" -D cross_signal_input
+
+      - name: Run Cross-Signal Streak Backtest
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: |
+          python kalshi_cross_signal_streak_backtest.py \
+            --input cross_signal_input \
+            --output-dir cross_signal_streak_backtest_output
+
+      - name: Upload Backtest
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kalshi-cross-signal-streak-backtest-${{ github.run_id }}
+          path: cross_signal_streak_backtest_output/
+          if-no-files-found: warn
+          retention-days: 30

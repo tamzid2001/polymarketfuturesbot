@@ -1,0 +1,203 @@
+name: Kalshi KXBTC15M Shadow Stop Experiment
+
+# Shadow-only comparison lanes. Each stop profile owns a separate process,
+# state file, audit ledger, concurrency key, and bounded runtime-state branch.
+# No input or repository variable can promote this workflow to live trading.
+run-name: Kalshi KXBTC15M Shadow — stop_${{ inputs.stop_cents }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      stop_cents:
+        description: "Shadow hard-stop price in cents."
+        required: true
+        type: choice
+        options:
+          - "10"
+          - "20"
+          - "25"
+          - "30"
+          - "35"
+
+concurrency:
+  group: kalshi-kxbtc15m-shadow-stop-${{ inputs.stop_cents }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  shadow:
+    runs-on: ubuntu-latest
+    environment: Kalshi
+    timeout-minutes: 360
+    env:
+      STOP_CENTS: ${{ inputs.stop_cents }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Validate requested shadow profile
+        run: |
+          set -euo pipefail
+          case "$STOP_CENTS" in
+            10|20|25|30|35) ;;
+            *) echo "::error::stop_cents must be 10, 20, 25, 30, or 35"; exit 2 ;;
+          esac
+
+      - name: Restore isolated bounded runtime state
+        run: |
+          set -euo pipefail
+          runtime_ref="runtime-state-stop-${STOP_CENTS}"
+          state_file="data/kalshi_shadow_maker_hybrid_v11_sticky_stop_${STOP_CENTS}_state.json"
+          audit_file="data/kalshi_shadow_maker_hybrid_v11_sticky_stop_${STOP_CENTS}_audit.jsonl"
+          if git fetch --no-tags origin "refs/heads/${runtime_ref}"; then
+            for path in "$state_file" "$audit_file"; do
+              if git cat-file -e "FETCH_HEAD:$path" 2>/dev/null; then
+                mkdir -p "$(dirname "$path")"
+                git show "FETCH_HEAD:$path" > "${path}.runtime"
+                mv "${path}.runtime" "$path"
+              fi
+            done
+            echo "RUNTIME_STATE_RESTORED=${runtime_ref}"
+          else
+            echo "RUNTIME_STATE_BOOTSTRAP=${runtime_ref}"
+          fi
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install production dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements_kalshi_settlement_trader.txt
+
+      - name: Verify shadow-only strategy contract
+        run: |
+          set -euo pipefail
+          python -m py_compile strategy_core.py live_state.py audit_ledger.py kalshi_live_trader.py
+          PYTHONPATH=. python -m unittest -v tests.test_strategy_core tests.test_maker_hybrid_v11
+          python - "$STOP_CENTS" <<'PY'
+          import sys
+          from pathlib import Path
+          from kalshi_live_trader import load_config, load_config_from_value
+
+          cents = int(sys.argv[1])
+          base = load_config(Path("selected_live_strategy.json"))
+          candidate = load_config_from_value(dict(
+              base,
+              shadow_profile=f"sticky_stop_{cents}",
+              stop_price=f"0.{cents:02d}",
+              hybrid_hard_stop_cents=cents,
+              hybrid_stop_trigger_cents=cents + 1,
+              hybrid_maker_exit_cents=cents + 2,
+              trading_mode="shadow",
+          ))
+          assert candidate["trading_mode"] == "shadow"
+          assert candidate["shadow_profile"] == f"sticky_stop_{cents}"
+          assert candidate["entry_execution_mode"] == "signal_price_minus_offset_maker"
+          assert candidate["maker_order_time_in_force"] == "good_till_canceled"
+          assert candidate["entry_order_lifetime"] == "until_filled_or_market_close"
+          assert candidate["entry_limit_offset_cents"] == 1
+          assert candidate["signal_delay_seconds"] == 0
+          assert candidate["entry_timeout_seconds"] == 0
+          assert candidate["max_recovery_exponent"] == 0
+          print(
+              "SHADOW_STOP_CONTRACT=OK | "
+              f"profile=sticky_stop_{cents} hard={cents}c "
+              f"trigger={cents + 1}c maker_exit={cents + 2}c "
+              "signal_delay=0s entry=opening_ask_minus_1c tif=GTC "
+              "recovery_exponent_cap=disabled live=false"
+          )
+          PY
+
+      - name: Write Kalshi RSA private key
+        env:
+          KALSHI_PRIVATE_KEY: ${{ secrets.KALSHI_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          umask 077
+          printf '%s\n' "$KALSHI_PRIVATE_KEY" > kalshi_private_key.pem
+
+      - name: Configure isolated durable-state publisher
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Run isolated shadow worker
+        env:
+          KALSHI_API_KEY_ID: ${{ secrets.KALSHI_PROD_API_KEY }}
+          KALSHI_PEM_PATH: kalshi_private_key.pem
+          KALSHI_DEMO: "false"
+          KALSHI_LIVE_ENABLED: "false"
+          KALSHI_SHADOW_ONLY: "true"
+          KALSHI_CHECKPOINT_PUBLISH: "true"
+          KALSHI_RUNTIME_STATE_REF: runtime-state-stop-${{ inputs.stop_cents }}
+        run: |
+          set -euo pipefail
+          profile="sticky_stop_${STOP_CENTS}"
+          stop_price="$(printf '0.%02d' "$STOP_CENTS")"
+          state_file="data/kalshi_shadow_maker_hybrid_v11_sticky_stop_${STOP_CENTS}_state.json"
+          audit_file="data/kalshi_shadow_maker_hybrid_v11_sticky_stop_${STOP_CENTS}_audit.jsonl"
+          python kalshi_live_trader.py \
+            --config selected_live_strategy.json \
+            --state-file "$state_file" \
+            --audit-ledger "$audit_file" \
+            --run-seconds 18000 \
+            --shadow-profile "$profile" \
+            --stop-price "$stop_price" \
+            --hybrid-hard-stop-cents "$STOP_CENTS" \
+            --hybrid-stop-trigger-cents "$((STOP_CENTS + 1))" \
+            --hybrid-maker-exit-cents "$((STOP_CENTS + 2))" \
+            --trading-mode shadow \
+            --dry-run
+
+      - name: Persist isolated state and audit ledger
+        if: always()
+        run: |
+          set -euo pipefail
+          runtime_ref="runtime-state-stop-${STOP_CENTS}"
+          state_file="data/kalshi_shadow_maker_hybrid_v11_sticky_stop_${STOP_CENTS}_state.json"
+          audit_file="data/kalshi_shadow_maker_hybrid_v11_sticky_stop_${STOP_CENTS}_audit.jsonl"
+          for attempt in 1 2 3; do
+            if python live_checkpoint.py --reason end-of-run --runtime-ref "$runtime_ref" \
+              "$state_file" "$audit_file"; then
+              exit 0
+            fi
+            sleep "$attempt"
+          done
+          echo "::error::Unable to publish isolated ${STOP_CENTS}c runtime state after three retries."
+          exit 1
+
+      - name: Queue same-profile handoff only after safe checkpoint
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          state_file="data/kalshi_shadow_maker_hybrid_v11_sticky_stop_${STOP_CENTS}_state.json"
+          ready="$(python -c 'import json, pathlib; p=pathlib.Path("'"$state_file"'"); print(str(bool(json.loads(p.read_text()).get("handoff", {}).get("ready"))).lower() if p.exists() else "false")')"
+          if [ "$ready" != "true" ]; then
+            echo "HANDOFF NOT QUEUED | stop=${STOP_CENTS}c no persisted safe-handoff marker."
+            exit 0
+          fi
+          gh workflow run kalshi_btc15m_shadow_stop_experiments.yml \
+            --repo "$REPOSITORY" --ref main -f stop_cents="$STOP_CENTS"
+          echo "SAFE SHADOW HANDOFF QUEUED | stop=${STOP_CENTS}c"
+
+      - name: Remove private key
+        if: always()
+        run: rm -f kalshi_private_key.pem
+
+      - name: Upload isolated shadow evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kalshi-kxbtc15m-shadow-stop-${{ inputs.stop_cents }}-${{ github.run_id }}
+          path: |
+            data/kalshi_shadow_maker_hybrid_v11_sticky_stop_${{ inputs.stop_cents }}_state.json
+            data/kalshi_shadow_maker_hybrid_v11_sticky_stop_${{ inputs.stop_cents }}_audit.jsonl
+          if-no-files-found: warn
+          retention-days: 30

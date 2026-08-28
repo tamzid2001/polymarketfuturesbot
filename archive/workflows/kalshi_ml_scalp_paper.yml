@@ -1,0 +1,142 @@
+name: Kalshi ML Scalp Paper Monitor
+
+# Captures a full KXBTC15M order-book stream and runs paper-only YES/NO
+# entries plus probability-based trailing exits. This workflow never calls a
+# Kalshi order endpoint.
+on:
+  workflow_dispatch:
+    inputs:
+      windows:
+        description: "Upcoming 15-minute BTC windows to observe."
+        required: true
+        type: string
+        default: "1"
+      paper_shares:
+        description: "Paper-only fractional contracts used for depth checks."
+        required: true
+        type: string
+        default: "0.01"
+      min_entry_edge:
+        description: "Minimum frozen-model probability minus executable ask."
+        required: true
+        type: string
+        default: "0.03"
+      profit_step:
+        description: "Profit above model probability required to activate each trailing level."
+        required: true
+        type: string
+        default: "0.05"
+      trailing_step:
+        description: "Trailing-stop increment after each additional profit level."
+        required: true
+        type: string
+        default: "0.05"
+      model_run_id:
+        description: "Successful ML model-training workflow run ID."
+        required: true
+        type: string
+        default: "29706847167"
+      training_run_id:
+        description: "Historical feature-ledger backtest workflow run ID."
+        required: true
+        type: string
+        default: "29698207476"
+
+concurrency:
+  group: kalshi-ml-scalp-paper-singleton
+  cancel-in-progress: false
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    environment: "Kalshi"
+    timeout-minutes: 50
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+
+      - name: Setup Python 3.13
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements_kalshi.txt
+
+      - name: Verify Paper Monitor
+        run: |
+          python -m py_compile kalshi_ml_scalp_paper.py
+          python -m unittest -v test_kalshi_ml_scalp_paper.py
+
+      - name: Download Stored Gradient Model
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MODEL_RUN_ID: ${{ inputs.model_run_id }}
+        run: |
+          gh run download "$MODEL_RUN_ID" -R "${{ github.repository }}" \
+            -n "kalshi-kxbtc15m-ml-model-$MODEL_RUN_ID" -D stored_model
+          test -s stored_model/kxbtc15m_ml_model.joblib
+
+      - name: Download Historical Feature Ledger
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TRAINING_RUN_ID: ${{ inputs.training_run_id }}
+        run: |
+          gh run download "$TRAINING_RUN_ID" -R "${{ github.repository }}" \
+            -n "kalshi-btc15m-backtest-$TRAINING_RUN_ID" -D training_data
+          test -s training_data/prophet_ml_backtest_rows.csv
+
+      - name: Write Kalshi RSA Private Key
+        env:
+          KALSHI_PRIVATE_KEY: ${{ secrets.KALSHI_PRIVATE_KEY }}
+        run: |
+          printf '%s\n' "$KALSHI_PRIVATE_KEY" > kalshi_private_key.pem
+          chmod 600 kalshi_private_key.pem
+          head -1 kalshi_private_key.pem
+
+      - name: Capture Paper Scalping Window (No Orders)
+        env:
+          KALSHI_API_KEY_ID: ${{ secrets.KALSHI_PROD_API_KEY }}
+          KALSHI_PEM_PATH: kalshi_private_key.pem
+          KALSHI_DEMO: "false"
+          DRY_RUN: "true"
+        run: |
+          python kalshi_ml_scalp_paper.py \
+            --training-csv training_data/prophet_ml_backtest_rows.csv \
+            --model-path stored_model/kxbtc15m_ml_model.joblib \
+            --detail-output ml_scalp_paper_detail.jsonl \
+            --summary-output ml_scalp_paper_summary.json \
+            --ledger ml_scalp_paper_ledger.json \
+            --windows "${{ inputs.windows }}" \
+            --paper-shares "${{ inputs.paper_shares }}" \
+            --min-entry-edge "${{ inputs.min_entry_edge }}" \
+            --profit-step "${{ inputs.profit_step }}" \
+            --trailing-step "${{ inputs.trailing_step }}"
+
+      - name: Persist Paper Summary Ledger
+        if: always()
+        run: |
+          test -f ml_scalp_paper_ledger.json || exit 0
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add ml_scalp_paper_ledger.json
+          git diff-index --quiet HEAD || \
+            (git commit -m "chore: record ML scalp paper window [skip ci]" && \
+             git pull --rebase --autostash origin main && git push)
+
+      - name: Upload Detailed Order-Book Capture
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kalshi-ml-scalp-paper-${{ github.run_id }}
+          path: |
+            ml_scalp_paper_detail.jsonl
+            ml_scalp_paper_summary.json
+          if-no-files-found: warn
+          retention-days: 90
