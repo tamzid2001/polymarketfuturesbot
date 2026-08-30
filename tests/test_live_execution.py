@@ -114,8 +114,10 @@ class DelayedLadderFeed(TimestampedFeed):
             return None, "complete_depth_temporarily_unavailable"
         return super().executable_shadow_quote(ticker, side, quantity, age)
 
-    def push_price(self, ask: str, observed_at: float) -> None:
+    def push_price(self, ask: str, observed_at: float, bid: str | None = None) -> None:
         self.ask = ask
+        if bid is not None:
+            self.bid = bid
         self.observed_at = observed_at
         self.price_events.append({
             "quote_id": f"delayed-price:{ask}:{observed_at}",
@@ -1230,21 +1232,51 @@ class LiveExecutionTests(unittest.TestCase):
         feed.ask = "0.54"
         feed.observed_at = market_open + 65.25
         self.assertTrue(engine.observe_price_analytics(feed, record))
-        self.assertEqual(tracker["status"], "THRESHOLD_REACHED")
-        self.assertEqual(tracker["first_entry_price_cents"], 54)
-        self.assertEqual(tracker["first_entry_after_open_seconds"], 65.25)
-        self.assertTrue(tracker["first_entry_after_opening_capture_window"])
+        self.assertEqual(tracker["status"], "LIMIT_PENDING")
+        self.assertEqual(tracker["threshold_observed_ask_cents"], 54)
+        self.assertEqual(tracker["entry_limit_cents"], 53)
+        self.assertIsNone(tracker["first_entry_price_cents"])
+        self.assertEqual(tracker["threshold_after_open_seconds"], 65.25)
+        self.assertTrue(tracker["threshold_after_opening_capture_window"])
         self.assertEqual(tracker["displayed_ask_depth"], "4.25")
-        self.assertTrue(tracker["configured_quantity_fully_fillable"])
+        self.assertFalse(tracker["configured_quantity_fully_fillable"])
+        self.assertFalse(tracker["hypothetical_fill"])
         self.assertEqual(record["minimum_selected_price_cents"], 52)
 
         engine.finalize_settlement_analytics(record, "yes")
-        self.assertEqual(tracker["status"], "SETTLED_WIN")
-        self.assertEqual(tracker["no_stop_gross_pnl_per_share"], "0.46")
+        self.assertEqual(tracker["status"], "ENTRY_NOT_FILLED")
+        self.assertTrue(tracker["zero_fill"])
+        self.assertIsNone(tracker["no_stop_gross_pnl_per_share"])
         summary = engine.delayed_entry_performance()
         self.assertEqual(summary["entries_after_opening_capture_window"], 1)
         self.assertEqual(summary["directional_wins"], 1)
         self.assertEqual(summary["directional_losses"], 0)
+        self.assertEqual(summary["direct_limit_filled_entries"], 0)
+        self.assertEqual(summary["direct_limit_zero_fills"], 1)
+
+    def test_delayed_trigger_freezes_from_price_only_quote_without_depth(self) -> None:
+        engine = self.engine()
+        market_open = 1_800_000_000.0
+        feed = TimestampedFeed("0.52", market_open + 0.5, depth="0")
+        record = engine.set_signal(
+            {"ticker": "KXBTC15M-delayed-price-only-trigger", "open_epoch": market_open, "close_epoch": market_open + 900},
+            {"outcome": "no", "ticker": "KXBTC15M-prior"},
+        )
+        engine.freeze_initial_signal_price(feed, record, market_open + 0.5)
+
+        feed.ask = "0.54"
+        feed.observed_at = market_open + 12.25
+        self.assertTrue(engine.observe_price_analytics(feed, record))
+        tracker = record["delayed_entry_tracking"]
+        self.assertEqual(tracker["status"], "LIMIT_PENDING")
+        self.assertEqual(tracker["threshold_observed_ask_cents"], 54)
+        self.assertEqual(tracker["entry_limit_cents"], 53)
+        self.assertEqual(tracker["displayed_ask_depth"], "0")
+        self.assertFalse(tracker["hypothetical_fill"])
+        self.assertEqual(
+            tracker["ladder"]["direct_entry_order"]["simulated_filled_quantity"],
+            "0.00",
+        )
 
     def test_delayed_entry_activates_persistent_public_trade_ladder(self) -> None:
         engine = self.engine()
@@ -1259,10 +1291,13 @@ class LiveExecutionTests(unittest.TestCase):
         feed.push_price("0.54", market_open + 65)
         self.assertTrue(engine.observe_price_analytics(feed, record))
         tracker = record["delayed_entry_tracking"]
-        self.assertEqual(tracker["first_entry_price_cents"], 54)
-        self.assertEqual(tracker["ladder"]["contract_version"], 1)
+        self.assertEqual(tracker["threshold_observed_ask_cents"], 54)
+        self.assertEqual(tracker["entry_limit_cents"], 53)
+        self.assertIsNone(tracker["first_entry_price_cents"])
+        self.assertEqual(tracker["ladder"]["contract_version"], 3)
 
         for seconds, price, quantity in (
+            (68, "0.53", "1.00"),
             (70, "0.49", "1.00"),
             (80, "0.39", "2.00"),
             (90, "0.29", "4.00"),
@@ -1274,17 +1309,29 @@ class LiveExecutionTests(unittest.TestCase):
             self.assertTrue(engine.observe_price_analytics(feed, record))
 
         lane = tracker["ladder"]
+        self.assertEqual(tracker["first_entry_price_cents"], 53)
+        self.assertEqual(tracker["hypothetical_filled_quantity"], "1.00")
+        self.assertTrue(tracker["configured_quantity_fully_fillable"])
         for level in (50, 40, 30, 20, 10):
             rung = lane["rungs"][str(level)]
             self.assertTrue(rung["touched"])
             self.assertTrue(rung["simulated_full_fill"])
         engine.finalize_settlement_analytics(record, "yes")
+        self.assertEqual(tracker["no_stop_gross_pnl_per_share"], "0.47")
         self.assertEqual(lane["gross_no_stop_pnl"], "25.300")
-        cohorts = engine.delayed_entry_performance()["cohorts"]
+        delayed_summary = engine.delayed_entry_performance()
+        self.assertEqual(delayed_summary["trigger_ask_buckets_cents"], {"54": 1})
+        self.assertEqual(delayed_summary["entry_price_buckets_cents"], {"53": 1})
+        self.assertEqual(delayed_summary["direct_limit_filled_entries"], 1)
+        self.assertEqual(delayed_summary["direct_limit_filled_wins"], 1)
+        self.assertEqual(delayed_summary["gross_no_stop_pnl_total"], "0.4700")
+        cohorts = delayed_summary["cohorts"]
         self.assertEqual(cohorts["53"]["complete_resolved_entries"], 1)
         self.assertEqual(cohorts["54"]["complete_resolved_entries"], 1)
         self.assertEqual(cohorts["55"]["complete_resolved_entries"], 0)
         self.assertEqual(cohorts["54"]["ladder_resolved_entries"], 1)
+        self.assertEqual(cohorts["54"]["direct_filled_entries"], 1)
+        self.assertEqual(cohorts["54"]["gross_no_stop_direct_entry_pnl"], "0.4700")
         self.assertEqual(cohorts["54"]["gross_no_stop_ladder_pnl"], "25.300")
         self.assertEqual(cohorts["54"]["rungs"]["10"]["gross_no_stop_pnl"], "14.400")
 
@@ -1304,9 +1351,161 @@ class LiveExecutionTests(unittest.TestCase):
         feed.push_price("0.49", market_open + 70)
         feed.push_trade("0.49", "1.00", market_open + 70.1)
         self.assertTrue(engine.observe_price_analytics(feed, record))
+        direct = record["delayed_entry_tracking"]["ladder"]["direct_entry_order"]
         rung = record["delayed_entry_tracking"]["ladder"]["rungs"]["50"]
         self.assertTrue(rung["touched"])
+        self.assertEqual(direct["simulated_filled_quantity"], "1.00")
+        self.assertEqual(rung["simulated_filled_quantity"], "0.00")
+
+        feed.push_trade("0.49", "1.00", market_open + 70.2)
+        self.assertTrue(engine.observe_price_analytics(feed, record))
         self.assertEqual(rung["simulated_filled_quantity"], "1.00")
+
+    def test_delayed_minus_one_limit_persists_partial_fill_without_double_counting(self) -> None:
+        engine = self.engine()
+        market_open = time.time() - 100
+        feed = DelayedLadderFeed("0.52", market_open + 0.5)
+        record = engine.set_signal(
+            {"ticker": "KXBTC15M-delayed-partial", "open_epoch": market_open, "close_epoch": market_open + 900},
+            {"outcome": "no", "ticker": "KXBTC15M-prior"},
+        )
+        record["intended_quantity"] = "2.00"
+        engine.freeze_initial_signal_price(feed, record, market_open + 0.5)
+        feed.push_price("0.54", market_open + 65)
+        engine.observe_price_analytics(feed, record)
+
+        feed.push_price("0.53", market_open + 70)
+        feed.push_trade("0.53", "0.75", market_open + 70.1)
+        self.assertTrue(engine.observe_price_analytics(feed, record))
+        tracker = record["delayed_entry_tracking"]
+        order = tracker["ladder"]["direct_entry_order"]
+        self.assertEqual(tracker["status"], "LIMIT_PARTIAL")
+        self.assertEqual(tracker["first_entry_price_cents"], 53)
+        self.assertEqual(tracker["hypothetical_filled_quantity"], "0.75")
+        self.assertFalse(tracker["configured_quantity_fully_fillable"])
+        self.assertEqual(order["status"], "PARTIAL")
+
+        # Reprocessing the same buffered public trade is idempotent.
+        engine.observe_price_analytics(feed, record)
+        self.assertEqual(order["simulated_filled_quantity"], "0.75")
+
+        feed.push_trade("0.53", "1.25", market_open + 70.2)
+        self.assertTrue(engine.observe_price_analytics(feed, record))
+        self.assertEqual(tracker["status"], "LIMIT_FILLED")
+        self.assertEqual(tracker["hypothetical_filled_quantity"], "2.00")
+        self.assertTrue(tracker["configured_quantity_fully_fillable"])
+        self.assertEqual(order["status"], "FILLED")
+
+        engine.finalize_settlement_analytics(record, "yes")
+        self.assertEqual(tracker["no_stop_gross_pnl_per_share"], "0.47")
+        self.assertEqual(tracker["no_stop_gross_pnl"], "0.9400")
+        stop = tracker["ladder"]["direct_hybrid_stop"]
+        self.assertEqual(stop["exit_classification"], "SETTLEMENT_WIN")
+        self.assertEqual(stop["gross_pnl"], "0.9400")
+
+    def test_delayed_hybrid_51_trigger_52_maker_exit_fills_fully(self) -> None:
+        engine = self.engine()
+        market_open = time.time() - 100
+        feed = DelayedLadderFeed("0.52", market_open + 0.5, bid="0.51")
+        record = engine.set_signal(
+            {"ticker": "KXBTC15M-delayed-maker-stop", "open_epoch": market_open, "close_epoch": market_open + 900},
+            {"outcome": "no", "ticker": "KXBTC15M-prior"},
+        )
+        engine.freeze_initial_signal_price(feed, record, market_open + 0.5)
+        feed.push_price("0.54", market_open + 65, bid="0.53")
+        engine.observe_price_analytics(feed, record)
+        feed.push_price("0.53", market_open + 66, bid="0.52")
+        feed.push_trade("0.53", "1.00", market_open + 66.1)
+        engine.observe_price_analytics(feed, record)
+
+        feed.push_price("0.52", market_open + 70, bid="0.51")
+        engine.observe_price_analytics(feed, record)
+        stop = record["delayed_entry_tracking"]["ladder"]["direct_hybrid_stop"]
+        self.assertEqual(stop["state"], "MAKER_EXIT_PENDING")
+        self.assertEqual(stop["maker_requested_quantity"], "1.00")
+
+        feed.push_trade("0.52", "1.00", market_open + 71)
+        feed.push_price("0.53", market_open + 71.1, bid="0.52")
+        self.assertTrue(engine.observe_price_analytics(feed, record))
+        self.assertEqual(stop["state"], "CLOSED")
+        self.assertEqual(stop["exit_classification"], "MAKER_EXIT_FULL")
+        self.assertEqual(stop["maker_filled_quantity"], "1.00")
+        self.assertEqual(stop["hard_filled_quantity"], "0.00")
+        self.assertEqual(stop["gross_pnl"], "-0.0100")
+
+    def test_delayed_hybrid_partial_maker_then_50c_hard_stop_exits_only_remainder(self) -> None:
+        engine = self.engine()
+        market_open = time.time() - 100
+        feed = DelayedLadderFeed("0.52", market_open + 0.5, bid="0.51")
+        record = engine.set_signal(
+            {"ticker": "KXBTC15M-delayed-partial-stop", "open_epoch": market_open, "close_epoch": market_open + 900},
+            {"outcome": "no", "ticker": "KXBTC15M-prior"},
+        )
+        record["intended_quantity"] = "2.00"
+        engine.freeze_initial_signal_price(feed, record, market_open + 0.5)
+        feed.push_price("0.54", market_open + 65, bid="0.53")
+        engine.observe_price_analytics(feed, record)
+        feed.push_price("0.53", market_open + 66, bid="0.52")
+        feed.push_trade("0.53", "2.00", market_open + 66.1)
+        engine.observe_price_analytics(feed, record)
+
+        feed.push_price("0.52", market_open + 70, bid="0.51")
+        engine.observe_price_analytics(feed, record)
+        feed.push_trade("0.52", "0.75", market_open + 71)
+        feed.push_price("0.53", market_open + 71.1, bid="0.52")
+        engine.observe_price_analytics(feed, record)
+        stop = record["delayed_entry_tracking"]["ladder"]["direct_hybrid_stop"]
+        self.assertEqual(stop["maker_filled_quantity"], "0.75")
+
+        feed.push_price("0.50", market_open + 72, bid="0.50")
+        self.assertTrue(engine.observe_price_analytics(feed, record))
+        self.assertEqual(stop["state"], "CLOSED")
+        self.assertEqual(stop["exit_classification"], "MAKER_EXIT_PARTIAL_THEN_HARD_STOP")
+        self.assertEqual(stop["maker_filled_quantity"], "0.75")
+        self.assertEqual(stop["hard_filled_quantity"], "1.25")
+        self.assertEqual(stop["hard_fill_price_cents"], 50)
+        self.assertEqual(stop["gross_pnl"], "-0.0450")
+
+        engine.finalize_settlement_analytics(record, "yes")
+        self.assertTrue(stop["stopped_then_eventual_winner"])
+        summary = engine.delayed_entry_performance()
+        self.assertEqual(summary["hybrid_partial_then_hard"], 1)
+        self.assertEqual(summary["hybrid_false_stops"], 1)
+        self.assertEqual(summary["gross_hybrid_pnl_total"], "-0.0450")
+
+    def test_delayed_hybrid_reconnect_does_not_reuse_maker_exit_trade(self) -> None:
+        engine = self.engine()
+        market_open = time.time() - 100
+        feed = DelayedLadderFeed("0.52", market_open + 0.5, bid="0.51")
+        record = engine.set_signal(
+            {"ticker": "KXBTC15M-delayed-stop-reconnect", "open_epoch": market_open, "close_epoch": market_open + 900},
+            {"outcome": "no", "ticker": "KXBTC15M-prior"},
+        )
+        record["intended_quantity"] = "2.00"
+        engine.freeze_initial_signal_price(feed, record, market_open + 0.5)
+        feed.push_price("0.54", market_open + 65, bid="0.53")
+        engine.observe_price_analytics(feed, record)
+        feed.push_price("0.53", market_open + 66, bid="0.52")
+        feed.push_trade("0.53", "2.00", market_open + 66.1)
+        engine.observe_price_analytics(feed, record)
+        feed.push_price("0.52", market_open + 70, bid="0.51")
+        engine.observe_price_analytics(feed, record)
+        feed.push_trade("0.52", "0.50", market_open + 71)
+        feed.push_price("0.53", market_open + 71.1, bid="0.52")
+        engine.observe_price_analytics(feed, record)
+        stop = record["delayed_entry_tracking"]["ladder"]["direct_hybrid_stop"]
+        self.assertEqual(stop["maker_filled_quantity"], "0.50")
+
+        # A replacement stream may replay the same exchange trade. The
+        # durable event key prevents it from counting a second time.
+        feed.session_token = "delayed-ladder-session-2"
+        engine.observe_price_analytics(feed, record)
+        self.assertEqual(stop["maker_filled_quantity"], "0.50")
+
+        feed.push_trade("0.52", "0.50", market_open + 72)
+        feed.push_price("0.53", market_open + 72.1, bid="0.52")
+        engine.observe_price_analytics(feed, record)
+        self.assertEqual(stop["maker_filled_quantity"], "1.00")
 
     def test_delayed_53_tracker_never_submits_a_second_live_order(self) -> None:
         async def scenario() -> None:
@@ -1328,7 +1527,9 @@ class LiveExecutionTests(unittest.TestCase):
             feed.observed_at = market_open + 500
             engine.observe_price_analytics(feed, record)
             self.assertEqual(len(rest.calls), 1)
-            self.assertTrue(record["delayed_entry_tracking"]["hypothetical_fill"])
+            tracker = record["delayed_entry_tracking"]
+            self.assertFalse(tracker["hypothetical_fill"])
+            self.assertEqual(tracker["entry_limit_cents"], 54)
         asyncio.run(scenario())
 
     def test_at_or_above_53_initial_quote_is_not_in_delayed_cohort(self) -> None:
@@ -1390,14 +1591,16 @@ class LiveExecutionTests(unittest.TestCase):
         feed.ask = "0.54"
         feed.observed_at = market_open + 75.5
         self.assertTrue(engine.observe_price_analytics(feed, record))
-        self.assertEqual(tracker["status"], "THRESHOLD_REACHED")
-        self.assertEqual(tracker["first_entry_price_cents"], 54)
-        self.assertTrue(tracker["first_entry_after_opening_capture_window"])
+        self.assertEqual(tracker["status"], "LIMIT_PENDING")
+        self.assertEqual(tracker["threshold_observed_ask_cents"], 54)
+        self.assertEqual(tracker["entry_limit_cents"], 53)
+        self.assertTrue(tracker["threshold_after_opening_capture_window"])
         engine.finalize_settlement_analytics(record, "yes")
         summary = engine.delayed_entry_performance()
         self.assertEqual(summary["complete_coverage_signals"], 1)
         self.assertEqual(summary["partial_legacy_coverage_signals"], 0)
         self.assertEqual(summary["directional_wins"], 1)
+        self.assertEqual(summary["direct_limit_zero_fills"], 1)
 
     def test_delayed_tracker_marks_pre_restart_quote_gap_as_partial(self) -> None:
         engine = self.engine()

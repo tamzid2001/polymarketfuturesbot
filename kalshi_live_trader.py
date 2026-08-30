@@ -76,7 +76,14 @@ OPENING_PRICE_CAPTURE_CONTRACT_VERSION = 3
 # the bounded list response omits strike metadata. A list-only v1 worker must
 # fail the workflow guard instead of silently restoring UNAVAILABLE targets.
 BTC_TARGET_CAPTURE_CONTRACT_VERSION = 2
-DELAYED_ENTRY_LADDER_CONTRACT_VERSION = 1
+# v3 freezes an analytics-only resting limit one cent below the delayed
+# threshold ask.  It requires subsequent public-trade volume for a fill and
+# consumes that volume only once across the direct order and ladder rungs. It
+# also applies the partial-fill-safe 51/52/50 delayed hybrid-stop contract.
+DELAYED_ENTRY_LADDER_CONTRACT_VERSION = 3
+DELAYED_HYBRID_STOP_TRIGGER_CENTS = 51
+DELAYED_HYBRID_MAKER_EXIT_CENTS = 52
+DELAYED_HYBRID_HARD_STOP_CENTS = 50
 BTC_TARGET_RECORD_FIELDS = (
     "btc_target_capture_version",
     "btc_target_status",
@@ -1275,9 +1282,9 @@ class LiveEngine:
             } if self.dry_run else None),
             # Analytics-only delayed entry lane.  It never submits an order
             # or mutates primary sizing/P&L.  For signals whose first fresh
-            # selected-side ask is below 53c, retain only the first later
-            # executable ask >=53c (and its displayed depth) through market
-            # close.  This avoids an unbounded full-book checkpoint history.
+            # selected-side ask is below 53c, the first later executable ask
+            # >=53c freezes a resting limit one cent lower. Public-trade
+            # volume, not the trigger quote, determines partial/full fill.
             "delayed_entry_tracking": {
                 "enabled": bool(self.config["delayed_entry_tracking_enabled"]),
                 "ladder_contract_version": DELAYED_ENTRY_LADDER_CONTRACT_VERSION,
@@ -1286,7 +1293,13 @@ class LiveEngine:
                 "eligible": None,
                 "coverage_complete_from_initial_quote": False,
                 "threshold_reached": False,
+                "threshold_observed_ask_cents": None,
+                "threshold_timestamp": None,
+                "threshold_exchange_epoch": None,
+                "threshold_after_open_seconds": None,
                 "hypothetical_fill": False,
+                "entry_limit_offset_cents": int(self.config["entry_limit_offset_cents"]),
+                "entry_limit_cents": None,
                 "first_entry_price_cents": None,
                 "first_entry_timestamp": None,
                 "first_entry_exchange_epoch": None,
@@ -1300,6 +1313,8 @@ class LiveEngine:
                 "settlement_outcome": None,
                 "directional_winner": None,
                 "no_stop_gross_pnl_per_share": None,
+                "no_stop_gross_pnl": None,
+                "zero_fill": False,
                 # Created only when the delayed >=53c entry actually
                 # activates. It is analytics-only and can never create an
                 # exchange order or change primary sizing/accounting state.
@@ -2012,12 +2027,13 @@ class LiveEngine:
     def advance_shadow_ladder_fills(
         self, feed: KalshiLiveFeed, record: dict[str, Any], lane: dict[str, Any],
     ) -> bool:
-        """Advance one analytics ladder using durable public-trade evidence.
+        """Advance one analytics lane using durable public-trade evidence.
 
         Public volume is consumed once in descending limit-price priority.
         This deliberately claims neither queue priority nor an exchange fill;
         it is the shared deterministic shadow assumption for opening and
-        delayed cohorts.
+        delayed cohorts.  A delayed direct entry is placed ahead of the fixed
+        ladder because its limit is always at least 52c, above the 50c rung.
         """
 
         trigger_epoch = float(lane["trigger_exchange_epoch"])
@@ -2030,8 +2046,13 @@ class LiveEngine:
         feed_session_token = str(getattr(feed, "session_token", "") or "")
         prior_session_token = str(lane.get("public_trade_feed_session_token") or "")
         last_trade_id = str(lane.get("last_processed_public_trade_id") or "")
+        processed_keys = list(lane.get("processed_public_trade_keys") or [])
+        processed_key_set = set(processed_keys)
         start_event_index = 0
-        if last_trade_id and prior_session_token == feed_session_token:
+        if last_trade_id and not processed_keys:
+            # Backward-compatible recovery for pre-key checkpoints. Trade IDs
+            # are exchange-stable, so locating the cursor does not depend on
+            # the WebSocket session that originally observed it.
             for index, event in enumerate(events):
                 if str(event.get("trade_id") or "") == last_trade_id:
                     start_event_index = index + 1
@@ -2043,26 +2064,53 @@ class LiveEngine:
                     lane["public_trade_cursor_gap_count"] = int(
                         lane.get("public_trade_cursor_gap_count", 0)
                     ) + 1
-        elif last_trade_id and prior_session_token != feed_session_token:
-            # A new feed session starts with an empty trade buffer, so all
-            # events now present are post-reconnect and therefore new.
-            start_event_index = 0
-            lane["last_processed_public_trade_id"] = None
+        if prior_session_token and feed_session_token and prior_session_token != feed_session_token:
+            lane["public_trade_session_change_count"] = int(
+                lane.get("public_trade_session_change_count", 0)
+            ) + 1
         lane["public_trade_feed_session_token"] = feed_session_token
+        order_specs: list[tuple[str, int, Decimal, dict[str, Any]]] = []
+        direct_order = lane.get("direct_entry_order")
+        if isinstance(direct_order, dict):
+            try:
+                direct_price = int(direct_order["price_cents"])
+                direct_requested = Decimal(str(
+                    direct_order.get("fill_ceiling_quantity")
+                    if direct_order.get("fill_ceiling_quantity") is not None
+                    else direct_order["requested_quantity"]
+                ))
+            except (ArithmeticError, KeyError, TypeError, ValueError):
+                direct_price = 0
+                direct_requested = Decimal("0")
+            if direct_price > 0 and direct_requested > 0:
+                order_specs.append(("direct_entry", direct_price, direct_requested, direct_order))
+        for level, requested in OPENING_CROSS_LADDER_RUNGS:
+            rung = lane.get("rungs", {}).get(str(level))
+            if isinstance(rung, dict):
+                order_specs.append((f"rung:{level}", level, requested, rung))
+        order_specs.sort(key=lambda item: item[1], reverse=True)
         allocations = {
-            str(level): {
-                "quantity": Decimal(str(
-                    lane.get("rungs", {}).get(str(level), {}).get("simulated_filled_quantity") or "0"
-                )),
-                "first": lane.get("rungs", {}).get(str(level), {}).get("first_fill_timestamp"),
-                "last": lane.get("rungs", {}).get(str(level), {}).get("last_fill_timestamp"),
+            key: {
+                "quantity": Decimal(str(order.get("simulated_filled_quantity") or "0")),
+                "first": order.get("first_fill_timestamp"),
+                "last": order.get("last_fill_timestamp"),
             }
-            for level, _ in OPENING_CROSS_LADDER_RUNGS
+            for key, _, _, order in order_specs
         }
         changed = False
         side = str(record["signal_side"])
         for event in events[start_event_index:]:
             trade_id = str(event.get("trade_id") or "")
+            event_key = trade_id or "|".join((
+                str(event.get("source_server_timestamp") or event.get("received_at") or ""),
+                str(event.get(f"{side}_price") or ""),
+                str(event.get("count") or ""),
+            ))
+            if event_key in processed_key_set:
+                continue
+            if event_key:
+                append_unique(processed_keys, event_key, maximum=4096)
+                processed_key_set.add(event_key)
             if trade_id:
                 lane["last_processed_public_trade_id"] = trade_id
             lane["public_trade_events_processed"] = int(
@@ -2075,10 +2123,10 @@ class LiveEngine:
                 continue
             if available <= 0:
                 continue
-            for level, requested in OPENING_CROSS_LADDER_RUNGS:
-                if event_cents > level or available <= 0:
+            for key, limit_cents, requested, _order in order_specs:
+                if event_cents > limit_cents or available <= 0:
                     continue
-                bucket = allocations[str(level)]
+                bucket = allocations[key]
                 remaining = requested - bucket["quantity"]
                 if remaining <= 0:
                     continue
@@ -2091,13 +2139,13 @@ class LiveEngine:
                 )
                 bucket["last"] = event.get("source_server_timestamp") or event.get("received_at")
                 available -= allocated
-        for level, requested in OPENING_CROSS_LADDER_RUNGS:
-            rung = lane["rungs"][str(level)]
-            allocation = allocations[str(level)]
-            prior_quantity = Decimal(str(rung.get("simulated_filled_quantity") or "0"))
+        lane["processed_public_trade_keys"] = processed_keys
+        for key, _limit_cents, requested, order in order_specs:
+            allocation = allocations[key]
+            prior_quantity = Decimal(str(order.get("simulated_filled_quantity") or "0"))
             filled_quantity = allocation["quantity"]
             if filled_quantity != prior_quantity:
-                rung.update({
+                order.update({
                     "simulated_filled_quantity": format(filled_quantity, "f"),
                     "simulated_full_fill": filled_quantity >= requested,
                     "first_fill_timestamp": allocation["first"],
@@ -2110,12 +2158,265 @@ class LiveEngine:
                 changed = True
         return changed
 
+    def sync_delayed_direct_entry(self, record: dict[str, Any], delayed: dict[str, Any]) -> bool:
+        """Copy v3 direct-limit fill evidence into the durable summary fields."""
+
+        lane = delayed.get("ladder")
+        order = lane.get("direct_entry_order") if isinstance(lane, dict) else None
+        if not isinstance(order, dict):
+            return False
+        requested = Decimal(str(order.get("requested_quantity") or "0"))
+        filled = Decimal(str(order.get("simulated_filled_quantity") or "0"))
+        full = bool(requested > 0 and filled >= requested)
+        prior = (
+            delayed.get("hypothetical_fill"), delayed.get("hypothetical_filled_quantity"),
+            delayed.get("configured_quantity_fully_fillable"), delayed.get("status"),
+            delayed.get("first_entry_timestamp"), delayed.get("first_entry_price_cents"),
+        )
+        delayed.update({
+            "hypothetical_fill": filled > 0,
+            "hypothetical_filled_quantity": format(filled, "f"),
+            "configured_quantity_fully_fillable": full,
+        })
+        if order.get("fill_ceiling_quantity") is not None and filled < requested:
+            order["status"] = "CANCELLED_REMAINDER_FOR_STOP"
+        else:
+            order["status"] = "FILLED" if full else ("PARTIAL" if filled > 0 else "RESTING")
+        if filled > 0:
+            fill_timestamp = order.get("first_fill_timestamp")
+            fill_epoch = _iso_epoch(fill_timestamp)
+            open_epoch = float(record.get("market_open_epoch") or 0)
+            signal_epoch = _iso_epoch(record.get("signal_timestamp"))
+            delayed.update({
+                "status": "LIMIT_FILLED" if full else "LIMIT_PARTIAL",
+                "first_entry_price_cents": int(order["price_cents"]),
+                "first_entry_price": format(cents_price(int(order["price_cents"])), "f"),
+                "first_entry_timestamp": fill_timestamp,
+                "first_entry_exchange_epoch": fill_epoch or None,
+                "first_entry_exchange_timestamp": fill_timestamp,
+                "first_entry_after_open_seconds": (
+                    round(max(0.0, fill_epoch - open_epoch), 6)
+                    if fill_epoch and open_epoch else None
+                ),
+                "first_entry_after_signal_seconds": (
+                    _seconds_since(signal_epoch, fill_epoch) if fill_epoch is not None else None
+                ),
+                "first_entry_after_opening_capture_window": bool(
+                    fill_epoch and open_epoch
+                    and fill_epoch - open_epoch >= int(self.config["opening_quote_capture_seconds"])
+                ),
+                "final_entry_timestamp": order.get("final_fill_timestamp"),
+            })
+        elif delayed.get("settlement_outcome") is None:
+            delayed["status"] = "LIMIT_PENDING"
+        current = (
+            delayed.get("hypothetical_fill"), delayed.get("hypothetical_filled_quantity"),
+            delayed.get("configured_quantity_fully_fillable"), delayed.get("status"),
+            delayed.get("first_entry_timestamp"), delayed.get("first_entry_price_cents"),
+        )
+        return current != prior
+
+    def advance_delayed_direct_hybrid_stop(
+        self, feed: KalshiLiveFeed, record: dict[str, Any], delayed: dict[str, Any], now: float,
+    ) -> bool:
+        """Advance the analytics-only 51/52/50 stop for actual simulated entry quantity.
+
+        A selected-side executable bid at or below 51c freezes the filled entry
+        quantity and cancels the unfilled direct-limit remainder. The 52c maker
+        exit then requires subsequent public-trade volume at or above 52c. If
+        an executable bid reaches 50c first, only the still-open quantity exits
+        at that bid (capped at 50c). This makes partial exits and retries
+        deterministic without claiming queue priority or historical fills.
+        """
+
+        if int(delayed.get("ladder_contract_version") or 1) < 3:
+            return False
+        lane = delayed.get("ladder")
+        if not isinstance(lane, dict):
+            return False
+        order = lane.get("direct_entry_order")
+        stop = lane.get("direct_hybrid_stop")
+        if not isinstance(order, dict) or not isinstance(stop, dict) or not stop.get("enabled"):
+            return False
+        filled = Decimal(str(order.get("simulated_filled_quantity") or "0"))
+        if filled <= 0 or stop.get("state") == "CLOSED":
+            return False
+        first_fill_epoch = _iso_epoch(order.get("first_fill_timestamp"))
+        if first_fill_epoch is None:
+            return False
+        getter = getattr(feed, "selected_price_quotes_between", None)
+        if not callable(getter):
+            return False
+        closed = float(record["market_close_epoch"])
+        quote_start = float(stop.get("trigger_exchange_epoch") or first_fill_epoch)
+        quote_rows: list[tuple[float, int, dict[str, Any]]] = []
+        for quote in getter(
+            record["ticker"], str(record["signal_side"]), quote_start, min(now, closed),
+        ):
+            try:
+                quote_epoch = float(quote["selected_component_epoch"])
+                bid_cents = price_to_cents(
+                    str(quote["selected_best_bid"]), "delayed hybrid selected-side bid",
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+            if quote_epoch >= first_fill_epoch:
+                quote_rows.append((quote_epoch, bid_cents, quote))
+        quote_rows.sort(key=lambda row: row[0])
+        changed = False
+        if stop.get("state") == "ARMED":
+            trigger_row = next(
+                (row for row in quote_rows if row[1] <= int(stop["trigger_cents"])), None,
+            )
+            if trigger_row is None:
+                return False
+            trigger_epoch, trigger_bid, trigger_quote = trigger_row
+            trigger_timestamp = datetime.fromtimestamp(trigger_epoch, timezone.utc).isoformat()
+            stop.update({
+                "state": "MAKER_EXIT_PENDING",
+                "trigger_timestamp": trigger_timestamp,
+                "trigger_exchange_epoch": trigger_epoch,
+                "trigger_bid_cents": trigger_bid,
+                "trigger_quote_id": trigger_quote.get("quote_id"),
+                "entry_quantity_at_trigger": format(filled, "f"),
+                "maker_requested_quantity": format(filled, "f"),
+                "maker_submitted_at": trigger_timestamp,
+            })
+            order["fill_ceiling_quantity"] = format(filled, "f")
+            if filled < Decimal(str(order.get("requested_quantity") or "0")):
+                order["status"] = "CANCELLED_REMAINDER_FOR_STOP"
+            changed = True
+
+        trigger_epoch = float(stop["trigger_exchange_epoch"])
+        target_quantity = Decimal(str(stop.get("entry_quantity_at_trigger") or filled))
+        maker_filled = Decimal(str(stop.get("maker_filled_quantity") or "0"))
+        hard_row = next(
+            (
+                row for row in quote_rows
+                if row[0] >= trigger_epoch and row[1] <= int(stop["hard_stop_cents"])
+            ),
+            None,
+        )
+        hard_epoch = hard_row[0] if hard_row is not None else None
+
+        try:
+            events = feed.public_trades_after(
+                record["ticker"], datetime.fromtimestamp(trigger_epoch, timezone.utc),
+            )
+        except (AttributeError, TypeError, ValueError):
+            events = []
+        feed_token = str(getattr(feed, "session_token", "") or "")
+        prior_token = str(stop.get("public_trade_feed_session_token") or "")
+        last_trade_id = str(stop.get("last_processed_public_trade_id") or "")
+        processed_keys = list(stop.get("processed_public_trade_keys") or [])
+        processed_key_set = set(processed_keys)
+        start_index = 0
+        if last_trade_id and not processed_keys:
+            for index, event in enumerate(events):
+                if str(event.get("trade_id") or "") == last_trade_id:
+                    start_index = index + 1
+                    break
+            else:
+                if events:
+                    stop["public_trade_cursor_gap_count"] = int(
+                        stop.get("public_trade_cursor_gap_count", 0)
+                    ) + 1
+        if prior_token and feed_token and prior_token != feed_token:
+            stop["public_trade_session_change_count"] = int(
+                stop.get("public_trade_session_change_count", 0)
+            ) + 1
+        stop["public_trade_feed_session_token"] = feed_token
+        side = str(record["signal_side"])
+        maker_first = stop.get("maker_first_fill_timestamp")
+        maker_last = stop.get("maker_last_fill_timestamp")
+        for event in events[start_index:]:
+            event_timestamp = event.get("source_server_timestamp") or event.get("received_at")
+            event_epoch = _iso_epoch(event_timestamp)
+            if event_epoch is None or event_epoch <= trigger_epoch:
+                continue
+            if hard_epoch is not None and event_epoch >= hard_epoch:
+                break
+            trade_id = str(event.get("trade_id") or "")
+            event_key = trade_id or "|".join((
+                str(event_timestamp or ""),
+                str(event.get(f"{side}_price") or ""),
+                str(event.get("count") or ""),
+            ))
+            if event_key in processed_key_set:
+                continue
+            if event_key:
+                append_unique(processed_keys, event_key, maximum=4096)
+                processed_key_set.add(event_key)
+            if trade_id:
+                stop["last_processed_public_trade_id"] = trade_id
+            stop["public_trade_events_processed"] = int(
+                stop.get("public_trade_events_processed", 0)
+            ) + 1
+            try:
+                event_cents = price_to_cents(
+                    str(event[f"{side}_price"]), "delayed maker-exit public trade price",
+                )
+                available = Decimal(str(event.get("count") or "0"))
+            except (KeyError, ArithmeticError, TypeError, ValueError):
+                continue
+            if event_cents < int(stop["maker_exit_cents"]) or available <= 0:
+                continue
+            remaining = target_quantity - maker_filled
+            if remaining <= 0:
+                break
+            allocated = min(remaining, available)
+            maker_filled += allocated
+            maker_first = maker_first or event_timestamp
+            maker_last = event_timestamp
+            changed = True
+        stop["processed_public_trade_keys"] = processed_keys
+        stop.update({
+            "maker_filled_quantity": format(maker_filled, "f"),
+            "maker_first_fill_timestamp": maker_first,
+            "maker_last_fill_timestamp": maker_last,
+        })
+
+        entry_cost = target_quantity * cents_price(int(order["price_cents"]))
+        maker_proceeds = maker_filled * cents_price(int(stop["maker_exit_cents"]))
+        if maker_filled >= target_quantity:
+            stop.update({
+                "state": "CLOSED",
+                "maker_final_fill_timestamp": maker_last,
+                "closed_quantity": format(target_quantity, "f"),
+                "exit_classification": "MAKER_EXIT_FULL",
+                "gross_pnl": format(maker_proceeds - entry_cost, "f"),
+                "closed_at": maker_last,
+            })
+            changed = True
+        elif hard_row is not None:
+            hard_epoch, hard_bid_cents, hard_quote = hard_row
+            remaining = max(Decimal("0"), target_quantity - maker_filled)
+            hard_price_cents = min(int(stop["hard_stop_cents"]), hard_bid_cents)
+            hard_proceeds = remaining * cents_price(hard_price_cents)
+            hard_timestamp = datetime.fromtimestamp(hard_epoch, timezone.utc).isoformat()
+            stop.update({
+                "state": "CLOSED",
+                "hard_filled_quantity": format(remaining, "f"),
+                "hard_fill_price_cents": hard_price_cents,
+                "hard_fill_timestamp": hard_timestamp,
+                "hard_quote_id": hard_quote.get("quote_id"),
+                "closed_quantity": format(target_quantity, "f"),
+                "exit_classification": (
+                    "MAKER_EXIT_PARTIAL_THEN_HARD_STOP"
+                    if maker_filled > 0 else "HARD_STOP_ONLY"
+                ),
+                "gross_pnl": format(maker_proceeds + hard_proceeds - entry_cost, "f"),
+                "closed_at": hard_timestamp,
+            })
+            changed = True
+        return changed
+
     def observe_delayed_entry_ladder(
         self, feed: KalshiLiveFeed, record: dict[str, Any], delayed: dict[str, Any], now: float,
     ) -> bool:
-        """Track the 50/40/30/20/10 ladder after a delayed >=53c entry.
+        """Track the direct limit and 50/40/30/20/10 ladder after a >=53c trigger.
 
-        The activation quote is the already-frozen delayed entry event. Quote
+        The activation quote freezes the trigger ask and lower limit. Quote
         touches and public-trade evidence are then collected through market
         close. The object is analytics-only in both shadow and live workers.
         """
@@ -2160,6 +2461,7 @@ class LiveEngine:
                     changed = True
 
         newly_touched: list[int] = []
+        direct_limit_touched = False
         for quote in quotes[start_index:]:
             quote_id = str(quote.get("quote_id") or "")
             try:
@@ -2172,6 +2474,19 @@ class LiveEngine:
             if quote_epoch < trigger_epoch:
                 continue
             lane["price_events_processed"] = int(lane.get("price_events_processed", 0)) + 1
+            direct_order = lane.get("direct_entry_order")
+            if isinstance(direct_order, dict):
+                direct_limit = int(direct_order["price_cents"])
+                if ask_cents <= direct_limit and not direct_order.get("touched"):
+                    direct_order.update({
+                        "touched": True,
+                        "touch_timestamp": datetime.fromtimestamp(quote_epoch, timezone.utc).isoformat(),
+                        "touch_quote_id": quote_id or None,
+                        "touch_observed_ask_cents": ask_cents,
+                        "touch_evidence": "price_only_executable_selected_side_ask",
+                    })
+                    direct_limit_touched = True
+                    changed = True
             for level_text, rung in lane.get("rungs", {}).items():
                 level = int(level_text)
                 if ask_cents <= level and not rung.get("touched"):
@@ -2187,25 +2502,43 @@ class LiveEngine:
             lane["last_processed_quote_id"] = quote_id or lane.get("last_processed_quote_id")
         fills_changed = self.advance_shadow_ladder_fills(feed, record, lane)
         changed = fills_changed or changed
+        direct_sync_changed = self.sync_delayed_direct_entry(record, delayed)
+        changed = direct_sync_changed or changed
+        stop_changed = self.advance_delayed_direct_hybrid_stop(
+            feed, record, delayed, min(now, closed),
+        )
+        changed = stop_changed or changed
         if changed:
             self.audit(
                 "delayed_entry_ladder_updated",
                 ticker=record["ticker"], side=record["signal_side"], analytics_only=True,
                 ladder_contract_version=DELAYED_ENTRY_LADDER_CONTRACT_VERSION,
                 delayed_entry_price_cents=delayed.get("first_entry_price_cents"),
+                delayed_entry_limit_cents=delayed.get("entry_limit_cents"),
+                direct_limit_touched=direct_limit_touched,
                 newly_touched_rungs=sorted(set(newly_touched), reverse=True),
-                fills_changed=fills_changed,
+                fills_changed=fills_changed or direct_sync_changed,
+                hybrid_stop_changed=stop_changed,
+                direct_hybrid_stop=lane.get("direct_hybrid_stop"),
                 coverage_complete=lane.get("coverage_complete"),
                 coverage_note=lane.get("coverage_note"),
                 rungs=lane.get("rungs"),
             )
-            if newly_touched or fills_changed:
+            if newly_touched or direct_limit_touched or fills_changed or direct_sync_changed or stop_changed:
+                stop = lane.get("direct_hybrid_stop", {})
                 LOG.warning(
-                    "DELAYED ENTRY LADDER | ticker=%s side=%s delayed_entry=%sc touches=%s "
-                    "fills_changed=%s coverage=%s analytics_only=true",
+                    "DELAYED ENTRY/LADDER | ticker=%s side=%s trigger_ask=%sc limit=%sc "
+                    "limit_touch=%s fill=%s filled_qty=%s rung_touches=%s "
+                    "fills_changed=%s stop=%s stop_exit=%s maker_exit_qty=%s hard_exit_qty=%s "
+                    "coverage=%s analytics_only=true",
                     record["ticker"], str(record["signal_side"]).upper(),
-                    delayed.get("first_entry_price_cents"), sorted(set(newly_touched), reverse=True),
-                    fills_changed, lane.get("coverage_note"),
+                    delayed.get("threshold_observed_ask_cents"), delayed.get("entry_limit_cents"),
+                    bool(lane.get("direct_entry_order", {}).get("touched")),
+                    delayed.get("hypothetical_fill"), delayed.get("hypothetical_filled_quantity"),
+                    sorted(set(newly_touched), reverse=True),
+                    fills_changed or direct_sync_changed, stop.get("state"),
+                    stop.get("exit_classification"), stop.get("maker_filled_quantity"),
+                    stop.get("hard_filled_quantity"), lane.get("coverage_note"),
                 )
         return changed
 
@@ -2270,30 +2603,61 @@ class LiveEngine:
             except (ArithmeticError, TypeError, ValueError):
                 displayed_depth = Decimal("0")
                 intended_quantity = Decimal("0")
-            if displayed_depth > 0:
-                open_epoch = float(record["market_open_epoch"])
-                signal_epoch = _iso_epoch(record.get("signal_timestamp"))
-                elapsed_open = round(max(0.0, quote_epoch - open_epoch), 6)
-                fillable_quantity = min(displayed_depth, intended_quantity) if intended_quantity > 0 else Decimal("0")
+            # A fresh price-only top-of-book update is sufficient to freeze a
+            # resting limit. Displayed depth is optional trigger metadata and
+            # is never treated as fill evidence; only later public trades can
+            # advance the simulated filled quantity.
+            open_epoch = float(record["market_open_epoch"])
+            signal_epoch = _iso_epoch(record.get("signal_timestamp"))
+            elapsed_open = round(max(0.0, quote_epoch - open_epoch), 6)
+            entry_limit_offset = int(self.config["entry_limit_offset_cents"])
+            entry_limit_cents = selected_ask_cents - entry_limit_offset
+            if not 1 <= entry_limit_cents <= 99:
                 delayed.update({
-                    "status": "THRESHOLD_REACHED",
+                    "status": "INVALID_LIMIT_PRICE",
                     "threshold_reached": True,
-                    "hypothetical_fill": True,
-                    "first_entry_price_cents": selected_ask_cents,
-                    "first_entry_price": format(cents_price(selected_ask_cents), "f"),
-                    "first_entry_timestamp": utc_now(),
-                    "first_entry_exchange_epoch": quote_epoch,
-                    "first_entry_exchange_timestamp": quote.get("source_server_timestamp"),
-                    "first_entry_quote_id": quote_id or None,
-                    "first_entry_after_open_seconds": elapsed_open,
-                    "first_entry_after_signal_seconds": _seconds_since(signal_epoch, quote_epoch),
-                    "first_entry_after_opening_capture_window": elapsed_open >= int(self.config["opening_quote_capture_seconds"]),
+                    "threshold_observed_ask_cents": selected_ask_cents,
+                    "entry_limit_cents": entry_limit_cents,
+                })
+                delayed_entry_recorded = True
+                changed = True
+                entry_limit_cents = 0
+            trigger_timestamp = (
+                quote.get("source_server_timestamp")
+                or datetime.fromtimestamp(quote_epoch, timezone.utc).isoformat()
+            )
+            if entry_limit_cents:
+                delayed.update({
+                    "status": "LIMIT_PENDING",
+                    "threshold_reached": True,
+                    "threshold_observed_ask_cents": selected_ask_cents,
+                    "threshold_timestamp": trigger_timestamp,
+                    "threshold_exchange_epoch": quote_epoch,
+                    "threshold_exchange_timestamp": trigger_timestamp,
+                    "threshold_quote_id": quote_id or None,
+                    "threshold_after_open_seconds": elapsed_open,
+                    "threshold_after_signal_seconds": _seconds_since(signal_epoch, quote_epoch),
+                    "threshold_after_opening_capture_window": elapsed_open >= int(self.config["opening_quote_capture_seconds"]),
+                    "hypothetical_fill": False,
+                    "hypothetical_filled_quantity": "0.00",
+                    "entry_limit_offset_cents": entry_limit_offset,
+                    "entry_limit_cents": entry_limit_cents,
+                    "entry_limit_price": format(cents_price(entry_limit_cents), "f"),
+                    "first_entry_price_cents": None,
+                    "first_entry_price": None,
+                    "first_entry_timestamp": None,
+                    "first_entry_exchange_epoch": None,
+                    "first_entry_exchange_timestamp": None,
+                    "first_entry_quote_id": None,
+                    "first_entry_after_open_seconds": None,
+                    "first_entry_after_signal_seconds": None,
+                    "first_entry_after_opening_capture_window": None,
                     "displayed_ask_depth": format(displayed_depth, "f"),
-                    "hypothetical_filled_quantity": format(fillable_quantity, "f"),
-                    "configured_quantity_fully_fillable": bool(
-                        intended_quantity > 0 and displayed_depth >= intended_quantity
+                    "configured_quantity_fully_fillable": False,
+                    "execution_assumption": (
+                        "resting_limit_one_cent_below_frozen_threshold_ask; quote_touch_is_not_fill; "
+                        "post_trigger_public_trade_volume_at_or_below_limit_required"
                     ),
-                    "execution_assumption": "fresh_executable_ask_with_displayed_depth_no_historical_order_claim",
                     "minimum_selected_ask_after_entry_cents": selected_ask_cents,
                     "maximum_selected_ask_after_entry_cents": selected_ask_cents,
                     "ladder_contract_version": DELAYED_ENTRY_LADDER_CONTRACT_VERSION,
@@ -2324,6 +2688,50 @@ class LiveEngine:
                         "public_trade_feed_session_token": None,
                         "last_processed_public_trade_id": None,
                         "public_trade_events_processed": 0,
+                        "processed_public_trade_keys": [],
+                        "direct_entry_order": {
+                            "analytics_only": True,
+                            "order_type": "resting_limit",
+                            "time_in_force": "through_market_close",
+                            "price_cents": entry_limit_cents,
+                            "requested_quantity": format(intended_quantity, "f"),
+                            "fill_ceiling_quantity": None,
+                            "touched": False,
+                            "touch_timestamp": None,
+                            "simulated_filled_quantity": "0.00",
+                            "simulated_full_fill": False,
+                            "first_fill_timestamp": None,
+                            "final_fill_timestamp": None,
+                            "status": "RESTING",
+                            "fill_assumption": (
+                                "post_trigger_public_trade_volume_at_or_below_limit_allocated_once_"
+                                "without_queue_priority"
+                            ),
+                        },
+                        "direct_hybrid_stop": {
+                            "enabled": True,
+                            "trigger_cents": DELAYED_HYBRID_STOP_TRIGGER_CENTS,
+                            "maker_exit_cents": DELAYED_HYBRID_MAKER_EXIT_CENTS,
+                            "hard_stop_cents": DELAYED_HYBRID_HARD_STOP_CENTS,
+                            "state": "ARMED",
+                            "trigger_timestamp": None,
+                            "trigger_exchange_epoch": None,
+                            "entry_quantity_at_trigger": "0.00",
+                            "maker_requested_quantity": "0.00",
+                            "maker_filled_quantity": "0.00",
+                            "maker_first_fill_timestamp": None,
+                            "maker_final_fill_timestamp": None,
+                            "hard_filled_quantity": "0.00",
+                            "hard_fill_price_cents": None,
+                            "hard_fill_timestamp": None,
+                            "closed_quantity": "0.00",
+                            "exit_classification": None,
+                            "gross_pnl": None,
+                            "public_trade_feed_session_token": None,
+                            "last_processed_public_trade_id": None,
+                            "public_trade_events_processed": 0,
+                            "processed_public_trade_keys": [],
+                        },
                         "rungs": {
                             str(level): {
                                 "price_cents": level,
@@ -2379,21 +2787,24 @@ class LiveEngine:
                 "delayed_entry_threshold_reached", ticker=record["ticker"], side=record["signal_side"],
                 initial_signal_price_cents=delayed.get("initial_signal_price_cents"),
                 threshold_cents=delayed.get("threshold_cents"),
-                entry_price_cents=delayed.get("first_entry_price_cents"),
-                entry_after_open_seconds=delayed.get("first_entry_after_open_seconds"),
-                after_opening_capture_window=delayed.get("first_entry_after_opening_capture_window"),
+                threshold_observed_ask_cents=delayed.get("threshold_observed_ask_cents"),
+                entry_limit_offset_cents=delayed.get("entry_limit_offset_cents"),
+                entry_limit_cents=delayed.get("entry_limit_cents"),
+                threshold_after_open_seconds=delayed.get("threshold_after_open_seconds"),
+                after_opening_capture_window=delayed.get("threshold_after_opening_capture_window"),
                 displayed_ask_depth=delayed.get("displayed_ask_depth"),
-                configured_quantity_fully_fillable=delayed.get("configured_quantity_fully_fillable"),
+                hypothetical_fill=False,
                 coverage_complete_from_initial_quote=delayed.get("coverage_complete_from_initial_quote"),
             )
             LOG.warning(
-                "DELAYED >=53C ENTRY TRACKED | ticker=%s side=%s initial=%sc entry=%sc "
-                "after_open=%.3fs after_60s=%s depth=%s configured_qty_fillable=%s analytics_only=true",
+                "DELAYED >=53C LIMIT RESTING | ticker=%s side=%s initial=%sc trigger_ask=%sc "
+                "limit=%sc offset=%sc trigger_after_open=%.3fs after_60s=%s depth=%s "
+                "filled=false tif=through_market_close analytics_only=true",
                 record["ticker"], str(record["signal_side"]).upper(),
-                delayed.get("initial_signal_price_cents"), delayed.get("first_entry_price_cents"),
-                float(delayed.get("first_entry_after_open_seconds") or 0),
-                delayed.get("first_entry_after_opening_capture_window"), delayed.get("displayed_ask_depth"),
-                delayed.get("configured_quantity_fully_fillable"),
+                delayed.get("initial_signal_price_cents"), delayed.get("threshold_observed_ask_cents"),
+                delayed.get("entry_limit_cents"), delayed.get("entry_limit_offset_cents"),
+                float(delayed.get("threshold_after_open_seconds") or 0),
+                delayed.get("threshold_after_opening_capture_window"), delayed.get("displayed_ask_depth"),
             )
 
         try:
@@ -2605,8 +3016,15 @@ class LiveEngine:
         threshold = int(self.config["delayed_entry_threshold_cents"])
         eligible = complete_coverage = partial_coverage = threshold_reached = 0
         before_window = after_window = fully_fillable = resolved = wins = losses = 0
+        filled_entries = resolved_filled_entries = zero_fills = pending_unfilled = 0
+        partial_fills = full_fills = 0
+        filled_wins = filled_losses = legacy_contract_entries = 0
+        hybrid_resolved = hybrid_triggers = hybrid_maker_full = 0
+        hybrid_partial_hard = hybrid_hard_only = hybrid_false_stops = 0
         gross_pnl = Decimal("0")
+        hybrid_gross_pnl = Decimal("0")
         timings: list[float] = []
+        trigger_buckets: dict[str, int] = {}
         entry_buckets: dict[str, int] = {}
         cohort_rows: dict[str, dict[str, Any]] = {
             str(cohort_threshold): {
@@ -2617,7 +3035,22 @@ class LiveEngine:
                 "complete_resolved_entries": 0,
                 "directional_wins": 0,
                 "directional_losses": 0,
+                "direct_filled_entries": 0,
+                "direct_zero_fills": 0,
+                "direct_partial_fills": 0,
+                "direct_full_fills": 0,
+                "direct_filled_wins": 0,
+                "direct_filled_losses": 0,
+                "legacy_contract_entries": 0,
                 "gross_no_stop_direct_entry_pnl_per_share": Decimal("0"),
+                "gross_no_stop_direct_entry_pnl": Decimal("0"),
+                "hybrid_resolved_entries": 0,
+                "hybrid_stop_triggers": 0,
+                "hybrid_maker_exit_full": 0,
+                "hybrid_partial_then_hard": 0,
+                "hybrid_hard_only": 0,
+                "hybrid_false_stops": 0,
+                "gross_hybrid_pnl": Decimal("0"),
                 "ladder_tracked_entries": 0,
                 "legacy_entries_without_ladder": 0,
                 "ladder_resolved_entries": 0,
@@ -2651,29 +3084,60 @@ class LiveEngine:
             if not tracker.get("threshold_reached"):
                 continue
             threshold_reached += 1
-            after = bool(tracker.get("first_entry_after_opening_capture_window"))
+            after = bool(
+                tracker.get("threshold_after_opening_capture_window")
+                if tracker.get("threshold_after_opening_capture_window") is not None
+                else tracker.get("first_entry_after_opening_capture_window")
+            )
             after_window += int(after)
             before_window += int(not after)
             fully_fillable += int(bool(tracker.get("configured_quantity_fully_fillable")))
-            timing = tracker.get("first_entry_after_open_seconds")
+            timing = (
+                tracker.get("threshold_after_open_seconds")
+                if tracker.get("threshold_after_open_seconds") is not None
+                else tracker.get("first_entry_after_open_seconds")
+            )
             if timing is not None:
                 timings.append(float(timing))
+            contract_version = int(tracker.get("ladder_contract_version") or 1)
+            trigger_cents = tracker.get("threshold_observed_ask_cents")
             entry_cents = tracker.get("first_entry_price_cents")
+            if trigger_cents is None and contract_version < 2:
+                trigger_cents = entry_cents
+            if trigger_cents is not None:
+                text = str(int(trigger_cents))
+                trigger_buckets[text] = trigger_buckets.get(text, 0) + 1
             if entry_cents is not None:
                 text = str(int(entry_cents))
                 entry_buckets[text] = entry_buckets.get(text, 0) + 1
             winner = tracker.get("directional_winner")
             pnl = tracker.get("no_stop_gross_pnl_per_share")
+            ladder = tracker.get("ladder")
+            direct_stop = (
+                ladder.get("direct_hybrid_stop") if isinstance(ladder, dict) else None
+            )
+            filled_quantity = Decimal(str(tracker.get("hypothetical_filled_quantity") or "0"))
+            intended_quantity = Decimal(str(record.get("intended_quantity") or "0"))
+            is_filled = filled_quantity > 0
+            is_full = bool(is_filled and intended_quantity > 0 and filled_quantity >= intended_quantity)
+            if contract_version >= 2:
+                filled_entries += int(is_filled)
+                resolved_filled_entries += int(winner is not None and is_filled)
+                zero_fills += int(winner is not None and not is_filled)
+                pending_unfilled += int(winner is None and not is_filled)
+                partial_fills += int(is_filled and not is_full)
+                full_fills += int(is_full)
+            else:
+                legacy_contract_entries += 1
             for cohort_threshold in OPENING_CROSS_LADDER_TRIGGER_LEVELS:
-                if entry_cents is None or int(entry_cents) < cohort_threshold:
+                if trigger_cents is None or int(trigger_cents) < cohort_threshold:
                     continue
                 cohort = cohort_rows[str(cohort_threshold)]
                 cohort["entries"] += 1
                 complete = bool(tracker.get("coverage_complete_from_initial_quote"))
                 cohort["complete_coverage_entries"] += int(complete)
                 cohort["partial_coverage_entries"] += int(not complete)
-                ladder = tracker.get("ladder")
-                if isinstance(ladder, dict):
+                if contract_version >= 2 and isinstance(ladder, dict):
                     cohort["ladder_tracked_entries"] += 1
                     for level, requested in OPENING_CROSS_LADDER_RUNGS:
                         rung = ladder.get("rungs", {}).get(str(level), {})
@@ -2685,16 +3149,49 @@ class LiveEngine:
                         row["simulated_filled_quantity"] += quantity
                 else:
                     cohort["legacy_entries_without_ladder"] += 1
+                if contract_version < 2:
+                    cohort["legacy_contract_entries"] += 1
                 # Published cohort W/L and P&L intentionally use only records
                 # whose quote coverage began with the immutable opening
                 # reference. Partial legacy records remain visible above but
                 # cannot contaminate the complete-data result.
-                if not complete or winner is None or pnl is None:
+                if not complete or winner is None:
                     continue
                 cohort["complete_resolved_entries"] += 1
                 cohort["directional_wins"] += int(bool(winner))
                 cohort["directional_losses"] += int(not bool(winner))
-                cohort["gross_no_stop_direct_entry_pnl_per_share"] += Decimal(str(pnl))
+                if contract_version < 2:
+                    continue
+                cohort["direct_filled_entries"] += int(is_filled)
+                cohort["direct_zero_fills"] += int(not is_filled)
+                cohort["direct_partial_fills"] += int(is_filled and not is_full)
+                cohort["direct_full_fills"] += int(is_full)
+                cohort["direct_filled_wins"] += int(is_filled and bool(winner))
+                cohort["direct_filled_losses"] += int(is_filled and not bool(winner))
+                if is_filled and pnl is not None:
+                    cohort["gross_no_stop_direct_entry_pnl_per_share"] += Decimal(str(pnl))
+                    cohort["gross_no_stop_direct_entry_pnl"] += Decimal(str(
+                        tracker.get("no_stop_gross_pnl") or "0"
+                    ))
+                if (
+                    contract_version >= 3 and is_filled
+                    and isinstance(direct_stop, dict)
+                    and direct_stop.get("gross_pnl") is not None
+                ):
+                    classification = str(direct_stop.get("exit_classification") or "")
+                    cohort["hybrid_resolved_entries"] += 1
+                    cohort["hybrid_stop_triggers"] += int(
+                        direct_stop.get("trigger_timestamp") is not None
+                    )
+                    cohort["hybrid_maker_exit_full"] += int(classification == "MAKER_EXIT_FULL")
+                    cohort["hybrid_partial_then_hard"] += int(
+                        classification == "MAKER_EXIT_PARTIAL_THEN_HARD_STOP"
+                    )
+                    cohort["hybrid_hard_only"] += int(classification == "HARD_STOP_ONLY")
+                    cohort["hybrid_false_stops"] += int(bool(
+                        direct_stop.get("stopped_then_eventual_winner")
+                    ))
+                    cohort["gross_hybrid_pnl"] += Decimal(str(direct_stop["gross_pnl"]))
                 if not isinstance(ladder, dict) or ladder.get("gross_no_stop_pnl") is None:
                     continue
                 cohort["ladder_resolved_entries"] += 1
@@ -2707,12 +3204,32 @@ class LiveEngine:
                         if winner else -quantity * cents_price(level)
                     )
                     cohort["rungs"][str(level)]["gross_no_stop_pnl"] += rung_pnl
-            if winner is None or pnl is None:
+            if winner is None:
                 continue
             resolved += 1
             wins += int(bool(winner))
             losses += int(not bool(winner))
-            gross_pnl += Decimal(str(pnl))
+            if contract_version >= 2 and is_filled and pnl is not None:
+                filled_wins += int(bool(winner))
+                filled_losses += int(not bool(winner))
+                gross_pnl += Decimal(str(tracker.get("no_stop_gross_pnl") or "0"))
+            if (
+                contract_version >= 3 and is_filled
+                and isinstance(direct_stop, dict)
+                and direct_stop.get("gross_pnl") is not None
+            ):
+                classification = str(direct_stop.get("exit_classification") or "")
+                hybrid_resolved += 1
+                hybrid_triggers += int(direct_stop.get("trigger_timestamp") is not None)
+                hybrid_maker_full += int(classification == "MAKER_EXIT_FULL")
+                hybrid_partial_hard += int(
+                    classification == "MAKER_EXIT_PARTIAL_THEN_HARD_STOP"
+                )
+                hybrid_hard_only += int(classification == "HARD_STOP_ONLY")
+                hybrid_false_stops += int(bool(
+                    direct_stop.get("stopped_then_eventual_winner")
+                ))
+                hybrid_gross_pnl += Decimal(str(direct_stop["gross_pnl"]))
 
         timings.sort()
 
@@ -2725,8 +3242,11 @@ class LiveEngine:
         serialized_cohorts: dict[str, dict[str, Any]] = {}
         for cohort_threshold, cohort in cohort_rows.items():
             cohort_resolved = int(cohort["complete_resolved_entries"])
+            direct_filled = int(cohort["direct_filled_entries"])
             ladder_resolved = int(cohort["ladder_resolved_entries"])
             direct_pnl = Decimal(cohort["gross_no_stop_direct_entry_pnl_per_share"])
+            direct_total_pnl = Decimal(cohort["gross_no_stop_direct_entry_pnl"])
+            hybrid_pnl = Decimal(cohort["gross_hybrid_pnl"])
             ladder_pnl = Decimal(cohort["gross_no_stop_ladder_pnl"])
             rung_output: dict[str, dict[str, Any]] = {}
             for level, row in cohort["rungs"].items():
@@ -2739,20 +3259,31 @@ class LiveEngine:
                 }
             serialized_cohorts[cohort_threshold] = {
                 **{key: value for key, value in cohort.items() if key not in {
-                    "rungs", "gross_no_stop_direct_entry_pnl_per_share", "gross_no_stop_ladder_pnl",
+                    "rungs", "gross_no_stop_direct_entry_pnl_per_share",
+                    "gross_no_stop_direct_entry_pnl", "gross_hybrid_pnl",
+                    "gross_no_stop_ladder_pnl",
                 }},
                 "directional_win_rate": (
                     int(cohort["directional_wins"]) / cohort_resolved if cohort_resolved else None
                 ),
                 "gross_no_stop_direct_entry_pnl_per_share": format(direct_pnl, "f"),
                 "gross_no_stop_direct_entry_ev": (
-                    format(direct_pnl / cohort_resolved, "f") if cohort_resolved else None
+                    format(direct_pnl / direct_filled, "f") if direct_filled else None
+                ),
+                "gross_no_stop_direct_entry_pnl": format(direct_total_pnl, "f"),
+                "gross_hybrid_pnl": format(hybrid_pnl, "f"),
+                "gross_hybrid_ev": (
+                    format(hybrid_pnl / int(cohort["hybrid_resolved_entries"]), "f")
+                    if int(cohort["hybrid_resolved_entries"]) else None
+                ),
+                "direct_filled_win_rate": (
+                    int(cohort["direct_filled_wins"]) / direct_filled if direct_filled else None
                 ),
                 "gross_no_stop_ladder_pnl": format(ladder_pnl, "f"),
                 "gross_no_stop_ladder_ev": (
                     format(ladder_pnl / ladder_resolved, "f") if ladder_resolved else None
                 ),
-                "gross_no_stop_direct_plus_ladder_pnl": format(direct_pnl + ladder_pnl, "f"),
+                "gross_no_stop_direct_plus_ladder_pnl": format(direct_total_pnl + ladder_pnl, "f"),
                 "rungs": rung_output,
             }
 
@@ -2760,7 +3291,8 @@ class LiveEngine:
             "analytics_only": True,
             "entry_rule": (
                 f"initial selected-side ask below {threshold}c; first later fresh executable ask "
-                f"at or above {threshold}c through market close"
+                f"at or above {threshold}c freezes a resting limit "
+                f"{int(self.config['entry_limit_offset_cents'])}c lower through market close"
             ),
             "threshold_cents": threshold,
             "eligible_below_threshold_signals": eligible,
@@ -2775,21 +3307,58 @@ class LiveEngine:
             "directional_wins": wins,
             "directional_losses": losses,
             "directional_win_rate": wins / resolved if resolved else None,
-            "gross_no_stop_pnl_per_share_total": format(gross_pnl, "f"),
-            "gross_no_stop_ev_per_resolved_entry": (
-                format(gross_pnl / resolved, "f") if resolved else None
+            "direct_limit_filled_entries": filled_entries,
+            "direct_limit_resolved_filled_entries": resolved_filled_entries,
+            "direct_limit_zero_fills": zero_fills,
+            "direct_limit_pending_unfilled": pending_unfilled,
+            "direct_limit_partial_fills": partial_fills,
+            "direct_limit_full_fills": full_fills,
+            "direct_limit_fill_rate": (
+                resolved_filled_entries / (resolved_filled_entries + zero_fills)
+                if resolved_filled_entries + zero_fills else None
             ),
+            "direct_limit_filled_wins": filled_wins,
+            "direct_limit_filled_losses": filled_losses,
+            "direct_limit_filled_win_rate": (
+                filled_wins / (filled_wins + filled_losses)
+                if filled_wins + filled_losses else None
+            ),
+            "legacy_contract_entries": legacy_contract_entries,
+            "gross_no_stop_pnl_total": format(gross_pnl, "f"),
+            "gross_no_stop_ev_per_filled_entry": (
+                format(gross_pnl / resolved_filled_entries, "f")
+                if resolved_filled_entries else None
+            ),
+            "hybrid_stop_contract": {
+                "trigger_cents": DELAYED_HYBRID_STOP_TRIGGER_CENTS,
+                "maker_exit_cents": DELAYED_HYBRID_MAKER_EXIT_CENTS,
+                "hard_stop_cents": DELAYED_HYBRID_HARD_STOP_CENTS,
+            },
+            "hybrid_resolved_entries": hybrid_resolved,
+            "hybrid_stop_triggers": hybrid_triggers,
+            "hybrid_maker_exit_full": hybrid_maker_full,
+            "hybrid_partial_then_hard": hybrid_partial_hard,
+            "hybrid_hard_only": hybrid_hard_only,
+            "hybrid_false_stops": hybrid_false_stops,
+            "gross_hybrid_pnl_total": format(hybrid_gross_pnl, "f"),
+            "gross_hybrid_ev_per_filled_entry": (
+                format(hybrid_gross_pnl / hybrid_resolved, "f")
+                if hybrid_resolved else None
+            ),
+            "trigger_ask_buckets_cents": dict(sorted(
+                trigger_buckets.items(), key=lambda item: int(item[0]),
+            )),
             "entry_price_buckets_cents": dict(sorted(entry_buckets.items(), key=lambda item: int(item[0]))),
             "cohorts": serialized_cohorts,
             "ladder_contract_version": DELAYED_ENTRY_LADDER_CONTRACT_VERSION,
             "ladder_fill_assumption": (
-                "post_trigger_public_trade_volume_allocated_once_across_descending_limits_"
-                "without_queue_priority"
+                "post_trigger_public_trade_volume_allocated_once_across_the_direct_limit_and_"
+                "descending_ladder_limits_without_queue_priority"
             ),
-            "legacy_delayed_entries_are_not_backfilled_as_ladder_fills": True,
-            "entry_after_open_seconds_p50": percentile(0.50),
-            "entry_after_open_seconds_p90": percentile(0.90),
-            "entry_after_open_seconds_max": max(timings) if timings else None,
+            "legacy_pre_v3_entries_are_not_backfilled_or_mixed_into_v3_direct_results": True,
+            "threshold_after_open_seconds_p50": percentile(0.50),
+            "threshold_after_open_seconds_p90": percentile(0.90),
+            "threshold_after_open_seconds_max": max(timings) if timings else None,
             "updated_at": utc_now(),
         }
         self.state["delayed_entry_performance"] = output
@@ -2799,40 +3368,65 @@ class LiveEngine:
         result = self.delayed_entry_performance()
         rate = result["directional_win_rate"]
         hit_rate = result["threshold_reach_rate"]
+        fill_rate = result["direct_limit_fill_rate"]
+        filled_win_rate = result["direct_limit_filled_win_rate"]
         LOG.warning("================ FULL-MARKET DELAYED >=53C ANALYTICS ================")
         LOG.warning(
             "eligible_below53=%d complete_coverage=%d partial_legacy_coverage=%d reached=%d "
-            "reach_rate=%s within60s=%d after60s=%d fully_fillable=%d resolved=%d W/L=%d/%d "
-            "WR=%s gross_no_stop_pnl_per_share=%s EV_per_entry=%s entry_p50=%s entry_p90=%s entry_max=%s",
+            "reach_rate=%s within60s=%d after60s=%d resolved_signals=%d W/L=%d/%d WR=%s "
+            "limit_filled=%d resolved_filled=%d zero=%d pending=%d partial=%d full=%d "
+            "resolved_fill_rate=%s filled_W/L=%d/%d "
+            "filled_WR=%s gross_no_stop_pnl=%s EV_per_fill=%s trigger_p50=%s "
+            "trigger_p90=%s trigger_max=%s legacy_pre_v3=%d",
             result["eligible_below_threshold_signals"], result["complete_coverage_signals"],
             result["partial_legacy_coverage_signals"], result["threshold_reached"],
             "n/a" if hit_rate is None else f"{100 * hit_rate:.2f}%",
             result["entries_within_opening_capture_window"],
             result["entries_after_opening_capture_window"],
-            result["configured_quantity_fully_fillable"], result["resolved_entries"],
+            result["resolved_entries"],
             result["directional_wins"], result["directional_losses"],
             "n/a" if rate is None else f"{100 * rate:.2f}%",
-            result["gross_no_stop_pnl_per_share_total"],
-            result["gross_no_stop_ev_per_resolved_entry"],
-            result["entry_after_open_seconds_p50"], result["entry_after_open_seconds_p90"],
-            result["entry_after_open_seconds_max"],
+            result["direct_limit_filled_entries"], result["direct_limit_resolved_filled_entries"],
+            result["direct_limit_zero_fills"], result["direct_limit_pending_unfilled"],
+            result["direct_limit_partial_fills"], result["direct_limit_full_fills"],
+            "n/a" if fill_rate is None else f"{100 * fill_rate:.2f}%",
+            result["direct_limit_filled_wins"], result["direct_limit_filled_losses"],
+            "n/a" if filled_win_rate is None else f"{100 * filled_win_rate:.2f}%",
+            result["gross_no_stop_pnl_total"], result["gross_no_stop_ev_per_filled_entry"],
+            result["threshold_after_open_seconds_p50"], result["threshold_after_open_seconds_p90"],
+            result["threshold_after_open_seconds_max"], result["legacy_contract_entries"],
         )
+        LOG.warning(
+            "DELAYED HYBRID 51/52/50 | resolved=%d triggers=%d maker_full=%d "
+            "partial_then_hard=%d hard_only=%d false_stops=%d gross_pnl=$%s EV_per_fill=%s",
+            result["hybrid_resolved_entries"], result["hybrid_stop_triggers"],
+            result["hybrid_maker_exit_full"], result["hybrid_partial_then_hard"],
+            result["hybrid_hard_only"], result["hybrid_false_stops"],
+            result["gross_hybrid_pnl_total"], result["gross_hybrid_ev_per_filled_entry"],
+        )
+        LOG.warning("DELAYED TRIGGER ASK BUCKETS | %s", result["trigger_ask_buckets_cents"])
         LOG.warning("DELAYED ENTRY PRICE BUCKETS | %s", result["entry_price_buckets_cents"])
         LOG.warning("================ DELAYED-ENTRY COHORT LADDERS ================")
         LOG.warning(
-            "COHORT | ENTRIES | COMPLETE | PARTIAL | RESOLVED | W/L | WR | DIRECT PNL | "
+            "COHORT | TRIGGERS | COMPLETE | PARTIAL | RESOLVED | W/L | WR | "
+            "LIMIT FILLED/ZERO/PARTIAL/FULL | FILLED W/L | NO-STOP PNL | HYBRID PNL | "
             "LADDER TRACKED/RESOLVED | LADDER PNL | COMBINED"
         )
         for threshold in OPENING_CROSS_LADDER_TRIGGER_LEVELS:
             row = result["cohorts"][str(threshold)]
             win_rate = row["directional_win_rate"]
             LOG.warning(
-                ">=%sc | %d | %d | %d | %d | %d/%d | %s | $%s | %d/%d | $%s | $%s",
+                ">=%sc | %d | %d | %d | %d | %d/%d | %s | %d/%d/%d/%d | %d/%d | "
+                "$%s | $%s | %d/%d | $%s | $%s",
                 threshold, row["entries"], row["complete_coverage_entries"],
                 row["partial_coverage_entries"], row["complete_resolved_entries"],
                 row["directional_wins"], row["directional_losses"],
                 "n/a" if win_rate is None else f"{100 * win_rate:.2f}%",
-                row["gross_no_stop_direct_entry_pnl_per_share"],
+                row["direct_filled_entries"], row["direct_zero_fills"],
+                row["direct_partial_fills"], row["direct_full_fills"],
+                row["direct_filled_wins"], row["direct_filled_losses"],
+                row["gross_no_stop_direct_entry_pnl"],
+                row["gross_hybrid_pnl"],
                 row["ladder_tracked_entries"], row["ladder_resolved_entries"],
                 row["gross_no_stop_ladder_pnl"],
                 row["gross_no_stop_direct_plus_ladder_pnl"],
@@ -5421,17 +6015,106 @@ class LiveEngine:
                 "settlement_finalized_at": utc_now(),
             })
             entry_cents = delayed.get("first_entry_price_cents")
-            if delayed.get("threshold_reached") and entry_cents is not None:
+            contract_version = int(delayed.get("ladder_contract_version") or 1)
+            direct_order = (
+                delayed.get("ladder", {}).get("direct_entry_order")
+                if isinstance(delayed.get("ladder"), dict) else None
+            )
+            if contract_version >= 2 and delayed.get("threshold_reached"):
+                filled_quantity = Decimal(str(
+                    direct_order.get("simulated_filled_quantity") or "0"
+                    if isinstance(direct_order, dict) else "0"
+                ))
+                if filled_quantity > 0 and entry_cents is not None:
+                    entry_price = cents_price(int(entry_cents))
+                    gross_per_share = Decimal("1") - entry_price if winner else -entry_price
+                    delayed.update({
+                        "status": "SETTLED_WIN" if winner else "SETTLED_LOSS",
+                        "zero_fill": False,
+                        "no_stop_gross_pnl_per_share": format(gross_per_share, "f"),
+                        "no_stop_gross_pnl": format(filled_quantity * gross_per_share, "f"),
+                    })
+                    if isinstance(direct_order, dict):
+                        direct_order["status"] = "SETTLED"
+                else:
+                    delayed.update({
+                        "status": "ENTRY_NOT_FILLED",
+                        "zero_fill": True,
+                        "hypothetical_fill": False,
+                        "no_stop_gross_pnl_per_share": None,
+                        "no_stop_gross_pnl": "0",
+                    })
+                    if isinstance(direct_order, dict):
+                        direct_order["status"] = "EXPIRED_UNFILLED_AT_MARKET_CLOSE"
+            elif delayed.get("threshold_reached") and entry_cents is not None:
                 entry_price = cents_price(int(entry_cents))
                 gross_pnl = Decimal("1") - entry_price if winner else -entry_price
                 delayed.update({
                     "status": "SETTLED_WIN" if winner else "SETTLED_LOSS",
                     "no_stop_gross_pnl_per_share": format(gross_pnl, "f"),
+                    "no_stop_gross_pnl": format(gross_pnl, "f"),
                 })
             else:
                 delayed["status"] = "NO_THRESHOLD_CROSS_OBSERVED"
             delayed_ladder = delayed.get("ladder")
             if isinstance(delayed_ladder, dict):
+                direct_stop = delayed_ladder.get("direct_hybrid_stop")
+                if contract_version >= 3 and isinstance(direct_stop, dict):
+                    direct_filled = Decimal(str(
+                        direct_order.get("simulated_filled_quantity") or "0"
+                        if isinstance(direct_order, dict) else "0"
+                    ))
+                    if direct_filled <= 0:
+                        direct_stop.update({
+                            "state": "SETTLED",
+                            "exit_classification": "ENTRY_NOT_FILLED",
+                            "gross_pnl": "0",
+                            "stopped_then_eventual_winner": False,
+                        })
+                    elif direct_stop.get("state") == "CLOSED":
+                        delayed_stopped_then_winner = bool(winner)
+                        direct_stop["stopped_then_eventual_winner"] = delayed_stopped_then_winner
+                        if delayed_stopped_then_winner:
+                            hold_pnl = direct_filled * (
+                                Decimal("1") - cents_price(int(direct_order["price_cents"]))
+                            )
+                            direct_stop["hypothetical_lost_settlement_profit"] = format(
+                                hold_pnl - Decimal(str(direct_stop.get("gross_pnl") or "0")), "f",
+                            )
+                    else:
+                        maker_filled = Decimal(str(
+                            direct_stop.get("maker_filled_quantity") or "0"
+                        ))
+                        hard_filled = Decimal(str(
+                            direct_stop.get("hard_filled_quantity") or "0"
+                        ))
+                        remaining = max(
+                            Decimal("0"), direct_filled - maker_filled - hard_filled,
+                        )
+                        entry_cost = direct_filled * cents_price(int(direct_order["price_cents"]))
+                        maker_proceeds = maker_filled * cents_price(
+                            int(direct_stop["maker_exit_cents"]),
+                        )
+                        hard_proceeds = (
+                            hard_filled * cents_price(int(direct_stop["hard_fill_price_cents"]))
+                            if hard_filled > 0 and direct_stop.get("hard_fill_price_cents") is not None
+                            else Decimal("0")
+                        )
+                        settlement_payout = remaining if winner else Decimal("0")
+                        direct_stop.update({
+                            "state": "SETTLED",
+                            "settlement_quantity": format(remaining, "f"),
+                            "settlement_payout": format(settlement_payout, "f"),
+                            "exit_classification": (
+                                f"MAKER_EXIT_PARTIAL_THEN_SETTLEMENT_{'WIN' if winner else 'LOSS'}"
+                                if maker_filled > 0
+                                else f"SETTLEMENT_{'WIN' if winner else 'LOSS'}"
+                            ),
+                            "gross_pnl": format(
+                                maker_proceeds + hard_proceeds + settlement_payout - entry_cost, "f",
+                            ),
+                            "stopped_then_eventual_winner": False,
+                        })
                 filled_quantity = Decimal("0")
                 entry_cost = Decimal("0")
                 for level, _ in OPENING_CROSS_LADDER_RUNGS:
@@ -5834,7 +6517,9 @@ class LiveEngine:
                     "completed=%s stops=%s settlements=%s fees=%s hybrid_state=%s exit_class=%s "
                     "entry_mode=%s maker_tif=%s entry_lifetime=%s initial_quotes=%s stop_safety_no_entry=%s "
                     "delayed53_eligible=%s delayed53_reached=%s delayed53_after60=%s "
-                    "delayed53_resolved=%s delayed53_wl=%s/%s active=%s breaker=%s",
+                    "delayed53_resolved=%s delayed53_wl=%s/%s delayed53_limit_filled=%s "
+                    "delayed53_limit_zero=%s delayed53_limit_partial=%s delayed53_filled_wl=%s/%s "
+                    "active=%s breaker=%s",
                     "DRY_RUN" if self.dry_run else "LIVE",
                     active and active["ticker"],
                     record.get("status") if isinstance(record, dict) else None,
@@ -5864,6 +6549,11 @@ class LiveEngine:
                     delayed_metrics["entries_after_opening_capture_window"],
                     delayed_metrics["resolved_entries"],
                     delayed_metrics["directional_wins"], delayed_metrics["directional_losses"],
+                    delayed_metrics["direct_limit_filled_entries"],
+                    delayed_metrics["direct_limit_zero_fills"],
+                    delayed_metrics["direct_limit_partial_fills"],
+                    delayed_metrics["direct_limit_filled_wins"],
+                    delayed_metrics["direct_limit_filled_losses"],
                     self.state.get("active_market"), self.state["circuit_breaker"].get("blocked"),
                 )
                 self.last_heartbeat = time.monotonic()
