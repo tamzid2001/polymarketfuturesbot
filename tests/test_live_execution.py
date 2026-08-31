@@ -13,9 +13,10 @@ from unittest.mock import patch
 
 from audit_ledger import append_audit
 from live_checkpoint import (
-    DEFAULT_RUNTIME_STATE_REF, RUNTIME_STATE_MANIFEST, RUNTIME_STATE_OWNER,
+    DEFAULT_RUNTIME_STATE_REF, RUNTIME_PAYLOAD_PREFIX, RUNTIME_STATE_MANIFEST,
+    RUNTIME_STATE_OWNER, RUNTIME_STATE_SCHEMA_VERSION,
     MaterialCheckpointPublisher, publish_runtime_snapshot, validate_runtime_paths,
-    validate_runtime_ref,
+    validate_runtime_ref, restore_runtime_snapshot,
 )
 from kalshi_btc15m_average_down import KalshiLiveFeed
 from kalshi_live_trader import (
@@ -663,6 +664,31 @@ class LiveExecutionTests(unittest.TestCase):
         self.assertEqual(
             migrated["config_migrations"][-1]["kind"],
             "enable_compact_full_market_delayed_entry_analytics",
+        )
+        self.assertEqual(migrated["config_hash"], config_hash(self.config))
+
+    def test_chunked_checkpoint_interval_migration_preserves_all_strategy_state(self) -> None:
+        temporary = Path(tempfile.mkdtemp()) / "state.json"
+        prior_config = dict(self.config, durable_checkpoint_interval_seconds=5.0)
+        state = default_state(prior_config)
+        state["sizing"] = {
+            "base_share_count": "1.00", "recovery_exponent": 219,
+            "recovery_cycle_pnl": "-39.61", "next_base_threshold": "350.00",
+        }
+        state["markets"] = {
+            "KXBTC15M-settled": {
+                "ticker": "KXBTC15M-settled", "status": "CLOSED",
+                "actual_quantity": "8.84", "realized_net_pnl": "0.42",
+            },
+        }
+        save_state(temporary, state)
+
+        migrated = load_state(temporary, self.config)
+        self.assertEqual(migrated["sizing"], state["sizing"])
+        self.assertEqual(migrated["markets"], state["markets"])
+        self.assertEqual(
+            migrated["config_migrations"][-1]["kind"],
+            "enable_chunked_remote_checkpoint_coalescing",
         )
         self.assertEqual(migrated["config_hash"], config_hash(self.config))
 
@@ -1757,6 +1783,25 @@ class LiveExecutionTests(unittest.TestCase):
         engine.state["markets"]["KXBTC15M-current"]["status"] = "CLOSED"
         self.assertTrue(engine.handoff_ready(1_300)[0])
 
+    def test_latched_breaker_signal_without_order_or_position_does_not_force_six_hour_timeout(self) -> None:
+        engine = self.engine()
+        engine.markets = [{"ticker": "KXBTC15M-current", "open_epoch": 1_000, "close_epoch": 1_900, "status": "active"}]
+        engine.state["circuit_breaker"] = {
+            "blocked": True, "reason": "max_daily_realized_loss", "triggered_at": "2026-08-31T00:00:00+00:00",
+        }
+        engine.state["markets"]["KXBTC15M-current"] = {
+            "ticker": "KXBTC15M-current", "status": "SIGNAL_PENDING",
+            "actual_quantity": "0.00", "entry_orders": [], "exit_orders": [],
+        }
+        ready, details = engine.handoff_ready(1_300)
+        self.assertTrue(ready)
+        self.assertEqual(details["observational_signal_pending"], ["KXBTC15M-current"])
+
+        engine.state["markets"]["KXBTC15M-current"]["entry_orders"] = [{
+            "order_id": "possibly-resting", "status": "unknown", "remaining_count": "1.00",
+        }]
+        self.assertFalse(engine.handoff_ready(1_300)[0])
+
     def test_audit_and_state_are_checkpointed_for_each_material_event(self) -> None:
         temporary = Path(tempfile.mkdtemp())
         engine = LiveEngine(
@@ -1768,6 +1813,37 @@ class LiveExecutionTests(unittest.TestCase):
         self.assertEqual(records[-1]["event"], "checkpoint_contract_test")
         persisted = json.loads(engine.state_path.read_text(encoding="utf-8"))
         self.assertEqual(persisted["strategy_version"], self.config["strategy_version"])
+
+    def test_audit_omits_large_replay_dedupe_keys_but_preserves_their_count(self) -> None:
+        temporary = Path(tempfile.mkdtemp())
+        engine = LiveEngine(
+            dict(self.config), default_state(self.config), temporary / "state.json", temporary / "audit.jsonl", dry_run=True,
+        )
+        engine.audit(
+            "cursor_compaction_test",
+            ladder={"processed_public_trade_keys": ["a", "b"], "fill": "1.00"},
+        )
+        record = json.loads(engine.ledger_path.read_text(encoding="utf-8"))
+        self.assertNotIn("processed_public_trade_keys", record["ladder"])
+        self.assertEqual(record["ladder"]["processed_public_trade_keys_count"], 2)
+        self.assertEqual(record["ladder"]["fill"], "1.00")
+
+    def test_finalized_market_cursor_buffers_are_pruned_on_restart(self) -> None:
+        temporary = Path(tempfile.mkdtemp())
+        state = default_state(self.config)
+        state["markets"]["KXBTC15M-settled"] = {
+            "ticker": "KXBTC15M-settled", "analytics_settlement_finalized": True,
+            "opening_cross_ladder": {
+                "triggered": {"53": {"processed_public_trade_keys": ["a", "b"], "gross_no_stop_pnl": "1"}},
+            },
+        }
+        engine = LiveEngine(
+            dict(self.config), state, temporary / "state.json", temporary / "audit.jsonl", dry_run=True,
+        )
+        lane = engine.state["markets"]["KXBTC15M-settled"]["opening_cross_ladder"]["triggered"]["53"]
+        self.assertNotIn("processed_public_trade_keys", lane)
+        self.assertEqual(lane["gross_no_stop_pnl"], "1")
+        self.assertEqual(engine.state["storage_compaction"]["removed_finalized_public_trade_keys"], 2)
 
     def test_ledger_append_fsyncs_a_jsonl_record(self) -> None:
         path = Path(tempfile.mkdtemp()) / "audit.jsonl"
@@ -1836,23 +1912,16 @@ class LiveExecutionTests(unittest.TestCase):
             subprocess.check_output(["git", "-C", str(work), "rev-parse", "main"], text=True).strip(),
             main_before,
         )
-        self.assertEqual(
-            subprocess.check_output(
-                [
-                    "git", "--git-dir", str(remote), "show",
-                    f"{DEFAULT_RUNTIME_STATE_REF}:data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_state.json",
-                ], text=True,
-            ),
-            '{"sequence":2}\n',
-        )
         tree_paths = subprocess.check_output(
             ["git", "--git-dir", str(remote), "ls-tree", "-r", "--name-only", DEFAULT_RUNTIME_STATE_REF],
             text=True,
         ).splitlines()
-        self.assertEqual(tree_paths, [
-            RUNTIME_STATE_MANIFEST,
-            "data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_state.json",
-        ])
+        self.assertIn(RUNTIME_STATE_MANIFEST, tree_paths)
+        self.assertTrue(all(
+            path == RUNTIME_STATE_MANIFEST or path.startswith(f"{RUNTIME_PAYLOAD_PREFIX}/")
+            for path in tree_paths
+        ))
+        self.assertNotIn("data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_state.json", tree_paths)
         manifest = json.loads(subprocess.check_output(
             [
                 "git", "--git-dir", str(remote), "show",
@@ -1862,10 +1931,17 @@ class LiveExecutionTests(unittest.TestCase):
         ))
         self.assertEqual(manifest["owner"], RUNTIME_STATE_OWNER)
         self.assertEqual(manifest["runtime_ref"], DEFAULT_RUNTIME_STATE_REF)
+        self.assertEqual(manifest["schema_version"], RUNTIME_STATE_SCHEMA_VERSION)
         self.assertEqual(
             manifest["paths"],
             ["data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_state.json"],
         )
+        state.write_text('{"locally":"corrupted"}\n', encoding="utf-8")
+        self.assertEqual(
+            restore_runtime_snapshot(second, runtime_ref=DEFAULT_RUNTIME_STATE_REF, root=work),
+            ["data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_state.json"],
+        )
+        self.assertEqual(state.read_text(encoding="utf-8"), '{"sequence":2}\n')
 
     def test_runtime_checkpoint_rejects_non_kxbtc15m_ref(self) -> None:
         with self.assertRaisesRegex(ValueError, "not KXBTC15M-owned"):
@@ -1880,6 +1956,59 @@ class LiveExecutionTests(unittest.TestCase):
             "runtime-state-kxbtc15m",
             ["data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_state.json"],
         )
+
+    def test_runtime_checkpoint_splits_large_files_and_restores_exact_bytes(self) -> None:
+        temporary = Path(tempfile.mkdtemp())
+        remote = temporary / "remote.git"
+        work = temporary / "work"
+        subprocess.run(["git", "init", "--bare", str(remote)], check=True, capture_output=True)
+        subprocess.run(["git", "init", "-b", "main", str(work)], check=True, capture_output=True)
+        for key, value in (("user.name", "test"), ("user.email", "test@example.com")):
+            subprocess.run(["git", "-C", str(work), "config", key, value], check=True)
+        subprocess.run(["git", "-C", str(work), "remote", "add", "origin", str(remote)], check=True)
+        state = work / "data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_state.json"
+        state.parent.mkdir(parents=True)
+        expected = bytes(range(256)) * 5
+        state.write_bytes(expected)
+        (work / "README.md").write_text("source\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(work), "add", "README.md"], check=True)
+        subprocess.run(["git", "-C", str(work), "commit", "-m", "source"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(work), "push", "-u", "origin", "main"], check=True, capture_output=True)
+
+        with patch("live_checkpoint.RUNTIME_CHUNK_BYTES", 128):
+            self.assertTrue(publish_runtime_snapshot((state,), "chunk-test", root=work))
+        revision = subprocess.check_output(
+            ["git", "--git-dir", str(remote), "rev-parse", DEFAULT_RUNTIME_STATE_REF], text=True,
+        ).strip()
+        manifest = json.loads(subprocess.check_output(
+            ["git", "--git-dir", str(remote), "show", f"{revision}:{RUNTIME_STATE_MANIFEST}"], text=True,
+        ))
+        self.assertEqual(len(manifest["files"][0]["chunks"]), 10)
+        state.write_bytes(b"wrong")
+        restore_runtime_snapshot(revision, root=work)
+        self.assertEqual(state.read_bytes(), expected)
+
+    def test_runtime_restore_remains_backward_compatible_with_schema_v1(self) -> None:
+        work = Path(tempfile.mkdtemp()) / "work"
+        subprocess.run(["git", "init", "-b", "main", str(work)], check=True, capture_output=True)
+        for key, value in (("user.name", "test"), ("user.email", "test@example.com")):
+            subprocess.run(["git", "-C", str(work), "config", key, value], check=True)
+        state = work / "data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_state.json"
+        state.parent.mkdir(parents=True)
+        state.write_text('{"legacy":true}\n', encoding="utf-8")
+        manifest = {
+            "schema_version": 1,
+            "owner": RUNTIME_STATE_OWNER,
+            "runtime_ref": DEFAULT_RUNTIME_STATE_REF,
+            "paths": ["data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_state.json"],
+        }
+        (work / RUNTIME_STATE_MANIFEST).write_text(json.dumps(manifest), encoding="utf-8")
+        subprocess.run(["git", "-C", str(work), "add", "."], check=True)
+        subprocess.run(["git", "-C", str(work), "commit", "-m", "legacy runtime"], check=True, capture_output=True)
+        revision = subprocess.check_output(["git", "-C", str(work), "rev-parse", "HEAD"], text=True).strip()
+        state.write_text("corrupt\n", encoding="utf-8")
+        restore_runtime_snapshot(revision, root=work)
+        self.assertEqual(state.read_text(encoding="utf-8"), '{"legacy":true}\n')
 
     def test_entry_and_stop_latency_is_durable_and_observational(self) -> None:
         engine = self.engine()

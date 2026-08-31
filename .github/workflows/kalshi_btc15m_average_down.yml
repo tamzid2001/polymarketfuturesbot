@@ -74,6 +74,7 @@ jobs:
           runtime_ref=runtime-state-kxbtc15m
           legacy_runtime_ref=runtime-state
           restore_sha=""
+          restore_mode=""
           set +e
           git ls-remote --exit-code --heads origin "refs/heads/$runtime_ref" >/dev/null
           runtime_ref_status=$?
@@ -81,8 +82,8 @@ jobs:
           if [ "$runtime_ref_status" -eq 0 ]; then
             git fetch --no-tags origin "refs/heads/$runtime_ref"
             restore_sha="$(git rev-parse FETCH_HEAD)"
-            git show "$restore_sha:.kxbtc15m-runtime-state.json" | jq -e \
-              '.schema_version == 1 and .owner == "kalshi-kxbtc15m" and .runtime_ref == "runtime-state-kxbtc15m" and (.paths | type == "array") and (.paths == (.paths | sort))' >/dev/null
+            python3 live_checkpoint.py --restore-sha "$restore_sha" --runtime-ref "$runtime_ref"
+            restore_mode="canonical"
             echo "RUNTIME_STATE_OWNER=kalshi-kxbtc15m"
             echo "RUNTIME_STATE_RESTORED=$runtime_ref"
           elif [ "$runtime_ref_status" -eq 2 ]; then
@@ -93,6 +94,7 @@ jobs:
             if [ "$legacy_ref_status" -eq 0 ]; then
               git fetch --no-tags origin "refs/heads/$legacy_runtime_ref"
               restore_sha="$(git rev-parse FETCH_HEAD)"
+              restore_mode="legacy"
               git cat-file -e "$restore_sha:data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_state.json" || {
                 echo "::error::Legacy runtime ref does not contain canonical KXBTC15M state"; exit 2;
               }
@@ -107,7 +109,7 @@ jobs:
             echo "::error::Unable to determine canonical runtime ref status; refusing legacy fallback"
             exit 2
           fi
-          if [ -n "$restore_sha" ]; then
+          if [ "$restore_mode" = "legacy" ]; then
             for path in \
               selected_live_strategy.json \
               data/kalshi_live_maker_hybrid_v11_state.json \
@@ -147,7 +149,7 @@ jobs:
       - name: Assert canonical hybrid strategy contract
         run: |
           set -euo pipefail
-          python -c 'from decimal import Decimal; from kalshi_live_trader import ACTIVE_CONFIG_SCHEMA_VERSION, ACTIVE_STRATEGY_VERSION, BTC_TARGET_CAPTURE_CONTRACT_VERSION, DELAYED_ENTRY_LADDER_CONTRACT_VERSION, DELAYED_HYBRID_HARD_STOP_CENTS, DELAYED_HYBRID_MAKER_EXIT_CENTS, DELAYED_HYBRID_STOP_TRIGGER_CENTS, OPENING_CROSS_LADDER_RUNGS, OPENING_CROSS_LADDER_TRIGGER_LEVELS, OPENING_PRICE_CAPTURE_CONTRACT_VERSION, load_config; c = load_config(__import__("pathlib").Path("selected_live_strategy.json")); assert c["strategy_version"] == ACTIVE_STRATEGY_VERSION; assert c["config_schema_version"] == ACTIVE_CONFIG_SCHEMA_VERSION; assert OPENING_PRICE_CAPTURE_CONTRACT_VERSION == 3; assert BTC_TARGET_CAPTURE_CONTRACT_VERSION == 2; assert DELAYED_ENTRY_LADDER_CONTRACT_VERSION == 3; assert (DELAYED_HYBRID_STOP_TRIGGER_CENTS, DELAYED_HYBRID_MAKER_EXIT_CENTS, DELAYED_HYBRID_HARD_STOP_CENTS) == (51, 52, 50); assert OPENING_CROSS_LADDER_TRIGGER_LEVELS == tuple(range(53, 60)); assert [(p, str(q)) for p, q in OPENING_CROSS_LADDER_RUNGS] == [(50, "1.00"), (40, "2.00"), (30, "4.00"), (20, "8.00"), (10, "16.00")]; assert c["entry_execution_mode"] == "signal_price_minus_offset_maker"; assert c["maker_order_time_in_force"] == "good_till_canceled"; assert c["entry_order_lifetime"] == "until_filled_or_market_close"; assert c["entry_timeout_seconds"] == 0; assert c["opening_quote_capture_seconds"] == 60; assert c["delayed_entry_tracking_enabled"] is True; assert c["delayed_entry_threshold_cents"] == 53; assert c["entry_limit_offset_cents"] == 1; assert c["stop_policy"] == "hybrid_maker_then_hard_stop"; assert 1 <= c["hybrid_hard_stop_cents"] <= c["hybrid_stop_trigger_cents"] < c["hybrid_maker_exit_cents"] <= 99; assert c["shadow_profile"] == "sticky_stop_40"; assert Decimal(c["starting_base"]) > 0; assert Decimal(c["starting_base"]) <= Decimal(c["max_position"]); assert c["max_recovery_exponent"] == 0; print("CANONICAL_HYBRID_STRATEGY_CONTRACT=OK | opening_price=first_price_only_post_open contract=v3 btc_target=exchange_market_detail contract=v2 cross_ladder=53-59c:50x1,40x2,30x4,20x8,10x16 shadow_only breaker_independent=true delayed_ladder=contract_v3_trigger_ask_minus_1c_public_trade_fill_volume_shared_with_rungs_stop=51trigger_52maker_50hard entry=signal_ask_minus_1c maker_tif=GTC lifetime=until_fill_or_market_close delayed53=through_market_close hybrid=validated_configurable sizing=validated_configurable profile=40")'
+          python -c 'from decimal import Decimal; from kalshi_live_trader import ACTIVE_CONFIG_SCHEMA_VERSION, ACTIVE_STRATEGY_VERSION, BTC_TARGET_CAPTURE_CONTRACT_VERSION, DELAYED_ENTRY_LADDER_CONTRACT_VERSION, DELAYED_HYBRID_HARD_STOP_CENTS, DELAYED_HYBRID_MAKER_EXIT_CENTS, DELAYED_HYBRID_STOP_TRIGGER_CENTS, OPENING_CROSS_LADDER_RUNGS, OPENING_CROSS_LADDER_TRIGGER_LEVELS, OPENING_PRICE_CAPTURE_CONTRACT_VERSION, load_config; c = load_config(__import__("pathlib").Path("selected_live_strategy.json")); assert c["strategy_version"] == ACTIVE_STRATEGY_VERSION; assert c["config_schema_version"] == ACTIVE_CONFIG_SCHEMA_VERSION; assert OPENING_PRICE_CAPTURE_CONTRACT_VERSION == 3; assert BTC_TARGET_CAPTURE_CONTRACT_VERSION == 2; assert DELAYED_ENTRY_LADDER_CONTRACT_VERSION == 3; assert (DELAYED_HYBRID_STOP_TRIGGER_CENTS, DELAYED_HYBRID_MAKER_EXIT_CENTS, DELAYED_HYBRID_HARD_STOP_CENTS) == (51, 52, 50); assert OPENING_CROSS_LADDER_TRIGGER_LEVELS == tuple(range(53, 60)); assert [(p, str(q)) for p, q in OPENING_CROSS_LADDER_RUNGS] == [(50, "1.00"), (40, "2.00"), (30, "4.00"), (20, "8.00"), (10, "16.00")]; assert c["entry_execution_mode"] == "signal_price_minus_offset_maker"; assert c["maker_order_time_in_force"] == "good_till_canceled"; assert c["entry_order_lifetime"] == "until_filled_or_market_close"; assert c["entry_timeout_seconds"] == 0; assert c["opening_quote_capture_seconds"] == 60; assert c["delayed_entry_tracking_enabled"] is True; assert c["delayed_entry_threshold_cents"] == 53; assert c["entry_limit_offset_cents"] == 1; assert c["stop_policy"] == "hybrid_maker_then_hard_stop"; assert 1 <= c["hybrid_hard_stop_cents"] <= c["hybrid_stop_trigger_cents"] < c["hybrid_maker_exit_cents"] <= 99; assert c["shadow_profile"] == "sticky_stop_40"; assert Decimal(c["starting_base"]) > 0; assert Decimal(c["starting_base"]) <= Decimal(c["max_position"]); assert c["max_recovery_exponent"] == 0; assert c["durable_checkpoint_interval_seconds"] == 30.0; print("CANONICAL_HYBRID_STRATEGY_CONTRACT=OK | opening_price=first_price_only_post_open contract=v3 btc_target=exchange_market_detail contract=v2 cross_ladder=53-59c:50x1,40x2,30x4,20x8,10x16 shadow_only breaker_independent=true delayed_ladder=contract_v3_trigger_ask_minus_1c_public_trade_fill_volume_shared_with_rungs_stop=51trigger_52maker_50hard entry=signal_ask_minus_1c maker_tif=GTC lifetime=until_fill_or_market_close delayed53=through_market_close hybrid=validated_configurable sizing=validated_configurable checkpoint=v2_chunked_30s profile=40")'
 
       - name: Write Kalshi RSA private key
         env:

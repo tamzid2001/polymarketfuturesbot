@@ -163,7 +163,7 @@ def export_selected_live_strategy(path: Path, row: dict[str, Any], *, selection_
         "provisional_outcome_threshold": "0.99",
         "max_outcome_quote_age_seconds": 2.0,
         "max_stale_quote_seconds": 2.0,
-        "durable_checkpoint_interval_seconds": 5.0,
+        "durable_checkpoint_interval_seconds": 30.0,
         "delayed_entry_threshold_cents": 53,
         "delayed_entry_tracking_enabled": True,
         "max_recovery_exponent": 0,

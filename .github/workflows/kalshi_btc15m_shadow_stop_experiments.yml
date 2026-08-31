@@ -52,13 +52,7 @@ jobs:
           state_file="data/kalshi_shadow_maker_hybrid_v11_sticky_stop_${STOP_CENTS}_state.json"
           audit_file="data/kalshi_shadow_maker_hybrid_v11_sticky_stop_${STOP_CENTS}_audit.jsonl"
           if git fetch --no-tags origin "refs/heads/${runtime_ref}"; then
-            for path in "$state_file" "$audit_file"; do
-              if git cat-file -e "FETCH_HEAD:$path" 2>/dev/null; then
-                mkdir -p "$(dirname "$path")"
-                git show "FETCH_HEAD:$path" > "${path}.runtime"
-                mv "${path}.runtime" "$path"
-              fi
-            done
+            python3 live_checkpoint.py --restore-sha FETCH_HEAD --runtime-ref "$runtime_ref"
             echo "RUNTIME_STATE_RESTORED=${runtime_ref}"
           else
             echo "RUNTIME_STATE_BOOTSTRAP=${runtime_ref}"
