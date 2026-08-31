@@ -118,6 +118,7 @@ ACTIVE_STATES = {
     "MAKER_EXIT_PENDING", "MAKER_EXIT_PARTIAL", "MAKER_EXIT_CANCEL_UNCONFIRMED", "HARD_STOP_PENDING",
 }
 ENTRY_NOTIONAL_QUANTUM = Decimal("0.0001")
+_AUDIT_TRANSIENT_KEYS = frozenset({"processed_public_trade_keys"})
 
 
 def configure_logging() -> None:
@@ -227,6 +228,81 @@ def cents_price(value: int) -> Decimal:
     if not 1 <= int(value) <= 99:
         raise ValueError("price cents must be between 1 and 99")
     return Decimal(int(value)) / Decimal("100")
+
+
+def audit_safe_value(value: Any) -> Any:
+    """Copy analytics payloads without unbounded replay-only dedupe arrays.
+
+    The per-lane keys are operational cursors while a market is active; they
+    are not strategy evidence.  Persisting the same 4,096 IDs in every ladder
+    lane made individual audit rows exceed a megabyte.  Keep the count in the
+    append-only ledger and all actual trigger/fill/price facts, but omit the
+    redundant keys themselves.
+    """
+
+    if isinstance(value, dict):
+        result = {
+            key: audit_safe_value(item)
+            for key, item in value.items()
+            if key not in _AUDIT_TRANSIENT_KEYS
+        }
+        for key in _AUDIT_TRANSIENT_KEYS:
+            items = value.get(key)
+            if isinstance(items, list):
+                result[f"{key}_count"] = len(items)
+        return result
+    if isinstance(value, list):
+        return [audit_safe_value(item) for item in value]
+    return value
+
+
+def prune_finalized_public_trade_keys(record: dict[str, Any]) -> int:
+    """Remove active-only dedupe buffers once settlement makes them immutable."""
+
+    removed = 0
+
+    def visit(value: Any) -> None:
+        nonlocal removed
+        if isinstance(value, dict):
+            for key in tuple(value):
+                if key in _AUDIT_TRANSIENT_KEYS:
+                    items = value.pop(key)
+                    removed += len(items) if isinstance(items, list) else 1
+                else:
+                    visit(value[key])
+        elif isinstance(value, list):
+            for item in value:
+                visit(item)
+
+    if record.get("analytics_settlement_finalized"):
+        visit(record)
+    return removed
+
+
+def record_has_exchange_work(record: dict[str, Any]) -> bool:
+    """Return whether a durable market record still represents order/risk work."""
+
+    if record.get("current_order_id"):
+        return True
+    try:
+        if Decimal(str(record.get("actual_quantity") or "0")) != 0:
+            return True
+    except (ArithmeticError, TypeError, ValueError):
+        return True
+    for key in ("entry_orders", "exit_orders"):
+        for order in record.get(key, []):
+            if not isinstance(order, dict):
+                return True
+            try:
+                if Decimal(str(order.get("remaining_count") or "0")) != 0:
+                    return True
+            except (ArithmeticError, TypeError, ValueError):
+                return True
+            if order.get("order_id") and str(order.get("status") or "").lower() in {
+                "resting", "pending", "open", "unknown", "submit_failed",
+            }:
+                return True
+    return False
 
 
 def exact_entry_notional(quantity: Decimal | str, price: Decimal | str) -> Decimal:
@@ -450,7 +526,7 @@ def load_config(path: Path) -> dict[str, Any]:
     # State and audit writes are fsynced locally for every material event.
     # This only bounds GitHub checkpoint publication, avoiding a Git push for
     # every market-data update while preserving a short handoff-loss window.
-    value.setdefault("durable_checkpoint_interval_seconds", 5.0)
+    value.setdefault("durable_checkpoint_interval_seconds", 30.0)
     if value["trading_mode"] not in {"shadow", "live"}:
         raise ValueError("trading_mode must be shadow or live")
     if value["signal_mode"] != "sticky_until_directional_win":
@@ -534,7 +610,7 @@ def load_config_from_value(value: dict[str, Any]) -> dict[str, Any]:
     temporary.setdefault("handoff_guard_seconds", 60)
     temporary.setdefault("opening_quote_max_observations", 500)
     temporary.setdefault("opening_price_discovery_seconds", 3)
-    temporary.setdefault("durable_checkpoint_interval_seconds", 5.0)
+    temporary.setdefault("durable_checkpoint_interval_seconds", 30.0)
     temporary.setdefault("market_discovery_interval_seconds", 1.0)
     temporary.setdefault("entry_limit_offset_cents", 1)
     temporary.setdefault("shadow_entry_level_min_cents", 40)
@@ -830,6 +906,23 @@ class LiveEngine:
             }
         self.state["strategy_version"] = config["strategy_version"]
         self.state["config_hash"] = current_hash
+        compacted_keys = sum(
+            prune_finalized_public_trade_keys(record)
+            for record in self.state.get("markets", {}).values()
+            if isinstance(record, dict)
+        )
+        if compacted_keys:
+            self.state["storage_compaction"] = {
+                "version": 1,
+                "at": utc_now(),
+                "removed_finalized_public_trade_keys": compacted_keys,
+                "preserved_strategy_and_analytics_facts": True,
+            }
+            LOG.warning(
+                "DURABLE STATE COMPACTED | removed_finalized_public_trade_keys=%s "
+                "strategy_facts_preserved=true",
+                compacted_keys,
+            )
         self.tracker = ProvisionalOutcomeTracker(
             Decimal(config["provisional_outcome_threshold"]), int(config["outcome_observation_seconds"]),
             float(config["max_outcome_quote_age_seconds"]),
@@ -895,7 +988,8 @@ class LiveEngine:
     def audit(self, event: str, **details: Any) -> None:
         append_audit(self.ledger_path, {
             "event": event, "strategy_version": self.config["strategy_version"],
-            "config_hash": config_hash(self.config), **details,
+            "config_hash": config_hash(self.config),
+            **{key: audit_safe_value(value) for key, value in details.items()},
         })
         # An append is fsynced by ``append_audit``.  Immediately pair it with
         # the atomic state file so a crash cannot leave a fresh ledger event
@@ -4399,16 +4493,26 @@ class LiveEngine:
                 "window_start_epoch": window_start, "window_end_epoch": window_end,
             }
         blocking_states = set(ACTIVE_STATES)
-        blockers = [
-            {"ticker": item.get("ticker"), "status": item.get("status")}
-            for item in self.state.get("markets", {}).values()
-            if isinstance(item, dict) and item.get("status") in blocking_states
-        ]
+        breaker_blocked = bool(self.state.get("circuit_breaker", {}).get("blocked"))
+        blockers = []
+        observational_signals = []
+        for item in self.state.get("markets", {}).values():
+            if not isinstance(item, dict) or item.get("status") not in blocking_states:
+                continue
+            if (
+                item.get("status") == "SIGNAL_PENDING"
+                and breaker_blocked
+                and not record_has_exchange_work(item)
+            ):
+                observational_signals.append(item.get("ticker"))
+                continue
+            blockers.append({"ticker": item.get("ticker"), "status": item.get("status")})
         if blockers:
             return False, {"reason": "operational_state_requires_current_worker", "ticker": active["ticker"], "blockers": blockers}
         return True, {
             "reason": "safe_middle_13_minute_handoff", "ticker": active["ticker"],
             "window_start_epoch": window_start, "window_end_epoch": window_end,
+            "observational_signal_pending": observational_signals,
         }
 
     async def managed_orders(self, rest: KalshiREST) -> list[Any]:
@@ -6157,6 +6261,11 @@ class LiveEngine:
                     "status": "SETTLED_WIN" if winner else "SETTLED_LOSS",
                     "settlement_finalized_at": utc_now(),
                 })
+        # Public-trade IDs only prevent duplicate allocation while this market
+        # is active.  Settlement freezes every fill/result above, so retaining
+        # 4,096 keys in each of seven threshold lanes adds tens of megabytes
+        # without adding evidence or restart safety.
+        prune_finalized_public_trade_keys(record)
         if stopped_then_winner:
             proceeds, _ = self.exit_proceeds(record)
             quantity = Decimal(str(record.get("actual_quantity") or "0"))

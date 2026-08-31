@@ -42,6 +42,7 @@ jobs:
           set -euo pipefail
           runtime_ref=runtime-state-kxbtc15m
           legacy_runtime_ref=runtime-state
+          restore_mode=""
           set +e
           git ls-remote --exit-code --heads origin "refs/heads/$runtime_ref" >/dev/null
           runtime_ref_status=$?
@@ -49,13 +50,14 @@ jobs:
           if [ "$runtime_ref_status" -eq 0 ]; then
             git fetch --no-tags origin "refs/heads/$runtime_ref"
             restore_sha="$(git rev-parse FETCH_HEAD)"
-            git show "$restore_sha:.kxbtc15m-runtime-state.json" | jq -e \
-              '.schema_version == 1 and .owner == "kalshi-kxbtc15m" and .runtime_ref == "runtime-state-kxbtc15m" and (.paths | type == "array") and (.paths == (.paths | sort))' >/dev/null
+            python3 live_checkpoint.py --restore-sha "$restore_sha" --runtime-ref "$runtime_ref"
+            restore_mode="canonical"
             echo "RUNTIME_STATE_OWNER=kalshi-kxbtc15m"
             echo "RUNTIME_STATE_RESTORED=$runtime_ref"
           elif [ "$runtime_ref_status" -eq 2 ]; then
             git fetch --no-tags origin "refs/heads/$legacy_runtime_ref"
             restore_sha="$(git rev-parse FETCH_HEAD)"
+            restore_mode="legacy"
             git cat-file -e "$restore_sha:data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_state.json" || {
               echo "::error::Legacy runtime ref does not contain canonical KXBTC15M state"; exit 2;
             }
@@ -64,18 +66,20 @@ jobs:
             echo "::error::Unable to determine canonical runtime ref status; refusing legacy fallback"
             exit 2
           fi
-          for path in \
-            selected_live_strategy.json \
-            data/kalshi_live_maker_hybrid_v11_state.json \
-            data/kalshi_live_maker_hybrid_v11_audit.jsonl \
-            data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_state.json \
-            data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_audit.jsonl; do
-            if git cat-file -e "$restore_sha:$path" 2>/dev/null; then
-              mkdir -p "$(dirname "$path")"
-              git show "$restore_sha:$path" > "$path.runtime"
-              mv "$path.runtime" "$path"
-            fi
-          done
+          if [ "$restore_mode" = "legacy" ]; then
+            for path in \
+              selected_live_strategy.json \
+              data/kalshi_live_maker_hybrid_v11_state.json \
+              data/kalshi_live_maker_hybrid_v11_audit.jsonl \
+              data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_state.json \
+              data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_audit.jsonl; do
+              if git cat-file -e "$restore_sha:$path" 2>/dev/null; then
+                mkdir -p "$(dirname "$path")"
+                git show "$restore_sha:$path" > "$path.runtime"
+                mv "$path.runtime" "$path"
+              fi
+            done
+          fi
 
       - name: Validate source, live gates, state, and safe handoff window
         env:

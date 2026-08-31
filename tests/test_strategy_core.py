@@ -258,6 +258,8 @@ class StrategyCoreTests(unittest.TestCase):
         self.assertIn("runtime_ref=runtime-state-kxbtc15m", worker)
         self.assertIn("legacy_runtime_ref=runtime-state", worker)
         self.assertIn("RUNTIME_STATE_OWNER=kalshi-kxbtc15m", worker)
+        self.assertIn('live_checkpoint.py --restore-sha "$restore_sha" --runtime-ref "$runtime_ref"', worker)
+        self.assertIn('c["durable_checkpoint_interval_seconds"] == 30.0', worker)
         self.assertIn(
             "python live_checkpoint.py --reason end-of-run --runtime-ref runtime-state-kxbtc15m",
             worker,
@@ -272,6 +274,7 @@ class StrategyCoreTests(unittest.TestCase):
         self.assertIn("runtime_ref=runtime-state-kxbtc15m", controlled)
         self.assertIn("legacy_runtime_ref=runtime-state", controlled)
         self.assertIn("RUNTIME_STATE_OWNER=kalshi-kxbtc15m", controlled)
+        self.assertIn('live_checkpoint.py --restore-sha "$restore_sha" --runtime-ref "$runtime_ref"', controlled)
         self.assertIn('record.get("status") == "SIGNAL_PENDING"', controlled)
         self.assertIn("and breaker_blocked", controlled)
         self.assertIn("and not has_order_work(record)", controlled)

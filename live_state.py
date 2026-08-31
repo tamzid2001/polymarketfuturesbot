@@ -15,6 +15,8 @@ from typing import Any
 STATE_VERSION = 1
 UNCAPPED_RECOVERY_EXPONENT = 0
 LEGACY_RECOVERY_EXPONENT_LIMIT = 12
+LEGACY_REMOTE_CHECKPOINT_INTERVAL_SECONDS = 5.0
+REMOTE_CHECKPOINT_INTERVAL_SECONDS = 30.0
 TUNABLE_STRATEGY_FIELDS = {
     "starting_base",
     "recovery_multiplier",
@@ -198,6 +200,20 @@ def load_state(path: Path, config: dict[str, Any]) -> dict[str, Any]:
             and int(config.get("delayed_entry_threshold_cents", 0)) == 53
             and value.get("config_hash") == config_hash(pre_delayed_entry_analytics_config)
         )
+        # Schema-v2 snapshots must chunk/hash a large append-only audit file.
+        # Coalescing remote publication to 30 seconds prevents Git work from
+        # monopolizing the quote loop; every local state/audit event remains
+        # immediately fsynced. This is operational durability only and cannot
+        # alter orders, fills, sizing, stops, direction, or P&L.
+        pre_chunked_checkpoint_config = dict(config)
+        pre_chunked_checkpoint_config["durable_checkpoint_interval_seconds"] = (
+            LEGACY_REMOTE_CHECKPOINT_INTERVAL_SECONDS
+        )
+        is_chunked_checkpoint_interval_migration = (
+            float(config.get("durable_checkpoint_interval_seconds", 0))
+            == REMOTE_CHECKPOINT_INTERVAL_SECONDS
+            and value.get("config_hash") == config_hash(pre_chunked_checkpoint_config)
+        )
         prior_snapshot = value.get("active_config_snapshot")
         changed_fields: set[str] = set()
         if isinstance(prior_snapshot, dict):
@@ -220,6 +236,7 @@ def load_state(path: Path, config: dict[str, Any]) -> dict[str, Any]:
             is_explicit_gtc_migration,
             is_persistent_gtc_migration,
             is_delayed_entry_analytics_migration,
+            is_chunked_checkpoint_interval_migration,
             is_reviewed_tuning,
         )):
             raise RuntimeError("live state configuration hash differs from active configuration; fail closed")
@@ -264,6 +281,16 @@ def load_state(path: Path, config: dict[str, Any]) -> dict[str, Any]:
                 "previous_config_hash": value.get("config_hash"),
                 "config_hash": expected_hash,
                 "policy": "preserve_all_execution_and_accounting_state; new records receive complete analytics coverage",
+            })
+        if is_chunked_checkpoint_interval_migration:
+            migrations.append({
+                "at": utc_now(),
+                "kind": "enable_chunked_remote_checkpoint_coalescing",
+                "previous_interval_seconds": LEGACY_REMOTE_CHECKPOINT_INTERVAL_SECONDS,
+                "interval_seconds": REMOTE_CHECKPOINT_INTERVAL_SECONDS,
+                "previous_config_hash": value.get("config_hash"),
+                "config_hash": expected_hash,
+                "policy": "local state and audit remain fsynced per event; trading semantics are unchanged",
             })
         if is_reviewed_tuning:
             migrations.append({
