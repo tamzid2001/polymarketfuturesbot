@@ -121,6 +121,21 @@ class LiveHybridRest:
 class MakerHybridV11Tests(unittest.TestCase):
     def setUp(self) -> None:
         self.config = load_config(ROOT / "selected_live_strategy.json")
+        # This module is an archived regression suite for the v11 opening-entry
+        # contract.  Keep exercising those retained helpers without allowing
+        # the production v12 config to reinterpret the scenarios.
+        self.config.update({
+            "entry_execution_mode": "signal_price_minus_offset_maker",
+            "shadow_profile": "sticky_stop_40",
+            "entry_price": "0.49",
+            "stop_price": "0.40",
+            "hybrid_stop_trigger_cents": 45,
+            "hybrid_maker_exit_cents": 46,
+            "hybrid_hard_stop_cents": 44,
+            "recovery_multiplier": "1.01",
+            "threshold_growth_multiplier": "1.01",
+            "delayed_entry_start_seconds": 0,
+        })
 
     def engine(self, *, dry_run: bool = True) -> LiveEngine:
         directory = Path(tempfile.mkdtemp())

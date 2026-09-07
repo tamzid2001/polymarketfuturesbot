@@ -114,15 +114,20 @@ def export_selected_live_strategy(path: Path, row: dict[str, Any], *, selection_
     result, not an unattended-live default.
     """
 
+    if row.get("execution_profile") != "delayed_53_57_stop_50":
+        raise ValueError(
+            "live export requires execution_profile=delayed_53_57_stop_50; "
+            "settlement-only optimizer rows cannot prove delayed fills or hybrid stops"
+        )
     stop = row.get("stop_price")
-    if stop in {None, "no_stop"}:
-        raise ValueError("a live strategy export requires an explicit fixed stop")
-    if round(float(stop), 2) != 0.40:
-        raise ValueError("v11 production exports only the canonical sticky_stop_40 lane")
-    shadow_profile = "sticky_stop_40"
+    if stop in {None, "no_stop"} or round(float(stop), 2) != 0.50:
+        raise ValueError("v12 production exports only the reviewed 50c hard-stop profile")
+    if round(float(row.get("entry_price", 0)), 2) != 0.52:
+        raise ValueError("v12 entry_price is the 52c minimum reference for the delayed limit band")
+    shadow_profile = "delayed_53_57_stop_50"
     config = {
-        "config_schema_version": 11,
-        "strategy_version": "kxbtc15m-hybrid-live-v11",
+        "config_schema_version": 12,
+        "strategy_version": "kxbtc15m-delayed-band-live-v12",
         "selection_basis": selection_basis,
         "series": "KXBTC15M",
         "signal_delay_seconds": 0,
@@ -132,11 +137,11 @@ def export_selected_live_strategy(path: Path, row: dict[str, Any], *, selection_
         "stop_price": f"{float(stop):.2f}",
         "stop_policy": "hybrid_maker_then_hard_stop",
         "hybrid_stop_enabled": True,
-        "hybrid_stop_trigger_cents": 45,
-        "hybrid_maker_exit_cents": 46,
-        "hybrid_hard_stop_cents": 44,
+        "hybrid_stop_trigger_cents": 51,
+        "hybrid_maker_exit_cents": 52,
+        "hybrid_hard_stop_cents": 50,
         "stop_baseline_entry_price": "0.50",
-        "entry_execution_mode": "signal_price_minus_offset_maker",
+        "entry_execution_mode": "delayed_threshold_band_maker",
         "maker_order_time_in_force": "good_till_canceled",
         "entry_order_lifetime": "until_filled_or_market_close",
         "entry_limit_offset_cents": 1,
@@ -165,10 +170,12 @@ def export_selected_live_strategy(path: Path, row: dict[str, Any], *, selection_
         "max_stale_quote_seconds": 2.0,
         "durable_checkpoint_interval_seconds": 30.0,
         "delayed_entry_threshold_cents": 53,
+        "delayed_entry_start_seconds": 60,
+        "delayed_entry_max_limit_cents": 57,
         "delayed_entry_tracking_enabled": True,
         "max_recovery_exponent": 0,
-        "max_recovery_cycle_loss": "50.00",
-        "max_daily_realized_loss": "25.00",
+        "max_recovery_cycle_loss": "100.00",
+        "max_daily_realized_loss": "100.00",
         "max_api_failures": 5,
         "allow_capital_downsize": False,
         "shadow_fill_model": "conservative_public_trade_through",
@@ -818,14 +825,15 @@ def run_optimization(
     ) if calibration_uncertainty_draws else []
     if posterior_rows:
         _write_csv(output_dir / "calibration_uncertainty_results.csv", posterior_rows, ("calibration_draw", "win_entry_fill_probability", "loss_entry_fill_probability", "win_reach_40_joint_probability", "loss_reach_40_joint_probability", *OUTPUT_COLUMNS))
-    # Live selection favours an explicit stop and the 95%-survival constrained
-    # winner when it exists.  The unconstrained median-P&L winner may be a
-    # no-stop research configuration and is not silently promoted to live.
-    live_row = rank["best_median_with_95pct_100_survival"] or rank["best_40c_stop"] or best_row
-    selected_live = export_selected_live_strategy(
-        output_dir / "selected_live_strategy.json", live_row,
-        selection_basis="best_median_with_95pct_100_survival_then_best_40c_stop",
-    )
+    # This optimizer models 49c execution from aggregate calibration.  It
+    # cannot establish the quote-timed delayed 53-57c execution profile now
+    # used by production, so it must not silently export an incompatible live
+    # file. ``export_selected_live_strategy`` remains available to a replay
+    # row explicitly tagged with that execution profile.
+    selected_live = {
+        "exported": False,
+        "reason": "settlement_execution_optimizer_does_not_model_delayed_53_57_stop_50_profile",
+    }
     lines = [
         "# Kalshi hybrid backtest optimization summary",
         "",
@@ -861,7 +869,7 @@ def run_optimization(
         "",
         f"Regime analysis is in `regime_analysis.csv`; the untouched 20% test result is in `walkforward_results.csv`. Calibration posterior draws requested: {calibration_uncertainty_draws}.",
         "49c participation sensitivity for the selected 40c-stop configuration is in `execution_scenario_sensitivity.csv`.",
-        "`selected_live_strategy.json` is the exact fixed-stop configuration exported for the live worker.",
+        "No live file was exported: this settlement/execution optimizer does not model the delayed 53-57c quote-timed production profile.",
     ])
     (output_dir / "optimization_summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
     return {"history": history, "rankings": rank, "best": best_row, "selected_live_strategy": selected_live, "reference": reference_summary, "reconciliation": reconciliation_rows}

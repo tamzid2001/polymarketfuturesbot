@@ -40,9 +40,7 @@ jobs:
       - name: Restore latest bounded runtime state
         run: |
           set -euo pipefail
-          runtime_ref=runtime-state-kxbtc15m
-          legacy_runtime_ref=runtime-state
-          restore_mode=""
+          runtime_ref=runtime-state-kxbtc15m-delayed-v12
           set +e
           git ls-remote --exit-code --heads origin "refs/heads/$runtime_ref" >/dev/null
           runtime_ref_status=$?
@@ -51,34 +49,14 @@ jobs:
             git fetch --no-tags origin "refs/heads/$runtime_ref"
             restore_sha="$(git rev-parse FETCH_HEAD)"
             python3 live_checkpoint.py --restore-sha "$restore_sha" --runtime-ref "$runtime_ref"
-            restore_mode="canonical"
-            echo "RUNTIME_STATE_OWNER=kalshi-kxbtc15m"
+            echo "RUNTIME_STATE_OWNER=kalshi-kxbtc15m-delayed-v12"
             echo "RUNTIME_STATE_RESTORED=$runtime_ref"
           elif [ "$runtime_ref_status" -eq 2 ]; then
-            git fetch --no-tags origin "refs/heads/$legacy_runtime_ref"
-            restore_sha="$(git rev-parse FETCH_HEAD)"
-            restore_mode="legacy"
-            git cat-file -e "$restore_sha:data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_state.json" || {
-              echo "::error::Legacy runtime ref does not contain canonical KXBTC15M state"; exit 2;
-            }
-            echo "RUNTIME_STATE_MIGRATION_SOURCE=$legacy_runtime_ref"
-          else
-            echo "::error::Unable to determine canonical runtime ref status; refusing legacy fallback"
+            echo "::error::No v12 runtime checkpoint exists; start a fresh shadow worker before controlled restart"
             exit 2
-          fi
-          if [ "$restore_mode" = "legacy" ]; then
-            for path in \
-              selected_live_strategy.json \
-              data/kalshi_live_maker_hybrid_v11_state.json \
-              data/kalshi_live_maker_hybrid_v11_audit.jsonl \
-              data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_state.json \
-              data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_audit.jsonl; do
-              if git cat-file -e "$restore_sha:$path" 2>/dev/null; then
-                mkdir -p "$(dirname "$path")"
-                git show "$restore_sha:$path" > "$path.runtime"
-                mv "$path.runtime" "$path"
-              fi
-            done
+          else
+            echo "::error::Unable to determine v12 runtime ref status; refusing unsafe fallback"
+            exit 2
           fi
 
       - name: Validate source, live gates, state, and safe handoff window
@@ -86,7 +64,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           SOURCE_RUN_ID: ${{ inputs.source_run_id }}
           TARGET_LIVE: ${{ inputs.target_live }}
-          SHADOW_PROFILE: "sticky_stop_40"
+          SHADOW_PROFILE: "delayed_53_57_stop_50"
           LIVE_GATE: ${{ vars.KALSHI_LIVE_ENABLED || 'false' }}
           SHADOW_ONLY_LOCK: ${{ vars.KALSHI_SHADOW_ONLY || 'true' }}
         run: |
@@ -109,13 +87,13 @@ jobs:
             }
           fi
           if [[ "$title" == *"LIVE" ]]; then
-            state_file=data/kalshi_live_maker_hybrid_v11_state.json
+            state_file=data/kalshi_live_delayed_band_v12_state.json
           else
             expected_title="DRY_RUN $SHADOW_PROFILE"
             [[ "$title" == *"$expected_title"* ]] || {
               echo "::error::source title does not match requested shadow profile"; exit 2;
             }
-            state_file=data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_state.json
+            state_file=data/kalshi_shadow_delayed_band_v12_state.json
           fi
           [ -f "$state_file" ] || { echo "::error::Missing durable state: $state_file"; exit 2; }
 
@@ -199,7 +177,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           SOURCE_RUN_ID: ${{ inputs.source_run_id }}
           TARGET_LIVE: ${{ inputs.target_live }}
-          SHADOW_PROFILE: "sticky_stop_40"
+          SHADOW_PROFILE: "delayed_53_57_stop_50"
         run: |
           set -euo pipefail
           source_title="$(gh run view "$SOURCE_RUN_ID" --repo "$GITHUB_REPOSITORY" \
@@ -242,7 +220,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TARGET_LIVE: ${{ inputs.target_live }}
-          SHADOW_PROFILE: "sticky_stop_40"
+          SHADOW_PROFILE: "delayed_53_57_stop_50"
         run: |
           set -euo pipefail
           if [ "$TARGET_LIVE" = "true" ]; then

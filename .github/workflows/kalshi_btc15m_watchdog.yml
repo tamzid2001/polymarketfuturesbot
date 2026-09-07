@@ -3,8 +3,8 @@ name: Kalshi KXBTC15M Hybrid Live Watchdog
 # A recovery safety net for the hybrid trader. Normal five-hour workers only
 # hand off in the middle 13 minutes of a KXBTC15M market. This workflow is a
 # recovery path for a failed/missing worker; it never bypasses the live gate.
-# While KALSHI_SHADOW_ONLY=true, only the canonical sticky_stop_40 v11 lane is
-# maintained. Retired 30c/20c/10c experiments are never redispatched.
+# While KALSHI_SHADOW_ONLY=true, only the canonical delayed 53-57c v12 lane is
+# maintained. Older opening-entry and comparison-stop lanes are never dispatched.
 on:
   schedule:
     # Avoid minute zero, when GitHub Actions is most likely to delay or drop
@@ -58,7 +58,7 @@ jobs:
             --json databaseId,status,conclusion,updatedAt,displayTitle,event)"
 
           if [ "$KALSHI_SHADOW_ONLY" = "true" ]; then
-              profile=sticky_stop_40
+              profile=delayed_53_57_stop_50
               profile_runs="$(jq --arg title "DRY_RUN $profile" '[.[] | select((.displayTitle // "") | contains($title))]' <<<"$runs")"
               active="$(jq '[.[] | select(.status == "in_progress" or .status == "queued" or .status == "waiting")] | length' <<<"$profile_runs")"
               if [ "$active" -gt 0 ]; then

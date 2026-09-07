@@ -92,7 +92,7 @@ def default_state(config: dict[str, Any]) -> dict[str, Any]:
         "provisional_outcomes": {},
         "preloaded_markets": [],
         # Directional side is intentionally independent of execution.  The
-        # v8 shadow experiment holds a losing side until that side eventually
+        # The active sticky strategy holds a losing side until it eventually
         # settles correctly, then flips for the following market.
         "directional_signal_state": {
             "mode": config.get("signal_mode", "sticky_until_directional_win"),
@@ -111,7 +111,7 @@ def default_state(config: dict[str, Any]) -> dict[str, Any]:
         # Rebuilt from individual market timing records; telemetry only, not
         # an input to sizing, funding, or realized P&L.
         "execution_timing_metrics": {},
-        # Idempotently rebuilt from durable per-market v11 analytics facts.
+        # Idempotently rebuilt from durable per-market execution facts.
         "entry_price_performance": {},
         "delayed_entry_performance": {},
         "hybrid_stop_performance": {},
@@ -137,10 +137,9 @@ def load_state(path: Path, config: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeError(f"cannot load durable live state: {exc}") from exc
     if not isinstance(value, dict) or int(value.get("state_version", 0)) != STATE_VERSION:
         raise RuntimeError("live state has an unsupported schema; fail closed rather than migrate unknown risk")
-    # A recovery cycle is defined by its exact configuration.  Loading a v8
-    # maker/entry-adjusted-stop checkpoint under v9 would silently reinterpret
-    # exposure and P&L, so reject it rather than attempting a migration.  The
-    # workflow gives v9 its own durable state/ledger namespace.
+    # A recovery cycle is defined by its exact configuration. Loading an older
+    # strategy checkpoint under v12 would silently reinterpret exposure and
+    # P&L, so reject it. The workflow gives v12 its own durable namespace.
     if value.get("strategy_version") != config.get("strategy_version"):
         raise RuntimeError("live state strategy version differs from active configuration; fail closed")
     expected_hash = config_hash(config)

@@ -40,6 +40,7 @@ from kalshi_btc15m_average_down import (
 )
 from live_state import append_unique, config_hash, load_state, save_state, utc_now
 from strategy_core import (
+    delayed_band_entry_decision,
     StrategyParameters,
     apply_realized_filled_trade,
     decimal,
@@ -60,13 +61,14 @@ ORDER_PREFIX = "kxbtc15m-hybrid-v1-"
 # silently reinterpret an older selected configuration after a restart or a
 # watchdog handoff.  Bump both values deliberately with a reviewed migration
 # whenever the shared live/backtest strategy semantics change.
-# v11 is a hard compatibility boundary for status-filtered active-market
-# discovery, immutable signal-price-minus-one-cent maker entry, 40–49c
-# execution analytics, and the 45/46/44 hybrid stop contract.
+# v12 is a hard compatibility boundary for the delayed >=53c cohort: the
+# immutable opening ask must be below 53c; the first fresh qualifying ask at
+# or after 60 seconds freezes one post-only GTC limit one cent lower; limits
+# above 57c are filtered; and filled exposure uses the 51/52/50 hybrid stop.
 # An older worker cannot silently load this
 # configuration; it fails closed before it can submit an order.
-ACTIVE_STRATEGY_VERSION = "kxbtc15m-hybrid-live-v11"
-ACTIVE_CONFIG_SCHEMA_VERSION = 11
+ACTIVE_STRATEGY_VERSION = "kxbtc15m-delayed-band-live-v12"
+ACTIVE_CONFIG_SCHEMA_VERSION = 12
 # Operational release guard used by the production workflow.  Version 3 means
 # opening entry prices come from the buffered price-only stream, not the first
 # later complete-depth book.  This can advance without reinterpreting recovery
@@ -106,7 +108,10 @@ OPENING_CROSS_LADDER_RUNGS: tuple[tuple[int, Decimal], ...] = (
 )
 MARKET_DISCOVERY_LOOKBACK_SECONDS = 3_600
 MARKET_DISCOVERY_LOOKAHEAD_SECONDS = 3_600
-TERMINAL_STATES = {"CLOSED", "ZERO_FILL", "FUNDING_FAILURE", "MISSED_SIGNAL", "ERROR_RECONCILIATION"}
+TERMINAL_STATES = {
+    "CLOSED", "ZERO_FILL", "ENTRY_FILTERED", "FUNDING_FAILURE", "MISSED_SIGNAL",
+    "ERROR_RECONCILIATION",
+}
 # A cancellation acknowledgement or an order-submission response can be
 # uncertain.  These are deliberately active, risk-managed states: they block
 # every new entry, are retried through exchange reconciliation, and must not
@@ -146,10 +151,20 @@ def live_mode_allowed(
 
 
 def _iso_epoch(value: Any) -> float | None:
-    """Parse a persisted UTC timestamp for non-accounting telemetry only."""
+    """Parse persisted ISO or numeric timestamps without confusing ms and s."""
 
     if value in (None, ""):
         return None
+    if isinstance(value, (int, float, Decimal)):
+        numeric = float(value)
+        return numeric / 1000.0 if abs(numeric) > 10_000_000_000 else numeric
+    if isinstance(value, str):
+        try:
+            numeric = float(value)
+        except ValueError:
+            pass
+        else:
+            return numeric / 1000.0 if abs(numeric) > 10_000_000_000 else numeric
     try:
         parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
         if parsed.tzinfo is None:
@@ -187,6 +202,7 @@ INTEGER_CONFIG_FIELDS = {
     "entry_limit_offset_cents", "shadow_entry_level_min_cents", "shadow_entry_level_max_cents",
     "shadow_entry_level_step_cents", "hybrid_stop_trigger_cents", "hybrid_maker_exit_cents",
     "hybrid_hard_stop_cents", "opening_quote_capture_seconds", "delayed_entry_threshold_cents",
+    "delayed_entry_start_seconds", "delayed_entry_max_limit_cents",
 }
 FLOAT_CONFIG_FIELDS = {
     "stop_poll_interval", "reconciliation_interval", "max_outcome_quote_age_seconds", "max_stale_quote_seconds",
@@ -204,8 +220,9 @@ SHADOW_STOP_PROFILE_PRICES = {
     "sticky_stop_30": Decimal("0.30"),
     "sticky_stop_35": Decimal("0.35"),
     "sticky_stop_40": Decimal("0.40"),
+    "delayed_53_57_stop_50": Decimal("0.50"),
 }
-CANONICAL_LIVE_SHADOW_PROFILE = "sticky_stop_40"
+CANONICAL_LIVE_SHADOW_PROFILE = "delayed_53_57_stop_50"
 
 
 def price_to_cents(value: Decimal | str, name: str = "price") -> int:
@@ -350,8 +367,8 @@ def validate_entry_price_contract(value: dict[str, Any]) -> None:
     stop_baseline = decimal(value["stop_baseline_entry_price"])
     if not stop < entry < Decimal("1"):
         raise ValueError("reference entry_price must satisfy stop < entry_price < 1")
-    if value.get("entry_execution_mode") != "signal_price_minus_offset_maker":
-        raise ValueError("the active strategy requires entry_execution_mode=signal_price_minus_offset_maker")
+    if value.get("entry_execution_mode") != "delayed_threshold_band_maker":
+        raise ValueError("the active strategy requires entry_execution_mode=delayed_threshold_band_maker")
     if value.get("maker_order_time_in_force") != "good_till_canceled":
         raise ValueError("the active strategy requires maker_order_time_in_force=good_till_canceled")
     if value.get("entry_order_lifetime") != "until_filled_or_market_close":
@@ -368,13 +385,13 @@ def validate_entry_price_contract(value: dict[str, Any]) -> None:
         raise ValueError("the active strategy requires stop_policy=hybrid_maker_then_hard_stop")
     if stop_baseline != Decimal("0.50"):
         raise ValueError("the hybrid strategy requires stop_baseline_entry_price to equal exactly 0.50")
-    profile = str(value.get("shadow_profile") or "sticky_stop_40")
+    profile = str(value.get("shadow_profile") or CANONICAL_LIVE_SHADOW_PROFILE)
     expected_profile_stop = SHADOW_STOP_PROFILE_PRICES.get(profile)
     if expected_profile_stop is None:
         raise ValueError(
             "shadow_profile must be one of " + ", ".join(sorted(SHADOW_STOP_PROFILE_PRICES))
         )
-    if stop != expected_profile_stop:
+    if profile != CANONICAL_LIVE_SHADOW_PROFILE and stop != expected_profile_stop:
         raise ValueError(
             f"shadow_profile={profile} requires stop_price={format(expected_profile_stop, 'f')}"
         )
@@ -398,8 +415,12 @@ def validate_entry_price_contract(value: dict[str, Any]) -> None:
     if not 1 <= hard_stop <= trigger < maker_exit <= 99:
         raise ValueError("hybrid stop prices must be valid integer-cent ticks")
     if profile == CANONICAL_LIVE_SHADOW_PROFILE:
-        if not 40 <= hard_stop <= 49:
-            raise ValueError("the canonical 40c profile requires hybrid_hard_stop_cents between 40 and 49")
+        if not 10 <= hard_stop <= 50 or (trigger, maker_exit) != (hard_stop + 1, hard_stop + 2):
+            raise ValueError(
+                "the canonical delayed band requires a 10c-50c hard stop with trigger/maker exactly 1c/2c higher"
+            )
+        if stop != cents_price(hard_stop):
+            raise ValueError("the canonical delayed band stop_price must equal hybrid_hard_stop_cents")
     else:
         profile_cents = price_to_cents(expected_profile_stop, "shadow profile stop")
         if (hard_stop, trigger, maker_exit) != (
@@ -410,9 +431,9 @@ def validate_entry_price_contract(value: dict[str, Any]) -> None:
                 "at profile/profile+1c/profile+2c"
             )
     if not _bool(value.get("hybrid_stop_enabled", True)):
-        raise ValueError("the active v11 strategy requires hybrid_stop_enabled=true")
+        raise ValueError("the active v12 strategy requires hybrid_stop_enabled=true")
     if value.get("shadow_fill_model") != "conservative_public_trade_through":
-        raise ValueError("v11 shadow mode requires conservative_public_trade_through")
+        raise ValueError("v12 shadow mode requires conservative_public_trade_through")
     if offset < Decimal("0"):
         raise ValueError("maker_price_offset cannot be negative")
     if int(value["opening_quote_max_observations"]) < 1:
@@ -421,6 +442,10 @@ def validate_entry_price_contract(value: dict[str, Any]) -> None:
         raise ValueError("the active analytics contract requires delayed_entry_tracking_enabled=true")
     if int(value.get("delayed_entry_threshold_cents", 0)) != 53:
         raise ValueError("the active analytics contract requires delayed_entry_threshold_cents=53")
+    if int(value.get("delayed_entry_start_seconds", -1)) != 60:
+        raise ValueError("the active delayed entry contract requires delayed_entry_start_seconds=60")
+    if int(value.get("delayed_entry_max_limit_cents", 0)) != 57:
+        raise ValueError("the active delayed entry contract requires delayed_entry_max_limit_cents=57")
 
 
 def validate_sizing_config(value: dict[str, Any]) -> None:
@@ -452,7 +477,7 @@ def load_config(path: Path) -> dict[str, Any]:
         "first_base_threshold", "threshold_growth_multiplier", "base_increment", "max_position",
         "stop_policy", "stop_baseline_entry_price", "entry_execution_mode", "entry_limit_offset_cents",
         "maker_order_time_in_force", "entry_order_lifetime", "entry_timeout_seconds",
-        "opening_quote_capture_seconds",
+        "opening_quote_capture_seconds", "delayed_entry_start_seconds", "delayed_entry_max_limit_cents",
         "shadow_fill_model", "shadow_entry_level_min_cents", "shadow_entry_level_max_cents",
         "shadow_entry_level_step_cents", "hybrid_stop_enabled", "hybrid_stop_trigger_cents",
         "hybrid_maker_exit_cents", "hybrid_hard_stop_cents", "trading_mode", "config_schema_version",
@@ -480,12 +505,12 @@ def load_config(path: Path) -> dict[str, Any]:
     value.setdefault("starting_shadow_balance", "1000.00")
     value.setdefault("maker_price_offset", "0.01")
     value.setdefault("stop_policy", "hybrid_maker_then_hard_stop")
-    value.setdefault("entry_execution_mode", "signal_price_minus_offset_maker")
+    value.setdefault("entry_execution_mode", "delayed_threshold_band_maker")
     value.setdefault("maker_order_time_in_force", "good_till_canceled")
     value.setdefault("stop_baseline_entry_price", "0.50")
     value.setdefault("signal_delay_seconds", 0)
     value.setdefault("signal_mode", "sticky_until_directional_win")
-    value.setdefault("shadow_profile", "sticky_stop_40")
+    value.setdefault("shadow_profile", CANONICAL_LIVE_SHADOW_PROFILE)
     # A fresh post-open complete book is required to freeze the one-cent-below
     # maker limit. Missing or stale evidence fails closed.
     value.setdefault("entry_timeout_seconds", 0)
@@ -496,6 +521,8 @@ def load_config(path: Path) -> dict[str, Any]:
     # market close without retaining every full-book update.
     value.setdefault("delayed_entry_tracking_enabled", True)
     value.setdefault("delayed_entry_threshold_cents", 53)
+    value.setdefault("delayed_entry_start_seconds", 60)
+    value.setdefault("delayed_entry_max_limit_cents", 57)
     value.setdefault("entry_lateness_seconds", 60)
     value.setdefault("stop_poll_interval", 1.0)
     value.setdefault("reconciliation_interval", 5.0)
@@ -519,9 +546,9 @@ def load_config(path: Path) -> dict[str, Any]:
     value.setdefault("shadow_entry_level_max_cents", 49)
     value.setdefault("shadow_entry_level_step_cents", 1)
     value.setdefault("hybrid_stop_enabled", True)
-    value.setdefault("hybrid_stop_trigger_cents", 45)
-    value.setdefault("hybrid_maker_exit_cents", 46)
-    value.setdefault("hybrid_hard_stop_cents", 44)
+    value.setdefault("hybrid_stop_trigger_cents", 51)
+    value.setdefault("hybrid_maker_exit_cents", 52)
+    value.setdefault("hybrid_hard_stop_cents", 50)
     value.setdefault("trading_mode", "shadow")
     # State and audit writes are fsynced locally for every material event.
     # This only bounds GitHub checkpoint publication, avoiding a Git push for
@@ -581,7 +608,7 @@ def load_config_from_value(value: dict[str, Any]) -> dict[str, Any]:
         "first_base_threshold", "threshold_growth_multiplier", "base_increment", "max_position", "stop_policy",
         "stop_baseline_entry_price", "entry_execution_mode", "entry_limit_offset_cents", "shadow_fill_model",
         "maker_order_time_in_force", "entry_order_lifetime", "entry_timeout_seconds",
-        "opening_quote_capture_seconds",
+        "opening_quote_capture_seconds", "delayed_entry_start_seconds", "delayed_entry_max_limit_cents",
         "shadow_entry_level_min_cents", "shadow_entry_level_max_cents", "shadow_entry_level_step_cents",
         "hybrid_stop_enabled", "hybrid_stop_trigger_cents", "hybrid_maker_exit_cents",
         "hybrid_hard_stop_cents", "trading_mode", "config_schema_version",
@@ -596,16 +623,18 @@ def load_config_from_value(value: dict[str, Any]) -> dict[str, Any]:
     temporary.setdefault("starting_shadow_balance", "1000.00")
     temporary.setdefault("maker_price_offset", "0.01")
     temporary.setdefault("stop_policy", "hybrid_maker_then_hard_stop")
-    temporary.setdefault("entry_execution_mode", "signal_price_minus_offset_maker")
+    temporary.setdefault("entry_execution_mode", "delayed_threshold_band_maker")
     temporary.setdefault("maker_order_time_in_force", "good_till_canceled")
     temporary.setdefault("stop_baseline_entry_price", "0.50")
     temporary.setdefault("signal_mode", "sticky_until_directional_win")
-    temporary.setdefault("shadow_profile", "sticky_stop_40")
+    temporary.setdefault("shadow_profile", CANONICAL_LIVE_SHADOW_PROFILE)
     temporary.setdefault("entry_timeout_seconds", 0)
     temporary.setdefault("entry_order_lifetime", "until_filled_or_market_close")
     temporary.setdefault("opening_quote_capture_seconds", 60)
     temporary.setdefault("delayed_entry_tracking_enabled", True)
     temporary.setdefault("delayed_entry_threshold_cents", 53)
+    temporary.setdefault("delayed_entry_start_seconds", 60)
+    temporary.setdefault("delayed_entry_max_limit_cents", 57)
     temporary.setdefault("entry_lateness_seconds", 60)
     temporary.setdefault("handoff_guard_seconds", 60)
     temporary.setdefault("opening_quote_max_observations", 500)
@@ -617,9 +646,9 @@ def load_config_from_value(value: dict[str, Any]) -> dict[str, Any]:
     temporary.setdefault("shadow_entry_level_max_cents", 49)
     temporary.setdefault("shadow_entry_level_step_cents", 1)
     temporary.setdefault("hybrid_stop_enabled", True)
-    temporary.setdefault("hybrid_stop_trigger_cents", 45)
-    temporary.setdefault("hybrid_maker_exit_cents", 46)
-    temporary.setdefault("hybrid_hard_stop_cents", 44)
+    temporary.setdefault("hybrid_stop_trigger_cents", 51)
+    temporary.setdefault("hybrid_maker_exit_cents", 52)
+    temporary.setdefault("hybrid_hard_stop_cents", 50)
     temporary.setdefault("trading_mode", "shadow")
     validate_entry_price_contract(temporary)
     validate_sizing_config(temporary)
@@ -1786,6 +1815,164 @@ class LiveEngine:
         self.checkpoint("initial_signal_price_frozen")
         return cents_price(limit_cents)
 
+    def freeze_delayed_band_entry_price(
+        self, feed: KalshiLiveFeed, record: dict[str, Any], now: float,
+    ) -> Decimal | None:
+        """Freeze the v12 post-60-second >=53c ask-minus-1c entry.
+
+        The immutable opening selected-side ask is used only to establish that
+        this market belongs to the delayed cohort.  Execution waits until the
+        configured observation boundary, then the first fresh complete book
+        at or above the threshold is decisive.  A derived limit above the
+        ceiling filters the market instead of waiting for a later price and
+        silently changing the researched cohort.
+        """
+
+        existing = record.get("delayed_entry_decision")
+        if isinstance(existing, dict):
+            if existing.get("status") == "ELIGIBLE" and record.get("entry_limit_cents") is not None:
+                if self.ensure_opening_entry_cost(record):
+                    self.audit(
+                        "delayed_entry_cost_backfilled", ticker=record["ticker"],
+                        requested_quantity=record["opening_entry_quantity"],
+                        requested_price=record["opening_entry_price"],
+                        opening_entry_cost=record["opening_entry_cost"],
+                    )
+                return cents_price(int(record["entry_limit_cents"]))
+            return None
+
+        opened = float(record["market_open_epoch"])
+        start_seconds = int(self.config["delayed_entry_start_seconds"])
+        if now < opened + start_seconds:
+            record["delayed_entry_wait_reason"] = "observation_window_not_complete"
+            return None
+
+        reference = self.capture_opening_price_reference(feed, record, now)
+        if reference is None or not reference.get("coverage_complete_from_market_open"):
+            record["delayed_entry_decision"] = {
+                "status": "MISSED", "reason": "complete_opening_price_reference_unavailable",
+                "decided_at": utc_now(), "seconds_after_open": round(max(0.0, now - opened), 6),
+            }
+            self.transition(record, "MISSED_SIGNAL", "complete_opening_price_reference_unavailable")
+            if self.state.get("active_market") == record["ticker"]:
+                self.state["active_market"] = None
+            return None
+
+        quote, quote_state = self.selected_book(feed, record)
+        if quote is None:
+            record["delayed_entry_wait_reason"] = quote_state
+            return None
+        quote_epoch = executable_quote_epoch(quote)
+        if quote_epoch is None or quote_epoch < opened + start_seconds:
+            record["delayed_entry_wait_reason"] = "waiting_for_post_window_executable_book"
+            return None
+        try:
+            opening_cents = int(reference["selected_side_ask_cents"])
+            observed_cents = price_to_cents(
+                str(quote["economic_price"]), "delayed selected-side executable ask",
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            record["delayed_entry_wait_reason"] = str(exc)
+            return None
+        elapsed = Decimal(str(max(0.0, quote_epoch - opened)))
+        decision = delayed_band_entry_decision(
+            opening_ask_cents=opening_cents,
+            observed_ask_cents=observed_cents,
+            seconds_after_open=elapsed,
+            observation_start_seconds=start_seconds,
+            threshold_ask_cents=int(self.config["delayed_entry_threshold_cents"]),
+            maximum_limit_cents=int(self.config["delayed_entry_max_limit_cents"]),
+            offset_cents=int(self.config["entry_limit_offset_cents"]),
+        )
+        if decision.status == "WAITING":
+            record["delayed_entry_wait_reason"] = decision.reason
+            return None
+
+        decided_at = utc_now()
+        decision_record = {
+            "status": decision.status,
+            "reason": decision.reason,
+            "decided_at": decided_at,
+            "opening_selected_side_ask_cents": opening_cents,
+            "observed_selected_side_ask_cents": observed_cents,
+            "limit_price_cents": decision.limit_price_cents,
+            "quote_exchange_epoch": quote_epoch,
+            "quote_exchange_timestamp": datetime.fromtimestamp(quote_epoch, timezone.utc).isoformat(),
+            "seconds_after_open": round(float(elapsed), 6),
+            "threshold_ask_cents": int(self.config["delayed_entry_threshold_cents"]),
+            "maximum_limit_cents": int(self.config["delayed_entry_max_limit_cents"]),
+            "offset_cents": int(self.config["entry_limit_offset_cents"]),
+            "quote": quote,
+        }
+        record["delayed_entry_decision"] = decision_record
+        record.pop("delayed_entry_wait_reason", None)
+        if decision.status != "ELIGIBLE" or decision.limit_price_cents is None:
+            record["entry_rejection_quote"] = decision_record
+            self.transition(record, "ENTRY_FILTERED", decision.reason or "delayed_entry_filtered")
+            if self.state.get("active_market") == record["ticker"]:
+                self.state["active_market"] = None
+            self.audit("delayed_entry_filtered", ticker=record["ticker"], side=record["signal_side"], **decision_record)
+            LOG.warning(
+                "DELAYED ENTRY FILTERED | ticker=%s side=%s opening_ask=%sc observed_ask=%sc "
+                "derived_limit=%s ceiling=%sc reason=%s",
+                record["ticker"], str(record["signal_side"]).upper(), opening_cents,
+                observed_cents, decision.limit_price_cents,
+                int(self.config["delayed_entry_max_limit_cents"]), decision.reason,
+            )
+            return None
+
+        limit_cents = int(decision.limit_price_cents)
+        intended = Decimal(str(record["intended_quantity"]))
+        limit_price = cents_price(limit_cents)
+        requested_cost = exact_entry_notional(intended, limit_price)
+        record.update({
+            # For v12 these fields intentionally identify the immutable quote
+            # which created the actual order; the true opening quote remains
+            # separately preserved in ``opening_price_reference``.
+            "initial_signal_price_cents": observed_cents,
+            "initial_signal_price": format(cents_price(observed_cents), "f"),
+            "initial_signal_price_timestamp": decided_at,
+            "initial_signal_price_epoch": quote_epoch,
+            "initial_signal_price_exchange_timestamp": decision_record["quote_exchange_timestamp"],
+            "initial_signal_price_lag_seconds": decision_record["seconds_after_open"],
+            "initial_signal_price_observed_lag_seconds": round(max(0.0, now - opened), 6),
+            "initial_signal_quote": quote,
+            "entry_limit_cents": limit_cents,
+            "maker_entry_price": format(limit_price, "f"),
+            "opening_entry_quantity": format(intended, "f"),
+            "opening_entry_price": format(limit_price, "f"),
+            "opening_entry_cost": format(requested_cost, "f"),
+            "opening_entry_cost_recorded_at": decided_at,
+            "minimum_selected_price_cents": observed_cents,
+            "minimum_selected_price_timestamp": decision_record["quote_exchange_timestamp"],
+        })
+        self.audit(
+            "delayed_entry_price_frozen", ticker=record["ticker"], side=record["signal_side"],
+            opening_selected_side_ask_cents=opening_cents,
+            qualifying_selected_side_ask_cents=observed_cents,
+            entry_limit_cents=limit_cents, requested_quantity=format(intended, "f"),
+            requested_entry_cost=format(requested_cost, "f"),
+            seconds_after_open=decision_record["seconds_after_open"],
+            maximum_limit_cents=int(self.config["delayed_entry_max_limit_cents"]),
+            quote=quote,
+        )
+        LOG.warning("=" * 60)
+        LOG.warning("SIGNAL: %s", record["ticker"])
+        LOG.warning("SIDE: %s", str(record["signal_side"]).upper())
+        LOG.warning("OPENING SELECTED-SIDE ASK: %sc", opening_cents)
+        LOG.warning(
+            "POST-60 QUALIFYING ASK: %sc | %s GTC ENTRY: BUY %s @ %sc | QUANTITY: %s | CEILING: %sc",
+            observed_cents, "SHADOW" if self.dry_run else "LIVE",
+            str(record["signal_side"]).upper(), limit_cents, record["intended_quantity"],
+            int(self.config["delayed_entry_max_limit_cents"]),
+        )
+        LOG.warning("HYBRID STOP: trigger=%sc maker_exit=%sc hard_stop=%sc",
+                    record["hybrid_stop"]["trigger_cents"], record["hybrid_stop"]["maker_exit_cents"],
+                    record["hybrid_stop"]["hard_stop_cents"])
+        LOG.warning("=" * 60)
+        self.checkpoint("delayed_entry_price_frozen")
+        return limit_price
+
     def ensure_delayed_entry_tracking(
         self,
         record: dict[str, Any],
@@ -2689,6 +2876,8 @@ class LiveEngine:
             and delayed.get("eligible")
             and delayed.get("status") == "WATCHING"
             and quote_epoch < float(record.get("market_close_epoch") or float("inf"))
+            and quote_epoch - float(record.get("market_open_epoch") or 0)
+            >= int(self.config["delayed_entry_start_seconds"])
             and selected_ask_cents >= int(delayed["threshold_cents"])
         ):
             try:
@@ -3867,6 +4056,7 @@ class LiveEngine:
             "zero_fill_markets": 0,
             "funding_failure_markets": 0,
             "missed_signal_markets": 0,
+            "entry_filtered_markets": 0,
             "entry_pending_markets": 0,
             "maker_limit_only_markets": 0,
             "market_ioc_only_markets": 0,
@@ -3892,6 +4082,8 @@ class LiveEngine:
                 counts["funding_failure_markets"] += 1
             elif status == "MISSED_SIGNAL":
                 counts["missed_signal_markets"] += 1
+            elif status == "ENTRY_FILTERED":
+                counts["entry_filtered_markets"] += 1
             elif status in {"SIGNAL_PENDING", "ENTRY_PENDING", "ENTRY_PARTIAL"}:
                 counts["entry_pending_markets"] += 1
             self.update_entry_execution_summary(record)
@@ -5531,11 +5723,19 @@ class LiveEngine:
     async def submit_signal_maker_entry(
         self, rest: KalshiREST, feed: KalshiLiveFeed, record: dict[str, Any], now: float,
     ) -> None:
-        """Place exactly one immutable post-only limit one cent below signal ask."""
+        """Place exactly one immutable post-only GTC entry for the active mode."""
 
         if record.get("entry_orders") or record.get("maker_entry_submission_attempted"):
             return
-        maker_price = self.freeze_initial_signal_price(feed, record, now)
+        if self.config["entry_execution_mode"] == "delayed_threshold_band_maker":
+            maker_price = self.freeze_delayed_band_entry_price(feed, record, now)
+        elif self.config["entry_execution_mode"] == "signal_price_minus_offset_maker":
+            # Retained only for unit-level regression tests and forensic replay
+            # of v11 state.  Current configuration validation rejects this mode,
+            # so a production v12 worker cannot select it.
+            maker_price = self.freeze_initial_signal_price(feed, record, now)
+        else:
+            maker_price = None
         if maker_price is None or record.get("status") != "SIGNAL_PENDING":
             return
         record["maker_entry_submission_attempted"] = True
@@ -5602,10 +5802,13 @@ class LiveEngine:
         self.note_entry_order_submitted(record, order, "maker")
         self.note_entry_execution_summary(record, "maker_limit_submitted")
         self.state["current_order_id"] = order.get("order_id")
-        self.transition(record, "ENTRY_PENDING", "signal_minus_offset_post_only_limit_submitted")
+        self.transition(record, "ENTRY_PENDING", "delayed_band_post_only_gtc_limit_submitted")
         self.audit(
             "entry_submitted", ticker=record["ticker"], side=side,
             initial_signal_price_cents=record["initial_signal_price_cents"],
+            opening_selected_side_ask_cents=record.get("opening_price_reference", {}).get(
+                "selected_side_ask_cents"
+            ),
             requested_price_cents=record["entry_limit_cents"], requested_quantity=format(quantity, "f"),
             opening_entry_cost=record.get("opening_entry_cost"),
             requested_entry_cost=record["requested_entry_cost"],
@@ -5624,13 +5827,15 @@ class LiveEngine:
         self.capture_opening_quote(feed, record, now)
         if not self.circuit_allows_entry():
             return
-        if now > float(record["market_open_epoch"]) + int(self.config["entry_lateness_seconds"]):
-            self.transition(record, "MISSED_SIGNAL", "entry_lateness_exceeded")
+        if now >= float(record["market_close_epoch"]):
+            self.finish_entry_attempt(record, Decimal("0"), "market_closed_before_delayed_entry")
             return
-        # v11 has one reviewed entry contract.  Retained legacy functions are
-        # unreachable because configuration validation and this hard branch
-        # both reject every older execution mode.
-        if self.config["entry_execution_mode"] != "signal_price_minus_offset_maker":
+        # Current config validation permits only v12.  The v11 name remains
+        # reachable for pinned regression fixtures that instantiate LiveEngine
+        # directly; it cannot be loaded by a production worker.
+        if self.config["entry_execution_mode"] not in {
+            "delayed_threshold_band_maker", "signal_price_minus_offset_maker",
+        }:
             self.trip("unsupported_entry_execution_mode")
             return
         await self.submit_signal_maker_entry(rest, feed, record, now)
@@ -5920,7 +6125,7 @@ class LiveEngine:
             rest, record, next_action="stop", executable_bid=executable_bid,
         ):
             return
-        # The feed is required for conservative shadow depth.  Normal v11
+        # The feed is required for conservative shadow depth. Normal v12
         # execution calls ``submit_hybrid_hard_stop`` directly from manage_stop.
         if self.dry_run:
             raise RuntimeError("shadow hybrid hard stop requires the live feed adapter")
@@ -6619,12 +6824,13 @@ class LiveEngine:
                     "HEARTBEAT | mode=%s ticker=%s state=%s btc_target=%s comparison=%s "
                     "base=%s exponent=%d target=%s "
                     "deficit=%s threshold=%s tracked=%d filled=%d zero=%d funding_failures=%d "
-                    "missed=%d maker_fills=%d ioc_fills=%d mixed=%d opening_quotes=%s "
+                    "missed=%d filtered=%d maker_fills=%d ioc_fills=%d mixed=%d opening_quotes=%s "
                     "first_price_quote_lag=%s first_depth_quote_lag=%s opening_price_coverage=%s "
                     "maker_limit=%s gtc_market_close_in=%s entry_fill_p50=%s "
                     "stop_from_fill_p50=%s shadow_balance=%s shadow_pnl=%s shadow_dd=%s "
                     "completed=%s stops=%s settlements=%s fees=%s hybrid_state=%s exit_class=%s "
                     "entry_mode=%s maker_tif=%s entry_lifetime=%s initial_quotes=%s stop_safety_no_entry=%s "
+                    "delayed_entry_status=%s delayed_opening_ask=%s delayed_trigger_ask=%s delayed_limit=%s "
                     "delayed53_eligible=%s delayed53_reached=%s delayed53_after60=%s "
                     "delayed53_resolved=%s delayed53_wl=%s/%s delayed53_limit_filled=%s "
                     "delayed53_limit_zero=%s delayed53_limit_partial=%s delayed53_filled_wl=%s/%s "
@@ -6638,7 +6844,8 @@ class LiveEngine:
                     sizing.recovery_cycle_pnl, sizing.next_base_threshold,
                     execution["tracked_markets"], execution["markets_with_entry_fill"],
                     execution["zero_fill_markets"], execution["funding_failure_markets"],
-                    execution["missed_signal_markets"], execution["maker_limit_fill_markets"],
+                    execution["missed_signal_markets"], execution["entry_filtered_markets"],
+                    execution["maker_limit_fill_markets"],
                     execution["market_ioc_fill_markets"], execution["mixed_entry_markets"],
                     capture.get("observation_count"), capture.get("first_price_capture_lag_seconds"),
                     capture.get("first_depth_capture_lag_seconds"),
@@ -6653,6 +6860,10 @@ class LiveEngine:
                     self.config["maker_order_time_in_force"], self.config["entry_order_lifetime"],
                     eligibility["captured_initial_prices"],
                     eligibility["actual_strategy_stop_safety_rejections"],
+                    record.get("delayed_entry_decision", {}).get("status") if isinstance(record, dict) else None,
+                    record.get("opening_price_reference", {}).get("selected_side_ask_cents") if isinstance(record, dict) else None,
+                    record.get("initial_signal_price_cents") if isinstance(record, dict) else None,
+                    record.get("entry_limit_cents") if isinstance(record, dict) else None,
                     delayed_metrics["eligible_below_threshold_signals"],
                     delayed_metrics["threshold_reached"],
                     delayed_metrics["entries_after_opening_capture_window"],
@@ -6699,8 +6910,8 @@ class LiveEngine:
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
     result.add_argument("--config", type=Path, default=Path("live_strategy_config.json"))
-    result.add_argument("--state-file", type=Path, default=Path("data/kalshi_live_maker_hybrid_v11_state.json"))
-    result.add_argument("--audit-ledger", type=Path, default=Path("data/kalshi_live_maker_hybrid_v11_audit.jsonl"))
+    result.add_argument("--state-file", type=Path, default=Path("data/kalshi_live_delayed_band_v12_state.json"))
+    result.add_argument("--audit-ledger", type=Path, default=Path("data/kalshi_live_delayed_band_v12_audit.jsonl"))
     result.add_argument("--run-seconds", type=float, default=19_200)
     result.add_argument("--persist-config", action="store_true")
     result.add_argument("--reconcile-only", action="store_true")
