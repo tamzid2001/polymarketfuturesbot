@@ -14,6 +14,78 @@ from typing import Any
 from recovery_sizing import CENT, DEFAULT_MAX_POSITION, ZERO, RecoverySizingState, decimal, round_shares
 
 
+@dataclass(frozen=True)
+class DelayedBandEntryDecision:
+    """One deterministic delayed-entry decision shared by replay and live.
+
+    ``limit_price_cents`` is populated only when an order may be created.  A
+    ceiling rejection is terminal for the market: waiting for a later, cheaper
+    quote would be a different strategy from filtering the frozen first
+    qualifying post-window quote used by the research cohort.
+    """
+
+    status: str
+    limit_price_cents: int | None = None
+    reason: str | None = None
+
+
+def delayed_band_entry_decision(
+    *,
+    opening_ask_cents: int,
+    observed_ask_cents: int,
+    seconds_after_open: Decimal | str,
+    observation_start_seconds: int = 60,
+    threshold_ask_cents: int = 53,
+    maximum_limit_cents: int = 57,
+    offset_cents: int = 1,
+) -> DelayedBandEntryDecision:
+    """Freeze the first post-window >=53c ask into one ask-minus-1c order.
+
+    The cohort is eligible only when its immutable opening selected-side ask
+    was below the threshold.  After the observation window, the first fresh
+    selected-side ask at or above the threshold is decisive.  Its derived
+    limit must be a valid one-cent Kalshi tick and no greater than the selected
+    ceiling.  This function performs no I/O, sizing, P&L, or fill inference.
+    """
+
+    opening = int(opening_ask_cents)
+    observed = int(observed_ask_cents)
+    start = int(observation_start_seconds)
+    threshold = int(threshold_ask_cents)
+    maximum = int(maximum_limit_cents)
+    offset = int(offset_cents)
+    elapsed = decimal(seconds_after_open)
+    if not 1 <= opening <= 99 or not 1 <= observed <= 99:
+        raise ValueError("opening and observed asks must be integer cents from 1 through 99")
+    if start < 0:
+        raise ValueError("observation_start_seconds cannot be negative")
+    if offset < 0:
+        raise ValueError("offset_cents cannot be negative")
+    if not 1 <= threshold <= 99:
+        raise ValueError("threshold_ask_cents must be from 1 through 99")
+    if not 1 <= maximum <= 99:
+        raise ValueError("maximum_limit_cents must be from 1 through 99")
+    if opening >= threshold:
+        return DelayedBandEntryDecision(
+            "INELIGIBLE_OPENING", reason="opening_selected_side_ask_at_or_above_threshold",
+        )
+    if elapsed < Decimal(start):
+        return DelayedBandEntryDecision("WAITING", reason="observation_window_not_complete")
+    if observed < threshold:
+        return DelayedBandEntryDecision("WAITING", reason="threshold_not_reached")
+    limit_cents = observed - offset
+    if not 1 <= limit_cents <= 99:
+        return DelayedBandEntryDecision(
+            "REJECTED", reason="derived_limit_outside_supported_market_ticks",
+        )
+    if limit_cents > maximum:
+        return DelayedBandEntryDecision(
+            "REJECTED", limit_price_cents=limit_cents,
+            reason="first_qualifying_limit_above_configured_ceiling",
+        )
+    return DelayedBandEntryDecision("ELIGIBLE", limit_price_cents=limit_cents)
+
+
 def sticky_directional_prediction(
     prior_prediction_side: str | None,
     settled_outcome: str,

@@ -10,6 +10,7 @@ from recovery_sizing import RecoverySizingState
 from strategy_core import (
     StrategyParameters,
     apply_realized_filled_trade,
+    delayed_band_entry_decision,
     effective_stop_price,
     prescribed_quantity,
     sizing_state,
@@ -81,30 +82,33 @@ class StrategyCoreTests(unittest.TestCase):
 
     def test_optimizer_live_export_round_trips_without_reinterpreting_decimals(self) -> None:
         row = {
-            "entry_price": .50, "stop_price": .40, "recovery_multiplier": 1.01,
-            "first_base_threshold": 100, "threshold_growth_multiplier": 1.01, "base_increment": 1.00,
+            "execution_profile": "delayed_53_57_stop_50",
+            "entry_price": .52, "stop_price": .50, "recovery_multiplier": 2.50,
+            "first_base_threshold": 350, "threshold_growth_multiplier": 2.50, "base_increment": .50,
         }
         with TemporaryDirectory() as directory:
             path = Path(directory) / "selected_live_strategy.json"
             export_selected_live_strategy(path, row, selection_basis="test")
             config = load_config(path)
-        self.assertEqual(config["entry_price"], "0.50")
+        self.assertEqual(config["entry_price"], "0.52")
         self.assertEqual(config["starting_base"], "1.00")
-        self.assertEqual(config["base_increment"], "1.00")
+        self.assertEqual(config["base_increment"], "0.50")
         self.assertEqual(config["opening_price_discovery_seconds"], 3)
-        self.assertEqual(config["entry_execution_mode"], "signal_price_minus_offset_maker")
+        self.assertEqual(config["entry_execution_mode"], "delayed_threshold_band_maker")
         self.assertEqual(config["maker_order_time_in_force"], "good_till_canceled")
         self.assertEqual(config["entry_order_lifetime"], "until_filled_or_market_close")
         self.assertEqual(config["entry_timeout_seconds"], 0)
         self.assertEqual(config["opening_quote_capture_seconds"], 60)
         self.assertTrue(config["delayed_entry_tracking_enabled"])
         self.assertEqual(config["delayed_entry_threshold_cents"], 53)
+        self.assertEqual(config["delayed_entry_start_seconds"], 60)
+        self.assertEqual(config["delayed_entry_max_limit_cents"], 57)
         self.assertEqual(config["entry_limit_offset_cents"], 1)
         self.assertEqual(config["max_recovery_exponent"], 0)
         self.assertEqual(config["stop_policy"], "hybrid_maker_then_hard_stop")
         self.assertEqual(
             (config["hybrid_stop_trigger_cents"], config["hybrid_maker_exit_cents"], config["hybrid_hard_stop_cents"]),
-            (45, 46, 44),
+            (51, 52, 50),
         )
         self.assertEqual(config["stop_baseline_entry_price"], "0.50")
         self.assertEqual(config["strategy_version"], ACTIVE_STRATEGY_VERSION)
@@ -117,8 +121,28 @@ class StrategyCoreTests(unittest.TestCase):
         }
         with TemporaryDirectory() as directory:
             path = Path(directory) / "selected_live_strategy.json"
-            with self.assertRaisesRegex(ValueError, "only the canonical sticky_stop_40"):
+            with self.assertRaisesRegex(ValueError, "execution_profile=delayed_53_57_stop_50"):
                 export_selected_live_strategy(path, row, selection_basis="test")
+
+    def test_delayed_entry_band_is_a_pure_terminal_decision(self) -> None:
+        self.assertEqual(delayed_band_entry_decision(
+            opening_ask_cents=52, observed_ask_cents=53, seconds_after_open="59.99",
+        ).status, "WAITING")
+        self.assertEqual(delayed_band_entry_decision(
+            opening_ask_cents=53, observed_ask_cents=53, seconds_after_open="60",
+        ).status, "INELIGIBLE_OPENING")
+        eligible = delayed_band_entry_decision(
+            opening_ask_cents=52, observed_ask_cents=53, seconds_after_open="60",
+        )
+        self.assertEqual((eligible.status, eligible.limit_price_cents), ("ELIGIBLE", 52))
+        ceiling = delayed_band_entry_decision(
+            opening_ask_cents=52, observed_ask_cents=58, seconds_after_open="60",
+        )
+        self.assertEqual((ceiling.status, ceiling.limit_price_cents), ("ELIGIBLE", 57))
+        rejected = delayed_band_entry_decision(
+            opening_ask_cents=52, observed_ask_cents=59, seconds_after_open="60",
+        )
+        self.assertEqual((rejected.status, rejected.limit_price_cents), ("REJECTED", 58))
 
     def test_initial_shares_are_configurable_but_exact_and_capped(self) -> None:
         config = load_config(ROOT / "selected_live_strategy.json")
@@ -138,7 +162,7 @@ class StrategyCoreTests(unittest.TestCase):
             load_config_from_value(dict(config, starting_base="100.01"))
         with self.assertRaisesRegex(ValueError, "at least 1"):
             load_config_from_value(dict(config, recovery_multiplier="0.99"))
-        with self.assertRaisesRegex(ValueError, "canonical 40c profile"):
+        with self.assertRaisesRegex(ValueError, "canonical delayed band"):
             load_config_from_value(dict(
                 config,
                 hybrid_hard_stop_cents=39,
@@ -227,26 +251,29 @@ class StrategyCoreTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, r"profile/profile\+1c/profile\+2c"):
                 load_config_from_value(dict(profile, hybrid_stop_trigger_cents=cents))
 
-    def test_production_workflows_pin_v11_and_never_dispatch_retired_lanes(self) -> None:
+    def test_production_workflows_pin_v12_and_never_dispatch_retired_lanes(self) -> None:
         worker = (ROOT / ".github/workflows/kalshi_btc15m_average_down.yml").read_text(encoding="utf-8")
         watchdog = (ROOT / ".github/workflows/kalshi_btc15m_watchdog.yml").read_text(encoding="utf-8")
         controlled = (ROOT / ".github/workflows/kalshi_btc15m_controlled_restart.yml").read_text(encoding="utf-8")
         trader = (ROOT / "kalshi_live_trader.py").read_text(encoding="utf-8")
-        self.assertIn('entry_execution_mode"] == "signal_price_minus_offset_maker"', worker)
+        self.assertIn('entry_execution_mode"] == "delayed_threshold_band_maker"', worker)
+        self.assertIn('delayed_entry_start_seconds"] == 60', worker)
+        self.assertIn('delayed_entry_max_limit_cents"] == 57', worker)
         self.assertIn('maker_order_time_in_force"] == "good_till_canceled"', worker)
         self.assertIn('entry_order_lifetime"] == "until_filled_or_market_close"', worker)
         self.assertIn('entry_timeout_seconds"] == 0', worker)
         self.assertIn("OPENING_PRICE_CAPTURE_CONTRACT_VERSION == 3", worker)
         self.assertIn("BTC_TARGET_CAPTURE_CONTRACT_VERSION == 2", worker)
         self.assertIn("DELAYED_ENTRY_LADDER_CONTRACT_VERSION == 3", worker)
-        self.assertIn("(DELAYED_HYBRID_STOP_TRIGGER_CENTS, DELAYED_HYBRID_MAKER_EXIT_CENTS, DELAYED_HYBRID_HARD_STOP_CENTS) == (51, 52, 50)", worker)
-        self.assertIn("delayed_ladder=contract_v3_trigger_ask_minus_1c_public_trade_fill_volume_shared_with_rungs_stop=51trigger_52maker_50hard", worker)
-        self.assertIn("opening_price=first_price_only_post_open contract=v3", worker)
-        self.assertIn("btc_target=exchange_market_detail contract=v2", worker)
-        self.assertIn("cross_ladder=53-59c:50x1,40x2,30x4,20x8,10x16", worker)
+        self.assertIn('(c["hybrid_stop_trigger_cents"], c["hybrid_maker_exit_cents"], c["hybrid_hard_stop_cents"]) == (51, 52, 50)', worker)
+        self.assertIn("CANONICAL_DELAYED_BAND_STRATEGY_CONTRACT=OK", worker)
+        self.assertIn("opening_ask_below=53c", worker)
+        self.assertIn("first_qualifying_ask>=53c", worker)
+        self.assertIn("entry=ask_minus_1c", worker)
+        self.assertIn("max_limit=57c", worker)
         self.assertNotIn("--entry-timeout-seconds", worker)
-        self.assertIn("hybrid=validated_configurable", worker)
-        self.assertIn("kalshi_shadow_maker_hybrid_v11_sticky_stop_40", worker)
+        self.assertIn("hybrid=51trigger_52maker_50hard", worker)
+        self.assertIn("kalshi_shadow_delayed_band_v12", worker)
         self.assertIn("--persist-config", worker)
         self.assertIn('--starting-base "$INITIAL_SHARES"', worker)
         self.assertIn('--recovery-multiplier "$SCALING_MULTIPLIER"', worker)
@@ -255,13 +282,13 @@ class StrategyCoreTests(unittest.TestCase):
         self.assertIn('--base-increment "$SHARES_ADDED_AFTER_PROFIT_THRESHOLD"', worker)
         self.assertIn('--hybrid-hard-stop-cents "$MAX_STOP_LOSS_CENTS"', worker)
         self.assertIn("RUNTIME_STATE_RESTORED=$runtime_ref", worker)
-        self.assertIn("runtime_ref=runtime-state-kxbtc15m", worker)
-        self.assertIn("legacy_runtime_ref=runtime-state", worker)
-        self.assertIn("RUNTIME_STATE_OWNER=kalshi-kxbtc15m", worker)
+        self.assertIn("runtime_ref=runtime-state-kxbtc15m-delayed-v12", worker)
+        self.assertNotIn("legacy_runtime_ref=runtime-state", worker)
+        self.assertIn("RUNTIME_STATE_OWNER=kalshi-kxbtc15m-delayed-v12", worker)
         self.assertIn('live_checkpoint.py --restore-sha "$restore_sha" --runtime-ref "$runtime_ref"', worker)
         self.assertIn('c["durable_checkpoint_interval_seconds"] == 30.0', worker)
         self.assertIn(
-            "python live_checkpoint.py --reason end-of-run --runtime-ref runtime-state-kxbtc15m",
+            "python live_checkpoint.py --reason end-of-run --runtime-ref runtime-state-kxbtc15m-delayed-v12",
             worker,
         )
         self.assertLess(
@@ -271,9 +298,9 @@ class StrategyCoreTests(unittest.TestCase):
         self.assertNotIn("git push origin HEAD:main", worker)
         self.assertNotIn("chore: checkpoint KXBTC15M hybrid state", worker)
         self.assertIn("RUNTIME_STATE_RESTORED=$runtime_ref", controlled)
-        self.assertIn("runtime_ref=runtime-state-kxbtc15m", controlled)
-        self.assertIn("legacy_runtime_ref=runtime-state", controlled)
-        self.assertIn("RUNTIME_STATE_OWNER=kalshi-kxbtc15m", controlled)
+        self.assertIn("runtime_ref=runtime-state-kxbtc15m-delayed-v12", controlled)
+        self.assertNotIn("legacy_runtime_ref=runtime-state", controlled)
+        self.assertIn("RUNTIME_STATE_OWNER=kalshi-kxbtc15m-delayed-v12", controlled)
         self.assertIn('live_checkpoint.py --restore-sha "$restore_sha" --runtime-ref "$runtime_ref"', controlled)
         self.assertIn('record.get("status") == "SIGNAL_PENDING"', controlled)
         self.assertIn("and breaker_blocked", controlled)

@@ -226,6 +226,22 @@ class StopRetryRest(EntryRest):
 class LiveExecutionTests(unittest.TestCase):
     def setUp(self) -> None:
         self.config = load_config(ROOT / "live_strategy_config.json")
+        # Most cases in this long-running module intentionally pin the v11
+        # opening-entry behavior.  Production-v12 behavior has a separate
+        # contract suite so changing the selected config cannot mutate the
+        # meaning of these historical regression fixtures.
+        self.config.update({
+            "entry_execution_mode": "signal_price_minus_offset_maker",
+            "shadow_profile": "sticky_stop_40",
+            "entry_price": "0.49",
+            "stop_price": "0.40",
+            "hybrid_stop_trigger_cents": 45,
+            "hybrid_maker_exit_cents": 46,
+            "hybrid_hard_stop_cents": 44,
+            "recovery_multiplier": "1.01",
+            "threshold_growth_multiplier": "1.01",
+            "delayed_entry_start_seconds": 0,
+        })
 
     def engine(self, shadow_balance: str = "1000.00") -> LiveEngine:
         temporary = Path(tempfile.mkdtemp())

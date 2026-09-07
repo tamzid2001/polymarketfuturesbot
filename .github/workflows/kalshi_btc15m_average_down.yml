@@ -5,7 +5,7 @@ name: Kalshi KXBTC15M Hybrid Live
 # not assume a cron invocation occurred at exactly a 15-minute open.
 run-name: >-
   Kalshi KXBTC15M Hybrid —
-  ${{ (inputs.live_enabled && vars.KALSHI_LIVE_ENABLED == 'true' && vars.KALSHI_SHADOW_ONLY != 'true') && 'LIVE' || 'DRY_RUN sticky_stop_40' }}
+  ${{ (inputs.live_enabled && vars.KALSHI_LIVE_ENABLED == 'true' && vars.KALSHI_SHADOW_ONLY != 'true') && 'LIVE delayed_53_57_stop_50' || 'DRY_RUN delayed_53_57_stop_50' }}
 
 on:
   # The separately serialized watchdog owns the five-minute recovery
@@ -29,7 +29,7 @@ on:
         type: string
         default: ""
       scaling_multiplier:
-        description: "Recovery and geometric threshold multiplier (for example 1.01). Blank preserves the durable setting."
+        description: "Recovery and geometric threshold multiplier (default 2.50). Blank preserves the durable setting."
         required: false
         type: string
         default: ""
@@ -44,7 +44,7 @@ on:
         type: string
         default: ""
       max_stop_loss_cents:
-        description: "Hard-stop price from 40c through 49c; maker trigger/exit remain 1c/2c higher."
+        description: "Hard-stop price from 10c through 50c; trigger/maker exit remain 1c/2c higher. Blank preserves 50c."
         required: false
         type: string
         default: ""
@@ -71,10 +71,7 @@ jobs:
       - name: Restore latest bounded runtime state
         run: |
           set -euo pipefail
-          runtime_ref=runtime-state-kxbtc15m
-          legacy_runtime_ref=runtime-state
-          restore_sha=""
-          restore_mode=""
+          runtime_ref=runtime-state-kxbtc15m-delayed-v12
           set +e
           git ls-remote --exit-code --heads origin "refs/heads/$runtime_ref" >/dev/null
           runtime_ref_status=$?
@@ -83,45 +80,13 @@ jobs:
             git fetch --no-tags origin "refs/heads/$runtime_ref"
             restore_sha="$(git rev-parse FETCH_HEAD)"
             python3 live_checkpoint.py --restore-sha "$restore_sha" --runtime-ref "$runtime_ref"
-            restore_mode="canonical"
-            echo "RUNTIME_STATE_OWNER=kalshi-kxbtc15m"
+            echo "RUNTIME_STATE_OWNER=kalshi-kxbtc15m-delayed-v12"
             echo "RUNTIME_STATE_RESTORED=$runtime_ref"
           elif [ "$runtime_ref_status" -eq 2 ]; then
-            set +e
-            git ls-remote --exit-code --heads origin "refs/heads/$legacy_runtime_ref" >/dev/null
-            legacy_ref_status=$?
-            set -e
-            if [ "$legacy_ref_status" -eq 0 ]; then
-              git fetch --no-tags origin "refs/heads/$legacy_runtime_ref"
-              restore_sha="$(git rev-parse FETCH_HEAD)"
-              restore_mode="legacy"
-              git cat-file -e "$restore_sha:data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_state.json" || {
-                echo "::error::Legacy runtime ref does not contain canonical KXBTC15M state"; exit 2;
-              }
-              echo "RUNTIME_STATE_MIGRATION_SOURCE=$legacy_runtime_ref"
-            elif [ "$legacy_ref_status" -eq 2 ]; then
-              echo "RUNTIME_STATE_BOOTSTRAP=main_snapshot"
-            else
-              echo "::error::Unable to determine legacy runtime ref status; refusing unsafe bootstrap"
-              exit 2
-            fi
+            echo "RUNTIME_STATE_BOOTSTRAP=fresh_v12_namespace"
           else
-            echo "::error::Unable to determine canonical runtime ref status; refusing legacy fallback"
+            echo "::error::Unable to determine v12 runtime ref status; refusing unsafe fallback"
             exit 2
-          fi
-          if [ "$restore_mode" = "legacy" ]; then
-            for path in \
-              selected_live_strategy.json \
-              data/kalshi_live_maker_hybrid_v11_state.json \
-              data/kalshi_live_maker_hybrid_v11_audit.jsonl \
-              data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_state.json \
-              data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_audit.jsonl; do
-              if git cat-file -e "$restore_sha:$path" 2>/dev/null; then
-                mkdir -p "$(dirname "$path")"
-                git show "$restore_sha:$path" > "$path.runtime"
-                mv "$path.runtime" "$path"
-              fi
-            done
           fi
 
       - uses: actions/setup-python@v6
@@ -141,6 +106,7 @@ jobs:
             tests.test_strategy_core \
             tests.test_live_execution \
             tests.test_maker_hybrid_v11 \
+            tests.test_delayed_band_v12 \
             tests.test_reconciliation \
             tests.test_recovery_sizing \
             tests.test_execution_path_model \
@@ -149,7 +115,7 @@ jobs:
       - name: Assert canonical hybrid strategy contract
         run: |
           set -euo pipefail
-          python -c 'from decimal import Decimal; from kalshi_live_trader import ACTIVE_CONFIG_SCHEMA_VERSION, ACTIVE_STRATEGY_VERSION, BTC_TARGET_CAPTURE_CONTRACT_VERSION, DELAYED_ENTRY_LADDER_CONTRACT_VERSION, DELAYED_HYBRID_HARD_STOP_CENTS, DELAYED_HYBRID_MAKER_EXIT_CENTS, DELAYED_HYBRID_STOP_TRIGGER_CENTS, OPENING_CROSS_LADDER_RUNGS, OPENING_CROSS_LADDER_TRIGGER_LEVELS, OPENING_PRICE_CAPTURE_CONTRACT_VERSION, load_config; c = load_config(__import__("pathlib").Path("selected_live_strategy.json")); assert c["strategy_version"] == ACTIVE_STRATEGY_VERSION; assert c["config_schema_version"] == ACTIVE_CONFIG_SCHEMA_VERSION; assert OPENING_PRICE_CAPTURE_CONTRACT_VERSION == 3; assert BTC_TARGET_CAPTURE_CONTRACT_VERSION == 2; assert DELAYED_ENTRY_LADDER_CONTRACT_VERSION == 3; assert (DELAYED_HYBRID_STOP_TRIGGER_CENTS, DELAYED_HYBRID_MAKER_EXIT_CENTS, DELAYED_HYBRID_HARD_STOP_CENTS) == (51, 52, 50); assert OPENING_CROSS_LADDER_TRIGGER_LEVELS == tuple(range(53, 60)); assert [(p, str(q)) for p, q in OPENING_CROSS_LADDER_RUNGS] == [(50, "1.00"), (40, "2.00"), (30, "4.00"), (20, "8.00"), (10, "16.00")]; assert c["entry_execution_mode"] == "signal_price_minus_offset_maker"; assert c["maker_order_time_in_force"] == "good_till_canceled"; assert c["entry_order_lifetime"] == "until_filled_or_market_close"; assert c["entry_timeout_seconds"] == 0; assert c["opening_quote_capture_seconds"] == 60; assert c["delayed_entry_tracking_enabled"] is True; assert c["delayed_entry_threshold_cents"] == 53; assert c["entry_limit_offset_cents"] == 1; assert c["stop_policy"] == "hybrid_maker_then_hard_stop"; assert 1 <= c["hybrid_hard_stop_cents"] <= c["hybrid_stop_trigger_cents"] < c["hybrid_maker_exit_cents"] <= 99; assert c["shadow_profile"] == "sticky_stop_40"; assert Decimal(c["starting_base"]) > 0; assert Decimal(c["starting_base"]) <= Decimal(c["max_position"]); assert c["max_recovery_exponent"] == 0; assert c["durable_checkpoint_interval_seconds"] == 30.0; print("CANONICAL_HYBRID_STRATEGY_CONTRACT=OK | opening_price=first_price_only_post_open contract=v3 btc_target=exchange_market_detail contract=v2 cross_ladder=53-59c:50x1,40x2,30x4,20x8,10x16 shadow_only breaker_independent=true delayed_ladder=contract_v3_trigger_ask_minus_1c_public_trade_fill_volume_shared_with_rungs_stop=51trigger_52maker_50hard entry=signal_ask_minus_1c maker_tif=GTC lifetime=until_fill_or_market_close delayed53=through_market_close hybrid=validated_configurable sizing=validated_configurable checkpoint=v2_chunked_30s profile=40")'
+          python -c 'from decimal import Decimal; from kalshi_live_trader import ACTIVE_CONFIG_SCHEMA_VERSION, ACTIVE_STRATEGY_VERSION, BTC_TARGET_CAPTURE_CONTRACT_VERSION, DELAYED_ENTRY_LADDER_CONTRACT_VERSION, OPENING_PRICE_CAPTURE_CONTRACT_VERSION, load_config; c = load_config(__import__("pathlib").Path("selected_live_strategy.json")); assert c["strategy_version"] == ACTIVE_STRATEGY_VERSION; assert c["config_schema_version"] == ACTIVE_CONFIG_SCHEMA_VERSION == 12; assert OPENING_PRICE_CAPTURE_CONTRACT_VERSION == 3; assert BTC_TARGET_CAPTURE_CONTRACT_VERSION == 2; assert DELAYED_ENTRY_LADDER_CONTRACT_VERSION == 3; assert c["entry_execution_mode"] == "delayed_threshold_band_maker"; assert c["maker_order_time_in_force"] == "good_till_canceled"; assert c["entry_order_lifetime"] == "until_filled_or_market_close"; assert c["entry_timeout_seconds"] == 0; assert c["opening_quote_capture_seconds"] == 60; assert c["delayed_entry_start_seconds"] == 60; assert c["delayed_entry_threshold_cents"] == 53; assert c["delayed_entry_max_limit_cents"] == 57; assert c["entry_limit_offset_cents"] == 1; assert (c["hybrid_stop_trigger_cents"], c["hybrid_maker_exit_cents"], c["hybrid_hard_stop_cents"]) == (51, 52, 50); assert c["stop_price"] == "0.50"; assert c["shadow_profile"] == "delayed_53_57_stop_50"; assert c["recovery_multiplier"] == "2.50"; assert c["threshold_growth_multiplier"] == "2.50"; assert Decimal(c["starting_base"]) == Decimal("1.00"); assert Decimal(c["max_position"]) == Decimal("100.00"); assert c["max_recovery_exponent"] == 0; assert c["durable_checkpoint_interval_seconds"] == 30.0; print("CANONICAL_DELAYED_BAND_STRATEGY_CONTRACT=OK | opening_ask_below=53c post_window=60s first_qualifying_ask>=53c entry=ask_minus_1c max_limit=57c maker_tif=GTC lifetime=until_fill_or_market_close hybrid=51trigger_52maker_50hard recovery=2.50x base=1.00 cap=100 checkpoint=v2_chunked_30s")'
 
       - name: Write Kalshi RSA private key
         env:
@@ -172,11 +138,11 @@ jobs:
           KALSHI_LIVE_ENABLED: ${{ vars.KALSHI_LIVE_ENABLED || 'false' }}
           KALSHI_SHADOW_ONLY: ${{ vars.KALSHI_SHADOW_ONLY || 'true' }}
           KALSHI_CHECKPOINT_PUBLISH: "true"
-          KALSHI_RUNTIME_STATE_REF: "runtime-state-kxbtc15m"
+          KALSHI_RUNTIME_STATE_REF: "runtime-state-kxbtc15m-delayed-v12"
           RUN_SECONDS: "18000"
           REQUESTED_LIVE: ${{ inputs.live_enabled && vars.KALSHI_LIVE_ENABLED == 'true' && vars.KALSHI_SHADOW_ONLY != 'true' }}
           RECONCILE_ONLY: ${{ inputs.reconcile_only || false }}
-          SHADOW_PROFILE: "sticky_stop_40"
+          SHADOW_PROFILE: "delayed_53_57_stop_50"
           INITIAL_SHARES: ${{ inputs.initial_shares || '' }}
           SCALING_MULTIPLIER: ${{ inputs.scaling_multiplier || '' }}
           PROFIT_THRESHOLD: ${{ inputs.profit_threshold || '' }}
@@ -188,18 +154,18 @@ jobs:
           # intentionally reads the live state but still cannot submit an
           # entry because the Python worker receives --reconcile-only.
           if [ "$REQUESTED_LIVE" = "true" ] || [ "$RECONCILE_ONLY" = "true" ]; then
-            state_file=data/kalshi_live_maker_hybrid_v11_state.json
-            audit_file=data/kalshi_live_maker_hybrid_v11_audit.jsonl
+            state_file=data/kalshi_live_delayed_band_v12_state.json
+            audit_file=data/kalshi_live_delayed_band_v12_audit.jsonl
             profile_stop=""
           else
             case "$SHADOW_PROFILE" in
-              sticky_stop_40) profile_stop=0.40 ;;
+              delayed_53_57_stop_50) profile_stop=0.50 ;;
               *) echo "::error::Unknown shadow profile: $SHADOW_PROFILE"; exit 2 ;;
             esac
-            # v11 deliberately starts a new namespace. Archived v10 IOC and
-            # 30/20/10 evidence remains immutable and cannot become live state.
-            state_file="data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_state.json"
-            audit_file="data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_audit.jsonl"
+            # v12 deliberately starts a new namespace. Older opening-entry and
+            # comparison-stop evidence cannot become executable state.
+            state_file="data/kalshi_shadow_delayed_band_v12_state.json"
+            audit_file="data/kalshi_shadow_delayed_band_v12_audit.jsonl"
           fi
           args=(--config selected_live_strategy.json
                 --state-file "$state_file"
@@ -221,11 +187,12 @@ jobs:
           [ -z "$SHARES_ADDED_AFTER_PROFIT_THRESHOLD" ] || args+=(--base-increment "$SHARES_ADDED_AFTER_PROFIT_THRESHOLD")
           if [ -n "$MAX_STOP_LOSS_CENTS" ]; then
             [[ "$MAX_STOP_LOSS_CENTS" =~ ^[0-9]+$ ]] || {
-              echo "::error::max_stop_loss_cents must be an integer from 40 through 49"; exit 2;
+              echo "::error::max_stop_loss_cents must be an integer from 10 through 50"; exit 2;
             }
-            [ "$MAX_STOP_LOSS_CENTS" -ge 40 ] && [ "$MAX_STOP_LOSS_CENTS" -le 49 ] || {
-              echo "::error::max_stop_loss_cents must be an integer from 40 through 49"; exit 2;
+            [ "$MAX_STOP_LOSS_CENTS" -ge 10 ] && [ "$MAX_STOP_LOSS_CENTS" -le 50 ] || {
+              echo "::error::max_stop_loss_cents must be an integer from 10 through 50"; exit 2;
             }
+            args+=(--stop-price "$(printf '0.%02d' "$MAX_STOP_LOSS_CENTS")")
             args+=(--hybrid-hard-stop-cents "$MAX_STOP_LOSS_CENTS")
             args+=(--hybrid-stop-trigger-cents "$((MAX_STOP_LOSS_CENTS + 1))")
             args+=(--hybrid-maker-exit-cents "$((MAX_STOP_LOSS_CENTS + 2))")
@@ -241,12 +208,12 @@ jobs:
         run: |
           set -euo pipefail
           for attempt in 1 2 3; do
-            if python live_checkpoint.py --reason end-of-run --runtime-ref runtime-state-kxbtc15m \
+            if python live_checkpoint.py --reason end-of-run --runtime-ref runtime-state-kxbtc15m-delayed-v12 \
               selected_live_strategy.json \
-              data/kalshi_live_maker_hybrid_v11_state.json \
-              data/kalshi_live_maker_hybrid_v11_audit.jsonl \
-              data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_state.json \
-              data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_audit.jsonl; then
+              data/kalshi_live_delayed_band_v12_state.json \
+              data/kalshi_live_delayed_band_v12_audit.jsonl \
+              data/kalshi_shadow_delayed_band_v12_state.json \
+              data/kalshi_shadow_delayed_band_v12_audit.jsonl; then
               exit 0
             fi
             sleep "$attempt"
@@ -261,14 +228,14 @@ jobs:
           REPOSITORY: ${{ github.repository }}
           REQUESTED_LIVE: ${{ inputs.live_enabled && vars.KALSHI_LIVE_ENABLED == 'true' && vars.KALSHI_SHADOW_ONLY != 'true' }}
           RECONCILE_ONLY: ${{ inputs.reconcile_only || false }}
-          SHADOW_PROFILE: "sticky_stop_40"
+          SHADOW_PROFILE: "delayed_53_57_stop_50"
         run: |
           set -euo pipefail
           [ "$RECONCILE_ONLY" = "true" ] && exit 0
           if [ "$REQUESTED_LIVE" = "true" ]; then
-            state_file=data/kalshi_live_maker_hybrid_v11_state.json
+            state_file=data/kalshi_live_delayed_band_v12_state.json
           else
-            state_file=data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_state.json
+            state_file=data/kalshi_shadow_delayed_band_v12_state.json
           fi
           ready="$(python -c 'import json, pathlib; p=pathlib.Path("'"$state_file"'"); print(str(bool(json.loads(p.read_text()).get("handoff", {}).get("ready"))).lower() if p.exists() else "false")')"
           if [ "$ready" != "true" ]; then
@@ -296,9 +263,9 @@ jobs:
           name: kalshi-kxbtc15m-hybrid-${{ github.run_id }}
           path: |
             selected_live_strategy.json
-            data/kalshi_live_maker_hybrid_v11_state.json
-            data/kalshi_live_maker_hybrid_v11_audit.jsonl
-            data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_state.json
-            data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_audit.jsonl
+            data/kalshi_live_delayed_band_v12_state.json
+            data/kalshi_live_delayed_band_v12_audit.jsonl
+            data/kalshi_shadow_delayed_band_v12_state.json
+            data/kalshi_shadow_delayed_band_v12_audit.jsonl
           if-no-files-found: warn
           retention-days: 30
