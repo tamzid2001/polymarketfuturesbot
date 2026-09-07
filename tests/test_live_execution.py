@@ -13,7 +13,8 @@ from unittest.mock import patch
 
 from audit_ledger import append_audit
 from live_checkpoint import (
-    DEFAULT_RUNTIME_STATE_REF, RUNTIME_PAYLOAD_PREFIX, RUNTIME_STATE_MANIFEST,
+    DELAYED_V12_RUNTIME_STATE_REF, DEFAULT_RUNTIME_STATE_REF,
+    RUNTIME_PAYLOAD_PREFIX, RUNTIME_STATE_MANIFEST,
     RUNTIME_STATE_OWNER, RUNTIME_STATE_SCHEMA_VERSION,
     MaterialCheckpointPublisher, publish_runtime_snapshot, validate_runtime_paths,
     validate_runtime_ref, restore_runtime_snapshot,
@@ -1965,6 +1966,10 @@ class LiveExecutionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "not KXBTC15M-owned"):
             validate_runtime_ref("main")
         self.assertEqual(validate_runtime_ref("runtime-state-kxbtc15m"), "runtime-state-kxbtc15m")
+        self.assertEqual(
+            validate_runtime_ref(DELAYED_V12_RUNTIME_STATE_REF),
+            DELAYED_V12_RUNTIME_STATE_REF,
+        )
         self.assertEqual(validate_runtime_ref("runtime-state-stop-20"), "runtime-state-stop-20")
         with self.assertRaisesRegex(ValueError, "non-owned durable paths"):
             validate_runtime_paths("runtime-state-kxbtc15m", ["state.json"])
@@ -1972,6 +1977,21 @@ class LiveExecutionTests(unittest.TestCase):
             "runtime-state-kxbtc15m",
             ["data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_state.json"],
         )
+        validate_runtime_paths(
+            DELAYED_V12_RUNTIME_STATE_REF,
+            [
+                "selected_live_strategy.json",
+                "data/kalshi_live_delayed_band_v12_state.json",
+                "data/kalshi_live_delayed_band_v12_audit.jsonl",
+                "data/kalshi_shadow_delayed_band_v12_state.json",
+                "data/kalshi_shadow_delayed_band_v12_audit.jsonl",
+            ],
+        )
+        with self.assertRaisesRegex(ValueError, "non-owned durable paths"):
+            validate_runtime_paths(
+                DELAYED_V12_RUNTIME_STATE_REF,
+                ["data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_state.json"],
+            )
 
     def test_runtime_checkpoint_splits_large_files_and_restores_exact_bytes(self) -> None:
         temporary = Path(tempfile.mkdtemp())

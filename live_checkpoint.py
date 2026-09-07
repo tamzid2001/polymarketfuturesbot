@@ -27,6 +27,7 @@ from typing import BinaryIO
 
 
 DEFAULT_RUNTIME_STATE_REF = "runtime-state-kxbtc15m"
+DELAYED_V12_RUNTIME_STATE_REF = "runtime-state-kxbtc15m-delayed-v12"
 RUNTIME_STATE_OWNER = "kalshi-kxbtc15m"
 RUNTIME_STATE_MANIFEST = ".kxbtc15m-runtime-state.json"
 RUNTIME_PAYLOAD_PREFIX = ".kxbtc15m-runtime-payload"
@@ -34,7 +35,7 @@ RUNTIME_STATE_SCHEMA_VERSION = 2
 RUNTIME_CHUNK_BYTES = 8 * 1024 * 1024
 RUNTIME_CACHE_MAX_FILES = 40
 _ALLOWED_RUNTIME_STATE_REF = re.compile(
-    r"runtime-state-(?:kxbtc15m|stop-(?:10|20|25|30|35))\Z"
+    r"runtime-state-(?:kxbtc15m(?:-delayed-v12)?|stop-(?:10|20|25|30|35))\Z"
 )
 _CANONICAL_RUNTIME_PATHS = frozenset({
     "selected_live_strategy.json",
@@ -42,6 +43,13 @@ _CANONICAL_RUNTIME_PATHS = frozenset({
     "data/kalshi_live_maker_hybrid_v11_audit.jsonl",
     "data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_state.json",
     "data/kalshi_shadow_maker_hybrid_v11_sticky_stop_40_audit.jsonl",
+})
+_DELAYED_V12_RUNTIME_PATHS = frozenset({
+    "selected_live_strategy.json",
+    "data/kalshi_live_delayed_band_v12_state.json",
+    "data/kalshi_live_delayed_band_v12_audit.jsonl",
+    "data/kalshi_shadow_delayed_band_v12_state.json",
+    "data/kalshi_shadow_delayed_band_v12_audit.jsonl",
 })
 
 
@@ -58,6 +66,8 @@ def validate_runtime_paths(runtime_ref: str, relative_paths: list[str]) -> None:
 
     if runtime_ref == DEFAULT_RUNTIME_STATE_REF:
         allowed = _CANONICAL_RUNTIME_PATHS
+    elif runtime_ref == DELAYED_V12_RUNTIME_STATE_REF:
+        allowed = _DELAYED_V12_RUNTIME_PATHS
     else:
         stop_cents = runtime_ref.rsplit("-", 1)[-1]
         allowed = frozenset({
