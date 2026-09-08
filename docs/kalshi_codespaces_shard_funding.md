@@ -17,6 +17,7 @@ While this remains draft PR #87, open this repository in a Codespace and run:
 
 ```bash
 gh pr checkout 87
+git pull --ff-only
 python -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements_kalshi_settlement_trader.txt
@@ -53,10 +54,14 @@ automatic allocation. It never prints the key ID, private key or signed headers.
 Successful admin preflight does not prove the bot is ready or clear its breaker.
 The read-only `transfers` command also checks nonterminal transfers individually
 by ID, prints unresolved IDs/amounts/routes/timestamps, and never submits a transfer.
-Old pending transfers are not silently ignored. If Kalshi still reports one as
-pending, resolve it through Kalshi before using the transfer/allocation commands;
-do not delete a journal or bypass the check. A history check marked clear does not
-replace the other funding and exposure checks.
+Pending outgoing/event-contract shard transfers and unknown transfer states block
+new writes. Verified **incoming `margined` → `event_contract` credits** are instead
+reported as warnings: they cannot debit event-contract collateral and are not a
+duplicate of the intended shard transfer. Their amounts are never included in
+available cash. They remain unresolved; this distinction does not pretend that
+Kalshi completed them. Age alone never makes a pending transfer safe to ignore.
+Resolve blocking transfers through Kalshi rather than deleting a journal or
+bypassing the check. The transfer preview runs the full read-only account preflight.
 
 The default series is `KXBTC15M`; `--ticker` accepts an explicitly API-discovered
 market instead of discovering the current active market. Do not use an old market
@@ -68,7 +73,7 @@ First pause account trading workers and their watchdogs **yourself**, with a
 graceful handoff only when safe. A maintenance flag can stop new workflow dispatch
 without stopping an already-running process. Do not force-cancel a worker that is
 managing real exposure. The tool additionally refuses writes when it observes
-resting orders, open/unknown positions, or pending/unknown transfers.
+resting orders, open/unknown positions, or conflicting pending/unknown transfers.
 
 Only after the workers really are paused:
 
@@ -100,6 +105,9 @@ A 200 POST response is only acceptance. The tool polls the returned transfer ID,
 verifies source/destination/amount/time, and waits for official `status=complete`.
 It then reads both balances and checks them against the saved plan. A mismatch
 is reported for manual review, never used as a reason to resend the transfer.
+For example, a separate pending incoming credit may settle after confirmation:
+that can increase a balance beyond the saved plan, but it does not authorize
+another transfer. The one-time amount remains exactly what you confirmed.
 
 ```bash
 python kalshi_shard_admin.py resume-transfer

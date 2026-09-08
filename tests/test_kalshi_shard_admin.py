@@ -264,7 +264,7 @@ class ShardAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.api.posts(), [])
         self.assertTrue(any(call[1] == admin.TRANSFERS + "/old-transfer" for call in self.api.calls))
 
-    async def test_old_pending_transfer_is_not_ignored_and_report_has_no_write(self):
+    async def test_pending_incoming_margin_is_visible_but_not_counted_as_cash(self):
         self.api.transfer_payload = {
             "transfer_id": "old-transfer", "status": "pending", "amount": "0.01",
             "source": "margined", "destination": "event_contract",
@@ -275,8 +275,40 @@ class ShardAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('"transfer_history_clear": false', self.stdout.getvalue())
         self.assertIn('"transfer_id": "old-transfer"', self.stdout.getvalue())
         self.assertFalse((self.root / "absent").exists())
+        self.assertEqual(self.api.posts(), [])
+        result = await self.transfer()
+        self.assertEqual(result["request"]["amount"], 1204724)
+        self.assertEqual(result["pending_incoming_margin_transfer_ids"], ["old-transfer"])
+        self.assertEqual(len(self.api.posts()), 1)
+
+    async def test_pending_event_contract_transfer_still_blocks_new_post(self):
+        self.api.transfer_payload = {
+            "transfer_id": "pending-event-transfer", "status": "pending", "amount": "1.00",
+            "source": "event_contract", "destination": "event_contract",
+            "source_exchange_shard": 0, "destination_exchange_shard": 2, "created_ts": 1700000000,
+        }
+        self.api.transfers = [deepcopy(self.api.transfer_payload)]
         with self.assertRaises(admin.SafetyError): await self.transfer()
         self.assertEqual(self.api.posts(), [])
+
+    def test_incoming_transfer_exception_requires_known_status_route_and_amount(self):
+        incoming = {"transfer_id": "incoming", "status": "pending", "amount": "1.00",
+                    "source": "margined", "destination": "event_contract",
+                    "source_exchange_shard": 0, "destination_exchange_shard": 0, "created_ts": 1700000000}
+        for changes in ({"status": "unknown"}, {"source": "event_contract"}, {"destination": "margined"}):
+            assessment = admin.pending_transfer_assessment([{**incoming, **changes}])
+            self.assertEqual(assessment["blocking_transfer_ids"], ["incoming"])
+            self.assertEqual(assessment["pending_incoming_margin_transfer_ids"], [])
+        for changes in ({"amount": "-1"}, {"source_exchange_shard": None}, {"created_ts": None}):
+            with self.assertRaises(admin.SafetyError):
+                admin.pending_transfer_assessment([{**incoming, **changes}])
+
+    async def test_preview_performs_full_read_only_exposure_preflight(self):
+        self.api.resting = [{"order_id": "mock"}]
+        with self.assertRaises(admin.SafetyError):
+            await admin.transfer_all(self.api, self.journal)
+        self.assertEqual(self.api.posts(), [])
+        self.assertIsNone(self.journal.load("transfer"))
 
     async def test_pending_transfer_id_lookup_mismatch_fails_closed(self):
         self.api.transfers = [{"transfer_id": "expected", "status": "pending"}]

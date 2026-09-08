@@ -247,7 +247,32 @@ async def inspect_account(api: Api, *, ticker=None, series="KXBTC15M", source=0)
             "can_submit_orders": False, "trading_readiness": "NOT_ASSESSED_BY_ADMIN_TOOL"}
 
 
-async def assert_quiet_account(api: Api, snapshot: dict) -> None:
+def pending_transfer_assessment(transfers: list[dict]) -> dict:
+    """Incoming margin credits cannot debit event-contract collateral.
+
+    Keep these unresolved records visible, but do not mistake them for a pending
+    duplicate event-contract shard transfer. Never count their amounts as cash.
+    All other pending/unknown transfers remain blocking, irrespective of age.
+    """
+    incoming, blocking = [], []
+    for transfer in transfers:
+        if transfer.get("status") in {"complete", "failed", "cancelled", "canceled"}:
+            continue
+        if (transfer.get("status") == "pending" and transfer.get("source") == "margined"
+                and transfer.get("destination") == "event_contract"):
+            identifier = checked_id(transfer.get("transfer_id"))
+            shard(transfer.get("source_exchange_shard"))
+            shard(transfer.get("destination_exchange_shard"))
+            centicents(transfer.get("amount"))
+            epoch(transfer.get("created_ts"))
+            incoming.append(identifier)
+        else:
+            blocking.append(checked_id(transfer.get("transfer_id")))
+    return {"pending_incoming_margin_transfer_ids": incoming,
+            "blocking_transfer_ids": blocking}
+
+
+async def assert_quiet_account(api: Api, snapshot: dict) -> dict:
     if snapshot["api_key_write"] != "PASS" or not snapshot["unrestricted_primary_key"]:
         raise SafetyError("An unrestricted account API key with verified write scope is required")
     if snapshot["region_attestation"] == "EXPIRED":
@@ -265,8 +290,13 @@ async def assert_quiet_account(api: Api, snapshot: dict) -> None:
             if not quantity.is_finite() or quantity != 0:
                 raise SafetyError("Open or unknown exposure exists; resolve it before shard administration")
     transfers = await transfer_history(api)
-    if any(t.get("status") not in {"complete", "failed", "cancelled", "canceled"} for t in transfers):
-        raise SafetyError("Pending or unknown-status account transfer exists; do not submit another")
+    assessment = pending_transfer_assessment(transfers)
+    if assessment["blocking_transfer_ids"]:
+        raise SafetyError("Conflicting pending or unknown-status account transfer exists; do not submit another")
+    if assessment["pending_incoming_margin_transfer_ids"]:
+        emit(action="INCOMING_MARGIN_TRANSFERS_PENDING", **assessment,
+             note="Unresolved incoming credits only, not event-contract debits; their amounts are excluded from the transfer plan")
+    return assessment
 
 
 async def transfer_history(api: Api) -> list[dict]:
@@ -303,6 +333,7 @@ async def report_transfers(api: Api) -> None:
                  orders_sent=0, transfer_posts=0)
     emit(action="READ_ONLY_TRANSFER_HISTORY", total=len(transfers), statuses=counts,
          transfer_history_clear=not any(key in counts for key in ("pending", "unknown")),
+         **pending_transfer_assessment(transfers),
          note="Other write preflight checks still required; no worker or breaker changes")
 
 
@@ -417,13 +448,16 @@ async def transfer_all(api: Api, journal: Journal, *, ticker=None, series="KXBTC
                "source_exchange_shard": source, "destination_exchange_shard": destination,
                "source_subaccount": 0, "destination_subaccount": 0}
     emit(action="TRANSFER_PREVIEW", amount_dollars=str(Decimal(amount) / CENTICENTS), request=request, execute=execute)
-    if not execute:
-        return request
-    if not workers_paused:
+    if execute and not workers_paused:
         raise SafetyError("Pause all trading workers/watchdogs yourself, then provide --workers-paused")
-    await assert_quiet_account(api, snapshot)
+    assessment = await assert_quiet_account(api, snapshot)
     if snapshot["target_allocation"] not in ({}, {destination: 100}):
         raise SafetyError("Existing rebalancing could undo this transfer; review/change allocation separately first")
+    emit(action="TRANSFER_PREFLIGHT_PASS", source_exchange_shard=source,
+         destination_exchange_shard=destination, amount_centicents=amount,
+         **assessment, transfer_posts=0, workers_paused_attested=workers_paused)
+    if not execute:
+        return request
     phrase = f"TRANSFER {Decimal(amount) / CENTICENTS:.4f} USD FROM SHARD {source} TO SHARD {destination}"
     confirm(phrase, answer)
     # Recheck after the operator has read/typed the confirmation. Do not sweep
@@ -431,10 +465,11 @@ async def transfer_all(api: Api, journal: Journal, *, ticker=None, series="KXBTC
     fresh = await inspect_account(api, ticker=snapshot["market_ticker"], source=source)
     if fresh["market_exchange_index"] != destination or fresh["shard_balances"] != snapshot["shard_balances"] or fresh["target_allocation"] != snapshot["target_allocation"]:
         raise SafetyError("Funding/routing changed during confirmation; nothing submitted, rerun preview")
-    await assert_quiet_account(api, fresh)
+    fresh_assessment = await assert_quiet_account(api, fresh)
     operation = {"schema_version": 1, "kind": "transfer", "status": "SUBMITTING", "created_at": utc_now(),
                  "market_ticker": snapshot["market_ticker"], "request": request,
-                 "balances_before": snapshot["shard_balances"]}
+                 "balances_before": snapshot["shard_balances"],
+                 "pending_incoming_margin_transfer_ids": fresh_assessment["pending_incoming_margin_transfer_ids"]}
     journal.save(operation)  # Durable BEFORE the only POST; no client idempotency field is documented.
     try:
         response = await api.request("POST", TRANSFER, body=request)
