@@ -5,7 +5,7 @@ name: Kalshi KXBTC15M Hybrid Live
 # not assume a cron invocation occurred at exactly a 15-minute open.
 run-name: >-
   Kalshi KXBTC15M Hybrid —
-  ${{ (inputs.live_enabled && vars.KALSHI_LIVE_ENABLED == 'true' && vars.KALSHI_SHADOW_ONLY != 'true') && 'LIVE delayed_53_57_stop_50' || 'DRY_RUN delayed_53_57_stop_50' }}
+  ${{ inputs.reconcile_only && 'RECONCILE_ONLY delayed_53_57_stop_50' || (inputs.live_enabled && vars.KALSHI_LIVE_ENABLED == 'true' && vars.KALSHI_SHADOW_ONLY == 'false') && 'LIVE delayed_53_57_stop_50' || inputs.live_enabled && 'LIVE_REQUEST_BLOCKED delayed_53_57_stop_50' || 'DRY_RUN delayed_53_57_stop_50' }}
 
 on:
   # The separately serialized watchdog owns the five-minute recovery
@@ -14,12 +14,12 @@ on:
   workflow_dispatch:
     inputs:
       live_enabled:
-        description: "Permit real orders only when repository variable KALSHI_LIVE_ENABLED is also true."
+        description: "LIVE SWITCH: checked = real orders; unchecked = shadow. Requires KALSHI_LIVE_ENABLED=true and KALSHI_SHADOW_ONLY=false."
         required: true
         type: boolean
         default: false
       reconcile_only:
-        description: "Authenticate and reconcile orders/positions only; never create an entry."
+        description: "READ-ONLY CHECK: checked = reconciliation only, NO orders. Leave unchecked to trade."
         required: true
         type: boolean
         default: false
@@ -67,8 +67,40 @@ jobs:
     timeout-minutes: 360
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: main
+
+      - name: Validate explicit live switch (never silently fall back)
+        id: live_gate
+        env:
+          LIVE_SWITCH: ${{ inputs.live_enabled || false }}
+          READ_ONLY: ${{ inputs.reconcile_only || false }}
+          LIVE_PERMISSION: ${{ vars.KALSHI_LIVE_ENABLED || 'false' }}
+          SHADOW_ONLY: ${{ vars.KALSHI_SHADOW_ONLY || 'true' }}
+        run: |
+          set -euo pipefail
+          if [ "$READ_ONLY" = "true" ]; then
+            mode=RECONCILE_ONLY
+          elif [ "$LIVE_SWITCH" = "true" ]; then
+            if [ "$LIVE_PERMISSION" != "true" ] || [ "$SHADOW_ONLY" != "false" ]; then
+              echo "::error::LIVE REQUEST BLOCKED: set repository KALSHI_LIVE_ENABLED=true and KALSHI_SHADOW_ONLY=false yourself. No worker started and no orders sent."
+              exit 2
+            fi
+            mode=LIVE
+          else
+            mode=DRY_RUN
+          fi
+          echo "REQUESTED_MODE=$mode | source_sha=$(git rev-parse HEAD)"
+          echo "KALSHI_SOURCE_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          {
+            echo "### Requested trading mode: $mode"
+            echo 'Live switch must be checked AND both repository gates must permit live execution.'
+            echo 'Reconciliation-only overrides the live switch and submits no orders.'
+            echo 'Exchange authentication/reconciliation must still pass before the worker can trade.'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Restore latest bounded runtime state
+        id: runtime_restore
         run: |
           set -euo pipefail
           runtime_ref=runtime-state-kxbtc15m-delayed-v12
@@ -105,6 +137,7 @@ jobs:
           PYTHONPATH=. python -m unittest -v \
             tests.test_strategy_core \
             tests.test_live_execution \
+            tests.test_live_stop_safety \
             tests.test_maker_hybrid_v11 \
             tests.test_delayed_band_v12 \
             tests.test_reconciliation \
@@ -115,6 +148,7 @@ jobs:
       - name: Assert canonical hybrid strategy contract
         run: |
           set -euo pipefail
+          python -c 'from kalshi_live_trader import LIVE_STOP_SAFETY_CONTRACT_VERSION; assert LIVE_STOP_SAFETY_CONTRACT_VERSION == 1; print("LIVE_STOP_SAFETY_CONTRACT=1 | durable_intent=true unknown_post=reconcile_before_retry hard_stop=latched_reduce_only")'
           python -c 'from decimal import Decimal; from kalshi_live_trader import ACTIVE_CONFIG_SCHEMA_VERSION, ACTIVE_STRATEGY_VERSION, BTC_TARGET_CAPTURE_CONTRACT_VERSION, DELAYED_ENTRY_LADDER_CONTRACT_VERSION, OPENING_PRICE_CAPTURE_CONTRACT_VERSION, load_config; c = load_config(__import__("pathlib").Path("selected_live_strategy.json")); assert c["strategy_version"] == ACTIVE_STRATEGY_VERSION; assert c["config_schema_version"] == ACTIVE_CONFIG_SCHEMA_VERSION == 12; assert OPENING_PRICE_CAPTURE_CONTRACT_VERSION == 3; assert BTC_TARGET_CAPTURE_CONTRACT_VERSION == 2; assert DELAYED_ENTRY_LADDER_CONTRACT_VERSION == 3; assert c["entry_execution_mode"] == "delayed_threshold_band_maker"; assert c["maker_order_time_in_force"] == "good_till_canceled"; assert c["entry_order_lifetime"] == "until_filled_or_market_close"; assert c["entry_timeout_seconds"] == 0; assert c["opening_quote_capture_seconds"] == 60; assert c["delayed_entry_start_seconds"] == 60; assert c["delayed_entry_threshold_cents"] == 53; assert c["delayed_entry_max_limit_cents"] == 57; assert c["entry_limit_offset_cents"] == 1; assert (c["hybrid_stop_trigger_cents"], c["hybrid_maker_exit_cents"], c["hybrid_hard_stop_cents"]) == (51, 52, 50); assert c["stop_price"] == "0.50"; assert c["shadow_profile"] == "delayed_53_57_stop_50"; assert c["recovery_multiplier"] == "2.50"; assert c["threshold_growth_multiplier"] == "2.50"; assert Decimal(c["starting_base"]) == Decimal("1.00"); assert Decimal(c["max_position"]) == Decimal("100.00"); assert c["max_recovery_exponent"] == 0; assert c["durable_checkpoint_interval_seconds"] == 30.0; print("CANONICAL_DELAYED_BAND_STRATEGY_CONTRACT=OK | opening_ask_below=53c post_window=60s first_qualifying_ask>=53c entry=ask_minus_1c max_limit=57c maker_tif=GTC lifetime=until_fill_or_market_close hybrid=51trigger_52maker_50hard recovery=2.50x base=1.00 cap=100 checkpoint=v2_chunked_30s")'
 
       - name: Write Kalshi RSA private key
@@ -140,7 +174,7 @@ jobs:
           KALSHI_CHECKPOINT_PUBLISH: "true"
           KALSHI_RUNTIME_STATE_REF: "runtime-state-kxbtc15m-delayed-v12"
           RUN_SECONDS: "18000"
-          REQUESTED_LIVE: ${{ inputs.live_enabled && vars.KALSHI_LIVE_ENABLED == 'true' && vars.KALSHI_SHADOW_ONLY != 'true' }}
+          REQUESTED_LIVE: ${{ !inputs.reconcile_only && inputs.live_enabled && vars.KALSHI_LIVE_ENABLED == 'true' && vars.KALSHI_SHADOW_ONLY == 'false' }}
           RECONCILE_ONLY: ${{ inputs.reconcile_only || false }}
           SHADOW_PROFILE: "delayed_53_57_stop_50"
           INITIAL_SHARES: ${{ inputs.initial_shares || '' }}
@@ -204,7 +238,7 @@ jobs:
           fi
 
       - name: Persist state, audit ledger, and chosen configuration
-        if: always()
+        if: always() && steps.live_gate.outcome == 'success' && steps.runtime_restore.outcome == 'success'
         run: |
           set -euo pipefail
           for attempt in 1 2 3; do
@@ -226,7 +260,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
-          REQUESTED_LIVE: ${{ inputs.live_enabled && vars.KALSHI_LIVE_ENABLED == 'true' && vars.KALSHI_SHADOW_ONLY != 'true' }}
+          REQUESTED_LIVE: ${{ !inputs.reconcile_only && inputs.live_enabled && vars.KALSHI_LIVE_ENABLED == 'true' && vars.KALSHI_SHADOW_ONLY == 'false' }}
           RECONCILE_ONLY: ${{ inputs.reconcile_only || false }}
           SHADOW_PROFILE: "delayed_53_57_stop_50"
         run: |

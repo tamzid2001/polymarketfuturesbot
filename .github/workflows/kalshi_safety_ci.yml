@@ -1,0 +1,40 @@
+name: Kalshi Offline Safety Tests
+
+on:
+  pull_request:
+    paths:
+      - '*.py'
+      - 'tests/**'
+      - '.github/workflows/kalshi*.yml'
+      - 'selected_live_strategy.json'
+      - 'requirements_kalshi_settlement_trader.txt'
+  push:
+    branches: [main]
+    paths:
+      - '*.py'
+      - 'tests/**'
+      - '.github/workflows/kalshi*.yml'
+      - 'selected_live_strategy.json'
+      - 'requirements_kalshi_settlement_trader.txt'
+
+permissions:
+  contents: read
+
+jobs:
+  offline-safety:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      KALSHI_LIVE_ENABLED: 'false'
+      KALSHI_SHADOW_ONLY: 'true'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - name: Install dependencies (no account secrets)
+        run: pip install -r requirements_kalshi_settlement_trader.txt
+      - name: Run offline strategy and mocked-order tests
+        run: |
+          python -m unittest discover -s tests -q
+          python -m unittest discover -s tests/live -q
