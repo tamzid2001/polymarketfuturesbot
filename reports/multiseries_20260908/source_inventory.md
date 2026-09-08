@@ -9,15 +9,15 @@ tracked paths are counted separately (`--skip-uniqueness`).
 
 | Category | Files | Code lines | Comment/docstring lines | Blank lines |
 | --- | ---: | ---: | ---: | ---: |
-| Non-archived source, excluding tests/workflows | 32 | 20,976 | 2,214 | 1,867 |
-| Non-archived tests | 21 | 5,794 | 107 | 648 |
+| Non-archived source, excluding tests/workflows | 32 | 20,979 | 2,214 | 1,867 |
+| Non-archived tests | 21 | 5,810 | 107 | 649 |
 | Current workflow definitions | 11 | 1,056 | 71 | 100 |
 | Archived source/tests/workflows | 55 | 16,508 | 1,097 | 1,985 |
-| **Total** | **119** | **44,334** | **3,489** | **4,600** |
+| **Total** | **119** | **44,353** | **3,489** | **4,601** |
 
-Thus the non-archived subtotal including tests and workflows is **27,826 code
+Thus the non-archived subtotal including tests and workflows is **27,845 code
 lines**; all counted physical lines including comments and blanks total
-**52,423**. Non-archived does not mean every module or workflow is currently
+**52,443**. Non-archived does not mean every module or workflow is currently
 executing in production. The archived 16,508 lines are not part of the current
 runner and should not be represented as active trading logic.
 

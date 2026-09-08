@@ -5763,6 +5763,9 @@ class LiveEngine:
         # base, recovery exponent or requested configuration. Existing
         # position/order guards below still prohibit additive/duplicate risk.
         cap = self.record_parameters(record).max_position
+        if self.state["circuit_breaker"].get("blocked"):
+            self.transition(record, "ERROR_RECONCILIATION", "invalid_prescribed_entry_configuration")
+            return
         if not quantity.is_finite() or quantity <= 0 or quantity != round_shares(quantity) or quantity > cap:
             self.trip("entry_quantity_exceeds_position_cap_or_invalid")
             self.transition(record, "ERROR_RECONCILIATION", "invalid_prescribed_entry_quantity")

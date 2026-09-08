@@ -185,6 +185,23 @@ class PositionCapTests(unittest.TestCase):
             live, _ = apply_realized_filled_trade(p, live, event)
             self.assertEqual(live, full_snapshot(replay))
 
+    def test_corrupt_cap_snapshot_blocks_order_instead_of_using_fallback(self):
+        async def scenario():
+            with TemporaryDirectory() as directory:
+                path = Path(directory) / "state.json"
+                engine = LiveEngine(self.config, default_state(self.config), path, path.with_suffix(".jsonl"), dry_run=False)
+                opened = time.time() - 61
+                record = engine.set_signal(
+                    {"ticker": "KXBTC15M-corrupt-cap", "open_epoch": opened, "close_epoch": opened + 900},
+                    {"ticker": "KXBTC15M-prior", "outcome": "no"},
+                )
+                record["config_snapshot"]["max_position"] = "NaN"
+                rest = EntryRest()
+                await engine.submit_entry(rest, BandFeed(opened, 52, 53), record, opened + 60.2)
+                self.assertEqual(rest.calls, [])
+                self.assertEqual(record["status"], "ERROR_RECONCILIATION")
+        asyncio.run(scenario())
+
     def test_optimizer_export_preserves_cap_instead_of_hardcoding_100(self):
         self.assertEqual(ParameterSet(2.5, 350, .5, max_position=200.25).reference_configuration().max_position, D("200.25"))
         row = {"execution_profile": "delayed_53_57_stop_50", "entry_price": .52,
