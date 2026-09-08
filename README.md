@@ -214,6 +214,13 @@ transfer to the active market's shard, and a separately confirmed 100% recurring
 allocation. It never places orders, clears the bot's breaker or restarts a worker.
 See the [exact setup, confirmation and recovery instructions](docs/kalshi_codespaces_shard_funding.md).
 
+After funding, the separate [operator-run order smoke test](docs/kalshi_order_smoke_test.md)
+can check a shard-2 market and WebSocket read-only. An explicitly confirmed
+`--execute --workers-paused` run sends one 1¢/one-contract post-only test order,
+then cancels/reconciles it with a 30-second server expiry as backup. It never
+resets the strategy breaker or restarts a worker. A test order can fill; actual
+exposure requires operator review, not an assumed successful cancellation.
+
 ### Sticky signal transition
 
 The v12 signal has no loss-skip rule and is independent of execution. For each new market, the worker freezes the immediately preceding market’s realtime provisional outcome, later checks it against official settlement, and records the transition in both state and audit ledger:
