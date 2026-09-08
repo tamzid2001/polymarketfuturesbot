@@ -236,16 +236,36 @@ def run(output: Path, cache: Path, offline: bool = False):
     write_csv(output / "directional_summary.csv", primary)
     write_csv(output / "boundary_proxy_summary.csv", proxy)
     write_csv(output / "monthly_directional_results.csv", regimes)
+    other_series = [s for s in primary if s["series"] != "KXBTC15M"]
+    family_size = len(other_series)
     lines = ["# Multi-series historical settlement directional replay", "", f"Snapshot cutoff: {discovery['as_of']}", "",
              "Primary: unchanged original BTC algorithm, market open +45s, inverse of the most recent available official prior settlement. Every eligible market is scored against its actual settlement. No loss-based skips. Sticky-after-loss/flip-after-win was checked against the same source sequence.", "",
              "Secondary boundary proxy: immediately previous eventual settlement used as a provisional-outcome proxy. This is NOT proof that the result was known at the opening boundary; separate CSV prevents mixing it into causal historical evidence.", "",
              "No fills, stops, fees, recovery-sizing P&L, or live orders are inferred or simulated in this directional-only test.", "",
-             "| Series | Settled | Eligible | W / L | WR | 95% Wilson CI | Max W/L streak |", "|---|---:|---:|---:|---:|---:|---:|"]
+             "| Series | Settled | Eligible | W / L | WR | 95% Wilson CI | Binomial p | Bonferroni p | Max W/L streak |", "|---|---:|---:|---:|---:|---:|---:|---:|---:|"]
     for s in primary:
-        lines.append(f"| {s['series']} | {s['total_settled_markets']:,} | {s['eligible_predictions']:,} | {s['directional_wins']:,} / {s['directional_losses']:,} | {s['directional_win_rate']:.4%} | {s['ci95_low']:.2%}–{s['ci95_high']:.2%} | {s['longest_win_streak']} / {s['longest_loss_streak']} |")
+        p_value = s["nominal_binomial_p_two_sided"]
+        adjusted = f"{min(1, family_size*p_value):.6g}" if s["series"] != "KXBTC15M" else "control; excluded"
+        lines.append(f"| {s['series']} | {s['total_settled_markets']:,} | {s['eligible_predictions']:,} | {s['directional_wins']:,} / {s['directional_losses']:,} | {s['directional_win_rate']:.4%} | {s['ci95_low']:.2%}–{s['ci95_high']:.2%} | {p_value:.6g} | {adjusted} | {s['longest_win_streak']} / {s['longest_loss_streak']} |")
+    if other_series:
+        total_n = sum(s["eligible_predictions"] for s in other_series)
+        total_w = sum(s["directional_wins"] for s in other_series)
+        total_markets = sum(s["total_settled_markets"] for s in other_series)
+        lines += ["", f"Non-BTC descriptive total: **{family_size} series; {total_markets:,} settled markets; {total_n:,} eligible signals; {total_w:,} wins / {total_n-total_w:,} losses; {total_w/total_n:.4%} WR**. No pooled binomial p-value or cross-series streak is claimed: simultaneous asset signals are correlated and do not form one independent trading sequence."]
+    lines += ["", "## Statistical interpretation", "",
+              "Two-sided exact binomial test: H0 is P(directional win)=0.50 versus H1 !=0.50. For n signals and w wins, p=min(1, 2*sum(comb(n,k), k=0..min(w,n-w))/2**n). The implementation evaluates this probability in log space. This is not the probability that H0 is true, and 50% is not the live strategy's fee-adjusted break-even rate.", "",
+              f"Bonferroni p=min(1, {family_size}*raw p) across the {family_size} non-BTC primary tests; BTC is a separate pre-existing control. A corrected p<0.05 survives this specified comparison family only. Wilson intervals are individual, not simultaneous. Both intervals and tests are nominal IID-Bernoulli benchmarks: correction for multiple series does not fix serial dependence, earlier strategy selection, or execution uncertainty.", "",
+              "## Coverage and chronological stability", "",
+              "Halves split eligible signals chronologically, not calendar days; the second half has one extra observation when n is odd. The recent window is the latest min(1000,n) eligible signals. Current streak means at the frozen snapshot, not the current live worker.", "",
+              "| Series | First settled market open (UTC) | Last settled market open (UTC) | No eligible signal | First-half WR | Second-half WR | Recent n | Recent W / L | Recent WR | Current streak |",
+              "|---|---|---|---:|---:|---:|---:|---:|---:|---|"]
+    for s in primary:
+        recent_n = s["latest_1000_n"]
+        recent_w = round(recent_n*s["latest_1000_wr"])
+        lines.append(f"| {s['series']} | {s['first_settled_market_timestamp']} | {s['last_settled_market_timestamp']} | {s['total_settled_markets']-s['eligible_predictions']} | {s['first_half_wr']:.2%} | {s['second_half_wr']:.2%} | {recent_n:,} | {recent_w} / {recent_n-recent_w} | {s['latest_1000_wr']:.2%} | {s['current_streak_length']}{s['current_streak_side']} |")
     lines += ["", "The universe is the catalog's active fifteen-minute Crypto/Commodities up-or-down series with settled markets in the current API, plus BTC as a control. Templates with no current settled rows are listed separately in series_discovery.json; this does not assert their archive is empty.", "",
               "Both current and historical settlement endpoints must finish pagination. Duplicate tickers are deduplicated, conflicts abort, and post-cutoff settlements are excluded. Young series have shorter histories; their estimates are not as precise as BTC's. CI/p-values are nominal independent-trial benchmarks; serial dependence, cross-asset correlation, and testing multiple series can invalidate a simple significance interpretation. Streaks span eligible signals, including market/session gaps.", "",
-              "Sources: https://docs.kalshi.com/api-reference/market/get-markets and https://docs.kalshi.com/api-reference/market/get-series-list", "",
+              "Sources: [Kalshi markets](https://docs.kalshi.com/api-reference/market/get-markets), [series discovery](https://docs.kalshi.com/api-reference/market/get-series-list), and [binomial-test definition](https://docs.scipy.org/doc/scipy/reference/generated/scipy.stats.binomtest.html).", "",
               f"Reproduce offline in this checkout: `python kalshi_multiseries_backtest.py --output {output} --cache {cache} --offline`", "",
               "Or extract reproducible_settlement_replay.zip into an empty folder and run: `python kalshi_multiseries_backtest.py --output reports --cache cache --offline` (Python 3.11+; standard library only).", ""]
     (output / "backtest_summary.md").write_text("\n".join(lines))
