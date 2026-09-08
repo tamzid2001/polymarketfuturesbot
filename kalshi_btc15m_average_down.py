@@ -864,7 +864,33 @@ def order_fee_total(order: Any) -> float:
     if explicit is not None:
         return max(0.0, explicit)
     parts = [as_float(field(order, "taker_fees_dollars")), as_float(field(order, "maker_fees_dollars"))]
+    if all(value is None for value in parts):
+        # The V2 POST response reports an average fee PER filled contract,
+        # unlike GET order history, which reports maker/taker fee totals.
+        average = field(order, "average_fee_paid")
+        if average is not None:
+            count = field(order, "fill_count_fp", "fill_count") or "0"
+            return float(max(Decimal("0"), Decimal(str(average)) * Decimal(str(count))))
     return round(sum(value for value in parts if value is not None), 6)
+
+
+def record_submission_failure(record: dict[str, Any], exc: Exception) -> None:
+    """Separate definitive HTTP rejection from an unknown POST outcome.
+
+    Never persist/print the SDK exception body: it can contain authenticated
+    request headers. Timeouts, conflicts, rate limits and server failures are
+    uncertain and require exchange lookup, not a new order identifier.
+    """
+    status = getattr(exc, "status", None)
+    rejected = status in {400, 401, 403, 404, 422}
+    record.update({
+        "status": "submit_failed",
+        "submission_outcome": "rejected" if rejected else "unknown",
+        "error_type": type(exc).__name__,
+        "http_status": status if isinstance(status, int) else None,
+    })
+    if rejected:
+        record["remaining_count"] = 0.0
 
 
 def client_order_id(ticker: str, side: str, order_key: str) -> str:
@@ -2208,6 +2234,7 @@ class KalshiREST:
             record["status"] = "paused"
             record["error"] = self.pause_reason or "scheduled Kalshi trading pause"
             LOG.warning("EXIT DEFERRED FOR PAUSE | %s %s bid=$%.4f", ticker, held_side.upper(), economic_exit_price)
+            record.update(submission_outcome="not_submitted", remaining_count=0.0)
             return record
         try:
             response = await self.orders.create_order_v2(
@@ -2222,13 +2249,10 @@ class KalshiREST:
                 post_only=False,
             )
         except Exception as exc:  # noqa: BLE001
-            if pause_error(exc):
-                self.note_trading_pause(str(exc))
-                record["status"] = "paused"
-            else:
-                record["status"] = "submit_failed"
-            record["error"] = str(exc)
-            LOG.error("EXIT REJECTED | %s %s bid=$%.4f: %s", ticker, held_side.upper(), economic_exit_price, exc)
+            record_submission_failure(record, exc)
+            LOG.error("EXIT SUBMISSION %s | %s %s http_status=%s error_type=%s",
+                      record["submission_outcome"].upper(), ticker, held_side.upper(),
+                      record["http_status"], record["error_type"])
             return record
         record["order_id"] = str(field(response, "order_id") or "") or None
         record["fill_count"] = round(order_fill_count(response), 2)
@@ -2281,6 +2305,7 @@ class KalshiREST:
         if self.trading_pause_active():
             record["status"] = "paused"
             record["error"] = self.pause_reason or "scheduled Kalshi trading pause"
+            record.update(submission_outcome="not_submitted", remaining_count=0.0)
             return record
         try:
             response = await self.orders.create_order_v2(
@@ -2291,9 +2316,10 @@ class KalshiREST:
                 reduce_only=True, post_only=True,
             )
         except Exception as exc:  # noqa: BLE001
-            record["status"] = "paused" if pause_error(exc) else "submit_failed"
-            record["error"] = str(exc)
-            LOG.error("MAKER EXIT REJECTED | %s %s @ $%.4f: %s", ticker, held_side.upper(), economic_exit_price, exc)
+            record_submission_failure(record, exc)
+            LOG.error("MAKER EXIT SUBMISSION %s | %s %s http_status=%s error_type=%s",
+                      record["submission_outcome"].upper(), ticker, held_side.upper(),
+                      record["http_status"], record["error_type"])
             return record
         record["order_id"] = str(field(response, "order_id") or "") or None
         record["fill_count"] = round(order_fill_count(response), 2)
@@ -2357,16 +2383,55 @@ class KalshiREST:
                 return
             LOG.warning("Order lookup failed for %s: %s", order_id, exc)
 
-    async def refresh_exit_order(self, record: dict[str, Any]) -> None:
+    async def recover_exit_submission(self, record: dict[str, Any]) -> bool:
+        """Recover a lost POST response by its exact persisted client ID.
+
+        An absent order is NOT proof of rejection. Keep uncertainty latched
+        across polls/restarts; never allow a replacement on an empty lookup.
+        """
+        if record.get("submission_outcome") in {"rejected", "not_submitted"}:
+            return True
+        if not record.get("order_id"):
+            client_id, ticker = record.get("client_order_id"), record.get("ticker")
+            if not client_id or not ticker:
+                return False
+            cursor = None
+            seen = set()
+            try:
+                for _ in range(20):
+                    kwargs = {"ticker": ticker, "limit": 1000}
+                    if cursor:
+                        kwargs["cursor"] = cursor
+                    response = await self.orders.get_orders(**kwargs)
+                    matches = [item for item in (field(response, "orders") or [])
+                               if field(item, "client_order_id") == client_id
+                               and field(item, "ticker") == ticker]
+                    if len(matches) > 1:
+                        return False
+                    if matches:
+                        record["order_id"] = field(matches[0], "order_id")
+                        break
+                    cursor = field(response, "cursor")
+                    if not cursor or cursor in seen:
+                        return False
+                    seen.add(cursor)
+            except Exception as exc:  # no exception body or headers in logs
+                LOG.warning("EXIT RECOVERY UNAVAILABLE | %s error_type=%s", ticker, type(exc).__name__)
+                return False
+        if not record.get("order_id"):
+            return False
+        return await self.refresh_exit_order(record)
+
+    async def refresh_exit_order(self, record: dict[str, Any]) -> bool:
         """Refresh a reduce-only exit without treating its book side as a new long side."""
         order_id = record.get("order_id")
-        if not order_id or record.get("status") in {"dry_run", "submit_failed", "canceled", "canceled_unfilled"}:
-            return
+        if not order_id or record.get("status") == "dry_run":
+            return False
         try:
             response = await self.orders.get_order(order_id)
             order = field(response, "order")
             if order is None:
-                return
+                return False
             held_side = str(record.get("held_side") or record.get("side") or "")
             record["fill_count"] = round(order_fill_count(order), 2)
             remaining = order_remaining_count(order)
@@ -2380,12 +2445,15 @@ class KalshiREST:
             if status:
                 record["status"] = status
             record["last_checked_at"] = now_iso()
+            record["submission_outcome"] = "accepted"
+            return True
         except Exception as exc:  # noqa: BLE001
             if (getattr(exc, "status", None) == 404
                     and float(record.get("fill_count") or 0.0) > 0.004
                     and float(record.get("remaining_count") or 0.0) <= 0.004):
-                return
-            LOG.warning("Exit order lookup failed for %s: %s", order_id, exc)
+                return True
+            LOG.warning("Exit order lookup failed for %s: %s", order_id, type(exc).__name__)
+            return False
 
     async def cancel_order(self, record: dict[str, Any], dry_run: bool) -> bool:
         """Cancel an order and report whether its disappearance is confirmed.

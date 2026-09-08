@@ -88,9 +88,11 @@ jobs:
             echo "WATCHDOG HOLD | active_or_queued_hybrid_runs=$active; refusing overlap."
             exit 0
           fi
-          latest="$(jq -c 'sort_by(.updatedAt // "") | last // {}' <<<"$runs")"
-          prior_live="$(jq -r '(.displayTitle // "") | endswith("LIVE")' <<<"$latest")"
-          if [ "$KALSHI_LIVE_ENABLED" = "true" ] && { [ "$TRIGGER" = "schedule" ] || [ "$prior_live" = "true" ]; }; then
+          latest="$(jq -c '[.[] | select((.displayTitle // "") | test("(DRY_RUN|LIVE) delayed_53_57_stop_50$"))] | sort_by(.updatedAt // "") | last // {}' <<<"$runs")"
+          prior_live="$(jq -r '(.displayTitle // "") | endswith("LIVE delayed_53_57_stop_50")' <<<"$latest")"
+          # Repository flags grant permission; they are not a start command.
+          # Live recovery requires a prior explicitly requested LIVE worker.
+          if [ "$KALSHI_LIVE_ENABLED" = "true" ] && [ "$KALSHI_SHADOW_ONLY" = "false" ] && [ "$prior_live" = "true" ]; then
             gh workflow run kalshi_btc15m_average_down.yml --repo "$REPOSITORY" --ref main \
               -f live_enabled=true -f reconcile_only=false
             echo "WATCHDOG DISPATCHED | gated live hybrid recovery queued."

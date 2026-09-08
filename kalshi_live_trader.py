@@ -83,6 +83,7 @@ BTC_TARGET_CAPTURE_CONTRACT_VERSION = 2
 # consumes that volume only once across the direct order and ladder rungs. It
 # also applies the partial-fill-safe 51/52/50 delayed hybrid-stop contract.
 DELAYED_ENTRY_LADDER_CONTRACT_VERSION = 3
+LIVE_STOP_SAFETY_CONTRACT_VERSION = 1
 DELAYED_HYBRID_STOP_TRIGGER_CENTS = 51
 DELAYED_HYBRID_MAKER_EXIT_CENTS = 52
 DELAYED_HYBRID_HARD_STOP_CENTS = 50
@@ -915,13 +916,26 @@ class ProvisionalOutcomeTracker:
 
 
 class LiveEngine:
-    def __init__(self, config: dict[str, Any], state: dict[str, Any], state_path: Path, ledger_path: Path, dry_run: bool, config_path: Path | None = None) -> None:
+    def __init__(self, config: dict[str, Any], state: dict[str, Any], state_path: Path, ledger_path: Path, dry_run: bool, config_path: Path | None = None, *, reconcile_only: bool = False) -> None:
         self.config = config
         self.state = state
         self.state_path = state_path
         self.ledger_path = ledger_path
         self.config_path = config_path
         self.dry_run = dry_run
+        self.execution_mode = "RECONCILE_ONLY" if reconcile_only else "DRY_RUN" if dry_run else "LIVE"
+        namespace = "live" if reconcile_only or not dry_run else "shadow"
+        prior_namespace = state.get("execution_context", {}).get("state_namespace")
+        if prior_namespace is not None and prior_namespace != namespace:
+            raise RuntimeError("refusing to mix live and shadow checkpoint namespaces")
+        self.state["execution_context"] = {
+            "mode": self.execution_mode, "state_namespace": namespace,
+            "real_order_submission_enabled": not dry_run and not reconcile_only,
+            "workflow_run_id": os.getenv("GITHUB_RUN_ID"),
+            "source_commit": os.getenv("KALSHI_SOURCE_SHA") or os.getenv("GITHUB_SHA"),
+            "stop_safety_contract": LIVE_STOP_SAFETY_CONTRACT_VERSION,
+            "observed_at": utc_now(),
+        }
         self.parameters = strategy_parameters(config)
         previous_hash = str(self.state.get("config_hash") or "")
         current_hash = config_hash(config)
@@ -1019,6 +1033,8 @@ class LiveEngine:
             "event": event, "strategy_version": self.config["strategy_version"],
             "config_hash": config_hash(self.config),
             **{key: audit_safe_value(value) for key, value in details.items()},
+            "execution_mode": self.execution_mode,
+            "execution_context": self.state["execution_context"],
         })
         # An append is fsynced by ``append_audit``.  Immediately pair it with
         # the atomic state file so a crash cannot leave a fresh ledger event
@@ -5299,11 +5315,9 @@ class LiveEngine:
         if action == "stop":
             if filled > 0:
                 self.finish_entry_attempt(record, filled, "entry_cancel_confirmed_before_hybrid_stop")
-                await self.start_hybrid_maker_exit(
-                    rest, feed, record,
-                    bid or cents_price(int(self.config["hybrid_stop_trigger_cents"])),
-                    entries_confirmed=True,
-                )
+                # Re-evaluate fresh executable pricing, never the stale bid
+                # saved before the failed cancellation. Hard-stop latch stays.
+                await self.manage_stop(rest, feed, record)
             else:
                 self.finish_entry_attempt(record, filled, "entry_cancel_confirmed_before_stop")
             return True
@@ -5977,24 +5991,29 @@ class LiveEngine:
                 "post_only": True, "reduce_only": True, "status": "shadow_resting", "submitted_at": utc_now(),
             }
         else:
+            intent = self.persist_exit_intent(record, client_id, "maker_exit", quantity, maker_price)
             order = await rest.create_reduce_only_maker_exit(
                 ticker=record["ticker"], held_side=side, economic_exit_price=float(maker_price),
                 quantity=float(quantity), expiration_time=int(float(record["market_close_epoch"])), dry_run=False,
                 order_key="hybrid-maker-exit",
                 client_order_id_override=client_id,
             )
+            intent.update(order)
+            if order.get("order_id") and order.get("status") not in {"submit_failed", "paused"}:
+                intent["submission_outcome"] = "accepted"
+            order = intent
             if order.get("time_in_force") != maker_tif:
-                record.setdefault("exit_orders", []).append(order)
                 self.trip("hybrid_maker_exit_time_in_force_mismatch")
                 self.transition(record, "RECONCILIATION_PENDING", "hybrid_maker_exit_time_in_force_mismatch")
                 return
-            if order.get("status") in {"submit_failed", "paused"}:
-                record.setdefault("exit_orders", []).append(order)
+            if (order.get("status") in {"submit_failed", "paused"}
+                    and order.get("submission_outcome") not in {"rejected", "not_submitted"}):
                 record["hybrid_stop"]["maker_order_id"] = order.get("order_id")
                 self.trip("hybrid_maker_exit_submission_unknown")
                 self.transition(record, "MAKER_EXIT_CANCEL_UNCONFIRMED", "hybrid_maker_exit_submission_unknown")
                 return
-        record.setdefault("exit_orders", []).append(order)
+        if self.dry_run:
+            record.setdefault("exit_orders", []).append(order)
         record["hybrid_stop"].update({
             "state": "MAKER_EXIT_PENDING", "triggered_at": record.get("stop_trigger", {}).get("at"),
             "maker_order_id": order.get("order_id"), "maker_client_order_id": client_id,
@@ -6008,24 +6027,57 @@ class LiveEngine:
             exchange_order_id=order.get("order_id"), shadow=self.dry_run,
         )
 
+    def persist_exit_intent(
+        self, record: dict[str, Any], client_id: str, phase: str,
+        quantity: Decimal, price: Decimal,
+    ) -> dict[str, Any]:
+        """Fsync the order identity BEFORE the POST; restart cannot invent a retry."""
+        maker = phase == "maker_exit"
+        intent = {
+            "client_order_id": client_id, "order_id": None, "ticker": record["ticker"],
+            "side": record["signal_side"], "held_side": record["signal_side"],
+            "exit_phase": phase, "quantity": format(quantity, "f"),
+            "position_price": format(price, "f"), "fill_count": "0.00",
+            "remaining_count": format(quantity, "f"), "fees_paid": "0",
+            "time_in_force": "good_till_canceled" if maker else "immediate_or_cancel",
+            "post_only": maker, "reduce_only": True, "status": "submitting",
+            "submission_outcome": "unknown", "submitted_at": utc_now(),
+        }
+        record.setdefault("exit_orders", []).append(intent)
+        self.transition(record, "MAKER_EXIT_PENDING" if maker else "HARD_STOP_PENDING", "exit_submission_intent")
+        self.audit("exit_submission_intent", ticker=record["ticker"], client_order_id=client_id,
+                   phase=phase, quantity=format(quantity, "f"), price=format(price, "f"))
+        return intent
+
     async def cancel_hybrid_maker_exit_and_confirm(self, rest: KalshiREST, record: dict[str, Any]) -> bool:
         order = self.hybrid_maker_exit_order(record)
-        if not isinstance(order, dict) or Decimal(str(order.get("remaining_count") or "0")) <= 0:
+        if not isinstance(order, dict):
+            return True
+        if order.get("submission_outcome") in {"rejected", "not_submitted"}:
+            return True
+        if not self.dry_run and not order.get("order_id"):
+            if not await rest.recover_exit_submission(order):
+                self.trip("hybrid_maker_exit_submission_unresolved")
+                self.transition(record, "MAKER_EXIT_CANCEL_UNCONFIRMED", "hybrid_maker_exit_submission_unresolved")
+                return False
+        if Decimal(str(order.get("remaining_count") or "0")) <= 0:
             return True
         if self.dry_run:
             order["remaining_count"] = "0.00"
             order["status"] = "shadow_canceled"
             order["canceled_at"] = utc_now()
             return True
-        await rest.refresh_exit_order(order)
+        if await rest.refresh_exit_order(order) is False:
+            return False
         if Decimal(str(order.get("remaining_count") or "0")) <= 0:
             return True
         acknowledged = await rest.cancel_order(order, False)
         if acknowledged:
             # Capture the cancellation response and then the final exchange
             # history view before calculating the residual hard-stop size.
-            await rest.refresh_exit_order(order)
-        if not acknowledged:
+            if await rest.refresh_exit_order(order) is False:
+                acknowledged = False
+        if not acknowledged or Decimal(str(order.get("remaining_count") or "0")) > 0:
             record["hybrid_stop"]["state"] = "MAKER_EXIT_CANCEL_UNCONFIRMED"
             self.trip("hybrid_maker_exit_cancellation_unconfirmed")
             self.transition(record, "MAKER_EXIT_CANCEL_UNCONFIRMED", "hybrid_maker_exit_cancellation_unconfirmed")
@@ -6035,8 +6087,22 @@ class LiveEngine:
     async def submit_hybrid_hard_stop(
         self, rest: KalshiREST, feed: KalshiLiveFeed, record: dict[str, Any], executable_bid: Decimal,
     ) -> None:
+        record.setdefault("hybrid_stop", {})["hard_stop_latched"] = True
         if not await self.cancel_hybrid_maker_exit_and_confirm(rest, record):
             return
+        prior_hard_orders = [order for order in record.get("exit_orders", []) if order.get("exit_phase") == "hard_stop"]
+        if not self.dry_run:
+            for previous in prior_hard_orders:
+                if previous.get("submission_outcome") in {"rejected", "not_submitted"}:
+                    continue
+                if not previous.get("order_id") or previous.get("status") in {"submitting", "submit_failed", "paused"}:
+                    confirmed = await rest.recover_exit_submission(previous)
+                else:
+                    confirmed = await rest.refresh_exit_order(previous)
+                if confirmed is False or Decimal(str(previous.get("remaining_count") or "0")) > 0:
+                    self.trip("hard_stop_previous_submission_unresolved")
+                    self.checkpoint("hard_stop_previous_submission_unresolved")
+                    return
         side = str(record["signal_side"])
         maker_order = self.hybrid_maker_exit_order(record)
         maker_filled = Decimal(str((maker_order or {}).get("fill_count") or "0"))
@@ -6061,12 +6127,12 @@ class LiveEngine:
                 return
             residual = abs(signed)
         if residual <= 0:
-            classification = "MAKER_EXIT_FULL"
+            classification = ("MAKER_EXIT_PARTIAL_THEN_HARD_STOP" if maker_filled > 0
+                              else "HARD_STOP_ONLY") if prior_hard_orders else "MAKER_EXIT_FULL"
             record["exit_classification"] = classification
             record["hybrid_stop"]["state"] = classification
             await self.finalize_stop(record)
             return
-        prior_hard_orders = [order for order in record.get("exit_orders", []) if order.get("exit_phase") == "hard_stop"]
         client_id = deterministic_client_order_id(
             record["ticker"], side, f"hybrid-hard-stop-{len(prior_hard_orders)}", self.config,
         )
@@ -6085,13 +6151,19 @@ class LiveEngine:
                 "submitted_at": utc_now(),
             }
         else:
+            intent = self.persist_exit_intent(record, client_id, "hard_stop", residual, executable_bid)
             order = await rest.create_reduce_only_exit(
                 ticker=record["ticker"], held_side=side, economic_exit_price=float(executable_bid),
                 quantity=float(residual), dry_run=False, order_key=f"hybrid-hard-stop-{len(prior_hard_orders)}",
                 client_order_id_override=client_id,
             )
             order["exit_phase"] = "hard_stop"
-        record.setdefault("exit_orders", []).append(order)
+            intent.update(order)
+            if order.get("order_id") and order.get("status") not in {"submit_failed", "paused"}:
+                intent["submission_outcome"] = "accepted"
+            order = intent
+        if self.dry_run:
+            record.setdefault("exit_orders", []).append(order)
         self.note_stop_exit_submitted(record, order)
         hard_filled = sum(
             (Decimal(str(item.get("fill_count") or "0")) for item in record["exit_orders"] if item.get("exit_phase") == "hard_stop"),
@@ -6234,12 +6306,25 @@ class LiveEngine:
         status = str(record.get("status"))
         maker_order = self.hybrid_maker_exit_order(record)
         if status in {"ENTRY_PARTIAL", "POSITION_OPEN"}:
-            if bid is not None and bid <= trigger:
+            if bid is not None and (bid <= hard or record.get("hybrid_stop", {}).get("hard_stop_latched")):
+                record["hybrid_stop"]["hard_stop_latched"] = True
+                self.note_stop_trigger(record, bid, trigger, self.local_remaining_position(record), shadow=self.dry_run)
+                if not await self.cancel_entry_orders_and_confirm(rest, record, next_action="stop", executable_bid=bid):
+                    return
+                if not self.dry_run:
+                    await self.refresh_entry(rest, record)
+                await self.submit_hybrid_hard_stop(rest, feed, record, bid)
+            elif bid is not None and bid <= trigger:
                 await self.start_hybrid_maker_exit(rest, feed, record, bid)
             return
         if maker_order is not None:
             if self.dry_run:
                 self.refresh_shadow_maker_exit(feed, record)
+            elif (not maker_order.get("order_id")
+                  and maker_order.get("submission_outcome") not in {"rejected", "not_submitted"}):
+                # Recovery is needed even if prices rebound: the lost maker
+                # response may already represent a fully filled protective exit.
+                await rest.recover_exit_submission(maker_order)
             else:
                 await rest.refresh_exit_order(maker_order)
             maker_filled = Decimal(str(maker_order.get("fill_count") or "0"))
@@ -6262,7 +6347,8 @@ class LiveEngine:
                 return
             if maker_filled > 0 and status == "MAKER_EXIT_PENDING":
                 self.transition(record, "MAKER_EXIT_PARTIAL", "hybrid_maker_exit_partial_fill")
-        if bid is not None and (bid <= hard or status in {"MAKER_EXIT_CANCEL_UNCONFIRMED", "HARD_STOP_PENDING"}):
+        if bid is not None and (bid <= hard or record.get("hybrid_stop", {}).get("hard_stop_latched")
+                                or status == "HARD_STOP_PENDING"):
             await self.submit_hybrid_hard_stop(rest, feed, record, bid)
             return
 
@@ -6830,7 +6916,7 @@ class LiveEngine:
                     "stop_from_fill_p50=%s shadow_balance=%s shadow_pnl=%s shadow_dd=%s "
                     "completed=%s stops=%s settlements=%s fees=%s hybrid_state=%s exit_class=%s "
                     "entry_mode=%s maker_tif=%s entry_lifetime=%s initial_quotes=%s stop_safety_no_entry=%s "
-                    "delayed_entry_status=%s delayed_opening_ask=%s delayed_trigger_ask=%s delayed_limit=%s "
+                    "delayed_entry_status=%s delayed_opening_ask=%s delayed_trigger_ask=%s delayed_limit=%s delayed_filter_reason=%s "
                     "delayed53_eligible=%s delayed53_reached=%s delayed53_after60=%s "
                     "delayed53_resolved=%s delayed53_wl=%s/%s delayed53_limit_filled=%s "
                     "delayed53_limit_zero=%s delayed53_limit_partial=%s delayed53_filled_wl=%s/%s "
@@ -6862,8 +6948,9 @@ class LiveEngine:
                     eligibility["actual_strategy_stop_safety_rejections"],
                     record.get("delayed_entry_decision", {}).get("status") if isinstance(record, dict) else None,
                     record.get("opening_price_reference", {}).get("selected_side_ask_cents") if isinstance(record, dict) else None,
-                    record.get("initial_signal_price_cents") if isinstance(record, dict) else None,
-                    record.get("entry_limit_cents") if isinstance(record, dict) else None,
+                    record.get("delayed_entry_decision", {}).get("observed_selected_side_ask_cents"),
+                    record.get("delayed_entry_decision", {}).get("limit_price_cents"),
+                    record.get("delayed_entry_decision", {}).get("reason"),
                     delayed_metrics["eligible_below_threshold_signals"],
                     delayed_metrics["threshold_reached"],
                     delayed_metrics["entries_after_opening_capture_window"],
@@ -6938,8 +7025,8 @@ async def async_main(args: argparse.Namespace) -> int:
     shadow_only_lock = _bool(os.getenv("KALSHI_SHADOW_ONLY", "false"))
     live = live_mode_allowed(requested_live, environment_live, shadow_only_lock, bool(args.dry_run))
     dry_run = not live
-    if requested_live and shadow_only_lock:
-        LOG.warning("LIVE REQUEST BLOCKED | KALSHI_SHADOW_ONLY=true; forcing MODE=DRY_RUN")
+    if requested_live and not live and not args.reconcile_only:
+        raise SystemExit("LIVE REQUEST BLOCKED | explicit live permission required and shadow-only lock must be off; no orders sent")
     # Reconciliation-only intentionally opens no risk but reads the live
     # namespace/configuration, so it is the sole dry execution allowed to use
     # trading_mode=live.
@@ -6950,7 +7037,7 @@ async def async_main(args: argparse.Namespace) -> int:
         )
     LOG.warning(
         "MODE=%s | strategy=%s config_hash=%s opening_price_capture_contract=v%s",
-        "LIVE" if live else "DRY_RUN", config["strategy_version"], config_hash(config)[:12],
+        "RECONCILE_ONLY" if args.reconcile_only else "LIVE" if live else "DRY_RUN", config["strategy_version"], config_hash(config)[:12],
         OPENING_PRICE_CAPTURE_CONTRACT_VERSION,
     )
     api_key = os.getenv("KALSHI_API_KEY_ID", "")
@@ -7009,13 +7096,13 @@ async def async_main(args: argparse.Namespace) -> int:
             if str(field(position, "ticker") or "").startswith(config["series"] + "-")
             and Decimal(str(field(position, "position_fp", "position") or "0")) != 0
         ]
-        if active_positions or await LiveEngine(config, state, args.state_file, args.audit_ledger, dry_run).managed_orders(rest):
+        if active_positions or await LiveEngine(config, state, args.state_file, args.audit_ledger, dry_run, reconcile_only=args.reconcile_only).managed_orders(rest):
             await rest.close()
             raise SystemExit("refusing reset_state while exchange KXBTC15M exposure or managed orders exist")
         state = load_state(Path("/nonexistent"), config)
     feed = KalshiLiveFeed(rest.auth)
     feed_task = asyncio.create_task(feed.run(), name="kalshi-hybrid-live-feed")
-    engine = LiveEngine(config, state, args.state_file, args.audit_ledger, dry_run, args.config)
+    engine = LiveEngine(config, state, args.state_file, args.audit_ledger, dry_run, args.config, reconcile_only=args.reconcile_only)
     try:
         if args.cancel_managed_entries:
             await engine.cancel_managed_entries(rest)
