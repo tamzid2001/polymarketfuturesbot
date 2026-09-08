@@ -91,6 +91,22 @@ class WorkflowConfigurationTests(unittest.TestCase):
         self.assertIn("ref: main", text)
         self.assertIn('test "$(git rev-parse HEAD)" = "$KALSHI_SOURCE_SHA"', text)
 
+    def test_live_startup_probe_is_gated_ordered_and_durable(self):
+        workflow = (ROOT / ".github/workflows/kalshi_btc15m_average_down.yml").read_text()
+        probe = "name: Verify live create and cancel path on the market shard"
+        worker = "name: Run KXBTC15M hybrid worker"
+        self.assertLess(workflow.index(probe), workflow.index(worker))
+        probe_block = workflow[workflow.index(probe):workflow.index(worker)]
+        self.assertIn("!inputs.reconcile_only", probe_block)
+        self.assertIn("inputs.live_enabled", probe_block)
+        self.assertIn("vars.KALSHI_LIVE_ENABLED == 'true'", probe_block)
+        self.assertIn("vars.KALSHI_SHADOW_ONLY == 'false'", probe_block)
+        self.assertIn("kalshi_startup_order_check.py --execute", probe_block)
+        worker_block = workflow[workflow.index(worker):]
+        self.assertIn('KALSHI_STARTUP_ORDER_CHECK_ENABLED: "true"', worker_block)
+        journal = "data/.kalshi_live_delayed_band_v12_startup_order_check/order-smoke-test.json"
+        self.assertGreaterEqual(workflow.count(journal), 2)
+
     def test_checkpoint_does_not_require_runner_git_identity_setup(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

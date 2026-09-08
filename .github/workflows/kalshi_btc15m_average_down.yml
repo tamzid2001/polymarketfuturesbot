@@ -116,7 +116,7 @@ jobs:
       - name: Verify shared live strategy engine
         run: |
           set -euo pipefail
-          python -m py_compile strategy_core.py live_state.py audit_ledger.py kalshi_live_trader.py optimizer.py
+          python -m py_compile strategy_core.py live_state.py audit_ledger.py kalshi_live_trader.py optimizer.py kalshi_order_smoke_test.py kalshi_startup_order_check.py
           PYTHONPATH=. python -m unittest -v \
             tests.test_strategy_core \
             tests.test_position_cap \
@@ -125,9 +125,12 @@ jobs:
             tests.test_maker_hybrid_v11 \
             tests.test_delayed_band_v12 \
             tests.test_reconciliation \
+            tests.test_exchange_shard_safety \
             tests.test_recovery_sizing \
             tests.test_execution_path_model \
             tests.test_historical_replay \
+            tests.test_order_smoke_test \
+            tests.test_startup_order_check \
             tests.test_workflow_configuration
 
       # Offline tests use the reviewed source defaults, never mutable operator
@@ -170,6 +173,29 @@ jobs:
           umask 077
           printf '%s\n' "$KALSHI_PRIVATE_KEY" > kalshi_private_key.pem
 
+      - name: Verify live create and cancel path on the market shard
+        if: ${{ !inputs.reconcile_only && inputs.live_enabled && vars.KALSHI_LIVE_ENABLED == 'true' && vars.KALSHI_SHADOW_ONLY == 'false' }}
+        env:
+          KALSHI_API_KEY_ID: ${{ secrets.KALSHI_PROD_API_KEY }}
+          KALSHI_PEM_PATH: kalshi_private_key.pem
+          KALSHI_DEMO: "false"
+          KALSHI_LIVE_ENABLED: ${{ vars.KALSHI_LIVE_ENABLED || 'false' }}
+          KALSHI_SHADOW_ONLY: ${{ vars.KALSHI_SHADOW_ONLY || 'true' }}
+          KALSHI_STARTUP_ORDER_CHECK_ENABLED: "true"
+          KALSHI_RUNTIME_STATE_REF: "runtime-state-kxbtc15m-delayed-v12"
+        run: |
+          set -euo pipefail
+          # One 1.00-share/1c post-only probe is journaled before POST. The
+          # strategy worker starts only after the exact create ACK, exact
+          # cancel ACK, zero fills, zero remainder, and flat position are
+          # independently reconciled on the market's authoritative shard.
+          python kalshi_startup_order_check.py --execute \
+            --worker-id "$GITHUB_RUN_ID" \
+            --state-file data/kalshi_live_delayed_band_v12_state.json \
+            --audit-ledger data/kalshi_live_delayed_band_v12_audit.jsonl \
+            --config selected_live_strategy.json \
+            --runtime-ref runtime-state-kxbtc15m-delayed-v12
+
       - name: Run KXBTC15M hybrid worker
         env:
           KALSHI_API_KEY_ID: ${{ secrets.KALSHI_PROD_API_KEY }}
@@ -177,6 +203,7 @@ jobs:
           KALSHI_DEMO: "false"
           KALSHI_LIVE_ENABLED: ${{ vars.KALSHI_LIVE_ENABLED || 'false' }}
           KALSHI_SHADOW_ONLY: ${{ vars.KALSHI_SHADOW_ONLY || 'true' }}
+          KALSHI_STARTUP_ORDER_CHECK_ENABLED: "true"
           KALSHI_CHECKPOINT_PUBLISH: "true"
           KALSHI_RUNTIME_STATE_REF: "runtime-state-kxbtc15m-delayed-v12"
           RUN_SECONDS: "18000"
@@ -254,6 +281,7 @@ jobs:
               selected_live_strategy.json \
               data/kalshi_live_delayed_band_v12_state.json \
               data/kalshi_live_delayed_band_v12_audit.jsonl \
+              data/.kalshi_live_delayed_band_v12_startup_order_check/order-smoke-test.json \
               data/kalshi_shadow_delayed_band_v12_state.json \
               data/kalshi_shadow_delayed_band_v12_audit.jsonl; then
               exit 0
@@ -307,6 +335,7 @@ jobs:
             selected_live_strategy.json
             data/kalshi_live_delayed_band_v12_state.json
             data/kalshi_live_delayed_band_v12_audit.jsonl
+            data/.kalshi_live_delayed_band_v12_startup_order_check/order-smoke-test.json
             data/kalshi_shadow_delayed_band_v12_state.json
             data/kalshi_shadow_delayed_band_v12_audit.jsonl
           if-no-files-found: warn

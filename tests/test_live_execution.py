@@ -23,6 +23,7 @@ from kalshi_btc15m_average_down import KalshiLiveFeed
 from kalshi_live_trader import (
     BTC_TARGET_CAPTURE_CONTRACT_VERSION, LiveEngine, ProvisionalOutcomeTracker, QuoteObservation,
     btc_target_metadata, deterministic_client_order_id, epoch, live_mode_allowed, load_config,
+    startup_order_check_allows_worker,
     market_metadata,
 )
 from live_state import config_hash, default_state, load_state, save_state
@@ -607,6 +608,25 @@ class LiveExecutionTests(unittest.TestCase):
         self.assertFalse(live_mode_allowed(True, True, False, True))
         self.assertFalse(live_mode_allowed(True, False, False, False))
         self.assertTrue(live_mode_allowed(True, True, False, False))
+
+    def test_live_worker_requires_current_exact_startup_order_proof(self) -> None:
+        check = {
+            "state": "CANCELED_NO_FILL", "worker_id": "101", "ticker": "KXBTC15M-test",
+            "exchange_index": 2, "economic_limit": "0.01", "quantity": "1.00",
+            "order_id": "order-1", "client_order_id": "client-1",
+            "create_acknowledged": True, "cancel_acknowledged": True,
+            "filled_quantity": "0.00", "remaining_quantity": "0.00", "position": "0.00",
+        }
+        state = {"startup_order_check": check}
+        self.assertTrue(startup_order_check_allows_worker(state, "101"))
+        for key, value in (
+            ("state", "UNRESOLVED_DO_NOT_REPEAT"), ("worker_id", "older"),
+            ("exchange_index", 0), ("create_acknowledged", False),
+            ("cancel_acknowledged", False), ("filled_quantity", "0.01"),
+            ("remaining_quantity", "1.00"), ("position", "1.00"),
+        ):
+            altered = dict(check, **{key: value})
+            self.assertFalse(startup_order_check_allows_worker({"startup_order_check": altered}, "101"), key)
 
     def test_v9_refuses_a_v8_checkpoint_instead_of_reinterpreting_recovery(self) -> None:
         temporary = Path(tempfile.mkdtemp()) / "state.json"

@@ -2,12 +2,15 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
+import tempfile
 import time
 import unittest
 from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+import kalshi_btc15m_average_down as trader
 from kalshi_btc15m_average_down import KalshiREST, record_submission_failure
 from tests import test_delayed_band_v12 as band_fixtures
 
@@ -29,6 +32,28 @@ class ExchangeShardSafetyTests(unittest.IsolatedAsyncioTestCase):
             cancel_order_v2=AsyncMock(return_value={"order_id": "mock-only", "reduced_by": "1.00"}),
         )
         return rest
+
+    def test_sdk_uses_current_external_v2_hosts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pem = Path(directory) / "test.pem"
+            pem.write_text("offline-test-key")
+            for demo, expected in (
+                (False, "https://external-api.kalshi.com/trade-api/v2"),
+                (True, "https://external-api.demo.kalshi.co/trade-api/v2"),
+            ):
+                configuration = SimpleNamespace()
+                with (
+                    patch.object(trader, "Configuration", return_value=configuration) as constructor,
+                    patch.object(trader, "KalshiClient", return_value=SimpleNamespace()),
+                    patch.object(trader, "KalshiAuth", return_value=SimpleNamespace()),
+                    patch.object(trader, "PortfolioApi", return_value=SimpleNamespace()),
+                    patch.object(trader, "EventsApi", return_value=SimpleNamespace()),
+                    patch.object(trader, "MarketApi", return_value=SimpleNamespace()),
+                    patch.object(trader, "OrdersApi", return_value=SimpleNamespace()),
+                ):
+                    rest = KalshiREST("offline-key-id", pem, demo=demo)
+                constructor.assert_called_once_with(host=expected)
+                self.assertEqual(rest.base_url, expected)
 
     def entry(self):
         fixture = band_fixtures.DelayedBandV12Tests()

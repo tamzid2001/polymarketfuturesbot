@@ -151,6 +151,43 @@ def live_mode_allowed(
     return requested_live and environment_live and not shadow_only_lock and not dry_run_requested
 
 
+def startup_order_check_allows_worker(state: dict[str, Any], worker_id: str) -> bool:
+    """Require the current Actions run's exact create/cancel/flat proof.
+
+    The workflow performs the probe in a separate process before launching the
+    strategy.  This second gate prevents a future workflow edit from launching
+    the LIVE worker after a skipped, stale, filled, or unresolved probe.
+    """
+
+    check = state.get("startup_order_check")
+    if not isinstance(check, dict) or not worker_id or check.get("worker_id") != worker_id:
+        return False
+    try:
+        zero = all(
+            Decimal(str(check.get(key))) == 0
+            for key in ("filled_quantity", "remaining_quantity", "position")
+        )
+        exact_probe = (
+            Decimal(str(check.get("economic_limit"))) == Decimal("0.01")
+            and Decimal(str(check.get("quantity"))) == Decimal("1.00")
+        )
+    except (ArithmeticError, TypeError, ValueError):
+        return False
+    exchange_index = check.get("exchange_index")
+    return bool(
+        check.get("state") == "CANCELED_NO_FILL"
+        and check.get("ticker")
+        and check.get("order_id")
+        and check.get("client_order_id")
+        and check.get("create_acknowledged") is True
+        and check.get("cancel_acknowledged") is True
+        and type(exchange_index) is int
+        and exchange_index == 2
+        and exact_probe
+        and zero
+    )
+
+
 def _iso_epoch(value: Any) -> float | None:
     """Parse persisted ISO or numeric timestamps without confusing ms and s."""
 
@@ -982,6 +1019,15 @@ class LiveEngine:
         checkpoint_paths = [state_path, ledger_path]
         if config_path is not None:
             checkpoint_paths.insert(0, config_path)
+        startup_order_check_journal = Path(os.getenv(
+            "KALSHI_STARTUP_ORDER_CHECK_JOURNAL",
+            "data/.kalshi_live_delayed_band_v12_startup_order_check/order-smoke-test.json",
+        ))
+        if not dry_run and startup_order_check_journal.exists():
+            # Once the pre-worker create/cancel proof succeeds, retain it in
+            # every later live snapshot instead of dropping it on the first
+            # ordinary strategy checkpoint.
+            checkpoint_paths.append(startup_order_check_journal)
         self.publisher = MaterialCheckpointPublisher(
             *checkpoint_paths,
             minimum_interval_seconds=float(config["durable_checkpoint_interval_seconds"]),
@@ -7118,6 +7164,29 @@ async def async_main(args: argparse.Namespace) -> int:
     if not api_key or not pem_path.exists():
         raise SystemExit("Kalshi authentication is required; credentials are never logged")
     state = load_state(args.state_file, config)
+    startup_check = state.get("startup_order_check")
+    startup_check_required = (
+        live
+        and _bool(os.getenv("GITHUB_ACTIONS", "false"))
+        and _bool(os.getenv("KALSHI_STARTUP_ORDER_CHECK_ENABLED", "true"))
+    )
+    if startup_check_required and not startup_order_check_allows_worker(
+        state, os.getenv("GITHUB_RUN_ID", ""),
+    ):
+        raise SystemExit(
+            "LIVE STARTUP BLOCKED | current GitHub run lacks exact canceled/no-fill shard-2 order proof"
+        )
+    if live and isinstance(startup_check, dict):
+        LOG.warning(
+            "STARTUP ORDER CHECK | state=%s worker_id=%s ticker=%s shard=%s limit=%s "
+            "quantity=%s create_ack=%s cancel_ack=%s fills=%s remaining=%s position=%s",
+            startup_check.get("state"), startup_check.get("worker_id"),
+            startup_check.get("ticker"), startup_check.get("exchange_index"),
+            startup_check.get("economic_limit"), startup_check.get("quantity"),
+            startup_check.get("create_acknowledged"), startup_check.get("cancel_acknowledged"),
+            startup_check.get("filled_quantity"), startup_check.get("remaining_quantity"),
+            startup_check.get("position"),
+        )
     # Never checkpoint an override until its hash has been accepted against
     # durable state. An active-order rejection must leave the last known-good
     # config in place so the watchdog can restart it without manual repair.

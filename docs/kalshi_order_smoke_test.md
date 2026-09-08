@@ -80,9 +80,18 @@ ORDER_TEST_RESULT state=CANCELED_NO_FILL position=0 fees=0
 ```
 
 An acknowledgment is **not a fill**. `CANCELED_NO_FILL` requires a terminal
-order with zero remaining, matching fill records and flat position. Acceptance
+order with zero remaining, matching fill records and flat position. The
+automatic live-worker variant additionally requires the exact DELETE response
+to acknowledge that same order ID before it can pass. Acceptance
 of one test proves only that request worked then; it cannot guarantee future
 orders, strategy signals, stops or account permissions will succeed.
+
+The automatic worker check also has one bounded legacy-recovery path. An old
+`maker_entry_submission_unknown` breaker can be cleared only when the durable
+client order ID belongs to a closed shard-2 market and current V2 order, fill,
+and position reads prove that it is terminal, unfilled, has no remainder, and
+left no exposure. The journal and original intent remain in the runtime
+snapshot with reconciliation metadata. Every other breaker remains blocked.
 
 The fsynced journal is `.kalshi-order-smoke-test/order-smoke-test.json`, ignored
 by Git, separate from strategy state/checkpoints. It is written **before** the

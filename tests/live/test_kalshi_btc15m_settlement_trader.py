@@ -126,7 +126,7 @@ class SettlementTraderTests(unittest.IsolatedAsyncioTestCase):
                 return False
 
             def get(self, url, *, params, headers):
-                if url != "https://api.elections.kalshi.com/trade-api/v2/portfolio/fills":
+                if url != "https://external-api.kalshi.com/trade-api/v2/portfolio/fills":
                     raise AssertionError(url)
                 if params != {"limit": 1000}:
                     raise AssertionError(params)
@@ -140,7 +140,7 @@ class SettlementTraderTests(unittest.IsolatedAsyncioTestCase):
         )
         rest = object.__new__(trader.KalshiREST)
         rest.auth = Auth()
-        rest.base_url = "https://api.elections.kalshi.com/trade-api/v2"
+        rest.base_url = "https://external-api.kalshi.com/trade-api/v2"
         with patch.object(trader, "aiohttp", fake_aiohttp):
             payload = await rest.get_raw_json("portfolio/fills", {"limit": 1000})
         self.assertEqual(payload, {"fills": []})
