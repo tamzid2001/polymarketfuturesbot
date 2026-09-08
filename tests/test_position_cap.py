@@ -14,7 +14,6 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import numpy as np
-import yaml
 
 import optimizer
 from execution_path_model import ExecutionCalibration, ExecutionPathModel
@@ -208,14 +207,13 @@ class PositionCapTests(unittest.TestCase):
             self.assertAlmostEqual(results[0, 16], float(reference.max_recovery_quantity), places=6)
 
     def test_workflow_input_and_startup_contract_accept_durable_custom_cap(self):
-        workflow = yaml.load((ROOT / ".github/workflows/kalshi_btc15m_average_down.yml").read_text(), Loader=yaml.BaseLoader)
-        self.assertEqual(workflow["on"]["workflow_dispatch"]["inputs"]["max_share_cap"]["default"], "")
-        steps = workflow["jobs"]["trade"]["steps"]
-        worker = next(step for step in steps if step.get("name") == "Run KXBTC15M hybrid worker")
-        self.assertIn('--max-position "$MAX_SHARE_CAP"', worker["run"])
-        self.assertIn("--persist-config", worker["run"])
-        contract = next(step for step in steps if step.get("name") == "Assert canonical hybrid strategy contract")
-        code = re.findall(r"python -c '([^\n]+)'", contract["run"])[-1]
+        # Do not require a YAML library in the minimal production environment.
+        workflow = (ROOT / ".github/workflows/kalshi_btc15m_average_down.yml").read_text()
+        cap_input = workflow.split("      max_share_cap:\n", 1)[1].split("      profit_threshold:", 1)[0]
+        self.assertIn('default: ""', cap_input)
+        self.assertIn('--max-position "$MAX_SHARE_CAP"', workflow)
+        self.assertIn("--persist-config", workflow)
+        code = next(code for code in re.findall(r"python -c '([^\n]+)'", workflow) if "CONFIGURED_FIXED_SHARE_CAP=" in code)
         with TemporaryDirectory() as directory:
             save_config(Path(directory) / "selected_live_strategy.json", dict(self.config, max_position="200.25"))
             result = subprocess.run([sys.executable, "-c", code], cwd=directory, env=dict(os.environ, PYTHONPATH=str(ROOT)), text=True, capture_output=True)
