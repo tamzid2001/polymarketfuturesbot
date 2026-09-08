@@ -67,6 +67,52 @@ The default series is `KXBTC15M`; `--ticker` accepts an explicitly API-discovere
 market instead of discovering the current active market. Do not use an old market
 from another shard as the target for a current crypto strategy.
 
+### If you receive HTTP 401 / authentication_error
+
+Do not keep attempting the transfer. Update this branch and run the read-only
+authentication diagnostic from the repository directory:
+
+```bash
+git pull --ff-only
+source .venv/bin/activate
+python kalshi_shard_admin.py auth-check
+```
+
+The diagnostic prints only known variable names and presence/format flags, the
+production API host, SDK version, local RSA signing self-check, and the result of
+one authenticated balance GET. It does not print key IDs, private keys, signed
+headers, raw API error bodies, or your balance. It never submits a transfer/order
+or creates an operation journal.
+
+- `key_id_alias_conflict=true`: both `KALSHI_API_KEY_ID` and
+  `KALSHI_PROD_API_KEY` are set to different values. Older code silently chose
+  the first; current code refuses to guess. Keep only the current production
+  ID matching your private key, or make both aliases identical.
+- Missing credentials: set **Codespaces** secrets with repository access. These
+  are not GitHub Actions environment secrets. Stop and start the Codespace after
+  adding/changing them; a new shell alone may still inherit the old environment.
+- `signer_self_check=PASS` followed by a remote 401: the PEM parses and the SDK
+  signs the expected path with millisecond timestamps, but Kalshi still rejects
+  the request. Check that ID and PEM belong to the **same current production
+  key**, that the key was not revoked, and that it is not a demo key. A local
+  signature test cannot verify the public key registered for an API key ID.
+- Surrounding whitespace and literal `\n`/`\r\n` PEM line endings are normalized
+  in memory. Quoted, truncated, encrypted, or non-RSA PEMs fail with a sanitized
+  message. Store the actual multiline PEM without surrounding quote characters.
+- A large `approx_http_date_clock_offset_seconds` is a clock diagnostic only:
+  HTTP Date may be approximate/cached. The tool never changes the clock or
+  automatically adjusts signing timestamps.
+
+The program uses the production host only. Kalshi production/demo credentials
+are not interchangeable. Authentication failures are not fixed by funding a
+shard, changing strategy parameters, or resetting a trading breaker.
+[Kalshi request signing](https://docs.kalshi.com/getting_started/api_keys),
+[Kalshi environments](https://docs.kalshi.com/getting_started/api_environments).
+
+Only after `AUTH_REMOTE_CHECK` reports `PASS`, run `status` and the read-only
+transfer preview again. The remote authentication check does not establish write
+permission or transfer readiness by itself; the complete preflight checks those.
+
 ## 3. One-time transfer of all available shard-0 cash
 
 First pause account trading workers and their watchdogs **yourself**, with a

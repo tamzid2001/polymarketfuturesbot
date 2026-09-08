@@ -10,10 +10,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
+from email.utils import parsedate_to_datetime
 import fcntl
+from importlib.metadata import version
 import json
 import os
 from pathlib import Path
@@ -44,6 +47,8 @@ class ApiError(SafetyError):
     def __init__(self, status: int | None, code: str = "unclassified"):
         self.status = status
         self.code = code if isinstance(code, str) and code in SAFE_CODES else "unclassified"
+        self.request_method = None
+        self.request_path = None
         super().__init__(f"API request failed: HTTP {status}; code={self.code}. No automatic write retry.")
 
 
@@ -95,23 +100,65 @@ def checked_id(value: Any) -> str:
     return value
 
 
+def credential_environment_report() -> dict:
+    """Presence/format only: never return secret values, lengths or fingerprints."""
+    aliases = ("KALSHI_API_KEY_ID", "KALSHI_PROD_API_KEY")
+    values = {name: os.getenv(name, "") for name in aliases}
+    present = {name: bool(value.strip()) for name, value in values.items()}
+    normalized = {value.strip() for value in values.values() if value.strip()}
+    pem = os.getenv("KALSHI_PRIVATE_KEY", "")
+    return {"key_id_variables_present": present, "key_id_alias_conflict": len(normalized) > 1,
+            "key_id_outer_whitespace": any(value != value.strip() for value in values.values()),
+            "private_key_env_present": bool(pem.strip()),
+            "pem_path_configured": bool(os.getenv("KALSHI_PEM_PATH")),
+            "private_key_literal_newlines": "\\n" in pem,
+            "private_key_outer_quotes": pem.strip().startswith(("'", '"'))}
+
+
+def load_environment_credentials() -> tuple[str, str, dict]:
+    ids = {name: os.getenv(name, "").strip() for name in ("KALSHI_API_KEY_ID", "KALSHI_PROD_API_KEY")}
+    sources = [name for name, value in ids.items() if value]
+    if len({ids[name] for name in sources}) > 1:
+        raise SafetyError("Conflicting KALSHI_API_KEY_ID and KALSHI_PROD_API_KEY: keep one current production key ID matching the private key; no credential was selected")
+    key_id = ids[sources[0]] if sources else ""
+    pem = os.getenv("KALSHI_PRIVATE_KEY", "").strip()
+    pem_source = "KALSHI_PRIVATE_KEY"
+    if not pem and os.getenv("KALSHI_PEM_PATH"):
+        pem_source = "KALSHI_PEM_PATH"
+        try:
+            pem = Path(os.environ["KALSHI_PEM_PATH"]).read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeError):
+            raise SafetyError("Could not read the private-key file named by KALSHI_PEM_PATH") from None
+    if not key_id or not pem:
+        raise SafetyError("Set Codespaces secrets KALSHI_PROD_API_KEY and KALSHI_PRIVATE_KEY, then stop/start the Codespace; Actions secrets are separate")
+    checked_id(key_id)
+    if pem.startswith(("'", '"')) or pem.endswith(("'", '"')):
+        raise SafetyError("Private-key secret contains surrounding quote characters; store the PEM itself, without quotes")
+    # Repair transport formatting only, not key material. Never rewrite secrets.
+    normalized_pem = pem.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\r\n", "\n") + "\n"
+    return key_id, normalized_pem, {"key_id_sources": sources, "private_key_source": pem_source,
+                                     "pem_transport_newlines_normalized": normalized_pem.rstrip() != pem}
+
+
 class Api:
     """Reuse the project's KalshiAuth signer; never expose raw API errors."""
     def __init__(self, key_id: str, pem: str, *, execute: bool = False):
         from kalshi_python_async import KalshiAuth
         self.key_id = key_id
-        self._auth = KalshiAuth(key_id, pem)
+        try:
+            self._auth = KalshiAuth(key_id, pem)
+        except Exception:
+            raise SafetyError("Private key could not be loaded as an unencrypted RSA PEM; check the complete matching Codespaces secret") from None
         self.execute = execute
+        self.credential_sources = {"key_id_sources": ["direct_constructor"], "private_key_source": "direct_constructor"}
+        self.last_response_diagnostics: dict = {}
 
     @classmethod
     def from_environment(cls, *, execute: bool = False) -> "Api":
-        key_id = os.getenv("KALSHI_API_KEY_ID") or os.getenv("KALSHI_PROD_API_KEY")
-        pem = os.getenv("KALSHI_PRIVATE_KEY")
-        if not pem and os.getenv("KALSHI_PEM_PATH"):
-            pem = Path(os.environ["KALSHI_PEM_PATH"]).read_text(encoding="utf-8")
-        if not key_id or not pem:
-            raise SafetyError("Set Codespaces secrets KALSHI_PROD_API_KEY and KALSHI_PRIVATE_KEY; never put them in source")
-        return cls(key_id, pem, execute=execute)
+        key_id, pem, sources = load_environment_credentials()
+        result = cls(key_id, pem, execute=execute)
+        result.credential_sources = sources
+        return result
 
     async def request(self, method: str, path: str, *, params=None, body=None) -> dict:
         import aiohttp
@@ -129,9 +176,18 @@ class Api:
         for attempt in range(attempts):
             try:
                 headers = self._auth.create_auth_headers(method, PREFIX + path)
+                started = time.time()
                 async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as session:
                     async with session.request(method, HOST + PREFIX + path, params=params,
                                                json=body, headers=headers, allow_redirects=False) as response:
+                        self.last_response_diagnostics = {"http_status": response.status, "method": method, "endpoint": path}
+                        try:
+                            server_date = parsedate_to_datetime(response.headers.get("Date", ""))
+                            if server_date.tzinfo is not None:
+                                self.last_response_diagnostics["approx_http_date_clock_offset_seconds"] = round(
+                                    server_date.timestamp() - (started + time.time()) / 2, 3)
+                        except (ValueError, TypeError, OverflowError):
+                            pass  # HTTP Date is approximate, not authoritative exchange time.
                         raw = await response.read()
                         try:
                             payload = json.loads(raw) if raw else {}
@@ -150,9 +206,47 @@ class Api:
                     await asyncio.sleep(2**attempt)
                     continue
                 if isinstance(exc, ApiError):
+                    exc.request_method, exc.request_path = method, path
                     raise
-                raise ApiError(None) from None
+                error = ApiError(None)
+                error.request_method, error.request_path = method, path
+                raise error from None
         raise SafetyError("Read retries exhausted")
+
+
+async def authentication_check(api: Api) -> None:
+    """Verify local signing, then one authenticated GET; never test credentials with a POST."""
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import padding
+    if api.execute:
+        raise SafetyError("Authentication diagnostics require a read-only client")
+    path = PREFIX + "/portfolio/balance"
+    try:
+        headers = api._auth.create_auth_headers("GET", path + "?exchange_index=2")
+        timestamp = headers["KALSHI-ACCESS-TIMESTAMP"]
+        if abs(int(timestamp) - int(time.time() * 1000)) > 5000 or headers["KALSHI-ACCESS-KEY"] != api.key_id:
+            raise ValueError()
+        api._auth.private_key.public_key().verify(
+            base64.b64decode(headers["KALSHI-ACCESS-SIGNATURE"], validate=True),
+            (timestamp + "GET" + path).encode(),
+            padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.DIGEST_LENGTH),
+            hashes.SHA256(),
+        )
+    except Exception:
+        raise SafetyError("Local SDK signing self-check failed; do not attempt a transfer") from None
+    emit(action="AUTH_LOCAL_CHECK", host=HOST, environment="production", kalshi_sdk_version=version("kalshi-python-async"),
+         **api.credential_sources, rsa_pem_parse="PASS", signer_self_check="PASS", timestamp_unit="milliseconds",
+         signed_path=path, registered_key_pair="NOT_YET_VERIFIED", orders_sent=0, transfer_posts=0)
+    try:
+        balance = await api.request("GET", "/portfolio/balance")
+        money(balance.get("balance_dollars"))
+    except ApiError as exc:
+        emit(action="AUTH_REMOTE_CHECK", result="FAILED", **api.last_response_diagnostics,
+             hint="For 401: check the current matching production key-ID/PEM pair, stale Codespaces secrets, revoked/demo keys and clock offset. Local signing alone does not prove the key ID matches the registered public key.",
+             orders_sent=0, transfer_posts=0)
+        raise exc
+    emit(action="AUTH_REMOTE_CHECK", result="PASS", **api.last_response_diagnostics,
+         authenticated_balance_read="PASS", note="Authentication only; run status for shard funding and write scope", orders_sent=0, transfer_posts=0)
 
 
 async def pages(api: Api, path: str, key: str, **params) -> list[dict]:
@@ -533,7 +627,7 @@ async def allocation_all(api: Api, journal: Journal, *, ticker=None, series="KXB
 
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
-    result.add_argument("command", nargs="?", default="status", choices=("status", "transfers", "transfer-all", "resume-transfer", "allocation-all"))
+    result.add_argument("command", nargs="?", default="status", choices=("status", "auth-check", "transfers", "transfer-all", "resume-transfer", "allocation-all"))
     result.add_argument("--ticker", help="Optional API-discovered market ticker; otherwise discover the active series market")
     result.add_argument("--series", default="KXBTC15M")
     result.add_argument("--source-shard", type=int, default=0)
@@ -552,6 +646,10 @@ async def run(args, api=None, *, root=JOURNAL_DIR) -> None:
     if not 0 <= args.timeout <= 600:
         raise SafetyError("Timeout must be between 0 and 600 seconds")
     shard(args.source_shard)
+    if args.command == "auth-check":
+        emit(action="AUTH_ENVIRONMENT", **credential_environment_report(), orders_sent=0, transfer_posts=0)
+        await authentication_check(api or Api.from_environment(execute=False))
+        return
     api = api or Api.from_environment(execute=args.execute)
     if args.command == "transfers":
         await report_transfers(api)
@@ -578,7 +676,8 @@ def main() -> int:
         asyncio.run(run(parser().parse_args()))
         return 0
     except SafetyError as exc:
-        emit(error=str(exc), orders_sent=0, breaker="UNCHANGED")
+        details = {"request_method": exc.request_method, "request_path": exc.request_path} if isinstance(exc, ApiError) else {}
+        emit(error=str(exc), **details, orders_sent=0, breaker="UNCHANGED")
         return 2
     except (Exception, KeyboardInterrupt) as exc:
         emit(error_type=type(exc).__name__, error="Stopped safely; sensitive details suppressed. Preserve any operation journal.")

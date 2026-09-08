@@ -7,6 +7,7 @@ from decimal import Decimal
 import io
 import json
 from pathlib import Path
+import os
 import tempfile
 import time
 import unittest
@@ -69,6 +70,15 @@ class FakeApi:
 
 
 class ShardAdminTests(unittest.IsolatedAsyncioTestCase):
+    @classmethod
+    def setUpClass(cls):
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        cls.ephemeral_pem = key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                                              serialization.NoEncryption()).decode()
+        cls.mock_key_id = "00000000-0000-4000-8000-000000000001"
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -251,7 +261,7 @@ class ShardAdminTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(admin.SafetyError): await api.request("POST", admin.TRANSFER)
 
     async def test_read_only_command_rejects_execute_flag_before_authentication(self):
-        for command in ("status", "transfers", "resume-transfer"):
+        for command in ("status", "auth-check", "transfers", "resume-transfer"):
             with self.assertRaises(admin.SafetyError):
                 await admin.run(admin.parser().parse_args([command, "--execute"]), self.api)
         self.assertEqual(self.api.calls, [])
@@ -360,6 +370,104 @@ class ShardAdminTests(unittest.IsolatedAsyncioTestCase):
             session.request.reset_mock()
             with self.assertRaises(admin.ApiError): await api.request("GET", "/portfolio/balance")
             self.assertEqual(session.request.call_count, 3)
+
+    def test_conflicting_key_id_aliases_are_not_silently_selected(self):
+        with patch.dict(os.environ, {"KALSHI_API_KEY_ID": "old-id", "KALSHI_PROD_API_KEY": "new-id",
+                                     "KALSHI_PRIVATE_KEY": self.ephemeral_pem}, clear=True):
+            report = admin.credential_environment_report()
+            self.assertTrue(report["key_id_alias_conflict"])
+            with self.assertRaises(admin.SafetyError) as error:
+                admin.Api.from_environment()
+            self.assertNotIn("old-id", str(error.exception))
+            self.assertNotIn("new-id", str(error.exception))
+            self.assertNotIn(self.ephemeral_pem, str(error.exception))
+
+    def test_credentials_trim_whitespace_and_allow_matching_aliases(self):
+        env = {"KALSHI_API_KEY_ID": "  " + self.mock_key_id + "\n", "KALSHI_PROD_API_KEY": self.mock_key_id,
+               "KALSHI_PRIVATE_KEY": self.ephemeral_pem}
+        with patch.dict(os.environ, env, clear=True):
+            api = admin.Api.from_environment()
+        self.assertEqual(api.key_id, self.mock_key_id)
+        self.assertFalse(api.execute)
+        self.assertEqual(len(api.credential_sources["key_id_sources"]), 2)
+
+    def test_single_key_alias_and_pem_newline_transport_forms(self):
+        for name in ("KALSHI_API_KEY_ID", "KALSHI_PROD_API_KEY"):
+            for pem in (self.ephemeral_pem, self.ephemeral_pem.replace("\n", "\r\n"),
+                        self.ephemeral_pem.replace("\n", "\\n"), self.ephemeral_pem.replace("\n", "\\r\\n")):
+                with patch.dict(os.environ, {name: self.mock_key_id, "KALSHI_PRIVATE_KEY": pem}, clear=True):
+                    api = admin.Api.from_environment()
+                self.assertEqual(api.credential_sources["key_id_sources"], [name])
+                self.assertEqual(api._auth.private_key.key_size, 2048)
+
+    def test_missing_quoted_and_invalid_private_keys_fail_without_secrets(self):
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertRaises(admin.SafetyError): admin.Api.from_environment()
+        for pem in ('"' + self.ephemeral_pem + '"', "private-value-that-must-not-print"):
+            with patch.dict(os.environ, {"KALSHI_PROD_API_KEY": self.mock_key_id, "KALSHI_PRIVATE_KEY": pem}, clear=True):
+                with self.assertRaises(admin.SafetyError) as error:
+                    admin.Api.from_environment()
+                self.assertNotIn(pem, str(error.exception))
+
+    def test_pem_path_source_only_when_environment_pem_missing(self):
+        with patch.dict(os.environ, {"KALSHI_PROD_API_KEY": self.mock_key_id, "KALSHI_PEM_PATH": "private-file"}, clear=True), \
+                patch.object(Path, "read_text", return_value=self.ephemeral_pem):
+            api = admin.Api.from_environment()
+        self.assertEqual(api.credential_sources["private_key_source"], "KALSHI_PEM_PATH")
+
+    async def test_auth_check_verifies_sdk_signing_and_reads_only_balance(self):
+        api = admin.Api(self.mock_key_id, self.ephemeral_pem, execute=False)
+        api.request = AsyncMock(return_value={"balance_dollars": "1.00"})
+        await admin.run(admin.parser().parse_args(["auth-check"]), api, root=self.root / "absent")
+        api.request.assert_awaited_once_with("GET", "/portfolio/balance")
+        self.assertIn('"signer_self_check": "PASS"', self.stdout.getvalue())
+        self.assertIn('"authenticated_balance_read": "PASS"', self.stdout.getvalue())
+        self.assertNotIn(self.mock_key_id, self.stdout.getvalue())
+        self.assertNotIn(self.ephemeral_pem, self.stdout.getvalue())
+        self.assertFalse((self.root / "absent").exists())
+
+    async def test_auth_check_401_is_not_reported_as_success_or_retried(self):
+        api = admin.Api(self.mock_key_id, self.ephemeral_pem, execute=False)
+        api.request = AsyncMock(side_effect=admin.ApiError(401, "authentication_error"))
+        with self.assertRaises(admin.ApiError): await admin.authentication_check(api)
+        self.assertEqual(api.request.await_count, 1)
+        self.assertIn('"result": "FAILED"', self.stdout.getvalue())
+        self.assertNotIn('"authenticated_balance_read": "PASS"', self.stdout.getvalue())
+
+    async def test_bad_sdk_timestamp_fails_local_check_before_network(self):
+        api = admin.Api(self.mock_key_id, self.ephemeral_pem, execute=False)
+        api.request = AsyncMock()
+        headers = api._auth.create_auth_headers("GET", admin.PREFIX + "/portfolio/balance")
+        headers["KALSHI-ACCESS-TIMESTAMP"] = str(int(time.time()))
+        with patch.object(api._auth, "create_auth_headers", return_value=headers):
+            with self.assertRaises(admin.SafetyError): await admin.authentication_check(api)
+        api.request.assert_not_awaited()
+
+    async def test_auth_check_rejects_write_enabled_client(self):
+        api = admin.Api(self.mock_key_id, self.ephemeral_pem, execute=True)
+        api.request = AsyncMock()
+        with self.assertRaises(admin.SafetyError): await admin.authentication_check(api)
+        api.request.assert_not_awaited()
+
+    async def test_transport_401_has_endpoint_but_never_raw_error_or_headers(self):
+        api = admin.Api(self.mock_key_id, self.ephemeral_pem, execute=False)
+        response = Mock(status=401, headers={"Date": "Tue, 08 Sep 2026 12:00:00 GMT"})
+        response.read = AsyncMock(return_value=b'{"error":{"code":"authentication_error","message":"secret-must-not-print"}}')
+        response.__aenter__ = AsyncMock(return_value=response)
+        response.__aexit__ = AsyncMock(return_value=False)
+        session = Mock()
+        session.__aenter__ = AsyncMock(return_value=session)
+        session.__aexit__ = AsyncMock(return_value=False)
+        session.request.return_value = response
+        with patch("aiohttp.ClientSession", return_value=session):
+            with self.assertRaises(admin.ApiError) as error:
+                await api.request("GET", "/portfolio/balance")
+        self.assertEqual(session.request.call_count, 1)
+        self.assertEqual(error.exception.request_path, "/portfolio/balance")
+        self.assertEqual(error.exception.request_method, "GET")
+        self.assertIn("approx_http_date_clock_offset_seconds", api.last_response_diagnostics)
+        self.assertNotIn("secret-must-not-print", str(error.exception))
+        self.assertNotIn(self.mock_key_id, str(api.last_response_diagnostics))
 
 
 if __name__ == "__main__": unittest.main()
