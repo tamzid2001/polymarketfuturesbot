@@ -41,6 +41,7 @@ DEFAULT_CONFIG = Path("selected_live_strategy.json")
 DEFAULT_AUDIT = Path("data/kalshi_live_delayed_band_v12_audit.jsonl")
 WORKER_ID = re.compile(r"[A-Za-z0-9_.:-]{1,128}\Z")
 TERMINAL_PASS = "CANCELED_NO_FILL"
+BOUNDARY_WAIT_SECONDS = 90
 
 
 def enabled_live_environment() -> bool:
@@ -279,6 +280,29 @@ def choose_safe_side(feed, market: dict):
     return side, quote
 
 
+async def preflight_current_when_safe(api: SmokeApi) -> dict:
+    """Wait across one boundary only when the current market is too near close."""
+
+    deadline = time.monotonic() + BOUNDARY_WAIT_SECONDS
+    waiting_logged = False
+    while True:
+        try:
+            return await preflight(api, None, "yes")
+        except SafetyError as exc:
+            if str(exc) != "Market is not open or has less than 60 seconds remaining":
+                raise
+            if time.monotonic() >= deadline:
+                raise SafetyError("No safely open KXBTC15M market appeared within the boundary wait") from None
+            if not waiting_logged:
+                emit(
+                    action="STARTUP_ORDER_CHECK_WAITING_FOR_NEXT_MARKET",
+                    reason="current_market_has_less_than_60_seconds_remaining",
+                    maximum_wait_seconds=BOUNDARY_WAIT_SECONDS, orders_sent=0,
+                )
+                waiting_logged = True
+            await asyncio.sleep(1)
+
+
 async def run_startup_check(
     args: argparse.Namespace, api: SmokeApi, journal: Journal, *, stream=quote_stream,
     publisher=publish_required,
@@ -309,7 +333,7 @@ async def run_startup_check(
 
     # Preflight obtains the market from Kalshi and verifies its exchange_index,
     # write scope, shard-specific balance, all resting orders, and all positions.
-    market = await preflight(api, None, "yes")
+    market = await preflight_current_when_safe(api)
     if state["circuit_breaker"].get("blocked"):
         state = await resolve_legacy_unknown_breaker(
             args, api, state, journal, publisher=publisher,

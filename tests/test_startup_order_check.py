@@ -79,6 +79,27 @@ class StartupOrderCheckTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.publications[-1][0], "startup-order-check-passed")
         self.assertIn("STARTUP_ORDER_CHECK_PASS", self.output.getvalue())
 
+    async def test_near_close_startup_waits_for_next_market_without_writing(self):
+        calls = 0
+        original = startup.preflight
+
+        async def boundary_then_open(api, ticker, side):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise SafetyError("Market is not open or has less than 60 seconds remaining")
+            return await original(api, ticker, side)
+
+        with (
+            patch.object(startup, "preflight", side_effect=boundary_then_open),
+            patch.object(startup.asyncio, "sleep", return_value=None),
+        ):
+            market = await startup.preflight_current_when_safe(self.api)
+        self.assertEqual(market["ticker"], self.api.market["ticker"])
+        self.assertEqual(calls, 2)
+        self.assertEqual(self.api.post_count, 0)
+        self.assertIn("STARTUP_ORDER_CHECK_WAITING_FOR_NEXT_MARKET", self.output.getvalue())
+
     async def test_same_worker_is_idempotent_but_next_worker_gets_one_new_probe(self):
         await self.run_check("100")
         await self.run_check("100")
