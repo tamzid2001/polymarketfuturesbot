@@ -165,6 +165,42 @@ The canonical worker, watchdog, and controlled restart now target only the v12 d
 
 All earlier state, IOC, opening-entry, and stop-comparison files remain forensic evidence only. They are not restored by the v12 workflow. A fresh v12 live state starts at exactly 1.00 share; its recovery state is not copied from the v11 shadow experiment.
 
+## September 8 multi-series directional replay
+
+The original open+45-second, available-official-settlement algorithm has now been
+replayed across **13 other active 15-minute crypto/commodity series**, with BTC
+as a control. Snapshot cutoff: **2026-09-08 01:27:59 UTC**. Both current and
+historical API pages are cached, deduplicated, and restricted to that cutoff.
+
+- [Full results, confidence intervals and streaks](reports/multiseries_20260908/backtest_summary.md)
+- [Summary CSV, including coverage dates and recent-window statistics](reports/multiseries_20260908/directional_summary.csv)
+- [Monthly results](reports/multiseries_20260908/monthly_directional_results.csv)
+- [Separate opening-boundary proxy results](reports/multiseries_20260908/boundary_proxy_summary.csv)
+- [Reproducible data/code ZIP](reports/multiseries_20260908/reproducible_settlement_replay.zip)
+- [Source-line inventory](reports/multiseries_20260908/source_inventory.md)
+
+Across BTC and the other 13 series: **164,330 unique settled markets / 164,306
+eligible predictions**. The original first 20,778 BTC predictions reproduce
+**10,751 wins / 10,027 losses** exactly. The refreshed full BTC sample is
+13,002 / 12,260 over 25,262 signals (51.4686%). Zcash has the highest directional
+rate in this snapshot (52.2918% over 6,567 eligible signals); this is not a ranking
+of executable net profitability.
+
+Run a new public-data snapshot with `python kalshi_multiseries_backtest.py`.
+For an exact offline replay, extract the ZIP into an empty folder and run
+`python kalshi_multiseries_backtest.py --output reports --cache cache --offline`.
+The script uses only public reads and the standard library. Each signal's source
+ticker, official result-availability timestamp, decision time and actual target
+settlement are saved. Sticky-after-loss/flip-after-win is checked against the
+original inverse-source rule. Boundary-proxy rows are kept separate because
+eventual settlement alone cannot prove a >=99c quote was available at open.
+
+**This is a directional-only historical settlement test.** It does not backtest
+the delayed 53–57¢ entry filter, maker fills, hybrid stops, 2.50× dollar returns,
+or fees. Those require separate execution evidence. All 31 result CSVs reproduced
+byte-for-byte from the cached settlements; raw cache, expanded signals and code
+hashes are preserved in the ZIP instead of duplicating every expanded file in Git.
+
 ## Reconstructed historical directional results — prior inverse baseline
 
 The following snapshot was regenerated from Kalshi’s public settlement endpoints on **2026-08-08** using the prior `inverse_latest_settlement` rule. The cache is intentionally ignored by Git because it is downloaded source data; the exact retrieval commands are below. It is a reproducibility baseline, **not** the v12 delayed-entry/hybrid-stop expected value.

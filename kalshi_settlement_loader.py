@@ -65,14 +65,14 @@ class SettlementMarket:
     source: str
 
     @classmethod
-    def from_api(cls, record: dict[str, Any], source: str) -> "SettlementMarket | None":
+    def from_api(cls, record: dict[str, Any], source: str, series_ticker: str = SERIES_TICKER) -> "SettlementMarket | None":
         ticker = str(record.get("ticker") or "")
         result = str(record.get("result") or record.get("market_result") or "").lower()
         open_time = parse_timestamp(record.get("open_time"))
         close_time = parse_timestamp(record.get("close_time") or record.get("expected_expiration_time"))
         settlement_time = parse_timestamp(record.get("settlement_ts") or record.get("settlement_time"))
         if not (
-            ticker.startswith(SERIES_TICKER + "-")
+            ticker.startswith(series_ticker + "-")
             and result in {"yes", "no"}
             and open_time is not None
             and close_time is not None
@@ -130,9 +130,12 @@ class HistoricalSignal:
 class KalshiSettlementLoader:
     """A paginated public-settlement client with a durable local cache."""
 
-    def __init__(self, cache_path: Path = DEFAULT_CACHE, timeout_seconds: int = 30) -> None:
+    def __init__(self, cache_path: Path = DEFAULT_CACHE, timeout_seconds: int = 30, *, series_ticker: str = SERIES_TICKER) -> None:
         self.cache_path = cache_path
         self.timeout_seconds = timeout_seconds
+        if not series_ticker or not series_ticker.isalnum():
+            raise ValueError("series_ticker must be an explicit alphanumeric Kalshi series ID")
+        self.series_ticker = series_ticker
 
     def _get_json(self, url: str, params: dict[str, str]) -> dict[str, Any]:
         request = Request(
@@ -150,7 +153,7 @@ class KalshiSettlementLoader:
         seen_cursors: set[str] = set()
         records: list[SettlementMarket] = []
         while True:
-            params = {"series_ticker": SERIES_TICKER, "limit": "1000", **extra_params}
+            params = {"series_ticker": self.series_ticker, "limit": "1000", **extra_params}
             if cursor:
                 params["cursor"] = cursor
             payload = self._get_json(url, params)
@@ -160,7 +163,7 @@ class KalshiSettlementLoader:
             source = "kalshi_public_historical" if "/historical/" in url else "kalshi_public_current"
             records.extend(
                 market for item in rows if isinstance(item, dict)
-                if (market := SettlementMarket.from_api(item, source)) is not None
+                if (market := SettlementMarket.from_api(item, source, self.series_ticker)) is not None
             )
             next_cursor = payload.get("cursor")
             if not next_cursor:
@@ -190,12 +193,12 @@ class KalshiSettlementLoader:
                 endpoint_errors.append(f"{url}: {exc}")
                 LOG.warning("settlement endpoint unavailable: %s", endpoint_errors[-1])
         if not by_ticker:
-            raise RuntimeError("No settled KXBTC15M markets downloaded; " + "; ".join(endpoint_errors))
+            raise RuntimeError(f"No settled {self.series_ticker} markets downloaded; " + "; ".join(endpoint_errors))
         markets = sorted(by_ticker.values(), key=lambda item: (item.open_time, item.ticker))
         self.cache_path.parent.mkdir(parents=True, exist_ok=True)
         self.cache_path.write_text(
             json.dumps({
-                "series_ticker": SERIES_TICKER,
+                "series_ticker": self.series_ticker,
                 "downloaded_at": timestamp_text(datetime.now(tz=UTC)),
                 "markets": [market.to_cache() for market in markets],
             }, indent=2, sort_keys=True),
@@ -207,10 +210,14 @@ class KalshiSettlementLoader:
         if refresh or not self.cache_path.exists():
             return self.refresh()
         payload = json.loads(self.cache_path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict) or payload.get("series_ticker") != self.series_ticker:
+            raise ValueError(f"settlement cache series mismatch: expected {self.series_ticker}")
         rows = payload.get("markets") if isinstance(payload, dict) else None
         if not isinstance(rows, list):
             raise ValueError(f"invalid settlement cache: {self.cache_path}")
         records = [SettlementMarket.from_cache(row) for row in rows if isinstance(row, dict)]
+        if any(not record.ticker.startswith(self.series_ticker + "-") for record in records):
+            raise ValueError("settlement cache contains a different series")
         if not records:
             raise ValueError(f"empty settlement cache: {self.cache_path}")
         return sorted(records, key=lambda item: (item.open_time, item.ticker))
