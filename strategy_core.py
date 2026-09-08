@@ -153,10 +153,14 @@ class StrategyParameters:
             "base_increment", "starting_base", "max_position",
         ):
             object.__setattr__(self, name, decimal(getattr(self, name)))
+            if not getattr(self, name).is_finite():
+                raise ValueError(f"{name} must be finite")
         if self.starting_base != round_shares(self.starting_base):
             raise ValueError("starting_base must have at most two decimal places")
         if self.base_increment != round_shares(self.base_increment):
             raise ValueError("base_increment must have at most two decimal places")
+        if self.max_position <= ZERO or self.max_position != round_shares(self.max_position):
+            raise ValueError("max_position must be positive and have at most two decimal places")
         if self.starting_base <= ZERO or self.starting_base > self.max_position:
             raise ValueError("starting_base must be positive and no greater than max_position")
 

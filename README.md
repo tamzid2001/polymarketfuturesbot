@@ -38,13 +38,56 @@ All dollar results below are gross unless explicitly marked otherwise. Fees, liv
 | Hybrid maker exit | **52¢ GTC reduce-only sale** | A position is not treated as exited until actual fills exist |
 | Hybrid hard stop | **Executable bid ≤50¢** | Confirms maker cancellation/fills, then IOC-exits only authoritative residual exposure |
 | Recovery multiplier | **2.50×** | Advances after every filled closed trade while cumulative cycle P&L remains negative |
-| Recovery exponent ceiling | **Disabled (`0`)** | Sizing remains mathematically uncapped by exponent; the independent 100-share position cap still applies |
+| Recovery exponent ceiling | **Disabled (`0`)** | Sizing remains uncapped by exponent; the independently configured fixed position cap still applies |
 | First base threshold | **$350.00** | Realized net P&L only |
 | Threshold growth | **2.50×** | Geometric after each permanent-base step |
 | Base increment | **+0.50 share** | Supports +0.25, +0.50, and +1.00 |
-| Position cap | **100.00 shares** | Applied after two-decimal 2.50× sizing; existing exposure is included |
+| Position cap | **100.00 fixed by default; configurable hard cap** | Actions input `max_share_cap` sets a constant maximum quantity; blank preserves the durable value |
 | Shadow balance | **$1,000.00** | Isolated from the live account state |
-| Real-money mode | **Currently gated off** | It requires `KALSHI_SHADOW_ONLY=false`, `KALSHI_LIVE_ENABLED=true`, and an explicit workflow `live_enabled=true` / `dry_run=false` request |
+| Real-money mode | **User-controlled; source defaults are shadow-safe** | Actual runtime mode is logged/checkpointed. Live requires `KALSHI_SHADOW_ONLY=false`, `KALSHI_LIVE_ENABLED=true`, and an explicit workflow `live_enabled=true` request |
+
+### Configurable fixed maximum share size
+
+The optional Actions input **`max_share_cap`** is a **fixed maximum number of
+shares per market**, not a multiplier. Enter `100`, `200`, or another positive
+finite value with at most two decimal places, no smaller than the configured
+starting base. Leaving it blank preserves the saved cap (100.00 by default).
+
+At base 1.00 and recovery multiplier 2.50, the quantities are calculated from
+`base × 2.50 ** exponent`, rounded HALF_UP to 0.01, then limited to the hard cap:
+
+| Recovery exponent | Cap 100 | Cap 200 |
+| ---: | ---: | ---: |
+| 0 | 1.00 | 1.00 |
+| 1 | 2.50 | 2.50 |
+| 2 | 6.25 | 6.25 |
+| 3 | 15.63 | 15.63 |
+| 4 | 39.06 | 39.06 |
+| 5 | 97.66 | 97.66 |
+| 6+ (while unrecovered) | 100.00 | 200.00 |
+
+The cap **does not increase when permanent base increases**. Recovery exponent
+advances after every filled completed trade while total recovery-cycle net P&L
+is negative, including an individual profitable trade that has not recovered
+the deficit. Only cycle P&L >= 0 resets to base. Zero fills change neither state.
+Funding checks and loss breakers are unchanged; a larger cap does not supply
+additional buying power or guarantee recovery.
+
+The input maps directly to `--max-position`, persisted as a Decimal
+string `max_position` in the chosen configuration, cycle parameters,
+and each signal's configuration snapshot. Each market also stores
+`effective_position_cap` and `effective_position_cap_after`; heartbeats print
+`cap`. Both historical reference replay and live/shadow execution use the same
+fixed cap calculation. Optimizer exports preserve the selected cap instead of
+silently substituting 100. Historical results are not reclassified.
+
+**Blank means preserve**, including on watchdog restarts and normal handoffs. An
+existing configuration keeps its `max_position`;
+publishing the code does not silently expand active live risk. A cap change
+is accepted only with no outstanding order/position. A negative recovery cycle
+continues using its saved old parameters; the new cap applies to a fresh cycle.
+No live/shadow state is reset. The next worker checks out `main` and restores only
+durable data/configuration, never an older runner source file.
 
 ### Frozen observed-ledger selection evidence
 

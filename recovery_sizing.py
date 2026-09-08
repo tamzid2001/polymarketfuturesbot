@@ -47,7 +47,9 @@ class RecoverySizingState:
         self.base_increment = decimal(self.base_increment)
         self.threshold_growth_multiplier = decimal(self.threshold_growth_multiplier or self.recovery_multiplier)
         self.base_share_count = round_shares(decimal(self.base_share_count))
-        self.max_position = round_shares(decimal(self.max_position))
+        self.max_position = decimal(self.max_position)
+        if not self.max_position.is_finite() or self.max_position <= ZERO or self.max_position != round_shares(self.max_position):
+            raise ValueError("max_position must be finite, positive, and at most two decimal places")
         self.recovery_cycle_pnl = decimal(self.recovery_cycle_pnl)
         self.profit_since_last_base_scale = decimal(self.profit_since_last_base_scale)
         self.next_base_threshold = decimal(self.next_base_threshold or self.first_base_threshold)
@@ -67,21 +69,30 @@ class RecoverySizingState:
         return self._last_quantity_was_capped
 
     def prescribed_quantity(self) -> Decimal:
-        # With the supported minimum multiplier (1.01), base >= 1.00, and a
-        # 100-share cap, exponent 1,001 is already far beyond the cap. Avoid
-        # constructing an astronomically large Decimal only to round and cap
-        # it; this is mathematically equivalent to the specified post-round
-        # cap for every supported configuration.
-        if self.recovery_exponent > 1_000:
-            self._last_quantity_was_capped = True
-            quantity = self.max_position
-            self.max_recovery_quantity = max(self.max_recovery_quantity, quantity)
-            self.cap_hit_count += 1
-            return quantity
-        raw_quantity = self.base_share_count * (self.recovery_multiplier ** self.recovery_exponent)
+        cap = self.max_position
+        # Bound the power before quantizing. This also works for configurable
+        # caps and m=1; an arbitrary exponent cutoff would not be equivalent.
+        exponent = self.recovery_exponent
+        if exponent < 0:
+            raise ValueError("recovery_exponent cannot be negative")
+        if self.recovery_multiplier >= 1:
+            raw_quantity = self.base_share_count
+            factor = self.recovery_multiplier
+            factor_ceiling = max(Decimal("1"), (cap + CENT) / self.base_share_count)
+            while exponent:
+                if exponent & 1:
+                    raw_quantity *= factor
+                    if raw_quantity > cap + CENT:
+                        raw_quantity = cap + CENT
+                        break
+                exponent //= 2
+                if exponent:
+                    factor = min(factor * factor, factor_ceiling)
+        else:
+            raw_quantity = self.base_share_count * (self.recovery_multiplier ** exponent)
         rounded_quantity = round_shares(raw_quantity)
-        self._last_quantity_was_capped = rounded_quantity > self.max_position
-        quantity = min(rounded_quantity, self.max_position)
+        self._last_quantity_was_capped = rounded_quantity > cap
+        quantity = min(rounded_quantity, cap)
         self.max_recovery_quantity = max(self.max_recovery_quantity, quantity)
         if self._last_quantity_was_capped:
             self.cap_hit_count += 1

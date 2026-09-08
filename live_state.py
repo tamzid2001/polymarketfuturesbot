@@ -18,6 +18,7 @@ LEGACY_RECOVERY_EXPONENT_LIMIT = 12
 LEGACY_REMOTE_CHECKPOINT_INTERVAL_SECONDS = 5.0
 REMOTE_CHECKPOINT_INTERVAL_SECONDS = 30.0
 TUNABLE_STRATEGY_FIELDS = {
+    "max_position",
     "starting_base",
     "recovery_multiplier",
     "threshold_growth_multiplier",

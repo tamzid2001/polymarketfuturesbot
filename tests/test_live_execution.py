@@ -738,7 +738,7 @@ class LiveExecutionTests(unittest.TestCase):
         temporary = Path(tempfile.mkdtemp()) / "state.json"
         save_state(temporary, default_state(self.config))
         with self.assertRaisesRegex(RuntimeError, "configuration hash differs"):
-            load_state(temporary, dict(self.config, max_position="99.00"))
+            load_state(temporary, dict(self.config, entry_limit_offset_cents=2))
 
     def test_reviewed_strategy_inputs_migrate_only_flat_state_and_preserve_cycle(self) -> None:
         temporary = Path(tempfile.mkdtemp()) / "state.json"

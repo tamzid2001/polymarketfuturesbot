@@ -76,6 +76,7 @@ class ParameterSet:
     entry_price: float = 0.49
     stop_slippage: float = 0.0
     fee_per_share: float = 0.0
+    max_position: float = 100.0
 
     @property
     def growth(self) -> float:
@@ -90,7 +91,7 @@ class ParameterSet:
             stop_price=None if self.stop_price is None else Decimal(str(self.stop_price)),
             entry_price=Decimal(str(self.entry_price)), stop_slippage=Decimal(str(self.stop_slippage)),
             fee_per_share=Decimal(str(self.fee_per_share)), starting_base=Decimal("1.00"),
-            max_position=Decimal("100.00"), starting_bankroll=Decimal("100.00"),
+            max_position=Decimal(str(self.max_position)), starting_bankroll=Decimal("100.00"),
         )
 
 
@@ -145,12 +146,12 @@ def export_selected_live_strategy(path: Path, row: dict[str, Any], *, selection_
         "maker_order_time_in_force": "good_till_canceled",
         "entry_order_lifetime": "until_filled_or_market_close",
         "entry_limit_offset_cents": 1,
-        "starting_base": "1.00",
+        "starting_base": format(Decimal(str(row.get("starting_base", "1.00"))), "f"),
         "recovery_multiplier": f"{float(row['recovery_multiplier']):.2f}",
         "first_base_threshold": f"{float(row['first_base_threshold']):.2f}",
         "threshold_growth_multiplier": f"{float(row['threshold_growth_multiplier']):.2f}",
         "base_increment": f"{float(row['base_increment']):.2f}",
-        "max_position": "100.00",
+        "max_position": format(Decimal(str(row.get("max_position", "100.00"))), "f"),
         "starting_shadow_balance": "1000.00",
         "live_enabled": False,
         "dry_run": True,
@@ -184,6 +185,9 @@ def export_selected_live_strategy(path: Path, row: dict[str, Any], *, selection_
         "shadow_entry_level_step_cents": 1,
         "trading_mode": "shadow",
     }
+    # Reject an invalid cap before emitting an apparently deployable config.
+    from kalshi_live_trader import load_config_from_value
+    load_config_from_value(config)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return config
@@ -214,6 +218,7 @@ if njit is not None:
         loss30: float, loss20: float, loss10: float,
         multiplier: float, first_threshold: float, increment: float, growth: float,
         stop_index: int, entry: float, stop_price: float, stop_slippage: float, fee_per_share: float,
+        cap: float,
     ) -> np.ndarray:
         # Output order is documented by ``_fast_summary`` below.
         metrics = np.zeros((simulations, 23), dtype=np.float64)
@@ -240,10 +245,10 @@ if njit is not None:
                     continue
                 # The precise reference engine uses Decimal.  This batched
                 # screening kernel mirrors its ROUND_HALF_UP cent rule.
-                capped_by_exponent = exponent > 500
-                quantity = 100.0 if capped_by_exponent else math.floor(base * multiplier ** exponent * 100.0 + 0.5) / 100.0
-                if quantity > 100.0:
-                    quantity = 100.0
+                capped_by_exponent = multiplier > 1 and exponent * math.log(multiplier) > math.log(max(cap / base, 1.0)) + 1.0
+                quantity = cap if capped_by_exponent else math.floor(base * multiplier ** exponent * 100.0 + 0.5) / 100.0
+                if quantity > cap:
+                    quantity = cap
                     cap_hits += 1
                 elif capped_by_exponent:
                     cap_hits += 1
@@ -361,6 +366,10 @@ def fast_results(
 
     if njit is None:
         raise RuntimeError("numba is required for the full grid; install requirements_kalshi_hybrid_backtest.txt")
+    from recovery_sizing import round_shares
+    cap = Decimal(str(parameters.max_position))
+    if not cap.is_finite() or cap <= 0 or cap != round_shares(cap):
+        raise ValueError("max_position must be finite, positive and at most two decimal places")
     stop_index, stop_price = _stop_index(parameters.stop_price)
     return _fast_replay(
         outcomes.astype(np.int8), simulations, np.uint64(seed),
@@ -370,6 +379,7 @@ def fast_results(
         calibration.loss_continue_30_given_40, calibration.loss_continue_20_given_30, calibration.loss_continue_10_given_20,
         parameters.recovery_multiplier, parameters.first_base_threshold, parameters.base_increment, parameters.growth,
         stop_index, parameters.entry_price, stop_price, parameters.stop_slippage, parameters.fee_per_share,
+        parameters.max_position,
     )
 
 
@@ -394,7 +404,7 @@ def _fast_summary(
         "base_increment": parameters.base_increment,
         "stop_price": "no_stop" if parameters.stop_price is None else parameters.stop_price,
         "entry_price": parameters.entry_price,
-        "starting_base": 1.00, "max_position": 100.00,
+        "starting_base": 1.00, "max_position": parameters.max_position,
         "historical_markets": history["total_settled_markets"],
         "eligible_historical_signals": history["eligible_predictions"],
         "actual_directional_wins": actual_wins, "actual_directional_losses": actual_losses,
@@ -504,6 +514,7 @@ def _row_to_parameters(row: dict[str, Any]) -> ParameterSet:
         float(row["recovery_multiplier"]), float(row["first_base_threshold"]), float(row["base_increment"]),
         None if row["stop_price"] == "no_stop" else float(row["stop_price"]),
         float(row["threshold_growth_multiplier"]), float(row["entry_price"]),
+        max_position=float(row.get("max_position", 100.0)),
     )
 
 
