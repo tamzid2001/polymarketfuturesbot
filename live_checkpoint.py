@@ -48,6 +48,7 @@ _DELAYED_V12_RUNTIME_PATHS = frozenset({
     "selected_live_strategy.json",
     "data/kalshi_live_delayed_band_v12_state.json",
     "data/kalshi_live_delayed_band_v12_audit.jsonl",
+    "data/.kalshi_live_delayed_band_v12_startup_order_check/order-smoke-test.json",
     "data/kalshi_shadow_delayed_band_v12_state.json",
     "data/kalshi_shadow_delayed_band_v12_audit.jsonl",
 })

@@ -221,6 +221,43 @@ then cancels/reconciles it with a 30-second server expiry as backup. It never
 resets the strategy breaker or restarts a worker. A test order can fill; actual
 exposure requires operator review, not an assumed successful cancellation.
 
+Every explicitly enabled **LIVE** Actions worker also runs the narrower
+`kalshi_startup_order_check.py` before the strategy process starts. It discovers
+the current KXBTC15M market, requires its API-reported `exchange_index=2`, reads
+the balance for shard 2, verifies key write scope and a flat shard, then chooses
+one side from fresh two-sided WebSocket quotes. It writes and remotely publishes
+a deterministic create intent before sending exactly one 1.00-share, 1¢,
+post-only probe. The strategy starts only after the exact create ACK, exact
+cancel ACK, zero remaining quantity, zero fills and a flat position are all
+reconciled. The same GitHub run ID cannot create a second probe after a retry.
+Shadow and reconciliation-only runs never execute this check.
+
+This startup probe is intentionally not sent when an unrelated strategy
+breaker, open order, position, stale quote, wrong shard, insufficient shard
+balance, missing write scope, old unresolved probe or checkpoint failure
+exists. Those are fail-closed results—not permission to keep trying different
+real orders. The one legacy exception is an old
+`maker_entry_submission_unknown` breaker: before any probe, the startup tool
+may clear it only after V2 order/fill history, the closed source market, the
+shard-wide open-order scan and the shard-wide position scan jointly prove that
+the exact durable client-order intent is terminal, unfilled and flat. The old
+intent is retained and annotated rather than deleted. A successful 1¢
+create/cancel validates that specific API path at that moment; it cannot
+guarantee later 52–57¢ entries and 50¢ stops. A 1¢ post-only order can still
+fill and incur fees; any fill stops startup for manual position review and is
+kept separate from strategy P&L.
+
+The live REST/SDK adapter uses Kalshi's current V2 hosts:
+`https://external-api.kalshi.com/trade-api/v2` in production and
+`https://external-api.demo.kalshi.co/trade-api/v2` in demo. Request signing is
+performed over the timestamp in milliseconds plus the HTTP method plus the
+full `/trade-api/v2/...` path without query parameters. Create Order V2 uses
+fixed-point string `count`/`price`, the single YES-book `bid`/`ask` convention,
+`good_till_canceled`, deterministic `client_order_id`, `post_only`, and the
+market's API-reported `exchange_index` (or `-1` ticker auto-routing after a
+restart). Cancellation is accepted only for the exact returned order ID and is
+then checked against order, fill and position reads.
+
 ### Sticky signal transition
 
 The v12 signal has no loss-skip rule and is independent of execution. For each new market, the worker freezes the immediately preceding market’s realtime provisional outcome, later checks it against official settlement, and records the transition in both state and audit ledger:
@@ -605,7 +642,8 @@ The controlled-restart workflow exposes only `source_run_id` and `target_live`. 
 # Shared-core, replay, path, reconciliation, v11 regression, v12 delayed-band, and live safety suite.
 PYTHONPATH=. .venv/bin/python -m unittest -v \
   tests.test_strategy_core tests.test_live_execution tests.test_maker_hybrid_v11 tests.test_delayed_band_v12 tests.test_reconciliation \
-  tests.test_recovery_sizing tests.test_execution_path_model tests.test_historical_replay
+  tests.test_recovery_sizing tests.test_execution_path_model tests.test_historical_replay \
+  tests.test_order_smoke_test tests.test_startup_order_check
 
 # Canonical v12 shadow run (isolated $1,000 state, never real orders).
 KALSHI_API_KEY_ID=... KALSHI_PEM_PATH=kalshi_private_key.pem \

@@ -183,12 +183,15 @@ def validate_market(market, side):
         raise SafetyError("One-cent economic price is not valid on this market price grid")
 
 
-def plan_for(market, side):
+def plan_for(market, side, *, client_scope="manual"):
     validate_market(market, side)
     ticker = checked_id(market["ticker"])
     return {"ticker": ticker, "side": "bid" if side == "yes" else "ask", "count": "1.00",
             "price": "0.0100" if side == "yes" else "0.9900",
-            "client_order_id": str(uuid.uuid5(uuid.NAMESPACE_URL, f"kalshi-order-smoke-v1:{ticker}:{side}")),
+            "client_order_id": str(uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"kalshi-order-smoke-v2:{client_scope}:{ticker}:{side}",
+            )),
             "time_in_force": "good_till_canceled", "expiration_time": int(time.time()) + EXPIRY_SECONDS,
             "self_trade_prevention_type": "taker_at_cross", "post_only": True,
             "cancel_order_on_pause": True, "reduce_only": False, "subaccount": 0, "exchange_index": SHARD}
@@ -253,7 +256,7 @@ async def find_order(api, plan):
     return order
 
 
-async def reconcile(api, journal, op, *, cancel, attempts=3):
+async def reconcile(api, journal, op, *, cancel, attempts=3, require_cancel_ack=False):
     """Only cancel this test's order; an ACK/DELETE isn't proof of no fill."""
     plan = op["plan"]
     cancel_attempted = False
@@ -270,7 +273,8 @@ async def reconcile(api, journal, op, *, cancel, attempts=3):
             journal.save(op)
             emit(action="ORDER_RECONCILED", order_id=op["order_id"], status=op["order_status"],
                  filled_quantity=filled, remaining_quantity=remaining, exchange_index=SHARD)
-            if remaining == 0 and order.get("status") in {"canceled", "cancelled", "executed", "filled", "expired"}:
+            terminal = order.get("status") in {"canceled", "cancelled", "executed", "filled", "expired"}
+            if remaining == 0 and terminal:
                 fills = await pages(api, "/portfolio/fills", "fills", exchange_index=SHARD,
                                     ticker=plan["ticker"], order_id=order["order_id"], subaccount=0, limit=1000)
                 unique = {}
@@ -289,7 +293,10 @@ async def reconcile(api, journal, op, *, cancel, attempts=3):
                                         ticker=plan["ticker"], subaccount=0, limit=1000)
                 position = sum((signed_quantity(p.get("position_fp", p.get("position"))) for p in positions), Decimal(0))
                 expected_position = filled if op["side"] == "yes" else -filled
-                if actual == filled and position == expected_position:
+                cancellation_proven = bool(op.get("cancel_acknowledged"))
+                if actual == filled and position == expected_position and (
+                    not require_cancel_ack or filled > 0 or cancellation_proven
+                ):
                     op.update(state="FILLED_REVIEW_REQUIRED" if filled else "CANCELED_NO_FILL",
                               fills=list(unique.values()), position=str(position), reconciled_at=utc_now())
                     journal.save(op)
@@ -297,7 +304,8 @@ async def reconcile(api, journal, op, *, cancel, attempts=3):
                          client_order_id=plan["client_order_id"], exchange_index=SHARD,
                          filled_quantity=filled, remaining_quantity=remaining, position=position,
                          fees=sum((Decimal(f["fees"]) for f in unique.values()), Decimal(0)),
-                         automatic_liquidation=False, breaker="UNCHANGED")
+                         automatic_liquidation=False, breaker="UNCHANGED",
+                         cancel_acknowledged=cancellation_proven)
                     if filled:
                         raise SafetyError("Test order filled; no more orders sent. Review the real position in Kalshi before resuming your bot")
                     return
@@ -309,8 +317,23 @@ async def reconcile(api, journal, op, *, cancel, attempts=3):
             journal.save(op)
             api.permitted_cancel_id = oid
             try:
-                await api.request("DELETE", CREATE + "/" + oid,
-                                  params={"exchange_index": SHARD, "market_ticker": plan["ticker"], "subaccount": 0})
+                response = await api.request(
+                    "DELETE", CREATE + "/" + oid,
+                    params={"exchange_index": SHARD, "market_ticker": plan["ticker"], "subaccount": 0},
+                )
+                canceled = response.get("order") if isinstance(response, dict) else None
+                acknowledged_id = (
+                    canceled.get("order_id") if isinstance(canceled, dict)
+                    else response.get("order_id") if isinstance(response, dict) else None
+                )
+                if not acknowledged_id:
+                    raise SafetyError("Cancellation acknowledgment did not identify the test order")
+                if checked_id(acknowledged_id) != oid:
+                    raise SafetyError("Cancellation acknowledgment did not identify the test order")
+                op.update(cancel_acknowledged=True, cancel_acknowledged_at=utc_now())
+                journal.save(op)
+                emit(action="CANCEL_ACK_RECEIVED", order_id=oid, exchange_index=SHARD,
+                     note="REST reads must still prove zero remaining, zero fills, and a flat position")
             except ApiError as exc:
                 emit(action="CANCEL_NOT_CONFIRMED", http_status=exc.status, code=exc.code,
                      note="REST reconciliation follows; do not assume cancellation")

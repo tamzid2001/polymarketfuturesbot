@@ -1809,7 +1809,16 @@ class KalshiREST:
         if KalshiClient is None or KalshiAuth is None:
             raise RuntimeError("Install requirements_kalshi_average_down.txt before running")
         pem = self.pem_path.read_text(encoding="utf-8")
-        self.base_url = "https://demo-api.kalshi.co/trade-api/v2" if self.demo else "https://api.elections.kalshi.com/trade-api/v2"
+        # The V2 order API is served from Kalshi's current external API hosts.
+        # Keep the SDK, raw signed REST reads, and websocket environment on the
+        # same production/demo generation; the retired elections host can
+        # otherwise authenticate public reads while leaving order intent in an
+        # indeterminate state.
+        self.base_url = (
+            "https://external-api.demo.kalshi.co/trade-api/v2"
+            if self.demo
+            else "https://external-api.kalshi.com/trade-api/v2"
+        )
         configuration = Configuration(host=self.base_url)
         configuration.api_key_id = self.api_key_id
         configuration.private_key_pem = pem
