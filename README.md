@@ -140,6 +140,34 @@ Every signal also maintains independent analytics for 40, 41, …, 49¢. It reco
 
 The ledger persists the opening ask, qualifying ask, derived limit, requested notional, exchange/client order IDs, actual fill quantities/prices/fees, stop timestamps, residual exposure, settlement, drawdown, and false-stop status. The heartbeat prints `delayed_entry_status`, `delayed_opening_ask`, `delayed_trigger_ask`, and `delayed_limit`. The corrected timestamp parser accepts ISO time, epoch seconds, and epoch milliseconds; this prevents persisted delayed fills from silently bypassing stop analytics after restart.
 
+### Exchange-specific funding and order health
+
+Kalshi balances are allocated by exchange shard. A positive aggregate account
+balance does **not** establish that a crypto market can be funded. Before a
+live entry, the adapter reads the market's authoritative `exchange_index` and
+queries the balance for that exchange only. Unavailable metadata or funding
+fails closed; it never silently substitutes aggregate cash or transfers funds.
+The signal's `entry_funding` snapshot records exchange index, available cash,
+required notional and read status in the durable state/audit ledger.
+See [Kalshi's exchange-sharding documentation](https://docs.kalshi.com/getting_started/exchange_sharding).
+
+Entry and reduce-only exit requests use the exchange index verified from market
+metadata. If that per-market cache is empty after restart, exits/cancellations
+require ticker-based auto-routing (`exchange_index=-1`); no balance lookup is
+needed to reduce risk. Cancellation always includes `market_ticker`, so an order
+ID alone cannot silently route to exchange 0. The routing cache is bounded and
+never hard-codes a shard from the ticker's spelling. The short
+`ORDER HEALTH` line separates recorded attempts, exchange acknowledgments,
+definitive rejections and uncertain submissions, with the persisted breaker
+reason. Analytical threshold hits are not order acknowledgments. Raw SDK
+exception bodies/headers are not retained for entry or cancellation failures.
+
+Credential rotation does not alter an existing worker's environment or clear
+a persisted breaker. Changing funds/credentials is not permission to discard
+order uncertainty: the operator must resolve account funding and reconcile
+orders, fills and positions before any explicit recovery. This patch has no
+automatic transfer, breaker reset or worker restart mechanism.
+
 ### Sticky signal transition
 
 The v12 signal has no loss-skip rule and is independent of execution. For each new market, the worker freezes the immediately preceding market’s realtime provisional outcome, later checks it against official settlement, and records the transition in both state and audit ledger:

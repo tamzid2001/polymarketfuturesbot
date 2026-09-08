@@ -889,6 +889,18 @@ def record_submission_failure(record: dict[str, Any], exc: Exception) -> None:
         "error_type": type(exc).__name__,
         "http_status": status if isinstance(status, int) else None,
     })
+    # Only stable, documented diagnostic codes may leave the exception object.
+    # Never log its body, headers, message or arbitrary server-provided strings.
+    try:
+        body = getattr(exc, "body", None)
+        payload = json.loads(body) if isinstance(body, (str, bytes)) else body
+        error = payload.get("error", payload) if isinstance(payload, dict) else {}
+        code = error.get("code") if isinstance(error, dict) else None
+        if code in {"user_not_found", "insufficient_balance", "insufficient_funds",
+                    "authentication_error", "unauthorized", "market_closed"}:
+            record["error_code"] = code
+    except (ValueError, TypeError):
+        pass
     if rejected:
         record["remaining_count"] = 0.0
 
@@ -1809,6 +1821,7 @@ class KalshiREST:
         self.orders = OrdersApi(self.client)
         self.pause_until = 0.0
         self.pause_reason: str | None = None
+        self._market_exchange_indexes: dict[str, int] = {}
 
     async def get_raw_json(self, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
         """Signed, retrying GET for historical/accounting endpoints absent from the SDK."""
@@ -1827,8 +1840,7 @@ class KalshiREST:
                 async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as session:
                     async with session.get(self.base_url + normalized_path, params=params or {}, headers=headers) as response:
                         if response.status >= 400:
-                            body = await response.text()
-                            raise RuntimeError(f"Kalshi GET {normalized_path} HTTP {response.status}: {body[:240]}")
+                            raise RuntimeError(f"Kalshi GET {normalized_path} HTTP {response.status}")
                         payload = await response.json(content_type=None)
                         if not isinstance(payload, dict):
                             raise RuntimeError(f"Kalshi GET {normalized_path} returned non-object JSON")
@@ -1869,6 +1881,47 @@ class KalshiREST:
             LOG.warning("Decimal balance lookup failed: %s", exc)
             return None
 
+    async def market_entry_funding(self, ticker: str) -> tuple[int, Decimal]:
+        """Read spendable cash on this market's exchange, never aggregate cash.
+
+        Metadata, not the ticker's spelling, determines the shard. This is a
+        read-only preflight: missing metadata/balances fail closed, and this
+        adapter never moves money between exchanges or provisions accounts.
+        """
+        payload = await self.get_raw_json(f"/markets/{ticker}")
+        market = payload.get("market", {})
+        if not isinstance(market, dict) or market.get("ticker") != ticker:
+            raise ValueError("Entry funding market metadata mismatch")
+        exchange_index = market.get("exchange_index")
+        if type(exchange_index) is not int or exchange_index < 0:
+            raise ValueError("Entry funding requires an authoritative exchange index")
+        # Kalshi documents that an existing market does not migrate shards.
+        # Only exchange metadata populates this cache; never infer from ticker
+        # spelling, account balance, or a caller's default exchange setting.
+        indexes = getattr(self, "_market_exchange_indexes", {})
+        if len(indexes) >= 256 and ticker not in indexes:
+            indexes.pop(next(iter(indexes)))
+        indexes[ticker] = exchange_index
+        self._market_exchange_indexes = indexes
+        payload = await self.get_raw_json("/portfolio/balance", {"exchange_index": exchange_index})
+        dollars = payload.get("balance_dollars")
+        cents = payload.get("balance")
+        if dollars is None and cents is None:
+            raise ValueError("Market exchange balance unavailable")
+        balance = Decimal(str(dollars)) if dollars is not None else Decimal(str(cents)) / Decimal("100")
+        if not balance.is_finite() or balance < 0:
+            raise ValueError("Invalid market exchange balance")
+        return exchange_index, balance
+
+    def order_exchange_index(self, ticker: str) -> int:
+        """Use verified metadata or require ticker-based exchange auto-routing.
+
+        After restart, an exit/cancel must not depend on a new balance lookup
+        succeeding. A cache miss uses -1 plus the ticker, never default shard 0.
+        """
+        index = getattr(self, "_market_exchange_indexes", {}).get(ticker)
+        return index if type(index) is int and index >= 0 else -1
+
     async def position_for_ticker(self, ticker: str) -> float | None:
         """Return the signed live Kalshi position for one market.
 
@@ -1879,13 +1932,14 @@ class KalshiREST:
         or cancels an order.
         """
         try:
-            response = await self.portfolio.get_positions(limit=200)
+            response = await self.portfolio.get_positions(ticker=ticker, limit=200)
             for position in field(response, "market_positions", "positions") or []:
                 if str(field(position, "ticker") or "") != ticker:
                     continue
                 raw_position = as_float(field(position, "position_fp", "position"))
-                return round(raw_position or 0.0, 2)
-            return 0.0
+                return None if raw_position is None else round(raw_position, 2)
+            # A truncated response is not evidence that exposure is zero.
+            return None if field(response, "cursor") else 0.0
         except Exception as exc:  # noqa: BLE001
             LOG.warning("Position lookup failed for %s: %s", ticker, exc)
             return None
@@ -1931,7 +1985,11 @@ class KalshiREST:
                 continue
             ticker = str(field(order, "ticker") or "?")
             try:
-                await self.orders.cancel_order_v2(order_id)
+                if ticker == "?":
+                    raise ValueError("Cancellation requires market ticker for exchange routing")
+                await self.orders.cancel_order_v2(
+                    order_id, market_ticker=ticker, exchange_index=self.order_exchange_index(ticker),
+                )
                 canceled += 1
                 LOG.warning(
                     "HANDOFF CANCELED | %s %s role=%s id=%s",
@@ -2114,6 +2172,7 @@ class KalshiREST:
             "position_price": round(position_price, 4),
             "api_price": side_api_price(side, position_price),
             "expected_outcome_side": side,
+            "routing_exchange_index": self.order_exchange_index(ticker),
             "quantity": round(quantity, 2),
             "time_in_force": tif,
             "post_only": post_only,
@@ -2133,6 +2192,7 @@ class KalshiREST:
             return record
         kwargs = {
             "ticker": ticker,
+            "exchange_index": record["routing_exchange_index"],
             "side": side_book_side(side),
             "count": f"{quantity:.2f}",
             "price": record["api_price"],
@@ -2147,13 +2207,13 @@ class KalshiREST:
         try:
             response = await self.orders.create_order_v2(**kwargs)
         except Exception as exc:  # noqa: BLE001
+            record_submission_failure(record, exc)
             if pause_error(exc):
-                self.note_trading_pause(str(exc))
+                self.note_trading_pause("exchange_trading_pause")
                 record["status"] = "paused"
-            else:
-                record["status"] = "submit_failed"
-            record["error"] = str(exc)
-            LOG.error("ORDER REJECTED | %s %s @ $%.2f: %s", ticker, side.upper(), position_price, exc)
+            LOG.error("ENTRY SUBMISSION %s | %s %s http_status=%s error_code=%s error_type=%s",
+                      record["submission_outcome"].upper(), ticker, side.upper(),
+                      record["http_status"], record.get("error_code"), record["error_type"])
             return record
         record["order_id"] = str(field(response, "order_id") or "") or None
         record["fill_count"] = round(order_fill_count(response), 2)
@@ -2181,9 +2241,10 @@ class KalshiREST:
                 "DIRECTION MISMATCH | %s expected=%s exchange_returned=%s; no additional ladder orders will be placed.",
                 ticker, side.upper(), observed_side.upper(),
             )
-        LOG.info("ORDER %s | %s %s @ $%.2f x %.2f | fill=%.2f remaining=%.2f id=%s",
+        LOG.info("ORDER %s | %s %s @ $%.2f x %.2f | fill=%.2f remaining=%.2f id=%s exchange_index=%s",
                  record["status"].upper(), ticker, side.upper(), position_price, quantity,
-                 record["fill_count"], record["remaining_count"], record["order_id"] or "?")
+                 record["fill_count"], record["remaining_count"], record["order_id"] or "?",
+                 record["routing_exchange_index"])
         return record
 
     async def create_reduce_only_exit(
@@ -2239,6 +2300,7 @@ class KalshiREST:
         try:
             response = await self.orders.create_order_v2(
                 ticker=ticker,
+                exchange_index=self.order_exchange_index(ticker),
                 side=book_side,
                 count=f"{quantity:.2f}",
                 price=record["api_price"],
@@ -2310,6 +2372,7 @@ class KalshiREST:
         try:
             response = await self.orders.create_order_v2(
                 ticker=ticker, side=book_side, count=f"{quantity:.2f}", price=record["api_price"],
+                exchange_index=self.order_exchange_index(ticker),
                 time_in_force="good_till_canceled", expiration_time=int(expiration_time),
                 client_order_id=record["client_order_id"],
                 self_trade_prevention_type=SelfTradePreventionType.TAKER_AT_CROSS,
@@ -2470,8 +2533,16 @@ class KalshiREST:
             record["status"] = "dry_run_canceled"
             record["remaining_count"] = 0.0
             return True
+        ticker = str(record.get("ticker") or "")
+        if not ticker:
+            record["cancel_error"] = "missing_market_ticker_for_exchange_routing"
+            LOG.error("CANCEL BLOCKED | id=%s reason=missing_market_ticker_for_exchange_routing", order_id)
+            return False
         try:
-            response = await self.orders.cancel_order_v2(order_id)
+            record["cancel_routing_exchange_index"] = self.order_exchange_index(ticker)
+            response = await self.orders.cancel_order_v2(
+                order_id, market_ticker=ticker, exchange_index=record["cancel_routing_exchange_index"],
+            )
             canceled = field(response, "order") or response
             if canceled is not None:
                 final_fill = order_fill_count(canceled)
@@ -2493,8 +2564,8 @@ class KalshiREST:
             # canceled resting orders.  Keep the failure audit trail and make
             # the uncertainty explicit to the caller; it must reconcile before
             # it may place a replacement or an exit.
-            record["cancel_error"] = str(exc)
-            LOG.warning("Cancel failed for %s: %s", order_id, exc)
+            record["cancel_error"] = type(exc).__name__
+            LOG.warning("Cancel failed for %s: %s", order_id, type(exc).__name__)
             return False
 
 
