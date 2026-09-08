@@ -11,7 +11,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 import fcntl
 import json
@@ -264,9 +264,46 @@ async def assert_quiet_account(api: Api, snapshot: dict) -> None:
                 raise SafetyError("Position quantity unavailable") from None
             if not quantity.is_finite() or quantity != 0:
                 raise SafetyError("Open or unknown exposure exists; resolve it before shard administration")
-    transfers = await pages(api, TRANSFERS, "transfers", limit=500)
+    transfers = await transfer_history(api)
     if any(t.get("status") not in {"complete", "failed", "cancelled", "canceled"} for t in transfers):
         raise SafetyError("Pending or unknown-status account transfer exists; do not submit another")
+
+
+async def transfer_history(api: Api) -> list[dict]:
+    """Confirm nonterminal list records by ID, never dismiss old pending transfers."""
+    transfers = await pages(api, TRANSFERS, "transfers", limit=500)
+    verified = []
+    for transfer in transfers:
+        if transfer.get("status") not in {"complete", "failed", "cancelled", "canceled"}:
+            identifier = checked_id(transfer.get("transfer_id"))
+            response = await api.request("GET", TRANSFERS + "/" + identifier)
+            current = response.get("transfer")
+            if not isinstance(current, dict) or current.get("transfer_id") != identifier:
+                raise SafetyError("Pending-transfer lookup could not be verified; do not submit another")
+            transfer = current
+        verified.append(transfer)
+    return verified
+
+
+async def report_transfers(api: Api) -> None:
+    transfers = await transfer_history(api)
+    counts: dict[str, int] = {}
+    for transfer in transfers:
+        raw_status = transfer.get("status")
+        status = raw_status if isinstance(raw_status, str) and raw_status in {"complete", "pending", "failed", "cancelled", "canceled"} else "unknown"
+        counts[status] = counts.get(status, 0) + 1
+        if status not in {"complete", "failed", "cancelled", "canceled"}:
+            emit(action="UNRESOLVED_TRANSFER", transfer_id=checked_id(transfer.get("transfer_id")),
+                 status=status, amount_dollars=str(money(transfer.get("amount"))),
+                 created_at_utc=datetime.fromtimestamp(epoch(transfer.get("created_ts")), timezone.utc).isoformat(),
+                 source_exchange_shard=shard(transfer.get("source_exchange_shard")),
+                 destination_exchange_shard=shard(transfer.get("destination_exchange_shard")),
+                 source=transfer.get("source") if transfer.get("source") in {"event_contract", "margined"} else "unknown",
+                 destination=transfer.get("destination") if transfer.get("destination") in {"event_contract", "margined"} else "unknown",
+                 orders_sent=0, transfer_posts=0)
+    emit(action="READ_ONLY_TRANSFER_HISTORY", total=len(transfers), statuses=counts,
+         transfer_history_clear=not any(key in counts for key in ("pending", "unknown")),
+         note="Other write preflight checks still required; no worker or breaker changes")
 
 
 class Journal:
@@ -461,7 +498,7 @@ async def allocation_all(api: Api, journal: Journal, *, ticker=None, series="KXB
 
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
-    result.add_argument("command", nargs="?", default="status", choices=("status", "transfer-all", "resume-transfer", "allocation-all"))
+    result.add_argument("command", nargs="?", default="status", choices=("status", "transfers", "transfer-all", "resume-transfer", "allocation-all"))
     result.add_argument("--ticker", help="Optional API-discovered market ticker; otherwise discover the active series market")
     result.add_argument("--series", default="KXBTC15M")
     result.add_argument("--source-shard", type=int, default=0)
@@ -481,6 +518,9 @@ async def run(args, api=None, *, root=JOURNAL_DIR) -> None:
         raise SafetyError("Timeout must be between 0 and 600 seconds")
     shard(args.source_shard)
     api = api or Api.from_environment(execute=args.execute)
+    if args.command == "transfers":
+        await report_transfers(api)
+        return
     if args.command == "status":
         emit(action="READ_ONLY_STATUS", **await inspect_account(api, ticker=args.ticker, series=args.series, source=args.source_shard))
         return

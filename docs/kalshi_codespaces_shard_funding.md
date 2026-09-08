@@ -41,6 +41,7 @@ and store the replacement only through the appropriate secret settings.
 
 ```bash
 python kalshi_shard_admin.py status
+python kalshi_shard_admin.py transfers
 python kalshi_shard_admin.py transfer-all
 ```
 
@@ -50,6 +51,12 @@ market ticker/shard, total cash, source/destination available cash and existing
 automatic allocation. It never prints the key ID, private key or signed headers.
 `can_submit_orders=false` describes this admin utility: it has no order endpoint.
 Successful admin preflight does not prove the bot is ready or clear its breaker.
+The read-only `transfers` command also checks nonterminal transfers individually
+by ID, prints unresolved IDs/amounts/routes/timestamps, and never submits a transfer.
+Old pending transfers are not silently ignored. If Kalshi still reports one as
+pending, resolve it through Kalshi before using the transfer/allocation commands;
+do not delete a journal or bypass the check. A history check marked clear does not
+replace the other funding and exposure checks.
 
 The default series is `KXBTC15M`; `--ticker` accepts an explicitly API-discovered
 market instead of discovering the current active market. Do not use an old market

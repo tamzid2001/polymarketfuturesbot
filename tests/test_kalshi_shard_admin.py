@@ -251,10 +251,38 @@ class ShardAdminTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(admin.SafetyError): await api.request("POST", admin.TRANSFER)
 
     async def test_read_only_command_rejects_execute_flag_before_authentication(self):
-        for command in ("status", "resume-transfer"):
+        for command in ("status", "transfers", "resume-transfer"):
             with self.assertRaises(admin.SafetyError):
                 await admin.run(admin.parser().parse_args([command, "--execute"]), self.api)
         self.assertEqual(self.api.calls, [])
+
+    async def test_stale_pending_list_is_confirmed_by_read_only_id_lookup(self):
+        self.api.transfers = [{"transfer_id": "old-transfer", "status": "pending"}]
+        self.api.transfer_payload = {"transfer_id": "old-transfer", "status": "complete"}
+        records = await admin.transfer_history(self.api)
+        self.assertEqual(records[0]["status"], "complete")
+        self.assertEqual(self.api.posts(), [])
+        self.assertTrue(any(call[1] == admin.TRANSFERS + "/old-transfer" for call in self.api.calls))
+
+    async def test_old_pending_transfer_is_not_ignored_and_report_has_no_write(self):
+        self.api.transfer_payload = {
+            "transfer_id": "old-transfer", "status": "pending", "amount": "0.01",
+            "source": "margined", "destination": "event_contract",
+            "source_exchange_shard": 0, "destination_exchange_shard": 0, "created_ts": 1700000000,
+        }
+        self.api.transfers = [deepcopy(self.api.transfer_payload)]
+        await admin.run(admin.parser().parse_args(["transfers"]), self.api, root=self.root / "absent")
+        self.assertIn('"transfer_history_clear": false', self.stdout.getvalue())
+        self.assertIn('"transfer_id": "old-transfer"', self.stdout.getvalue())
+        self.assertFalse((self.root / "absent").exists())
+        with self.assertRaises(admin.SafetyError): await self.transfer()
+        self.assertEqual(self.api.posts(), [])
+
+    async def test_pending_transfer_id_lookup_mismatch_fails_closed(self):
+        self.api.transfers = [{"transfer_id": "expected", "status": "pending"}]
+        self.api.transfer_payload = {"transfer_id": "wrong", "status": "complete"}
+        with self.assertRaises(admin.SafetyError): await self.transfer()
+        self.assertEqual(self.api.posts(), [])
 
     async def test_transfer_id_cannot_be_mistaken_for_a_post_idempotency_key(self):
         with self.assertRaises(admin.SafetyError):
