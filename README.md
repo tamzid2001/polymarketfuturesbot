@@ -186,6 +186,97 @@ eligible predictions**. The original first 20,778 BTC predictions reproduce
 rate in this snapshot (52.2918% over 6,567 eligible signals); this is not a ranking
 of executable net profitability.
 
+### All 13 non-BTC markets: directional results
+
+The 13-series descriptive total is **139,063 settled markets**, **139,044 eligible predictions**,
+**71,304 wins / 67,740 losses**, and **51.2816% WR**. The 19 excluded records
+had no eligible causal signal; there is no loss-based skipping. This pooled WR
+is descriptive, not 139,044 independent cross-asset trials. No pooled p-value or
+combined cross-asset streak is claimed.
+
+| Market / series | Eligible | Directional W / L | WR | 95% Wilson CI | Two-sided binomial p | Bonferroni p (13 tests) | Max W / L streak |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| BNB (`KXBNB15M`) | 16,287 | 8,365 / 7,922 | 51.36% | 50.59%–52.13% | 0.000533 | 0.006929 | 12 / 14 |
+| Copper (`KXCOPPER15M`) | 730 | 366 / 364 | 50.14% | 46.52%–53.75% | 0.970479 | 1.000000 | 10 / 8 |
+| Dogecoin (`KXDOGE15M`) | 16,286 | 8,448 / 7,838 | 51.87% | 51.11%–52.64% | 1.818e-6 | 2.364e-5 | 13 / 11 |
+| Ethereum (`KXETH15M`) | 25,249 | 12,987 / 12,262 | 51.44% | 50.82%–52.05% | 5.198e-6 | 6.757e-5 | 12 / 14 |
+| Gold (`KXGOLD15M`) | 2,595 | 1,291 / 1,304 | 49.75% | 47.83%–51.67% | 0.813775 | 1.000000 | 12 / 9 |
+| Hyperliquid (`KXHYPE15M`) | 16,286 | 8,275 / 8,011 | 50.81% | 50.04%–51.58% | 0.039313 | 0.511070 | 13 / 11 |
+| Natural gas (`KXNATGAS15M`) | 730 | 366 / 364 | 50.14% | 46.52%–53.75% | 0.970479 | 1.000000 | 15 / 7 |
+| NEAR (`KXNEAR15M`) | 6,567 | 3,283 / 3,284 | 49.99% | 48.78%–51.20% | 1.000000 | 1.000000 | 14 / 10 |
+| Silver (`KXSILVER15M`) | 2,595 | 1,331 / 1,264 | 51.29% | 49.37%–53.21% | 0.195099 | 1.000000 | 10 / 8 |
+| Solana (`KXSOL15M`) | 22,888 | 11,826 / 11,062 | 51.67% | 51.02%–52.32% | 4.563e-7 | 5.932e-6 | 14 / 11 |
+| WTI crude (`KXWTI15M`) | 2,595 | 1,350 / 1,245 | 52.02% | 50.10%–53.94% | 0.041173 | 0.535254 | 15 / 10 |
+| XRP (`KXXRP15M`) | 19,669 | 9,982 / 9,687 | 50.75% | 50.05%–51.45% | 0.036052 | 0.468673 | 13 / 11 |
+| Zcash (`KXZEC15M`) | 6,567 | 3,434 / 3,133 | 52.29% | 51.08%–53.50% | 0.000213 | 0.002774 | 14 / 10 |
+
+**Binomial test:** H0 is a directional win probability of 50%, versus a two-sided
+alternative. With `n` signals and `w` wins, the exact probability is
+`min(1, 2 * sum(comb(n,k), k=0..min(w,n-w)) / 2**n)`. The reported log-space
+calculation was independently checked using exact integer binomial coefficients
+for all 14 series, including BTC. See the [binomial-test definition](https://docs.scipy.org/doc/scipy/reference/generated/scipy.stats.binomtest.html).
+
+**BNB, DOGE, ETH, SOL and ZEC** retain p<0.05 after Bonferroni correction across
+these 13 primary tests. HYPE, XRP and WTI pass the uncorrected 0.05 threshold
+but not the correction. BTC is the pre-existing control, excluded from that family:
+**13,002 / 12,260**, **51.4686% WR**, **50.85%–52.08% CI**,
+**p=3.124691e-6**, and **14 / 11** maximum W/L streak.
+
+The tests and individual Wilson intervals assume independent, identically
+distributed Bernoulli trials. Serial dependence, earlier strategy selection,
+cross-asset correlation and execution costs limit interpretation. Bonferroni
+addresses these 13 simultaneous comparisons; it does not fix invalid
+within-series independence or prove a tradable edge. A p-value is not the
+probability that the null is true. Beating 50% does not imply beating actual
+entry prices plus fees.
+
+### Coverage and stability
+
+All rows end with the **2026-09-08 01:00 UTC market open**. First opens below
+are UTC; historical gaps and commodity trading sessions are retained.
+Halves divide eligible signals chronologically, not equal calendar durations.
+Recent windows use the last 1,000 signals, or the whole history if shorter.
+Current streaks are at the frozen cutoff—not the present LIVE worker.
+
+| Series | First market open (UTC) | First-half WR | Second-half WR | Recent n | Recent W / L | Recent WR | Current streak |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
+| KXBNB15M | 2026-03-07 00:15 | 51.19% | 51.53% | 1,000 | 501 / 499 | 50.10% | 3W |
+| KXCOPPER15M | 2026-08-27 20:30 | 53.42% | 46.85% | 730 | 366 / 364 | 50.14% | 1W |
+| KXDOGE15M | 2026-03-18 20:00 | 51.66% | 52.08% | 1,000 | 519 / 481 | 51.90% | 1L |
+| KXETH15M | 2025-12-10 21:45 | 51.05% | 51.83% | 1,000 | 516 / 484 | 51.60% | 2L |
+| KXGOLD15M | 2026-07-31 18:00 | 49.19% | 50.31% | 1,000 | 502 / 498 | 50.20% | 1L |
+| KXHYPE15M | 2026-03-18 20:00 | 50.42% | 51.20% | 1,000 | 518 / 482 | 51.80% | 1W |
+| KXNATGAS15M | 2026-08-27 20:30 | 49.04% | 51.23% | 730 | 366 / 364 | 50.14% | 4L |
+| KXNEAR15M | 2026-06-30 17:15 | 50.84% | 49.15% | 1,000 | 494 / 506 | 49.40% | 1W |
+| KXSILVER15M | 2026-07-31 18:00 | 51.04% | 51.54% | 1,000 | 514 / 486 | 51.40% | 3L |
+| KXSOL15M | 2026-01-09 00:30 | 52.28% | 51.06% | 1,000 | 509 / 491 | 50.90% | 2L |
+| KXWTI15M | 2026-07-31 18:00 | 51.50% | 52.54% | 1,000 | 528 / 472 | 52.80% | 3W |
+| KXXRP15M | 2026-02-11 05:00 | 51.31% | 50.19% | 1,000 | 527 / 473 | 52.70% | 2L |
+| KXZEC15M | 2026-06-30 17:15 | 52.54% | 52.04% | 1,000 | 516 / 484 | 51.60% | 2L |
+
+ZEC has the highest full-sample WR (52.29%), while SOL has the smallest nominal
+p-value. Neither is necessarily the most profitable executable strategy.
+Copper and natural gas each have only 730 signals. The latest BTC 1,000 are
+499 wins / 501 losses (49.90%), compared with its 51.47% full-history WR.
+
+### Relevant source-code size
+
+Counted for this reporting update with cloc 2.06: executable/source lines only,
+excluding comments, blank lines, datasets, documentation, dependencies and Git history.
+
+| Scope | Files | Code lines |
+| --- | ---: | ---: |
+| Non-archived source, excluding tests/workflows | 32 | 20,999 |
+| Non-archived tests | 21 | 5,827 |
+| Current workflow definitions | 11 | 1,056 |
+| **Relevant non-archived total** | 64 | **27,882** |
+| Archived source/tests/workflows (separate) | 55 | 16,508 |
+| **All counted source including archive** | 119 | **44,390** |
+
+Non-archived does not mean every module or workflow is currently running.
+Detailed file-by-file counts and the exact command are in the linked inventory.
+These counts measure repository size, not enterprise valuation or profitability.
+
 Run a new public-data snapshot with `python kalshi_multiseries_backtest.py`.
 For an exact offline replay, extract the ZIP into an empty folder and run
 `python kalshi_multiseries_backtest.py --output reports --cache cache --offline`.

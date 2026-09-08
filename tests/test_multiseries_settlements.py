@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import math
 import unittest
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
+from types import SimpleNamespace
 
 from kalshi_multiseries_backtest import AuditedLoader, summary
 from kalshi_settlement_loader import KalshiSettlementLoader, SettlementMarket, reconstruct_signals
@@ -80,6 +82,24 @@ class MultiSeriesSettlementTests(unittest.TestCase):
         self.assertEqual((value["directional_wins"], value["directional_losses"]), (2, 2))
         self.assertEqual(value["nominal_binomial_p_two_sided"], 1)
         self.assertEqual((value["longest_win_streak"], value["longest_loss_streak"]), (1, 1))
+
+    def test_two_sided_binomial_matches_exact_integer_probability(self):
+        # Independent exact combinatorial oracle; no SciPy/runtime dependency.
+        for n, wins in ((4, 0), (4, 4), (10, 8), (10, 2), (11, 5), (100, 64)):
+            signals = [SimpleNamespace(directional_win=i < wins) for i in range(n)]
+            with patch("kalshi_multiseries_backtest.signal_summary", return_value={}):
+                value = summary(signals, {})
+            expected = min(1, 2*sum(math.comb(n, k) for k in range(min(wins, n-wins)+1))/2**n)
+            self.assertAlmostEqual(value["nominal_binomial_p_two_sided"], expected, places=12)
+
+    def test_streak_and_recent_window_denominators(self):
+        outcomes = [True]*10 + [False]*3 + [True]*5 + [False]*2
+        with patch("kalshi_multiseries_backtest.signal_summary", return_value={}):
+            value = summary([SimpleNamespace(directional_win=x) for x in outcomes], {})
+        self.assertEqual((value["longest_win_streak"], value["longest_loss_streak"]), (10, 3))
+        self.assertEqual((value["current_streak_side"], value["current_streak_length"]), ("L", 2))
+        self.assertEqual((value["latest_1000_n"], value["latest_1000_wr"]), (20, .75))
+        self.assertEqual((value["first_half_wr"], value["second_half_wr"]), (1, .5))
 
 
 if __name__ == "__main__":
