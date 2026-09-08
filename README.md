@@ -168,6 +168,12 @@ order uncertainty: the operator must resolve account funding and reconcile
 orders, fills and positions before any explicit recovery. This patch has no
 automatic transfer, breaker reset or worker restart mechanism.
 
+An independent operator-run [Codespaces shard admin tool](kalshi_shard_admin.py)
+now supports read-only checks, a separately confirmed full available shard-0 cash
+transfer to the active market's shard, and a separately confirmed 100% recurring
+allocation. It never places orders, clears the bot's breaker or restarts a worker.
+See the [exact setup, confirmation and recovery instructions](docs/kalshi_codespaces_shard_funding.md).
+
 ### Sticky signal transition
 
 The v12 signal has no loss-skip rule and is independent of execution. For each new market, the worker freezes the immediately preceding market’s realtime provisional outcome, later checks it against official settlement, and records the transition in both state and audit ledger:
