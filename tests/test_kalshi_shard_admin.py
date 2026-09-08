@@ -11,6 +11,7 @@ import os
 import tempfile
 import time
 import unittest
+import warnings
 from unittest.mock import AsyncMock, Mock, patch
 
 import kalshi_shard_admin as admin
@@ -421,6 +422,7 @@ class ShardAdminTests(unittest.IsolatedAsyncioTestCase):
         await admin.run(admin.parser().parse_args(["auth-check"]), api, root=self.root / "absent")
         api.request.assert_awaited_once_with("GET", "/portfolio/balance")
         self.assertIn('"signer_self_check": "PASS"', self.stdout.getvalue())
+        self.assertIn('"diagnostic_version": 2', self.stdout.getvalue())
         self.assertIn('"authenticated_balance_read": "PASS"', self.stdout.getvalue())
         self.assertNotIn(self.mock_key_id, self.stdout.getvalue())
         self.assertNotIn(self.ephemeral_pem, self.stdout.getvalue())
@@ -468,6 +470,109 @@ class ShardAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("approx_http_date_clock_offset_seconds", api.last_response_diagnostics)
         self.assertNotIn("secret-must-not-print", str(error.exception))
         self.assertNotIn(self.mock_key_id, str(api.last_response_diagnostics))
+
+    def test_server_error_decoder_preserves_categories_not_raw_credentials(self):
+        examples = {
+            "INCORRECT_API_KEY_SIGNATURE": "SIGNATURE_REJECTED",
+            "INVALID_API_KEY_SIGNATURE": "SIGNATURE_REJECTED",
+            "API_KEY_NOT_FOUND": "KEY_NOT_RECOGNIZED",
+            "INVALID_API_KEY": "KEY_REJECTED_UNSPECIFIED",
+            "API_KEY_EXPIRED": "KEY_REVOKED_OR_EXPIRED",
+            "Invalid timestamp": "TIMESTAMP_REJECTED",
+            "IP not allowed": "ACCESS_RESTRICTED",
+            "Missing auth headers": "AUTH_HEADERS_MISSING",
+            "Insufficient permissions": "SCOPE_REJECTED",
+        }
+        for marker, category in examples.items():
+            payload = {"error": {"code": "authentication_error", "message": marker,
+                                  "details": {"reason": marker, "message": self.mock_key_id + self.ephemeral_pem}}}
+            result = admin.safe_server_error_details(payload)
+            self.assertEqual(result["server_reasons"], [category])
+            self.assertNotIn(self.mock_key_id, str(result))
+            self.assertNotIn(self.ephemeral_pem, str(result))
+
+    def test_unknown_server_error_is_not_invented_or_echoed(self):
+        for payload in ({"error": {"message": "new-secret-bearing-error", "details": "private-detail"}},
+                        {"error": "private-value"}, [], None):
+            result = admin.safe_server_error_details(payload)
+            self.assertEqual(result["server_reasons"], [])
+            self.assertFalse(result["server_detail_recognized"])
+            self.assertNotIn("private", str(result))
+
+    def test_only_safe_trace_identifiers_leave_response_headers(self):
+        result = admin.safe_response_ids({"X-Request-ID": "safe-request-123", "Authorization": "secret-token",
+                                         "X-Correlation-ID": "prefix-" + self.mock_key_id,
+                                         "CF-Ray": "value\nwith-newline", "X-Amzn-RequestId": "x" * 200},
+                                        secrets=(self.mock_key_id, "secret-token"))
+        self.assertEqual(result, {"request_id": "safe-request-123"})
+
+    async def test_transport_reports_specific_401_and_support_id_without_echoing_body(self):
+        api = admin.Api(self.mock_key_id, self.ephemeral_pem, execute=False)
+        response = Mock(status=401, headers={"X-Request-ID": "safe-request-123"})
+        response.read = AsyncMock(return_value=json.dumps({"error": {"code": "authentication_error",
+            "message": "INCORRECT_API_KEY_SIGNATURE", "details": self.mock_key_id + self.ephemeral_pem}}).encode())
+        response.__aenter__ = AsyncMock(return_value=response)
+        response.__aexit__ = AsyncMock(return_value=False)
+        session = Mock()
+        session.__aenter__ = AsyncMock(return_value=session)
+        session.__aexit__ = AsyncMock(return_value=False)
+        session.request.return_value = response
+        with patch("aiohttp.ClientSession", return_value=session):
+            with self.assertRaises(admin.ApiError): await admin.authentication_check(api)
+        self.assertIn('"SIGNATURE_REJECTED"', self.stdout.getvalue())
+        self.assertIn('"request_id": "safe-request-123"', self.stdout.getvalue())
+        self.assertNotIn(self.mock_key_id, self.stdout.getvalue())
+        self.assertNotIn(self.ephemeral_pem, self.stdout.getvalue())
+        self.assertEqual(session.request.call_count, 1)
+
+    def test_original_file_diagnostic_ignores_conflicting_environment_values(self):
+        with patch.dict(os.environ, {"KALSHI_API_KEY_ID": "old-id", "KALSHI_PROD_API_KEY": "other-id",
+                                     "KALSHI_PRIVATE_KEY": "wrong-pem"}, clear=True), \
+                patch.object(Path, "read_text", return_value=self.ephemeral_pem):
+            api = admin.Api.for_file_auth_check("private-file", prompt=lambda _: self.mock_key_id)
+        self.assertEqual(api.key_id, self.mock_key_id)
+        self.assertFalse(api.execute)
+        self.assertTrue(api.credential_sources["credential_environment_ignored"])
+
+    def test_original_file_check_refuses_noninteractive_hidden_prompt(self):
+        with patch("kalshi_shard_admin.sys.stdin.isatty", return_value=False), \
+                patch.object(Path, "read_text") as read:
+            with self.assertRaises(admin.SafetyError): admin.Api.for_file_auth_check("private-file")
+        read.assert_not_called()
+
+    def test_original_file_prompt_does_not_fall_back_to_echoing(self):
+        def unsafe_prompt(_):
+            warnings.warn("would fall back to visible input", admin.getpass.GetPassWarning)
+            raise AssertionError("Must not reach visible input")
+        with patch.object(Path, "read_text", return_value=self.ephemeral_pem):
+            with self.assertRaises(admin.SafetyError):
+                admin.Api.for_file_auth_check("private-file", prompt=unsafe_prompt)
+
+    async def test_key_file_option_cannot_authorize_any_write(self):
+        for command in ("status", "transfer-all", "allocation-all", "resume-transfer"):
+            with self.assertRaises(admin.SafetyError):
+                await admin.run(admin.parser().parse_args([command, "--key-file", "private-file"]))
+        with self.assertRaises(admin.SafetyError):
+            await admin.run(admin.parser().parse_args(["auth-check", "--key-file", "private-file", "--execute"]))
+
+    async def test_file_cli_performs_only_get_without_using_environment_or_journal(self):
+        with patch("kalshi_shard_admin.sys.stdin.isatty", return_value=True), \
+                patch("kalshi_shard_admin.getpass.getpass", return_value=self.mock_key_id), \
+                patch.object(Path, "read_text", return_value=self.ephemeral_pem), \
+                patch.object(admin.Api, "request", new_callable=AsyncMock, return_value={"balance_dollars": "1"}) as request, \
+                patch.object(admin.Api, "from_environment") as env:
+            await admin.run(admin.parser().parse_args(["auth-check", "--key-file", "private-file"]), root=self.root / "absent")
+        env.assert_not_called()
+        request.assert_awaited_once_with("GET", "/portfolio/balance")
+        self.assertFalse((self.root / "absent").exists())
+        self.assertNotIn(self.mock_key_id, self.stdout.getvalue())
+
+    def test_uuid_shape_check_does_not_expose_key_id(self):
+        for value, expected in ((self.mock_key_id, True), ("key-display-name", False)):
+            with patch.dict(os.environ, {"KALSHI_PROD_API_KEY": value}, clear=True):
+                report = admin.credential_environment_report()
+            self.assertEqual(report["key_id_has_uuid_format"], expected)
+            self.assertNotIn(value, str(report))
 
 
 if __name__ == "__main__": unittest.main()

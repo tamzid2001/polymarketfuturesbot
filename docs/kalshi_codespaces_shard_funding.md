@@ -84,6 +84,15 @@ one authenticated balance GET. It does not print key IDs, private keys, signed
 headers, raw API error bodies, or your balance. It never submits a transfer/order
 or creates an operation journal.
 
+Diagnostic version 2 also classifies recognized markers in Kalshi error
+`code`/`message`/`details` fields. `server_reasons` can distinguish a rejected
+signature, an unrecognized/expired key, a timestamp issue, missing headers, or an
+access/scope restriction **when the response supplies recognizable evidence**.
+Only fixed classifications and validated request identifiers are emitted, never
+arbitrary server text. An empty list means the reason remains unknown. Header
+presence flags reflect what this client supplied, not proof of what a downstream
+gateway received. UTC time and request identifiers help Kalshi investigate.
+
 - `key_id_alias_conflict=true`: both `KALSHI_API_KEY_ID` and
   `KALSHI_PROD_API_KEY` are set to different values. Older code silently chose
   the first; current code refuses to guess. Keep only the current production
@@ -112,6 +121,42 @@ shard, changing strategy parameters, or resetting a trading breaker.
 Only after `AUTH_REMOTE_CHECK` reports `PASS`, run `status` and the read-only
 transfer preview again. The remote authentication check does not establish write
 permission or transfer readiness by itself; the complete preflight checks those.
+
+#### Repeated 401: compare against the original key file
+
+Do not keep rotating credentials without new evidence. To remove Codespaces
+environment-variable loading from the test, use the original downloaded private
+key file and the API key ID created with that file. This optional diagnostic
+ignores **all** credential environment variables and performs only the balance GET.
+
+```bash
+mkdir -p .kalshi-credentials
+chmod 700 .kalshi-credentials
+```
+
+Using the Codespaces file explorer, upload the original file into that ignored
+folder as `original.key` (do not commit or paste its contents), then run:
+
+```bash
+chmod 600 .kalshi-credentials/original.key
+python kalshi_shard_admin.py auth-check --key-file .kalshi-credentials/original.key
+```
+
+The paired production API key ID is requested through a hidden terminal prompt,
+not a command-line argument or shell history. Do not use redirected input or a
+notebook: the tool refuses a prompt that cannot hide input. It does not store the
+prompted ID, modify secrets, or allow `--key-file` with a transfer/allocation.
+
+- File check passes but environment check fails: investigate differences in
+  credential material/loading; compare the paired ID/file before concluding the
+  secrets are wrong. Account/server state can also change between requests.
+- Both checks fail: inspect `server_reasons`. A specific rejection guides the
+  investigation; do not automatically blame formatting or generate another key.
+- Neither result supplies a specific reason: send Kalshi support the sanitized
+  diagnostic version, UTC time, host, endpoint, status and request identifier.
+  Ask them to identify the authentication denial for that request. Never send
+  private keys or signed headers. Access restrictions must be resolved with
+  Kalshi; this utility will not change hosts, locations, proxies or IPs to evade them.
 
 ## 3. One-time transfer of all available shard-0 cash
 

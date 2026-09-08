@@ -16,12 +16,15 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from email.utils import parsedate_to_datetime
 import fcntl
+import getpass
 from importlib.metadata import version
 import json
 import os
 from pathlib import Path
 import re
+import sys
 import time
+import warnings
 from typing import Any
 from urllib.parse import quote
 
@@ -37,6 +40,31 @@ CENTICENTS = Decimal("10000")
 SAFE_CODES = {"user_not_found", "available_balance_too_low", "insufficient_balance",
               "insufficient_funds", "authentication_error", "unauthorized", "forbidden",
               "invalid_parameters", "rate_limit_exceeded"}
+# Only these fixed classifications may leave the error decoder. Arbitrary
+# message/details text can echo credentials and must never enter logs/artifacts.
+AUTH_REASON_MARKERS = {
+    "SIGNATURE_REJECTED": ("incorrect_api_key_signature", "invalid_api_key_signature", "invalid_signature",
+                           "incorrect_signature", "signature_verification_failed", "signature_mismatch"),
+    "KEY_NOT_RECOGNIZED": ("api_key_not_found", "unknown_api_key", "invalid_api_key_id", "no_such_api_key"),
+    "KEY_REJECTED_UNSPECIFIED": ("invalid_api_key", "api_key_invalid"),
+    "KEY_REVOKED_OR_EXPIRED": ("api_key_revoked", "api_key_expired", "expired_api_key", "revoked_api_key"),
+    "TIMESTAMP_REJECTED": ("invalid_timestamp", "timestamp_expired", "request_expired", "timestamp_out_of_range", "timestamp_too_old"),
+    "ACCESS_RESTRICTED": ("georestricted", "geo_restricted", "region_restricted", "location_restricted",
+                          "region_expired", "invalid_region", "ip_not_allowed", "ip_restricted", "account_suspended", "account_disabled"),
+    "AUTH_HEADERS_MISSING": ("missing_authentication_headers", "missing_auth_headers", "missing_api_key",
+                             "missing_kalshi_access_key", "missing_kalshi_access_signature"),
+    "SCOPE_REJECTED": ("insufficient_scope", "insufficient_permissions", "permission_denied"),
+}
+AUTH_REASON_HINTS = {
+    "SIGNATURE_REJECTED": "Kalshi reports a rejected signature. Local self-verification cannot prove that the key ID is registered to this PEM. Compare the original paired ID/file using --key-file.",
+    "KEY_NOT_RECOGNIZED": "Kalshi reports an unrecognized key ID. Check the current production API key ID, not an account ID or key name.",
+    "KEY_REJECTED_UNSPECIFIED": "Kalshi reports an invalid API key without a more specific recognized reason. Verify the production key record; this alone does not establish a PEM mismatch.",
+    "KEY_REVOKED_OR_EXPIRED": "Kalshi reports an expired/revoked key. Check its status in the production account.",
+    "TIMESTAMP_REJECTED": "Kalshi reports a timestamp problem. Compare the clock diagnostics and ask Kalshi to investigate if the clock is aligned; no automatic clock changes.",
+    "ACCESS_RESTRICTED": "Kalshi reports an access restriction. Resolve account/location/IP eligibility with Kalshi; this tool will not change hosts, routes or locations.",
+    "AUTH_HEADERS_MISSING": "Kalshi reports missing authentication headers. Use the safe header-presence flags and request identifier when contacting Kalshi; never send signed headers.",
+    "SCOPE_REJECTED": "Kalshi reports a permission/scope restriction. Check the key permissions with Kalshi.",
+}
 
 
 class SafetyError(Exception):
@@ -49,6 +77,7 @@ class ApiError(SafetyError):
         self.code = code if isinstance(code, str) and code in SAFE_CODES else "unclassified"
         self.request_method = None
         self.request_path = None
+        self.server_diagnostics: dict = {}
         super().__init__(f"API request failed: HTTP {status}; code={self.code}. No automatic write retry.")
 
 
@@ -100,6 +129,44 @@ def checked_id(value: Any) -> str:
     return value
 
 
+def safe_server_error_details(payload: Any) -> dict:
+    """Recognize error categories, not raw messages; bounded known-field traversal."""
+    error = payload.get("error", payload) if isinstance(payload, dict) else {}
+    if not isinstance(error, dict):
+        return {"server_reasons": [], "server_detail_recognized": False}
+    values: list[str] = []
+    def visit(value, depth=0):
+        if depth > 3 or len(values) >= 24:
+            return
+        if isinstance(value, str):
+            values.append(value[:4096])
+        elif isinstance(value, dict):
+            for field in ("code", "message", "details", "reason", "error", "type"):
+                if field in value:
+                    visit(value[field], depth + 1)
+        elif isinstance(value, list):
+            for item in value[:8]:
+                visit(item, depth + 1)
+    visit(error)
+    normalized = [re.sub(r"[^a-z0-9]+", "_", value.lower()).strip("_") for value in values]
+    reasons = [reason for reason, markers in AUTH_REASON_MARKERS.items()
+               if any(marker in value for marker in markers for value in normalized)]
+    if len(reasons) > 1 and "KEY_REJECTED_UNSPECIFIED" in reasons:
+        reasons.remove("KEY_REJECTED_UNSPECIFIED")  # Prefer a specific signature/ID/access reason.
+    return {"server_reasons": reasons, "server_detail_recognized": bool(reasons),
+            "server_message_present": bool(error.get("message")), "server_details_present": bool(error.get("details"))}
+
+
+def safe_response_ids(headers, *, secrets=()) -> dict:
+    result = {}
+    for source, target in (("X-Request-ID", "request_id"), ("X-Correlation-ID", "correlation_id"),
+                           ("X-Amzn-RequestId", "aws_request_id"), ("CF-Ray", "edge_request_id")):
+        value = headers.get(source)
+        if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9._:-]{1,160}", value) and not any(secret and secret in value for secret in secrets):
+            result[target] = value
+    return result
+
+
 def credential_environment_report() -> dict:
     """Presence/format only: never return secret values, lengths or fingerprints."""
     aliases = ("KALSHI_API_KEY_ID", "KALSHI_PROD_API_KEY")
@@ -108,6 +175,7 @@ def credential_environment_report() -> dict:
     normalized = {value.strip() for value in values.values() if value.strip()}
     pem = os.getenv("KALSHI_PRIVATE_KEY", "")
     return {"key_id_variables_present": present, "key_id_alias_conflict": len(normalized) > 1,
+            "key_id_has_uuid_format": bool(normalized) and all(re.fullmatch(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", value) for value in normalized),
             "key_id_outer_whitespace": any(value != value.strip() for value in values.values()),
             "private_key_env_present": bool(pem.strip()),
             "pem_path_configured": bool(os.getenv("KALSHI_PEM_PATH")),
@@ -160,8 +228,29 @@ class Api:
         result.credential_sources = sources
         return result
 
-    async def request(self, method: str, path: str, *, params=None, body=None) -> dict:
-        import aiohttp
+    @classmethod
+    def for_file_auth_check(cls, path: str, *, prompt=None) -> "Api":
+        # Deliberately ignores all credential environment variables and cannot
+        # enable admin writes. The hidden prompt never enters shell history.
+        if prompt is None and not sys.stdin.isatty():
+            raise SafetyError("File authentication check needs an interactive terminal for a hidden key-ID prompt")
+        try:
+            pem = Path(path).read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            raise SafetyError("Cannot read the selected private-key file; do not paste its contents") from None
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", getpass.GetPassWarning)
+                key_id = (prompt or getpass.getpass)("Production API key ID paired with this file (hidden): ").strip()
+        except getpass.GetPassWarning:
+            raise SafetyError("Hidden input is unavailable; use an interactive terminal, not a notebook or redirected input") from None
+        checked_id(key_id)
+        result = cls(key_id, pem, execute=False)
+        result.credential_sources = {"key_id_sources": ["hidden_operator_prompt"], "private_key_source": "explicit_file",
+                                     "credential_environment_ignored": True}
+        return result
+
+    def authorize_request(self, method: str, path: str, *, params=None, body=None) -> None:
         get_allowed = path in {"/markets", "/api_keys", "/portfolio/balance", "/portfolio/orders",
                               "/portfolio/positions", TRANSFERS, ALLOCATION} or (
             path.startswith("/markets/") or path.startswith(TRANSFERS + "/"))
@@ -172,6 +261,10 @@ class Api:
             raise SafetyError("Writes are disabled or endpoint is not allowlisted; this tool cannot place orders")
         if ".." in path or "?" in path or "#" in path or not path.startswith("/"):
             raise SafetyError("Invalid API path")
+
+    async def request(self, method: str, path: str, *, params=None, body=None) -> dict:
+        import aiohttp
+        self.authorize_request(method, path, params=params, body=body)
         attempts = 3 if method == "GET" else 1
         for attempt in range(attempts):
             try:
@@ -180,7 +273,11 @@ class Api:
                 async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as session:
                     async with session.request(method, HOST + PREFIX + path, params=params,
                                                json=body, headers=headers, allow_redirects=False) as response:
-                        self.last_response_diagnostics = {"http_status": response.status, "method": method, "endpoint": path}
+                        self.last_response_diagnostics = {"http_status": response.status, "method": method, "endpoint": path,
+                            "diagnostic_utc": utc_now(),
+                            "auth_header_presence": {name: bool(headers.get(name)) for name in (
+                                "KALSHI-ACCESS-KEY", "KALSHI-ACCESS-SIGNATURE", "KALSHI-ACCESS-TIMESTAMP")},
+                            **safe_response_ids(response.headers, secrets=tuple(headers.values()))}
                         try:
                             server_date = parsedate_to_datetime(response.headers.get("Date", ""))
                             if server_date.tzinfo is not None:
@@ -196,7 +293,11 @@ class Api:
                         if not 200 <= response.status < 300:
                             error = payload.get("error", payload) if isinstance(payload, dict) else {}
                             code = error.get("code") if isinstance(error, dict) else None
-                            raise ApiError(response.status, code)
+                            safe_details = safe_server_error_details(payload)
+                            self.last_response_diagnostics.update(safe_details)
+                            failure = ApiError(response.status, code)
+                            failure.server_diagnostics = {**safe_details, **safe_response_ids(response.headers, secrets=tuple(headers.values()))}
+                            raise failure
                         if not isinstance(payload, dict):
                             raise ApiError(response.status)
                         return payload
@@ -234,15 +335,17 @@ async def authentication_check(api: Api) -> None:
         )
     except Exception:
         raise SafetyError("Local SDK signing self-check failed; do not attempt a transfer") from None
-    emit(action="AUTH_LOCAL_CHECK", host=HOST, environment="production", kalshi_sdk_version=version("kalshi-python-async"),
+    emit(action="AUTH_LOCAL_CHECK", diagnostic_version=2, host=HOST, environment="production", kalshi_sdk_version=version("kalshi-python-async"),
          **api.credential_sources, rsa_pem_parse="PASS", signer_self_check="PASS", timestamp_unit="milliseconds",
          signed_path=path, registered_key_pair="NOT_YET_VERIFIED", orders_sent=0, transfer_posts=0)
     try:
         balance = await api.request("GET", "/portfolio/balance")
         money(balance.get("balance_dollars"))
     except ApiError as exc:
+        reasons = api.last_response_diagnostics.get("server_reasons", [])
+        hints = [AUTH_REASON_HINTS[reason] for reason in reasons if reason in AUTH_REASON_HINTS]
         emit(action="AUTH_REMOTE_CHECK", result="FAILED", **api.last_response_diagnostics,
-             hint="For 401: check the current matching production key-ID/PEM pair, stale Codespaces secrets, revoked/demo keys and clock offset. Local signing alone does not prove the key ID matches the registered public key.",
+             hints=hints or ["No specific server reason was recognized. Compare environment credentials with the original file using --key-file, then give Kalshi support the sanitized UTC/endpoint/status/request identifier if it still fails. No further key rotation is assumed necessary."],
              orders_sent=0, transfer_posts=0)
         raise exc
     emit(action="AUTH_REMOTE_CHECK", result="PASS", **api.last_response_diagnostics,
@@ -634,11 +737,14 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--execute", action="store_true", help="Permit ONLY the selected admin write, after interactive confirmation")
     result.add_argument("--workers-paused", action="store_true", help="Operator attestation: all account workers/watchdogs were paused manually")
     result.add_argument("--transfer-id", help="For read-only recovery of a saved uncertain transfer; must match amount, routing and time")
+    result.add_argument("--key-file", help="Only with auth-check: read the original private-key file and prompt for its paired key ID; ignore credential environment variables")
     result.add_argument("--timeout", type=int, default=120, help="Transfer status polling deadline, 0-600 seconds")
     return result
 
 
 async def run(args, api=None, *, root=JOURNAL_DIR) -> None:
+    if args.key_file and (args.command != "auth-check" or api is not None):
+        raise SafetyError("--key-file is only for standalone read-only auth-check; it cannot authorize an admin write")
     if args.transfer_id and args.command != "resume-transfer":
         raise SafetyError("--transfer-id is only for read-only resume-transfer; it is not a POST idempotency key")
     if args.execute and args.command not in {"transfer-all", "allocation-all"}:
@@ -647,8 +753,12 @@ async def run(args, api=None, *, root=JOURNAL_DIR) -> None:
         raise SafetyError("Timeout must be between 0 and 600 seconds")
     shard(args.source_shard)
     if args.command == "auth-check":
-        emit(action="AUTH_ENVIRONMENT", **credential_environment_report(), orders_sent=0, transfer_posts=0)
-        await authentication_check(api or Api.from_environment(execute=False))
+        if args.key_file:
+            api = Api.for_file_auth_check(args.key_file)
+        else:
+            emit(action="AUTH_ENVIRONMENT", **credential_environment_report(), orders_sent=0, transfer_posts=0)
+            api = api or Api.from_environment(execute=False)
+        await authentication_check(api)
         return
     api = api or Api.from_environment(execute=args.execute)
     if args.command == "transfers":
@@ -676,7 +786,8 @@ def main() -> int:
         asyncio.run(run(parser().parse_args()))
         return 0
     except SafetyError as exc:
-        details = {"request_method": exc.request_method, "request_path": exc.request_path} if isinstance(exc, ApiError) else {}
+        details = {"request_method": exc.request_method, "request_path": exc.request_path,
+                   **exc.server_diagnostics} if isinstance(exc, ApiError) else {}
         emit(error=str(exc), **details, orders_sent=0, breaker="UNCHANGED")
         return 2
     except (Exception, KeyboardInterrupt) as exc:
