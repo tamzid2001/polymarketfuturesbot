@@ -243,4 +243,3 @@ class OrderSmokeTests(unittest.IsolatedAsyncioTestCase):
         feed = smoke.SmokeFeed(auth=None, url=smoke.WS_URL)
         with self.assertRaises(SafetyError) as raised: feed._handle('{"type":"error","msg":"SENSITIVE_MOCK"}')
         self.assertNotIn("SENSITIVE_MOCK", str(raised.exception))
-
