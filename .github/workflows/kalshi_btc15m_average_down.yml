@@ -33,6 +33,11 @@ on:
         required: false
         type: string
         default: ""
+      max_share_cap:
+        description: "FIXED maximum shares per market (e.g. 100 or 200). Does not grow with base. Two decimals allowed; blank preserves the durable cap."
+        required: false
+        type: string
+        default: ""
       profit_threshold:
         description: "Realized net profit required for the first permanent share increase. Blank preserves the durable setting."
         required: false
@@ -136,6 +141,7 @@ jobs:
           python -m py_compile strategy_core.py live_state.py audit_ledger.py kalshi_live_trader.py optimizer.py
           PYTHONPATH=. python -m unittest -v \
             tests.test_strategy_core \
+            tests.test_position_cap \
             tests.test_live_execution \
             tests.test_live_stop_safety \
             tests.test_maker_hybrid_v11 \
@@ -149,7 +155,7 @@ jobs:
         run: |
           set -euo pipefail
           python -c 'from kalshi_live_trader import LIVE_STOP_SAFETY_CONTRACT_VERSION; assert LIVE_STOP_SAFETY_CONTRACT_VERSION == 1; print("LIVE_STOP_SAFETY_CONTRACT=1 | durable_intent=true unknown_post=reconcile_before_retry hard_stop=latched_reduce_only")'
-          python -c 'from decimal import Decimal; from kalshi_live_trader import ACTIVE_CONFIG_SCHEMA_VERSION, ACTIVE_STRATEGY_VERSION, BTC_TARGET_CAPTURE_CONTRACT_VERSION, DELAYED_ENTRY_LADDER_CONTRACT_VERSION, OPENING_PRICE_CAPTURE_CONTRACT_VERSION, load_config; c = load_config(__import__("pathlib").Path("selected_live_strategy.json")); assert c["strategy_version"] == ACTIVE_STRATEGY_VERSION; assert c["config_schema_version"] == ACTIVE_CONFIG_SCHEMA_VERSION == 12; assert OPENING_PRICE_CAPTURE_CONTRACT_VERSION == 3; assert BTC_TARGET_CAPTURE_CONTRACT_VERSION == 2; assert DELAYED_ENTRY_LADDER_CONTRACT_VERSION == 3; assert c["entry_execution_mode"] == "delayed_threshold_band_maker"; assert c["maker_order_time_in_force"] == "good_till_canceled"; assert c["entry_order_lifetime"] == "until_filled_or_market_close"; assert c["entry_timeout_seconds"] == 0; assert c["opening_quote_capture_seconds"] == 60; assert c["delayed_entry_start_seconds"] == 60; assert c["delayed_entry_threshold_cents"] == 53; assert c["delayed_entry_max_limit_cents"] == 57; assert c["entry_limit_offset_cents"] == 1; assert (c["hybrid_stop_trigger_cents"], c["hybrid_maker_exit_cents"], c["hybrid_hard_stop_cents"]) == (51, 52, 50); assert c["stop_price"] == "0.50"; assert c["shadow_profile"] == "delayed_53_57_stop_50"; assert c["recovery_multiplier"] == "2.50"; assert c["threshold_growth_multiplier"] == "2.50"; assert Decimal(c["starting_base"]) == Decimal("1.00"); assert Decimal(c["max_position"]) == Decimal("100.00"); assert c["max_recovery_exponent"] == 0; assert c["durable_checkpoint_interval_seconds"] == 30.0; print("CANONICAL_DELAYED_BAND_STRATEGY_CONTRACT=OK | opening_ask_below=53c post_window=60s first_qualifying_ask>=53c entry=ask_minus_1c max_limit=57c maker_tif=GTC lifetime=until_fill_or_market_close hybrid=51trigger_52maker_50hard recovery=2.50x base=1.00 cap=100 checkpoint=v2_chunked_30s")'
+          python -c 'from decimal import Decimal; from kalshi_live_trader import ACTIVE_CONFIG_SCHEMA_VERSION, ACTIVE_STRATEGY_VERSION, BTC_TARGET_CAPTURE_CONTRACT_VERSION, DELAYED_ENTRY_LADDER_CONTRACT_VERSION, OPENING_PRICE_CAPTURE_CONTRACT_VERSION, load_config; c = load_config(__import__("pathlib").Path("selected_live_strategy.json")); assert c["strategy_version"] == ACTIVE_STRATEGY_VERSION; assert c["config_schema_version"] == ACTIVE_CONFIG_SCHEMA_VERSION == 12; assert OPENING_PRICE_CAPTURE_CONTRACT_VERSION == 3; assert BTC_TARGET_CAPTURE_CONTRACT_VERSION == 2; assert DELAYED_ENTRY_LADDER_CONTRACT_VERSION == 3; assert c["entry_execution_mode"] == "delayed_threshold_band_maker"; assert c["maker_order_time_in_force"] == "good_till_canceled"; assert c["entry_order_lifetime"] == "until_filled_or_market_close"; assert c["entry_timeout_seconds"] == 0; assert c["opening_quote_capture_seconds"] == 60; assert c["delayed_entry_start_seconds"] == 60; assert c["delayed_entry_threshold_cents"] == 53; assert c["delayed_entry_max_limit_cents"] == 57; assert c["entry_limit_offset_cents"] == 1; assert c["shadow_profile"] == "delayed_53_57_stop_50"; assert c["max_recovery_exponent"] == 0; assert c["durable_checkpoint_interval_seconds"] == 30.0; print("CANONICAL_DELAYED_BAND_STRATEGY_CONTRACT=OK | opening_ask_below=53c post_window=60s first_qualifying_ask>=53c entry=ask_minus_1c max_limit=57c maker_tif=GTC lifetime=until_fill_or_market_close hybrid=validated_config recovery=validated_config base=validated_config cap=fixed_config checkpoint=v2_chunked_30s"); print("CONFIGURED_FIXED_SHARE_CAP=" + c["max_position"])'
 
       - name: Write Kalshi RSA private key
         env:
@@ -179,6 +185,7 @@ jobs:
           SHADOW_PROFILE: "delayed_53_57_stop_50"
           INITIAL_SHARES: ${{ inputs.initial_shares || '' }}
           SCALING_MULTIPLIER: ${{ inputs.scaling_multiplier || '' }}
+          MAX_SHARE_CAP: ${{ inputs.max_share_cap || '' }}
           PROFIT_THRESHOLD: ${{ inputs.profit_threshold || '' }}
           SHARES_ADDED_AFTER_PROFIT_THRESHOLD: ${{ inputs.shares_added_after_profit_threshold || '' }}
           MAX_STOP_LOSS_CENTS: ${{ inputs.max_stop_loss_cents || '' }}
@@ -213,6 +220,7 @@ jobs:
           fi
           [ "$RECONCILE_ONLY" = "true" ] && args+=(--reconcile-only)
           [ -z "$INITIAL_SHARES" ] || args+=(--starting-base "$INITIAL_SHARES")
+          [ -z "$MAX_SHARE_CAP" ] || args+=(--max-position "$MAX_SHARE_CAP")
           if [ -n "$SCALING_MULTIPLIER" ]; then
             args+=(--recovery-multiplier "$SCALING_MULTIPLIER")
             args+=(--threshold-growth-multiplier "$SCALING_MULTIPLIER")

@@ -265,14 +265,15 @@ class StrategyCoreTests(unittest.TestCase):
         self.assertIn("OPENING_PRICE_CAPTURE_CONTRACT_VERSION == 3", worker)
         self.assertIn("BTC_TARGET_CAPTURE_CONTRACT_VERSION == 2", worker)
         self.assertIn("DELAYED_ENTRY_LADDER_CONTRACT_VERSION == 3", worker)
-        self.assertIn('(c["hybrid_stop_trigger_cents"], c["hybrid_maker_exit_cents"], c["hybrid_hard_stop_cents"]) == (51, 52, 50)', worker)
+        self.assertIn('c = load_config(', worker)
+        self.assertIn('CONFIGURED_FIXED_SHARE_CAP=', worker)
         self.assertIn("CANONICAL_DELAYED_BAND_STRATEGY_CONTRACT=OK", worker)
         self.assertIn("opening_ask_below=53c", worker)
         self.assertIn("first_qualifying_ask>=53c", worker)
         self.assertIn("entry=ask_minus_1c", worker)
         self.assertIn("max_limit=57c", worker)
         self.assertNotIn("--entry-timeout-seconds", worker)
-        self.assertIn("hybrid=51trigger_52maker_50hard", worker)
+        self.assertIn("hybrid=validated_config", worker)
         self.assertIn("kalshi_shadow_delayed_band_v12", worker)
         self.assertIn("--persist-config", worker)
         self.assertIn('--starting-base "$INITIAL_SHARES"', worker)
@@ -317,6 +318,7 @@ class StrategyCoreTests(unittest.TestCase):
         self.assertEqual(input_names, {
             "live_enabled", "reconcile_only", "initial_shares", "scaling_multiplier",
             "profit_threshold", "shares_added_after_profit_threshold", "max_stop_loss_cents",
+            "max_share_cap",
         })
         controlled_inputs = set(__import__("re").findall(
             r"^      [a-zA-Z0-9_]+:\s*$",

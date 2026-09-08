@@ -185,8 +185,8 @@ def _seconds_since(start: float | None, end: float) -> float | None:
 
 def _decimal_string(value: Any, name: str) -> str:
     amount = decimal(value)
-    if amount <= Decimal("0"):
-        raise ValueError(f"{name} must be positive")
+    if not amount.is_finite() or amount <= Decimal("0"):
+        raise ValueError(f"{name} must be finite and positive")
     return format(amount, "f")
 
 
@@ -459,6 +459,7 @@ def validate_sizing_config(value: dict[str, Any]) -> None:
         raise ValueError("starting_base must have at most two decimal places")
     if base_increment != round_shares(base_increment):
         raise ValueError("base_increment must have at most two decimal places")
+    strategy_parameters(value)  # shared finite, positive, two-decimal cap validation
     if starting_base <= Decimal("0") or starting_base > max_position:
         raise ValueError("starting_base must be positive and no greater than max_position")
     if decimal(value["recovery_multiplier"]) < Decimal("1"):
@@ -934,6 +935,7 @@ class LiveEngine:
             "workflow_run_id": os.getenv("GITHUB_RUN_ID"),
             "source_commit": os.getenv("KALSHI_SOURCE_SHA") or os.getenv("GITHUB_SHA"),
             "stop_safety_contract": LIVE_STOP_SAFETY_CONTRACT_VERSION,
+            "position_cap_contract": 1,
             "observed_at": utc_now(),
         }
         self.parameters = strategy_parameters(config)
@@ -1297,6 +1299,8 @@ class LiveEngine:
             "directional_transition": directional_transition,
             "signal_timestamp": utc_now(), "intended_quantity": format(quantity, "f"),
             "quantity_capped": capped, "base_before": format(sizing_state(parameters, self.state.get("sizing")).base_share_count, "f"),
+            "position_cap_mode": "fixed",
+            "effective_position_cap": format(parameters.max_position, "f"),
             "recovery_exponent_before": sizing_state(parameters, self.state.get("sizing")).recovery_exponent,
             "recovery_cycle_pnl_before": str(self.state.get("sizing", {}).get("recovery_cycle_pnl", "0")),
             "status": "SIGNAL_PENDING", "entry_orders": [], "exit_orders": [], "actual_quantity": "0.00",
@@ -5755,6 +5759,14 @@ class LiveEngine:
         record["maker_entry_submission_attempted"] = True
         side = str(record["signal_side"])
         quantity = Decimal(str(record["intended_quantity"]))
+        # Revalidate against the signal's frozen fixed cap, not a later
+        # base, recovery exponent or requested configuration. Existing
+        # position/order guards below still prohibit additive/duplicate risk.
+        cap = self.record_parameters(record).max_position
+        if not quantity.is_finite() or quantity <= 0 or quantity != round_shares(quantity) or quantity > cap:
+            self.trip("entry_quantity_exceeds_position_cap_or_invalid")
+            self.transition(record, "ERROR_RECONCILIATION", "invalid_prescribed_entry_quantity")
+            return
         required = exact_entry_notional(quantity, maker_price)
         record["requested_entry_cost"] = format(required, "f")
         record["requested_entry_cost_recorded_at"] = utc_now()
@@ -5824,6 +5836,8 @@ class LiveEngine:
                 "selected_side_ask_cents"
             ),
             requested_price_cents=record["entry_limit_cents"], requested_quantity=format(quantity, "f"),
+            effective_position_cap=format(cap, "f"),
+            position_cap_mode=record.get("position_cap_mode", "fixed"),
             opening_entry_cost=record.get("opening_entry_cost"),
             requested_entry_cost=record["requested_entry_cost"],
             client_order_id=client_id, exchange_order_id=order.get("order_id"), post_only=True,
@@ -6257,6 +6271,7 @@ class LiveEngine:
             "realized_net_pnl": format(net, "f"), "realized_method": method, "completed_at": utc_now(),
             "recovery_cycle_pnl_after": after["recovery_cycle_pnl"], "recovery_exponent_after": after["recovery_exponent"],
             "base_after": after["base_share_count"], "next_base_threshold_after": after["next_base_threshold"],
+            "effective_position_cap_after": format(self.current_parameters().max_position, "f"),
         })
         self.transition(record, "CLOSED", method)
         if self.state.get("active_market") == record["ticker"]:
@@ -6266,6 +6281,8 @@ class LiveEngine:
             "trade_closed", ticker=record["ticker"], method=method, net_pnl=format(net, "f"),
             quantity=record.get("actual_quantity"), recovery_reset=changes["recovery_reset"],
             base_increased=changes["base_increased"], entry_execution_type=record["entry_execution_type"],
+            effective_position_cap_before=record.get("effective_position_cap"),
+            effective_position_cap_after=record["effective_position_cap_after"],
             entry_execution_summary=record["entry_execution_summary"],
         )
         if self.dry_run:
@@ -6908,7 +6925,7 @@ class LiveEngine:
                 delayed_metrics = self.delayed_entry_performance()
                 LOG.warning(
                     "HEARTBEAT | mode=%s ticker=%s state=%s btc_target=%s comparison=%s "
-                    "base=%s exponent=%d target=%s "
+                    "base=%s exponent=%d target=%s cap=%s "
                     "deficit=%s threshold=%s tracked=%d filled=%d zero=%d funding_failures=%d "
                     "missed=%d filtered=%d maker_fills=%d ioc_fills=%d mixed=%d opening_quotes=%s "
                     "first_price_quote_lag=%s first_depth_quote_lag=%s opening_price_coverage=%s "
@@ -6927,6 +6944,7 @@ class LiveEngine:
                     record.get("btc_target_price_display") if isinstance(record, dict) else None,
                     record.get("btc_target_comparison") if isinstance(record, dict) else None,
                     sizing.base_share_count, sizing.recovery_exponent, sizing.prescribed_quantity(),
+                    self.current_parameters().max_position,
                     sizing.recovery_cycle_pnl, sizing.next_base_threshold,
                     execution["tracked_markets"], execution["markets_with_entry_fill"],
                     execution["zero_fill_markets"], execution["funding_failure_markets"],
