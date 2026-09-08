@@ -1,0 +1,113 @@
+"""Offline regressions for operator inputs and early-failure checkpointing."""
+import argparse
+from copy import deepcopy
+from decimal import Decimal
+import json
+import os
+from pathlib import Path
+import subprocess
+import tempfile
+import unittest
+from unittest.mock import patch
+
+from kalshi_live_trader import LiveEngine, apply_overrides, load_config, save_config, strategy_parameters
+from live_checkpoint import DELAYED_V12_RUNTIME_STATE_REF, publish_runtime_snapshot, restore_runtime_snapshot
+from live_state import default_state, load_state, save_state
+from strategy_core import apply_realized_filled_trade
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+class WorkflowConfigurationTests(unittest.TestCase):
+    def test_equivalent_multiplier_text_is_valid_without_accounting_rounding(self):
+        config = load_config(ROOT / "selected_live_strategy.json")
+        for value in ("2.5", "2.50", "2.500", "2.5125"):
+            updated = apply_overrides(config, argparse.Namespace(recovery_multiplier=value))
+            self.assertEqual(Decimal(updated["recovery_multiplier"]), Decimal(value))
+
+    def test_changed_inputs_and_blank_next_run_roundtrip_through_runtime_branch(self):
+        config = load_config(ROOT / "selected_live_strategy.json")
+        names = dict(starting_base="2.00", recovery_multiplier="2.5", threshold_growth_multiplier="2.5",
+                     max_position="200.00", first_base_threshold="400", base_increment="0.25",
+                     stop_price="0.40", hybrid_hard_stop_cents=40,
+                     hybrid_stop_trigger_cents=41, hybrid_maker_exit_cents=42)
+        changed = apply_overrides(config, argparse.Namespace(**names))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            remote, work = root / "remote.git", root / "work"
+            for command in (["git", "init", "--bare", str(remote)], ["git", "init", str(work)],
+                            ["git", "-C", str(work), "remote", "add", "origin", str(remote)]):
+                subprocess.run(command, capture_output=True, check=True)
+            path = work / "selected_live_strategy.json"
+            before = deepcopy(changed)
+            save_config(path, changed)
+            self.assertEqual(changed, before)  # atomic save must not mutate config/hash
+            publish_runtime_snapshot((path,), "operator-inputs", root=work, runtime_ref=DELAYED_V12_RUNTIME_STATE_REF)
+            sha = subprocess.check_output(["git", "ls-remote", str(remote), "refs/heads/" + DELAYED_V12_RUNTIME_STATE_REF], text=True).split()[0]
+            path.unlink()  # disposable test fixture, not real runtime state
+            restore_runtime_snapshot(sha, root=work, runtime_ref=DELAYED_V12_RUNTIME_STATE_REF)
+            for blank in (None, ""):
+                next_run = apply_overrides(load_config(path), argparse.Namespace(**dict.fromkeys(names, blank)))
+                for key, value in names.items():
+                    self.assertEqual(Decimal(str(next_run[key])), Decimal(str(value)), key)
+
+    def test_tuning_stop_and_sizing_preserves_negative_cycle_and_existing_base(self):
+        config = load_config(ROOT / "selected_live_strategy.json")
+        old = strategy_parameters(config)
+        state = default_state(config)
+        state["sizing"], _ = apply_realized_filled_trade(old, {}, "-1")
+        state["cycle_strategy_parameters"] = old.as_dict()
+        original = deepcopy(state["sizing"])
+        updated = apply_overrides(config, argparse.Namespace(starting_base="2.00", recovery_multiplier="1.75",
+            threshold_growth_multiplier="1.75", max_position="200", stop_price="0.40",
+            hybrid_hard_stop_cents=40, hybrid_stop_trigger_cents=41, hybrid_maker_exit_cents=42))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            save_state(path, state)
+            restored = load_state(path, updated)
+            self.assertEqual(restored["sizing"], original)
+            engine = LiveEngine(updated, restored, path, path.with_suffix(".jsonl"), dry_run=True)
+            self.assertEqual(engine.current_parameters().recovery_multiplier, old.recovery_multiplier)
+            self.assertEqual(engine.current_parameters().max_position, old.max_position)
+
+    def test_changed_inputs_refused_while_order_or_position_unresolved(self):
+        config = load_config(ROOT / "selected_live_strategy.json")
+        updated = apply_overrides(config, argparse.Namespace(max_position="200"))
+        for field, value in (("current_position", "0.01"), ("current_order_id", "test-order")):
+            with tempfile.TemporaryDirectory() as directory:
+                state = default_state(config)
+                state[field] = value
+                path = Path(directory) / "state.json"
+                save_state(path, state)
+                with self.assertRaises(RuntimeError):
+                    load_state(path, updated)
+
+    def test_workflow_tests_source_defaults_before_restoring_operator_settings(self):
+        text = (ROOT / ".github/workflows/kalshi_btc15m_average_down.yml").read_text()
+        self.assertLess(text.index("name: Verify shared live strategy engine"), text.index("name: Restore latest bounded runtime state"))
+        self.assertLess(text.index("name: Restore latest bounded runtime state"), text.index("name: Assert canonical hybrid strategy contract"))
+        self.assertIn("steps.runtime_restore.outcome == 'success'", text)
+        self.assertNotIn('--stop-price "$profile_stop"', text)
+        self.assertIn("ref: main", text)
+        self.assertIn('test "$(git rev-parse HEAD)" = "$KALSHI_SOURCE_SHA"', text)
+
+    def test_checkpoint_does_not_require_runner_git_identity_setup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            remote, work = root / "remote.git", root / "work"
+            isolated = {k: v for k, v in os.environ.items() if not k.startswith("GIT_") and k != "EMAIL"}
+            isolated.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
+            with patch.dict(os.environ, isolated, clear=True):
+                for command in (["git", "init", "--bare", str(remote)], ["git", "init", str(work)],
+                                ["git", "-C", str(work), "config", "user.useConfigOnly", "true"],
+                                ["git", "-C", str(work), "remote", "add", "origin", str(remote)]):
+                    subprocess.run(command, capture_output=True, check=True)
+                state = work / "data/kalshi_live_delayed_band_v12_state.json"
+                state.parent.mkdir()
+                state.write_text('{"test":"early_failure"}\n')
+                self.assertTrue(publish_runtime_snapshot((state,), "early-failure", root=work,
+                                                       runtime_ref=DELAYED_V12_RUNTIME_STATE_REF))
+                author = subprocess.check_output(["git", "--git-dir", str(remote), "show", "-s",
+                                                  "--format=%an <%ae>", DELAYED_V12_RUNTIME_STATE_REF], text=True).strip()
+                self.assertEqual(author, "github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>")
+                self.assertNotIn("GIT_AUTHOR_NAME", os.environ)

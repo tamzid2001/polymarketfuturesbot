@@ -162,6 +162,9 @@ class EntryRest:
     async def balance_decimal(self):
         return self.balance
 
+    async def market_entry_funding(self, _ticker: str):
+        return 2, await self.balance_decimal()
+
     async def position_for_ticker(self, _ticker: str):
         return Decimal("0")
 

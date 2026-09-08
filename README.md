@@ -140,6 +140,87 @@ Every signal also maintains independent analytics for 40, 41, …, 49¢. It reco
 
 The ledger persists the opening ask, qualifying ask, derived limit, requested notional, exchange/client order IDs, actual fill quantities/prices/fees, stop timestamps, residual exposure, settlement, drawdown, and false-stop status. The heartbeat prints `delayed_entry_status`, `delayed_opening_ask`, `delayed_trigger_ask`, and `delayed_limit`. The corrected timestamp parser accepts ISO time, epoch seconds, and epoch milliseconds; this prevents persisted delayed fills from silently bypassing stop analytics after restart.
 
+### Workflow inputs and checkpoint persistence (September 8 repair)
+
+**Blank numeric input means keep the last successfully checkpointed value**;
+it does not mean zero and does not reset to a default on each five-hour run.
+With no prior runtime configuration, reviewed source defaults apply. Enter a
+value to request a change. Once validated against durable state, configuration
+is atomically saved and included in the runtime snapshot. The next worker and
+watchdog recovery restore that configuration, even though the dispatch form
+shows blank fields. A failed validation or failed remote checkpoint is **not**
+confirmation that a requested change has persisted remotely.
+
+| Input | Meaning |
+| --- | --- |
+| `initial_shares` | Initial base for a brand-new strategy state; does not overwrite an existing permanent base. |
+| `scaling_multiplier` | Recovery multiplier and geometric threshold-growth multiplier. `2.5` and `2.50` mean the same value. |
+| `max_share_cap` | Fixed absolute share ceiling, independent of permanent-base increases. |
+| `profit_threshold` | First scaling threshold for new state; does not erase an existing accumulated profit/next threshold. |
+| `shares_added_after_profit_threshold` | Permanent base increment after realized net profit crosses the current threshold. |
+| `max_stop_loss_cents` | Hard stop, 10–50¢; trigger is +1¢ and maker exit +2¢. Blank preserves the saved stop, not necessarily 50¢. |
+
+Changes are refused while an order/position remains unresolved. An existing
+negative recovery cycle retains its saved sizing parameters until recovered;
+new settings do not retroactively resize it or reset P&L. Live and shadow keep
+separate state/ledgers, but this canonical lane's chosen configuration file is
+shared. Mode switches therefore still pass state/configuration reconciliation.
+The `live_enabled` and `reconcile_only` checkboxes are separate per-dispatch
+controls, **not numeric defaults**: live still requires both repository gates,
+and reconciliation-only sends no orders. The watchdog retains the guarded
+previous mode; changing a numeric input cannot itself activate live trading.
+
+Startup logs print `CONFIG SAVED LOCALLY` with the selected numeric settings
+and configuration hash. Confirm the remote checkpoint step also succeeds.
+Offline tests now run **before** restoring operator configuration; this avoids
+testing mutable live settings against fixed research defaults. Runtime commits
+provide their own Git author/committer identity, including on failure paths.
+Source code still comes from `main`; runtime restore permits only state,
+configuration and ledger paths and verifies the source SHA/code are unchanged.
+GitHub scheduling/network interruptions can still delay workers—this is
+restart-safe orchestration, not a guarantee of uninterrupted 24/7 execution.
+
+### Exchange-specific funding and order health
+
+Kalshi balances are allocated by exchange shard. A positive aggregate account
+balance does **not** establish that a crypto market can be funded. Before a
+live entry, the adapter reads the market's authoritative `exchange_index` and
+queries the balance for that exchange only. Unavailable metadata or funding
+fails closed; it never silently substitutes aggregate cash or transfers funds.
+The signal's `entry_funding` snapshot records exchange index, available cash,
+required notional and read status in the durable state/audit ledger.
+See [Kalshi's exchange-sharding documentation](https://docs.kalshi.com/getting_started/exchange_sharding).
+
+Entry and reduce-only exit requests use the exchange index verified from market
+metadata. If that per-market cache is empty after restart, exits/cancellations
+require ticker-based auto-routing (`exchange_index=-1`); no balance lookup is
+needed to reduce risk. Cancellation always includes `market_ticker`, so an order
+ID alone cannot silently route to exchange 0. The routing cache is bounded and
+never hard-codes a shard from the ticker's spelling. The short
+`ORDER HEALTH` line separates recorded attempts, exchange acknowledgments,
+definitive rejections and uncertain submissions, with the persisted breaker
+reason. Analytical threshold hits are not order acknowledgments. Raw SDK
+exception bodies/headers are not retained for entry or cancellation failures.
+
+Credential rotation does not alter an existing worker's environment or clear
+a persisted breaker. Changing funds/credentials is not permission to discard
+order uncertainty: the operator must resolve account funding and reconcile
+orders, fills and positions before any explicit recovery. This patch has no
+automatic transfer, breaker reset or worker restart mechanism.
+
+An independent operator-run [Codespaces shard admin tool](kalshi_shard_admin.py)
+now supports read-only checks, a separately confirmed full available shard-0 cash
+transfer to the active market's shard, and a separately confirmed 100% recurring
+allocation. It never places orders, clears the bot's breaker or restarts a worker.
+See the [exact setup, confirmation and recovery instructions](docs/kalshi_codespaces_shard_funding.md).
+
+After funding, the separate [operator-run order smoke test](docs/kalshi_order_smoke_test.md)
+can check a shard-2 market and WebSocket read-only. An explicitly confirmed
+`--execute --workers-paused` run sends one 1¢/one-contract post-only test order,
+then cancels/reconciles it with a 30-second server expiry as backup. It never
+resets the strategy breaker or restarts a worker. A test order can fill; actual
+exposure requires operator review, not an assumed successful cancellation.
+
 ### Sticky signal transition
 
 The v12 signal has no loss-skip rule and is independent of execution. For each new market, the worker freezes the immediately preceding market’s realtime provisional outcome, later checks it against official settlement, and records the transition in both state and audit ledger:

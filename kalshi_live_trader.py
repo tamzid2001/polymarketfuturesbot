@@ -574,7 +574,8 @@ def load_config(path: Path) -> dict[str, Any]:
 
 
 def save_config(path: Path, config: dict[str, Any]) -> None:
-    path.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    from live_state import save_json_atomic
+    save_json_atomic(path, config)
 
 
 def apply_overrides(config: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
@@ -1092,6 +1093,25 @@ class LiveEngine:
         if -realized >= Decimal(self.config["max_daily_realized_loss"]):
             self.trip("max_daily_realized_loss")
         return not self.state["circuit_breaker"].get("blocked")
+
+    def entry_submission_health(self) -> dict[str, Any]:
+        """Submission evidence is separate from analytical touches and fills."""
+        orders = [order for record in self.state.get("markets", {}).values()
+                  for order in record.get("entry_orders", [])]
+        health = {
+            "mode": self.execution_mode,
+            "recorded_entry_attempts": len(orders),
+            "exchange_acknowledgments": sum(bool(order.get("order_id")) for order in orders),
+            "definitive_rejections": sum(order.get("submission_outcome") == "rejected" for order in orders),
+            "unresolved_submissions": sum(
+                not order.get("order_id") and order.get("status") in {"submit_failed", "submitting"}
+                and order.get("submission_outcome") != "rejected" for order in orders
+            ),
+            "breaker_blocked": bool(self.state["circuit_breaker"].get("blocked")),
+            "breaker_reason": self.state["circuit_breaker"].get("reason"),
+        }
+        self.state["entry_submission_health"] = health
+        return health
 
     def backfill_btc_target(
         self, record: dict[str, Any], target_details: dict[str, Any], *, reason: str,
@@ -5773,19 +5793,38 @@ class LiveEngine:
         required = exact_entry_notional(quantity, maker_price)
         record["requested_entry_cost"] = format(required, "f")
         record["requested_entry_cost_recorded_at"] = utc_now()
-        balance = self.shadow_available_cash() if self.dry_run else await rest.balance_decimal()
+        preflight_started = time.monotonic()
+        funding_scope = "shadow_cash" if self.dry_run else "market_exchange"
+        exchange_index = None
+        funding_error_type = None
+        if self.dry_run:
+            balance = self.shadow_available_cash()
+        else:
+            try:
+                exchange_index, balance = await rest.market_entry_funding(record["ticker"])
+            except Exception as exc:  # no aggregate-balance fallback, no raw SDK exception
+                balance = None
+                funding_error_type = type(exc).__name__
+        record["entry_funding"] = {
+            "at": utc_now(), "scope": funding_scope, "exchange_index": exchange_index,
+            "available_balance": None if balance is None else format(balance, "f"),
+            "required_cash": format(required, "f"), "error_type": funding_error_type,
+        }
+        LOG.warning("ENTRY FUNDING | ticker=%s scope=%s exchange_index=%s available=%s required=%s error_type=%s",
+                    record["ticker"], funding_scope, exchange_index,
+                    record["entry_funding"]["available_balance"], required, funding_error_type)
         if self.dry_run:
             metrics = self.shadow_metrics()
             metrics["max_required_cash"] = format(max(Decimal(str(metrics["max_required_cash"])), required), "f")
         if balance is None or balance < required:
             details = {
-                "at": utc_now(), "available_balance": None if balance is None else format(balance, "f"),
-                "required_cash": format(required, "f"), "quantity": format(quantity, "f"),
+                **record["entry_funding"], "quantity": format(quantity, "f"),
                 "requested_price": format(maker_price, "f"),
             }
             record["funding_failure"] = details
-            self.note_entry_attempt_completed(record, Decimal("0"), "insufficient_cash_for_signal_limit")
-            self.transition(record, "FUNDING_FAILURE", "insufficient_cash_for_signal_limit")
+            reason = "market_exchange_funding_unavailable" if balance is None else "insufficient_cash_for_signal_limit"
+            self.note_entry_attempt_completed(record, Decimal("0"), reason)
+            self.transition(record, "FUNDING_FAILURE", reason)
             if self.dry_run:
                 self.shadow_metrics()["funding_failures"] = int(self.shadow_metrics()["funding_failures"]) + 1
             self.audit("funding_failure", ticker=record["ticker"], **details)
@@ -5799,7 +5838,9 @@ class LiveEngine:
             if abs(Decimal(str(existing))) > 0:
                 self.trip("existing_position_before_entry")
                 return
-        if now >= float(record["market_close_epoch"]):
+        # Include time spent awaiting authenticated preflight calls while
+        # preserving the event clock supplied by deterministic replay/tests.
+        if now + max(0.0, time.monotonic() - preflight_started) >= float(record["market_close_epoch"]):
             self.finish_entry_attempt(record, Decimal("0"), "market_closed_before_gtc_submission")
             return
         client_id = deterministic_client_order_id(record["ticker"], side, "entry", self.config)
@@ -5821,11 +5862,15 @@ class LiveEngine:
                 order_key="signal-minus-offset-entry", post_only=True, client_order_id_override=client_id,
             )
             order["entry_phase"] = "maker"
-            if order.get("status") in {"submit_failed", "paused", "direction_mismatch"}:
+            if not order.get("order_id") and order.get("status") not in {"submit_failed", "paused", "direction_mismatch"}:
+                order.update(status="submit_failed", submission_outcome="unknown")
+            if order.get("status") in {"submit_failed", "paused", "direction_mismatch"} or not order.get("order_id"):
                 record["entry_orders"].append(order)
                 self.note_entry_order_submitted(record, order, "maker")
-                self.trip("maker_entry_submission_unknown")
-                self.transition(record, "RECONCILIATION_PENDING", "maker_entry_submission_unknown")
+                reason = ("maker_entry_submission_rejected" if order.get("submission_outcome") == "rejected"
+                          else "maker_entry_submission_unknown")
+                self.trip(reason)
+                self.transition(record, "RECONCILIATION_PENDING", reason)
                 return
         record["entry_orders"].append(order)
         self.note_entry_order_submitted(record, order, "maker")
@@ -6926,6 +6971,13 @@ class LiveEngine:
                 fees = self.fee_metrics()
                 eligibility = self.entry_price_performance()["initial_stop_eligibility"]
                 delayed_metrics = self.delayed_entry_performance()
+                # Keep the blocker visible even when the long heartbeat is
+                # truncated by an Actions log viewer or notification transport.
+                health = self.entry_submission_health()
+                LOG.warning("ORDER HEALTH | mode=%s attempts=%s exchange_acks=%s rejected=%s unresolved=%s breaker=%s reason=%s",
+                            health["mode"], health["recorded_entry_attempts"], health["exchange_acknowledgments"],
+                            health["definitive_rejections"], health["unresolved_submissions"],
+                            health["breaker_blocked"], health["breaker_reason"])
                 LOG.warning(
                     "HEARTBEAT | mode=%s ticker=%s state=%s btc_target=%s comparison=%s "
                     "base=%s exponent=%d target=%s cap=%s "
@@ -7071,6 +7123,15 @@ async def async_main(args: argparse.Namespace) -> int:
     # config in place so the watchdog can restart it without manual repair.
     if args.persist_config:
         save_config(args.config, config)
+        LOG.warning(
+            "CONFIG SAVED LOCALLY | initial_shares=%s recovery_multiplier=%s threshold_growth_multiplier=%s "
+            "fixed_share_cap=%s first_profit_threshold=%s shares_added=%s hard_stop_cents=%s "
+            "mode=%s hash=%s | blank_inputs=preserve_restored_values remote_persistence=requires_successful_checkpoint "
+            "existing_base_and_recovery=preserved",
+            config["starting_base"], config["recovery_multiplier"], config["threshold_growth_multiplier"],
+            config["max_position"], config["first_base_threshold"], config["base_increment"],
+            config["hybrid_hard_stop_cents"], expected_mode, config_hash(config)[:12],
+        )
     migrations = state.get("config_migrations", [])
     if migrations and migrations[-1].get("kind") == "disable_recovery_exponent_breaker":
         LOG.warning(

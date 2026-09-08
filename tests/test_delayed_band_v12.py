@@ -87,6 +87,9 @@ class EntryRest:
     async def balance_decimal(self):
         return Decimal("150.00")
 
+    async def market_entry_funding(self, _ticker: str):
+        return 2, await self.balance_decimal()
+
     async def position_for_ticker(self, _ticker: str):
         return Decimal("0")
 
@@ -127,9 +130,9 @@ class DelayedBandV12Tests(unittest.TestCase):
     def test_exact_production_contract_is_shadow_safe_by_default(self) -> None:
         self.assertEqual(self.config["strategy_version"], "kxbtc15m-delayed-band-live-v12")
         self.assertEqual(self.config["entry_execution_mode"], "delayed_threshold_band_maker")
-        self.assertEqual(self.config["recovery_multiplier"], "2.50")
-        self.assertEqual(self.config["starting_base"], "1.00")
-        self.assertEqual(self.config["max_position"], "100.00")
+        self.assertEqual(Decimal(self.config["recovery_multiplier"]), Decimal("2.50"))
+        self.assertEqual(Decimal(self.config["starting_base"]), Decimal("1.00"))
+        self.assertEqual(Decimal(self.config["max_position"]), Decimal("100.00"))
         self.assertEqual(
             (self.config["hybrid_stop_trigger_cents"], self.config["hybrid_maker_exit_cents"],
              self.config["hybrid_hard_stop_cents"]),

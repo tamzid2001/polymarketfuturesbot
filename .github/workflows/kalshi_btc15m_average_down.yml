@@ -44,12 +44,12 @@ on:
         type: string
         default: ""
       shares_added_after_profit_threshold:
-        description: "Two-decimal shares permanently added whenever the current profit threshold is crossed."
+        description: "Shares permanently added after each profit threshold. Blank preserves the last successfully checkpointed value."
         required: false
         type: string
         default: ""
       max_stop_loss_cents:
-        description: "Hard-stop price from 10c through 50c; trigger/maker exit remain 1c/2c higher. Blank preserves 50c."
+        description: "Hard stop 10-50c; trigger/maker stay 1c/2c higher. Blank preserves the saved stop (50c for a new configuration)."
         required: false
         type: string
         default: ""
@@ -104,28 +104,6 @@ jobs:
             echo 'Exchange authentication/reconciliation must still pass before the worker can trade.'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Restore latest bounded runtime state
-        id: runtime_restore
-        run: |
-          set -euo pipefail
-          runtime_ref=runtime-state-kxbtc15m-delayed-v12
-          set +e
-          git ls-remote --exit-code --heads origin "refs/heads/$runtime_ref" >/dev/null
-          runtime_ref_status=$?
-          set -e
-          if [ "$runtime_ref_status" -eq 0 ]; then
-            git fetch --no-tags origin "refs/heads/$runtime_ref"
-            restore_sha="$(git rev-parse FETCH_HEAD)"
-            python3 live_checkpoint.py --restore-sha "$restore_sha" --runtime-ref "$runtime_ref"
-            echo "RUNTIME_STATE_OWNER=kalshi-kxbtc15m-delayed-v12"
-            echo "RUNTIME_STATE_RESTORED=$runtime_ref"
-          elif [ "$runtime_ref_status" -eq 2 ]; then
-            echo "RUNTIME_STATE_BOOTSTRAP=fresh_v12_namespace"
-          else
-            echo "::error::Unable to determine v12 runtime ref status; refusing unsafe fallback"
-            exit 2
-          fi
-
       - uses: actions/setup-python@v6
         with:
           python-version: "3.13"
@@ -149,7 +127,34 @@ jobs:
             tests.test_reconciliation \
             tests.test_recovery_sizing \
             tests.test_execution_path_model \
-            tests.test_historical_replay
+            tests.test_historical_replay \
+            tests.test_workflow_configuration
+
+      # Offline tests use the reviewed source defaults, never mutable operator
+      # settings. Restore only allowlisted data/config after tests have passed.
+      - name: Restore latest bounded runtime state
+        id: runtime_restore
+        run: |
+          set -euo pipefail
+          runtime_ref=runtime-state-kxbtc15m-delayed-v12
+          set +e
+          git ls-remote --exit-code --heads origin "refs/heads/$runtime_ref" >/dev/null
+          runtime_ref_status=$?
+          set -e
+          if [ "$runtime_ref_status" -eq 0 ]; then
+            git fetch --no-tags origin "refs/heads/$runtime_ref"
+            restore_sha="$(git rev-parse FETCH_HEAD)"
+            python3 live_checkpoint.py --restore-sha "$restore_sha" --runtime-ref "$runtime_ref"
+            echo "RUNTIME_STATE_OWNER=kalshi-kxbtc15m-delayed-v12"
+            echo "RUNTIME_STATE_RESTORED=$runtime_ref"
+          elif [ "$runtime_ref_status" -eq 2 ]; then
+            echo "RUNTIME_STATE_BOOTSTRAP=fresh_v12_namespace"
+          else
+            echo "::error::Unable to determine v12 runtime ref status; refusing unsafe fallback"
+            exit 2
+          fi
+          test "$(git rev-parse HEAD)" = "$KALSHI_SOURCE_SHA"
+          git diff --exit-code -- '*.py' '.github/workflows/' 'tests/' 'requirements_kalshi_settlement_trader.txt'
 
       - name: Assert canonical hybrid strategy contract
         run: |
@@ -164,11 +169,6 @@ jobs:
           set -euo pipefail
           umask 077
           printf '%s\n' "$KALSHI_PRIVATE_KEY" > kalshi_private_key.pem
-
-      - name: Configure durable-state publisher
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
       - name: Run KXBTC15M hybrid worker
         env:
@@ -197,10 +197,9 @@ jobs:
           if [ "$REQUESTED_LIVE" = "true" ] || [ "$RECONCILE_ONLY" = "true" ]; then
             state_file=data/kalshi_live_delayed_band_v12_state.json
             audit_file=data/kalshi_live_delayed_band_v12_audit.jsonl
-            profile_stop=""
           else
             case "$SHADOW_PROFILE" in
-              delayed_53_57_stop_50) profile_stop=0.50 ;;
+              delayed_53_57_stop_50) : ;;
               *) echo "::error::Unknown shadow profile: $SHADOW_PROFILE"; exit 2 ;;
             esac
             # v12 deliberately starts a new namespace. Older opening-entry and
@@ -216,7 +215,8 @@ jobs:
           if [ "$REQUESTED_LIVE" = "true" ] || [ "$RECONCILE_ONLY" = "true" ]; then
             args+=(--trading-mode live)
           else
-            args+=(--shadow-profile "$SHADOW_PROFILE" --stop-price "$profile_stop" --trading-mode shadow)
+            # Blank inputs must not reset a restored stop to 50c.
+            args+=(--shadow-profile "$SHADOW_PROFILE" --trading-mode shadow)
           fi
           [ "$RECONCILE_ONLY" = "true" ] && args+=(--reconcile-only)
           [ -z "$INITIAL_SHARES" ] || args+=(--starting-base "$INITIAL_SHARES")

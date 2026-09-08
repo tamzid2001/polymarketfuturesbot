@@ -19,6 +19,7 @@ LEGACY_REMOTE_CHECKPOINT_INTERVAL_SECONDS = 5.0
 REMOTE_CHECKPOINT_INTERVAL_SECONDS = 30.0
 TUNABLE_STRATEGY_FIELDS = {
     "max_position",
+    "stop_price",
     "starting_base",
     "recovery_multiplier",
     "threshold_growth_multiplier",
@@ -310,6 +311,11 @@ def load_state(path: Path, config: dict[str, Any]) -> dict[str, Any]:
 
 def save_state(path: Path, state: dict[str, Any]) -> None:
     state["updated_at"] = utc_now()
+    save_json_atomic(path, state)
+
+
+def save_json_atomic(path: Path, state: dict[str, Any]) -> None:
+    """Fsync/replace JSON without changing its fields (also used for config)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
     try:
