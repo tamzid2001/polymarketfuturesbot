@@ -574,7 +574,8 @@ def load_config(path: Path) -> dict[str, Any]:
 
 
 def save_config(path: Path, config: dict[str, Any]) -> None:
-    path.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    from live_state import save_json_atomic
+    save_json_atomic(path, config)
 
 
 def apply_overrides(config: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
@@ -7122,6 +7123,15 @@ async def async_main(args: argparse.Namespace) -> int:
     # config in place so the watchdog can restart it without manual repair.
     if args.persist_config:
         save_config(args.config, config)
+        LOG.warning(
+            "CONFIG SAVED LOCALLY | initial_shares=%s recovery_multiplier=%s threshold_growth_multiplier=%s "
+            "fixed_share_cap=%s first_profit_threshold=%s shares_added=%s hard_stop_cents=%s "
+            "mode=%s hash=%s | blank_inputs=preserve_restored_values remote_persistence=requires_successful_checkpoint "
+            "existing_base_and_recovery=preserved",
+            config["starting_base"], config["recovery_multiplier"], config["threshold_growth_multiplier"],
+            config["max_position"], config["first_base_threshold"], config["base_increment"],
+            config["hybrid_hard_stop_cents"], expected_mode, config_hash(config)[:12],
+        )
     migrations = state.get("config_migrations", [])
     if migrations and migrations[-1].get("kind") == "disable_recovery_exponent_breaker":
         LOG.warning(

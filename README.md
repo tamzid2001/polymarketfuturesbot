@@ -140,6 +140,46 @@ Every signal also maintains independent analytics for 40, 41, …, 49¢. It reco
 
 The ledger persists the opening ask, qualifying ask, derived limit, requested notional, exchange/client order IDs, actual fill quantities/prices/fees, stop timestamps, residual exposure, settlement, drawdown, and false-stop status. The heartbeat prints `delayed_entry_status`, `delayed_opening_ask`, `delayed_trigger_ask`, and `delayed_limit`. The corrected timestamp parser accepts ISO time, epoch seconds, and epoch milliseconds; this prevents persisted delayed fills from silently bypassing stop analytics after restart.
 
+### Workflow inputs and checkpoint persistence (September 8 repair)
+
+**Blank numeric input means keep the last successfully checkpointed value**;
+it does not mean zero and does not reset to a default on each five-hour run.
+With no prior runtime configuration, reviewed source defaults apply. Enter a
+value to request a change. Once validated against durable state, configuration
+is atomically saved and included in the runtime snapshot. The next worker and
+watchdog recovery restore that configuration, even though the dispatch form
+shows blank fields. A failed validation or failed remote checkpoint is **not**
+confirmation that a requested change has persisted remotely.
+
+| Input | Meaning |
+| --- | --- |
+| `initial_shares` | Initial base for a brand-new strategy state; does not overwrite an existing permanent base. |
+| `scaling_multiplier` | Recovery multiplier and geometric threshold-growth multiplier. `2.5` and `2.50` mean the same value. |
+| `max_share_cap` | Fixed absolute share ceiling, independent of permanent-base increases. |
+| `profit_threshold` | First scaling threshold for new state; does not erase an existing accumulated profit/next threshold. |
+| `shares_added_after_profit_threshold` | Permanent base increment after realized net profit crosses the current threshold. |
+| `max_stop_loss_cents` | Hard stop, 10–50¢; trigger is +1¢ and maker exit +2¢. Blank preserves the saved stop, not necessarily 50¢. |
+
+Changes are refused while an order/position remains unresolved. An existing
+negative recovery cycle retains its saved sizing parameters until recovered;
+new settings do not retroactively resize it or reset P&L. Live and shadow keep
+separate state/ledgers, but this canonical lane's chosen configuration file is
+shared. Mode switches therefore still pass state/configuration reconciliation.
+The `live_enabled` and `reconcile_only` checkboxes are separate per-dispatch
+controls, **not numeric defaults**: live still requires both repository gates,
+and reconciliation-only sends no orders. The watchdog retains the guarded
+previous mode; changing a numeric input cannot itself activate live trading.
+
+Startup logs print `CONFIG SAVED LOCALLY` with the selected numeric settings
+and configuration hash. Confirm the remote checkpoint step also succeeds.
+Offline tests now run **before** restoring operator configuration; this avoids
+testing mutable live settings against fixed research defaults. Runtime commits
+provide their own Git author/committer identity, including on failure paths.
+Source code still comes from `main`; runtime restore permits only state,
+configuration and ledger paths and verifies the source SHA/code are unchanged.
+GitHub scheduling/network interruptions can still delay workers—this is
+restart-safe orchestration, not a guarantee of uninterrupted 24/7 execution.
+
 ### Exchange-specific funding and order health
 
 Kalshi balances are allocated by exchange shard. A positive aggregate account

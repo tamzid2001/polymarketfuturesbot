@@ -212,6 +212,15 @@ def publish_runtime_snapshot(
     os.close(descriptor)
     os.unlink(index_name)
     environment = dict(os.environ, GIT_INDEX_FILE=index_name)
+    # Failure/finally publication may run before a workflow's git-config step.
+    # Supply identity only to this subprocess environment; never depend on or
+    # change the operator's global Git identity. No credentials enter commits.
+    environment.update(
+        GIT_AUTHOR_NAME="github-actions[bot]",
+        GIT_AUTHOR_EMAIL="41898282+github-actions[bot]@users.noreply.github.com",
+        GIT_COMMITTER_NAME="github-actions[bot]",
+        GIT_COMMITTER_EMAIL="41898282+github-actions[bot]@users.noreply.github.com",
+    )
     cache = _cache_directory(root)
     used_cache_files: set[Path] = set()
     try:

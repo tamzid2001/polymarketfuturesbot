@@ -228,7 +228,7 @@ class LiveStopSafetyTests(unittest.IsolatedAsyncioTestCase):
         from pathlib import Path
         workflow = Path(__file__).resolve().parents[1] / ".github/workflows/kalshi_btc15m_average_down.yml"
         text = workflow.read_text()
-        block = text.split("id: live_gate", 1)[1].split("        run: |\n", 1)[1].split("\n      - name:", 1)[0]
+        block = text.split("id: live_gate", 1)[1].split("        run: |\n", 1)[1].split("\n      - ", 1)[0]
         script = textwrap.dedent(block)
         for live, permission, shadow, read_only, expected_code, label in (
             ("true", "false", "true", "false", 2, "LIVE REQUEST BLOCKED"),
