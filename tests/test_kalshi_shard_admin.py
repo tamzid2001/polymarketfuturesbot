@@ -106,6 +106,27 @@ class ShardAdminTests(unittest.IsolatedAsyncioTestCase):
         for value in ("0.00001", "-1", "NaN", "Infinity", "bad", str(2**63)):
             with self.assertRaises(admin.SafetyError): admin.centicents(value)
 
+    def test_current_v2_transfer_request_schema_is_exact(self):
+        request = admin.transfer_request("100.0000", 0, 2)
+        self.assertEqual(request, {
+            "source": "event_contract", "destination": "event_contract",
+            "amount": 1000000, "source_exchange_shard": 0,
+            "destination_exchange_shard": 2, "source_subaccount": 0,
+            "destination_subaccount": 0,
+        })
+        admin.validate_transfer_request(request)
+        for invalid in (
+            {**request, "amount": "1000000"},
+            {**request, "amount": True},
+            {**request, "source": "margined"},
+            {**request, "source_subaccount": 1},
+            {**request, "source_subaccount": False},
+            {**request, "destination_exchange_shard": 0},
+            {**request, "undocumented": 1},
+        ):
+            with self.assertRaises(admin.SafetyError):
+                admin.validate_transfer_request(invalid)
+
     def test_epoch_seconds_millis_and_iso_match(self):
         self.assertEqual(admin.epoch("2026-09-08T00:00:00Z"), admin.epoch("1788825600000"))
         self.assertEqual(admin.epoch("1788825600"), admin.epoch(1788825600000))
@@ -136,6 +157,38 @@ class ShardAdminTests(unittest.IsolatedAsyncioTestCase):
             "source_exchange_shard": 0, "destination_exchange_shard": 2,
             "source_subaccount": 0, "destination_subaccount": 0})
         self.assertEqual(Decimal(self.api.balances[2]), Decimal("120.4724"))
+
+    async def test_explicit_amount_and_destination_do_not_depend_on_market_discovery(self):
+        result = await admin.transfer_funds(
+            self.api, self.journal, destination_shard=2,
+            amount_dollars="100.0000", execute=True, workers_paused=True,
+            answer=self.approve, timeout=0,
+        )
+        self.assertEqual(result["status"], "COMPLETED")
+        self.assertIsNone(result["market_ticker"])
+        self.assertEqual(result["destination_source"], "explicit_argument")
+        self.assertEqual(result["request"]["amount"], 1000000)
+        self.assertEqual(Decimal(self.api.balances[0]), Decimal("20.4724"))
+        self.assertEqual(Decimal(self.api.balances[2]), Decimal("100.0000"))
+        self.assertFalse(any(call[1] in {"/markets"} or call[1].startswith("/markets/")
+                             for call in self.api.calls))
+
+    async def test_explicit_amount_cannot_exceed_authenticated_source_balance(self):
+        with self.assertRaises(admin.SafetyError):
+            await admin.transfer_funds(
+                self.api, self.journal, destination_shard=2,
+                amount_dollars="120.4725", execute=True,
+                workers_paused=True, answer=self.approve, timeout=0,
+            )
+        self.assertEqual(self.api.posts(), [])
+        self.assertIsNone(self.journal.load("transfer"))
+
+    async def test_transfer_cli_requires_exact_amount_and_destination(self):
+        for arguments in (["transfer"], ["transfer", "--destination-shard", "2"],
+                          ["transfer", "--amount-dollars", "1.0000"]):
+            with self.assertRaises(admin.SafetyError):
+                await admin.run(admin.parser().parse_args(arguments), self.api, root=self.root)
+        self.assertEqual(self.api.calls, [])
 
     async def test_intent_is_fsynced_before_post(self):
         original = self.api.request
@@ -372,6 +425,36 @@ class ShardAdminTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(admin.ApiError): await api.request("GET", "/portfolio/balance")
             self.assertEqual(session.request.call_count, 3)
 
+    async def test_transfer_post_signs_current_full_v2_path(self):
+        api = admin.Api(self.mock_key_id, self.ephemeral_pem, execute=True)
+        api._auth = Mock()
+        api._auth.create_auth_headers.return_value = {
+            "KALSHI-ACCESS-KEY": "present",
+            "KALSHI-ACCESS-SIGNATURE": "present",
+            "KALSHI-ACCESS-TIMESTAMP": "present",
+        }
+        response = Mock(status=200, headers={})
+        response.read = AsyncMock(return_value=b'{"transfer_id":"mock-transfer"}')
+        response.__aenter__ = AsyncMock(return_value=response)
+        response.__aexit__ = AsyncMock(return_value=False)
+        session = Mock()
+        session.__aenter__ = AsyncMock(return_value=session)
+        session.__aexit__ = AsyncMock(return_value=False)
+        session.request.return_value = response
+        request = admin.transfer_request("1.0000", 0, 2)
+        with patch("aiohttp.ClientSession", return_value=session):
+            result = await api.request("POST", admin.TRANSFER, body=request)
+        api._auth.create_auth_headers.assert_called_once_with(
+            "POST", "/trade-api/v2/portfolio/intra_exchange_instance_transfer",
+        )
+        session.request.assert_called_once_with(
+            "POST", "https://external-api.kalshi.com/trade-api/v2/portfolio/intra_exchange_instance_transfer",
+            params=None, json=request,
+            headers=api._auth.create_auth_headers.return_value,
+            allow_redirects=False,
+        )
+        self.assertEqual(result, {"transfer_id": "mock-transfer"})
+
     def test_conflicting_key_id_aliases_are_not_silently_selected(self):
         with patch.dict(os.environ, {"KALSHI_API_KEY_ID": "old-id", "KALSHI_PROD_API_KEY": "new-id",
                                      "KALSHI_PRIVATE_KEY": self.ephemeral_pem}, clear=True):
@@ -549,9 +632,12 @@ class ShardAdminTests(unittest.IsolatedAsyncioTestCase):
                 admin.Api.for_file_auth_check("private-file", prompt=unsafe_prompt)
 
     async def test_key_file_option_cannot_authorize_any_write(self):
-        for command in ("status", "transfer-all", "allocation-all", "resume-transfer"):
+        for command in ("status", "transfer", "transfer-all", "allocation-all", "resume-transfer"):
             with self.assertRaises(admin.SafetyError):
-                await admin.run(admin.parser().parse_args([command, "--key-file", "private-file"]))
+                arguments = [command, "--key-file", "private-file"]
+                if command == "transfer":
+                    arguments += ["--destination-shard", "2", "--amount-dollars", "1"]
+                await admin.run(admin.parser().parse_args(arguments))
         with self.assertRaises(admin.SafetyError):
             await admin.run(admin.parser().parse_args(["auth-check", "--key-file", "private-file", "--execute"]))
 

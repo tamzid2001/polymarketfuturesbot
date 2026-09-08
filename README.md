@@ -209,9 +209,11 @@ orders, fills and positions before any explicit recovery. This patch has no
 automatic transfer, breaker reset or worker restart mechanism.
 
 An independent operator-run [Codespaces shard admin tool](kalshi_shard_admin.py)
-now supports read-only checks, a separately confirmed full available shard-0 cash
-transfer to the active market's shard, and a separately confirmed 100% recurring
-allocation. It never places orders, clears the bot's breaker or restarts a worker.
+supports authenticated read-only checks, an exact-amount transfer to an explicit
+exchange shard, a separately confirmed full available source-shard transfer, and
+a separately confirmed 100% recurring allocation. Transfer POSTs use integer
+centicents and the current V2 `intra_exchange_instance_transfer` request schema.
+It never places orders, clears the bot's breaker or restarts a worker.
 See the [exact setup, confirmation and recovery instructions](docs/kalshi_codespaces_shard_funding.md).
 
 After funding, the separate [operator-run order smoke test](docs/kalshi_order_smoke_test.md)
