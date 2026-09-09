@@ -217,6 +217,54 @@ def startup_order_check_allows_worker(state: dict[str, Any], worker_id: str) -> 
     )
 
 
+def state_has_reset_blocking_risk(state: dict[str, Any]) -> bool:
+    """Return true when a fresh-state reset could forget managed exposure.
+
+    A signal-only record is disposable because it has submitted no order and
+    owns no position. Every order/position/reconciliation state remains a
+    hard block until the authoritative exchange checks below also confirm the
+    account is flat.
+    """
+
+    try:
+        if Decimal(str(state.get("current_position") or "0")) != 0:
+            return True
+    except (ArithmeticError, TypeError, ValueError):
+        return True
+    if state.get("current_order_id"):
+        return True
+    reset_blocking_states = ACTIVE_STATES - {"SIGNAL_PENDING"}
+    for record in state.get("markets", {}).values():
+        if not isinstance(record, dict):
+            continue
+        status = str(record.get("status") or "")
+        if status in reset_blocking_states:
+            return True
+        if status != "SIGNAL_PENDING":
+            continue
+        try:
+            if Decimal(str(record.get("actual_quantity") or "0")) != 0:
+                return True
+        except (ArithmeticError, TypeError, ValueError):
+            return True
+        for key in ("entry_orders", "exit_orders"):
+            for order in record.get(key, []):
+                if not isinstance(order, dict):
+                    return True
+                try:
+                    if Decimal(str(order.get("remaining_count") or "0")) != 0:
+                        return True
+                    if Decimal(str(order.get("fill_count") or "0")) != 0:
+                        return True
+                except (ArithmeticError, TypeError, ValueError):
+                    return True
+                if order.get("order_id") and str(order.get("status") or "").lower() in {
+                    "resting", "pending", "open", "unknown", "submit_failed",
+                }:
+                    return True
+    return False
+
+
 def _iso_epoch(value: Any) -> float | None:
     """Parse persisted ISO or numeric timestamps without confusing ms and s."""
 
@@ -8166,7 +8214,7 @@ async def async_main(args: argparse.Namespace) -> int:
             len(state.get("markets", {})),
         )
     if args.reset_state:
-        if state.get("active_market") or any(item.get("status") in ACTIVE_STATES for item in state.get("markets", {}).values() if isinstance(item, dict)):
+        if state_has_reset_blocking_risk(state):
             raise SystemExit("refusing reset_state with active local strategy exposure; use reconciliation instead")
     rest = KalshiREST(api_key, pem_path, _bool(os.getenv("KALSHI_DEMO", "false")))
     if args.reset_state:
@@ -8182,7 +8230,42 @@ async def async_main(args: argparse.Namespace) -> int:
         if active_positions or await LiveEngine(config, state, args.state_file, args.audit_ledger, dry_run, reconcile_only=args.reconcile_only).managed_orders(rest):
             await rest.close()
             raise SystemExit("refusing reset_state while exchange KXBTC15M exposure or managed orders exist")
+        reset_at = utc_now()
+        prior_sizing = state.get("sizing", {})
+        prior_fees = state.get("fee_metrics", {})
+        reset_summary = {
+            "at": reset_at,
+            "reason": "explicit_operator_fresh_state_request",
+            "previous_base": prior_sizing.get("base_share_count", config["starting_base"]),
+            "previous_recovery_exponent": prior_sizing.get("recovery_exponent", 0),
+            "previous_recovery_cycle_pnl": prior_sizing.get("recovery_cycle_pnl", "0"),
+            "previous_cumulative_realized_pnl": state.get("cumulative_realized_pnl", "0"),
+            "previous_total_fees_paid": prior_fees.get("total_fees_paid", "0"),
+            "previous_completed_trade_count": prior_sizing.get("completed_trade_count", 0),
+            "reset_base": config["starting_base"],
+            "reset_recovery_exponent": 0,
+            "reset_recovery_cycle_pnl": "0.00",
+            "reset_total_fees_paid": "0.00",
+        }
+        # Retain the append-only forensic ledger while replacing only the
+        # active strategy state. This makes the reset auditable without
+        # allowing old fills, losses, or fees to seed the new recovery cycle.
+        append_audit(args.audit_ledger, {
+            "event": "fresh_strategy_state_reset",
+            "strategy_version": config["strategy_version"],
+            "config_hash": config_hash(config),
+            **reset_summary,
+        })
         state = load_state(Path("/nonexistent"), config)
+        state["fresh_reset"] = reset_summary
+        LOG.warning(
+            "FRESH STRATEGY STATE | exchange_flat=true managed_orders=0 "
+            "base=%s exponent=0 deficit=0.00 fees=0.00 prior_exponent=%s "
+            "prior_deficit=%s prior_fees=%s audit_preserved=true",
+            config["starting_base"], reset_summary["previous_recovery_exponent"],
+            reset_summary["previous_recovery_cycle_pnl"],
+            reset_summary["previous_total_fees_paid"],
+        )
     feed = KalshiLiveFeed(rest.auth)
     feed_task = asyncio.create_task(feed.run(), name="kalshi-hybrid-live-feed")
     engine = LiveEngine(config, state, args.state_file, args.audit_ledger, dry_run, args.config, reconcile_only=args.reconcile_only)

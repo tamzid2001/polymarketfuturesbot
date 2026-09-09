@@ -23,6 +23,11 @@ on:
         required: true
         type: boolean
         default: false
+      fresh_state_reset:
+        description: "ONE RUN ONLY: reset base/recovery/P&L/fees/metrics after authoritative flat checks. Audit ledger is preserved. Default off."
+        required: true
+        type: boolean
+        default: false
       initial_shares:
         description: "Initial two-decimal shares for a brand-new strategy state. Blank preserves the durable setting."
         required: false
@@ -85,10 +90,12 @@ jobs:
         env:
           LIVE_SWITCH: ${{ inputs.live_enabled || false }}
           READ_ONLY: ${{ inputs.reconcile_only || false }}
+          FRESH_STATE_RESET: ${{ inputs.fresh_state_reset || false }}
           LIVE_PERMISSION: ${{ vars.KALSHI_LIVE_ENABLED || 'false' }}
           SHADOW_ONLY: ${{ vars.KALSHI_SHADOW_ONLY || 'true' }}
         run: |
           set -euo pipefail
+          FRESH_STATE_RESET="${FRESH_STATE_RESET:-false}"
           if [ "$READ_ONLY" = "true" ]; then
             mode=RECONCILE_ONLY
           elif [ "$LIVE_SWITCH" = "true" ]; then
@@ -99,6 +106,10 @@ jobs:
             mode=LIVE
           else
             mode=DRY_RUN
+          fi
+          if [ "$FRESH_STATE_RESET" = "true" ] && { [ "$LIVE_SWITCH" != "true" ] || [ "$READ_ONLY" = "true" ]; }; then
+            echo "::error::fresh_state_reset requires live_enabled=true and reconcile_only=false"
+            exit 2
           fi
           echo "REQUESTED_MODE=$mode | source_sha=$(git rev-parse HEAD)"
           echo "KALSHI_SOURCE_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
@@ -222,6 +233,7 @@ jobs:
           PROFIT_THRESHOLD: ${{ inputs.profit_threshold || '' }}
           SHARES_ADDED_AFTER_PROFIT_THRESHOLD: ${{ inputs.shares_added_after_profit_threshold || '' }}
           MAX_STOP_LOSS_CENTS: ${{ inputs.max_stop_loss_cents || '' }}
+          FRESH_STATE_RESET: ${{ inputs.fresh_state_reset || false }}
         run: |
           set -euo pipefail
           # Shadow runs have a fully separate ledger/state.  Reconciliation
@@ -252,6 +264,7 @@ jobs:
             args+=(--shadow-profile "$SHADOW_PROFILE" --trading-mode shadow)
           fi
           [ "$RECONCILE_ONLY" = "true" ] && args+=(--reconcile-only)
+          [ "$FRESH_STATE_RESET" = "true" ] && args+=(--reset-state)
           [ -z "$INITIAL_SHARES" ] || args+=(--starting-base "$INITIAL_SHARES")
           [ -z "$MAX_SHARE_CAP" ] || args+=(--max-position "$MAX_SHARE_CAP")
           [ -z "$MAX_CAP_PER_BASE_SHARE" ] || args+=(--max-position-per-base-share "$MAX_CAP_PER_BASE_SHARE")

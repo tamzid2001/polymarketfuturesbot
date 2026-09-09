@@ -321,6 +321,7 @@ class StrategyCoreTests(unittest.TestCase):
             "profit_threshold", "shares_added_after_profit_threshold", "max_stop_loss_cents",
             "max_share_cap",
             "max_cap_per_base_share",
+            "fresh_state_reset",
         })
         controlled_inputs = set(__import__("re").findall(
             r"^      [a-zA-Z0-9_]+:\s*$",
