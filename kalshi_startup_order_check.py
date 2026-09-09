@@ -322,7 +322,9 @@ def choose_safe_side(feed, market: dict):
     for side in ("yes", "no"):
         with suppress(SafetyError):
             quote = feed.fresh(market["ticker"], side)
-            candidates.append((quote["selected_bid"] - PRICE, side, quote))
+            # Maximize distance from the executable ask.  That is the price a
+            # new 1c bid could cross; the selected bid can validly be 0c.
+            candidates.append((quote["selected_ask"] - PRICE, side, quote))
     if not candidates:
         raise SafetyError("Neither side has a sufficiently deep fresh quote for the one-cent probe")
     _, side, quote = max(candidates, key=lambda item: (item[0], item[1] == "yes"))
@@ -429,7 +431,9 @@ async def run_startup_check(
         emit(action="STARTUP_ORDER_CHECK_ALREADY_PASSED", worker_id=args.worker_id,
              order_id=prior.get("order_id"), orders_sent=0)
         return
-    async with stream(api, market["ticker"], "yes") as feed:
+    # Observe the single YES book but allow either economic side.  Near a
+    # binary outcome one side can be 1c/0c while the other is safely deep.
+    async with stream(api, market["ticker"], None) as feed:
         side, quote = choose_safe_side(feed, market)
         market = await preflight(api, market["ticker"], side)
         plan = plan_for(market, side, client_scope=f"startup:{args.worker_id}")

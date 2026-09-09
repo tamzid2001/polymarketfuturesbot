@@ -239,6 +239,24 @@ class OrderSmokeTests(unittest.IsolatedAsyncioTestCase):
         feed.quotes["KXBTC15M-test"]["exchange_epoch"] -= 10
         with self.assertRaises(SafetyError): feed.fresh("KXBTC15M-test", "yes")
 
+    def test_endpoint_quote_keeps_the_safely_deep_opposite_side_available(self):
+        import json
+        feed = smoke.SmokeFeed(auth=None, url=smoke.WS_URL)
+        feed.set_tickers(["KXBTC15M-test"])
+        feed.connected = True
+        msg = {
+            "market_ticker": "KXBTC15M-test",
+            "yes_bid_dollars": "0.0000",
+            "yes_ask_dollars": "0.0100",
+            "ts_ms": int(time.time() * 1000),
+        }
+        feed._handle(json.dumps({"type": "ticker", "msg": msg}))
+        with self.assertRaisesRegex(SafetyError, "not sufficiently deep"):
+            feed.fresh("KXBTC15M-test", "yes")
+        no_quote = feed.fresh("KXBTC15M-test", "no")
+        self.assertEqual(no_quote["selected_bid"], Decimal("0.99"))
+        self.assertEqual(no_quote["selected_ask"], Decimal("1"))
+
     def test_ws_error_text_never_echoes(self):
         feed = smoke.SmokeFeed(auth=None, url=smoke.WS_URL)
         with self.assertRaises(SafetyError) as raised: feed._handle('{"type":"error","msg":"SENSITIVE_MOCK"}')
