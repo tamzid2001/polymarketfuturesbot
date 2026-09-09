@@ -149,8 +149,33 @@ jobs:
                           return True
               return False
 
+          def definitively_rejected_without_exchange_order(record):
+              """Recognize only terminal V2 POST rejections, never ambiguity."""
+              orders = record.get("entry_orders", [])
+              if not orders:
+                  return False
+              for order in orders:
+                  if not isinstance(order, dict):
+                      return False
+                  try:
+                      http_status = int(order.get("http_status"))
+                      fill_count = float(order.get("fill_count") or 0)
+                      remaining_count = float(order.get("remaining_count") or 0)
+                  except (TypeError, ValueError):
+                      return False
+                  if not (
+                      order.get("submission_outcome") == "rejected"
+                      and http_status in {400, 404}
+                      and not order.get("order_id")
+                      and abs(fill_count) <= 1e-9
+                      and abs(remaining_count) <= 1e-9
+                  ):
+                      return False
+              return True
+
           unsafe = []
           safe_blocked_signals = []
+          safe_terminal_rejections = []
           for ticker, record in active:
               # A latched circuit breaker can deliberately leave the current
               # market in SIGNAL_PENDING while observational analytics keep
@@ -162,13 +187,25 @@ jobs:
                   and not has_order_work(record)
               ):
                   safe_blocked_signals.append(ticker)
+              elif (
+                  record.get("status") == "RECONCILIATION_PENDING"
+                  and state.get("circuit_breaker", {}).get("reason")
+                      == "maker_entry_submission_rejected"
+                  and not has_order_work(record)
+                  and definitively_rejected_without_exchange_order(record)
+              ):
+                  # The replacement startup performs the authoritative
+                  # order/fill/position proof and releases this interlock.
+                  # HTTP 400/404 with no order ID/fill is not a resting order.
+                  safe_terminal_rejections.append(ticker)
               else:
                   unsafe.append(ticker)
           if unsafe:
               raise SystemExit(f"persisted order/active state exists; refusing controlled restart: {unsafe}")
           print(
               "CONTROLLED_RESTART_PREFLIGHT=FLAT "
-              f"observational_signal_pending={safe_blocked_signals}"
+              f"observational_signal_pending={safe_blocked_signals} "
+              f"terminal_entry_rejections={safe_terminal_rejections}"
           )
           PY
 

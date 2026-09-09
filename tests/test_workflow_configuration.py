@@ -107,6 +107,17 @@ class WorkflowConfigurationTests(unittest.TestCase):
         journal = "data/.kalshi_live_delayed_band_v12_startup_order_check/order-smoke-test.json"
         self.assertGreaterEqual(workflow.count(journal), 2)
 
+    def test_controlled_restart_distinguishes_terminal_rejection_from_unknown_order(self):
+        workflow = (ROOT / ".github/workflows/kalshi_btc15m_controlled_restart.yml").read_text()
+        self.assertIn("def definitively_rejected_without_exchange_order(record):", workflow)
+        self.assertIn('order.get("submission_outcome") == "rejected"', workflow)
+        self.assertIn("http_status in {400, 404}", workflow)
+        self.assertIn("not order.get(\"order_id\")", workflow)
+        self.assertIn("abs(fill_count) <= 1e-9", workflow)
+        self.assertIn("abs(remaining_count) <= 1e-9", workflow)
+        self.assertIn('== "maker_entry_submission_rejected"', workflow)
+        self.assertNotIn('== "maker_entry_submission_unknown"\n                  and not has_order_work(record)', workflow)
+
     def test_checkpoint_does_not_require_runner_git_identity_setup(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
