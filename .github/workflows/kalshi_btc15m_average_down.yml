@@ -95,6 +95,7 @@ jobs:
           SHADOW_ONLY: ${{ vars.KALSHI_SHADOW_ONLY || 'true' }}
         run: |
           set -euo pipefail
+          FRESH_STATE_RESET="${FRESH_STATE_RESET:-false}"
           if [ "$READ_ONLY" = "true" ]; then
             mode=RECONCILE_ONLY
           elif [ "$LIVE_SWITCH" = "true" ]; then
