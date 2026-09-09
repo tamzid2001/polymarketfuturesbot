@@ -37,7 +37,9 @@ class PositionCapTests(unittest.TestCase):
         self.config = load_config(ROOT / "selected_live_strategy.json")
 
     def parameters(self, cap="100.00", **changes):
-        return strategy_parameters(load_config_from_value(dict(self.config, max_position=cap, **changes)))
+        values = dict(self.config, max_position=cap, max_position_per_base_share=None)
+        values.update(changes)
+        return strategy_parameters(load_config_from_value(values))
 
     def test_exact_two_point_five_sequence_clamps_to_fixed_cap(self):
         parameters = self.parameters()
@@ -48,12 +50,46 @@ class PositionCapTests(unittest.TestCase):
             state, _ = apply_realized_filled_trade(parameters, state, "-1.00")
         self.assertEqual(quantities, list(map(D, ["1", "2.50", "6.25", "15.63", "39.06", "97.66", "100", "100", "100"])))
 
-    def test_cap_remains_constant_after_permanent_base_increase(self):
+    def test_fixed_cap_remains_constant_after_permanent_base_increase(self):
         parameters = self.parameters(base_increment="1.00")
         state, _ = apply_realized_filled_trade(parameters, {}, "350.00")
         self.assertEqual(D(state["base_share_count"]), D("2.00"))
         state["recovery_exponent"] = 20
         self.assertEqual(prescribed_quantity(parameters, state)[0], D("100.00"))
+
+    def test_default_base_linked_cap_grows_only_with_permanent_base(self):
+        parameters = strategy_parameters(self.config)
+        self.assertEqual(parameters.effective_max_position("1.00"), D("100.00"))
+        self.assertEqual(prescribed_quantity(parameters, {"recovery_exponent": 20})[0], D("100.00"))
+        state, changes = apply_realized_filled_trade(parameters, {}, "350.00")
+        self.assertTrue(changes["base_increased"])
+        self.assertEqual(D(state["base_share_count"]), D("1.50"))
+        state["recovery_exponent"] = 20
+        self.assertEqual(prescribed_quantity(parameters, state)[0], D("150.00"))
+        state["base_share_count"] = "2.00"
+        self.assertEqual(prescribed_quantity(parameters, state)[0], D("200.00"))
+
+    def test_pre_base_linked_runtime_state_migrates_without_losing_sizing(self):
+        legacy_config = dict(self.config)
+        legacy_config.pop("max_position_per_base_share", None)
+        state = default_state(legacy_config)
+        state["sizing"].update({
+            "base_share_count": "1.50", "recovery_exponent": 3,
+            "recovery_cycle_pnl": "-4.25",
+        })
+        state["cycle_strategy_parameters"] = strategy_parameters(
+            load_config_from_value(dict(legacy_config, max_position_per_base_share=None))
+        ).as_dict()
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            save_state(path, state)
+            restored = load_state(path, self.config)
+        self.assertEqual(restored["sizing"], state["sizing"])
+        self.assertEqual(restored["active_config_snapshot"]["max_position_per_base_share"], "100.00")
+        self.assertIn(
+            "enable_permanent_base_linked_position_cap",
+            {item["kind"] for item in restored["config_migrations"]},
+        )
 
     def test_fractional_custom_cap_and_larger_cap_are_honored(self):
         for cap in ("37.55", "200.00", "1000.25"):
@@ -185,6 +221,26 @@ class PositionCapTests(unittest.TestCase):
             live, _ = apply_realized_filled_trade(p, live, event)
             self.assertEqual(live, full_snapshot(replay))
 
+    def test_historical_state_and_live_state_match_with_base_linked_cap(self):
+        p = strategy_parameters(load_config_from_value(dict(
+            self.config, first_base_threshold="1.00", base_increment="0.50",
+            max_position="100.00", max_position_per_base_share="100.00",
+        )))
+        replay = RecoverySizingState(
+            p.recovery_multiplier, p.first_base_threshold, p.base_increment,
+            p.threshold_growth_multiplier, p.starting_base, p.max_position,
+            max_position_per_base_share=p.max_position_per_base_share,
+        )
+        live = {}
+        for event in ("1", "-1", "-1", "0.10", "-1", "3", "-1", "-1", "-1", "-1"):
+            self.assertEqual(
+                prescribed_quantity(p, live)[0],
+                sizing_state(p, full_snapshot(replay)).prescribed_quantity(),
+            )
+            replay.apply_filled_trade(D(event))
+            live, _ = apply_realized_filled_trade(p, live, event)
+            self.assertEqual(live, full_snapshot(replay))
+
     def test_corrupt_cap_snapshot_blocks_order_instead_of_using_fallback(self):
         async def scenario():
             with TemporaryDirectory() as directory:
@@ -210,7 +266,10 @@ class PositionCapTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             path = Path(directory) / "config.json"
             export_selected_live_strategy(path, row, selection_basis="offline_test")
-            self.assertEqual(load_config(path)["max_position"], "200.25")
+            exported = load_config(path)
+            self.assertEqual(exported["max_position"], "200.25")
+            self.assertIsNone(exported["max_position_per_base_share"])
+            self.assertEqual(strategy_parameters(exported).effective_max_position("2.00"), D("200.25"))
 
     @unittest.skipIf(optimizer.njit is None, "optional Numba screening dependency")
     def test_accelerated_screen_agrees_with_decimal_replay_at_custom_cap(self):
@@ -226,16 +285,20 @@ class PositionCapTests(unittest.TestCase):
     def test_workflow_input_and_startup_contract_accept_durable_custom_cap(self):
         # Do not require a YAML library in the minimal production environment.
         workflow = (ROOT / ".github/workflows/kalshi_btc15m_average_down.yml").read_text()
-        cap_input = workflow.split("      max_share_cap:\n", 1)[1].split("      profit_threshold:", 1)[0]
+        cap_input = workflow.split("      max_share_cap:\n", 1)[1].split("      max_cap_per_base_share:", 1)[0]
         self.assertIn('default: ""', cap_input)
+        linked_input = workflow.split("      max_cap_per_base_share:\n", 1)[1].split("      profit_threshold:", 1)[0]
+        self.assertIn('default: ""', linked_input)
         self.assertIn('--max-position "$MAX_SHARE_CAP"', workflow)
+        self.assertIn('--max-position-per-base-share "$MAX_CAP_PER_BASE_SHARE"', workflow)
         self.assertIn("--persist-config", workflow)
-        code = next(code for code in re.findall(r"python -c '([^\n]+)'", workflow) if "CONFIGURED_FIXED_SHARE_CAP=" in code)
+        code = next(code for code in re.findall(r"python -c '([^\n]+)'", workflow) if "CONFIGURED_INITIAL_SHARE_CAP=" in code)
         with TemporaryDirectory() as directory:
             save_config(Path(directory) / "selected_live_strategy.json", dict(self.config, max_position="200.25"))
             result = subprocess.run([sys.executable, "-c", code], cwd=directory, env=dict(os.environ, PYTHONPATH=str(ROOT)), text=True, capture_output=True)
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("CONFIGURED_FIXED_SHARE_CAP=200.25", result.stdout)
+            self.assertIn("CONFIGURED_INITIAL_SHARE_CAP=200.25", result.stdout)
+            self.assertIn("CONFIGURED_CAP_PER_BASE_SHARE=100.00", result.stdout)
 
 
 if __name__ == "__main__":

@@ -152,6 +152,11 @@ def export_selected_live_strategy(path: Path, row: dict[str, Any], *, selection_
         "threshold_growth_multiplier": f"{float(row['threshold_growth_multiplier']):.2f}",
         "base_increment": f"{float(row['base_increment']):.2f}",
         "max_position": format(Decimal(str(row.get("max_position", "100.00"))), "f"),
+        "max_position_per_base_share": (
+            None
+            if row.get("max_position_per_base_share") in (None, "", 0, "0", "0.00")
+            else format(Decimal(str(row["max_position_per_base_share"])), "f")
+        ),
         "starting_shadow_balance": "1000.00",
         "live_enabled": False,
         "dry_run": True,

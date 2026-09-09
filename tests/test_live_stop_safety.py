@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 from kalshi_btc15m_average_down import KalshiREST, record_submission_failure, order_fee_total
+from kalshi_live_trader import LIVE_STOP_SAFETY_CONTRACT_VERSION, POSITION_CAP_CONTRACT_VERSION
 from tests import test_maker_hybrid_v11 as fixtures
 
 BookFeed = fixtures.BookFeed
@@ -15,6 +16,10 @@ LiveHybridRest = fixtures.LiveHybridRest
 
 
 class LiveStopSafetyTests(unittest.IsolatedAsyncioTestCase):
+    def test_production_safety_contract_versions_prevent_old_worker_semantics(self):
+        self.assertEqual(LIVE_STOP_SAFETY_CONTRACT_VERSION, 2)
+        self.assertEqual(POSITION_CAP_CONTRACT_VERSION, 2)
+
     def setup_trade(self, *, shadow=False):
         fixture = fixtures.MakerHybridV11Tests()
         fixture.setUp()
@@ -74,6 +79,21 @@ class LiveStopSafetyTests(unittest.IsolatedAsyncioTestCase):
         await engine.manage_stop(rest, feed, record)
         self.assertEqual(rest.hard_creates, 1)
         self.assertEqual(record["status"], "CLOSED")
+
+    async def test_maker_trigger_is_durably_latched_before_entry_cancel_confirmation(self):
+        engine, record, rest, feed = self.setup_trade()
+        async def cancel_unconfirmed(*_args, **_kwargs):
+            engine.transition(record, "ENTRY_CANCEL_UNCONFIRMED", "entry_cancellation_unconfirmed")
+            return False
+        engine.cancel_entry_orders_and_confirm = AsyncMock(side_effect=cancel_unconfirmed)
+        feed.bid = Decimal("0.51")
+        await engine.manage_stop(rest, feed, record)
+        self.assertEqual(record["status"], "ENTRY_CANCEL_UNCONFIRMED")
+        self.assertTrue(record["hybrid_stop"]["stop_exit_latched"])
+        self.assertIn("at", record["stop_trigger"])
+        saved = json.loads(engine.state_path.read_text())["markets"][record["ticker"]]
+        self.assertTrue(saved["hybrid_stop"]["stop_exit_latched"])
+        self.assertIn("at", saved["stop_trigger"])
 
     async def test_maker_unknown_response_recovers_id_before_cancel(self):
         engine, record, rest, feed = self.setup_trade()
@@ -182,9 +202,10 @@ class LiveStopSafetyTests(unittest.IsolatedAsyncioTestCase):
                     "exit_phase": "hard_stop", "order_type": "reduce_only_exit_ioc",
                     "quantity": str(requested), "position_price": str(kwargs["economic_exit_price"]),
                     "fill_count": str(filled),
-                    # Kalshi V2 IOC reports zero remaining after canceling the
-                    # unfilled part. The authoritative position is still 0.60.
-                    "remaining_count": "0.00", "average_fill_price": str(kwargs["economic_exit_price"]),
+                    # V2 can report the final unfilled/canceled IOC remainder.
+                    # It is not a resting order and must not block the next
+                    # authoritative-residual IOC.
+                    "remaining_count": "0.60", "average_fill_price": str(kwargs["economic_exit_price"]),
                     "fees_paid": "0", "post_only": False, "reduce_only": True,
                     "submission_outcome": "accepted", "status": "partial",
                 }
@@ -200,6 +221,104 @@ class LiveStopSafetyTests(unittest.IsolatedAsyncioTestCase):
                          [Decimal("1.00"), Decimal("0.60")])
         self.assertEqual(rest.position, Decimal("0"))
         self.assertEqual(record["status"], "CLOSED")
+
+    async def test_partial_entry_cancel_404_reconciles_then_hard_exits_exact_position(self):
+        engine, record, rest, feed = self.setup_trade()
+        record.update(status="ENTRY_PARTIAL", actual_quantity="0.40")
+        entry = record["entry_orders"][0]
+        entry.update({
+            "order_id": "partial-entry", "client_order_id": "partial-entry-client",
+            "ticker": record["ticker"], "quantity": "1.00", "fill_count": "0.40",
+            "remaining_count": "0.60", "average_fill_price": "0.54",
+            "routing_exchange_index": 2, "status": "partially_filled",
+        })
+        rest.position = Decimal("0.40")
+        rest.cancel_order = AsyncMock(return_value=False)
+
+        async def raw(path, _params):
+            if path == "/portfolio/orders":
+                # Complete current-order result: the raced entry is no longer
+                # resting and therefore cannot add exposure after the exit.
+                return {"orders": [], "cursor": ""}
+            if path == "/portfolio/fills":
+                return {"fills": [{
+                    "ticker": record["ticker"], "order_id": "partial-entry",
+                    "client_order_id": "partial-entry-client", "fill_id": "entry-fill",
+                    "count_fp": "0.40", "yes_price_dollars": "0.54",
+                    "fee_cost_dollars": "0", "action": "buy",
+                }], "cursor": ""}
+            raise AssertionError(path)
+
+        rest.get_raw_json = raw
+        feed.bid = Decimal("0.50")
+        await engine.manage_stop(rest, feed, record)
+        self.assertEqual(rest.hard_creates, 1)
+        self.assertEqual(Decimal(str(record["exit_orders"][-1]["quantity"])), Decimal("0.40"))
+        self.assertEqual(rest.position, Decimal("0"))
+        self.assertEqual(record["status"], "CLOSED")
+        self.assertTrue(entry["cancel_reconciled_after_failure"])
+        self.assertEqual(engine.protective_exit_health()["entry_cancel_races_reconciled"], 1)
+
+    async def test_maker_exit_cancel_404_reconciles_then_exits_only_residual(self):
+        engine, record, rest, feed = self.setup_trade()
+        await engine.manage_stop(rest, feed, record)
+        maker = record["exit_orders"][0]
+        maker.update(fill_count="0.40", remaining_count="0.60", average_fill_price="0.52")
+        rest.position = Decimal("0.60")
+        rest.cancel_order = AsyncMock(return_value=False)
+
+        async def raw(path, _params):
+            if path == "/portfolio/orders":
+                return {"orders": [], "cursor": ""}
+            if path == "/portfolio/fills":
+                return {"fills": [{
+                    "ticker": record["ticker"], "order_id": maker["order_id"],
+                    "client_order_id": maker["client_order_id"], "fill_id": "maker-fill",
+                    "count_fp": "0.40", "yes_price_dollars": "0.52",
+                    "fee_cost_dollars": "0", "action": "sell",
+                }], "cursor": ""}
+            raise AssertionError(path)
+
+        rest.get_raw_json = raw
+        feed.bid = Decimal("0.50")
+        await engine.manage_stop(rest, feed, record)
+        self.assertEqual(rest.hard_creates, 1)
+        self.assertEqual(Decimal(str(record["exit_orders"][-1]["quantity"])), Decimal("0.60"))
+        self.assertEqual(rest.position, Decimal("0"))
+        self.assertEqual(record["status"], "CLOSED")
+        self.assertTrue(maker["cancel_reconciled_after_failure"])
+        self.assertEqual(engine.protective_exit_health()["maker_cancel_races_reconciled"], 1)
+
+    async def test_latched_stop_is_not_silently_booked_as_settlement_while_position_exists(self):
+        engine, record, rest, _feed = self.setup_trade()
+        record["market_close_epoch"] = 1
+        record["status"] = "HARD_STOP_PENDING"
+        record["hybrid_stop"]["hard_stop_latched"] = True
+        rest.position = Decimal("1.00")
+        rest.get_market = AsyncMock(return_value={"ticker": record["ticker"], "result": "no"})
+        await engine.settle(rest, record, 2)
+        self.assertNotIn("realized_net_pnl", record)
+        self.assertEqual(
+            record["hard_stop_exit_deadline_incident"]["status"],
+            "UNFLATTENED_AFTER_MARKET_CLOSE",
+        )
+        self.assertEqual(engine.protective_exit_health()["pending_flatten"], 1)
+
+    async def test_flat_at_settlement_after_latched_stop_is_classified_as_exit_failure(self):
+        engine, record, rest, _feed = self.setup_trade()
+        record["market_close_epoch"] = 1
+        record["status"] = "HARD_STOP_PENDING"
+        record["hybrid_stop"].update(stop_exit_latched=True, hard_stop_latched=True)
+        rest.position = Decimal("0")
+        rest.get_market = AsyncMock(return_value={"ticker": record["ticker"], "result": "no"})
+        await engine.settle(rest, record, 2)
+        self.assertEqual(record["status"], "CLOSED")
+        self.assertEqual(record["realized_method"], "settlement")
+        self.assertEqual(record["exit_classification"], "HARD_STOP_EXIT_FAILURE_SETTLEMENT_LOSS")
+        self.assertTrue(record["protective_exit_failed_before_settlement"])
+        health = engine.protective_exit_health()
+        self.assertEqual(health["settled_after_protective_exit_latch"], 1)
+        self.assertEqual(health["settled_after_hard_stop_latch"], 1)
 
     async def test_adapter_empty_lookup_cannot_prove_rejection(self):
         rest = object.__new__(KalshiREST)
@@ -260,6 +379,8 @@ class LiveStopSafetyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(Decimal(metrics["realized_win_rate"]), Decimal("0.5"))
         self.assertEqual(Decimal(metrics["average_net_win_per_share"]), Decimal("0.4"))
         self.assertEqual(Decimal(metrics["average_net_loss_per_share"]), Decimal("0.1"))
+        self.assertEqual(Decimal(metrics["average_actual_gain_cents_per_share"]), Decimal("40.0"))
+        self.assertEqual(Decimal(metrics["average_actual_loss_cents_per_share"]), Decimal("10.0"))
         self.assertEqual(Decimal(metrics["fee_adjusted_break_even_win_rate"]), Decimal("0.2"))
         self.assertEqual(Decimal(metrics["win_rate_edge"]), Decimal("0.3"))
         self.assertEqual(Decimal(metrics["quantity_weighted_average_entry"]), Decimal("0.53"))

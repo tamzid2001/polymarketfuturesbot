@@ -38,60 +38,64 @@ All dollar results below are gross unless explicitly marked otherwise. Fees, liv
 | Hybrid maker exit | **52¢ GTC reduce-only sale** | A position is not treated as exited until actual fills exist |
 | Hybrid hard stop | **Executable bid ≤50¢** | Confirms maker cancellation/fills, then IOC-exits only authoritative residual exposure |
 | Recovery multiplier | **2.50×** | Advances after every filled closed trade while cumulative cycle P&L remains negative |
-| Recovery exponent ceiling | **Disabled (`0`)** | Sizing remains uncapped by exponent; the independently configured fixed position cap still applies |
+| Recovery exponent ceiling | **Disabled (`0`)** | Sizing remains uncapped by exponent; the effective base-linked position cap still applies |
 | First base threshold | **$350.00** | Realized net P&L only |
 | Threshold growth | **2.50×** | Geometric after each permanent-base step |
 | Base increment | **+0.50 share** | Supports +0.25, +0.50, and +1.00 |
-| Position cap | **100.00 fixed by default; configurable hard cap** | Actions input `max_share_cap` sets a constant maximum quantity; blank preserves the durable value |
+| Position cap | **100 contracts per permanent-base share by default** | Effective cap is 100 at base 1.00, 150 at base 1.50, and 200 at base 2.00; set `max_cap_per_base_share=0` to use a fixed `max_share_cap` instead |
 | Shadow balance | **$1,000.00** | Isolated from the live account state |
 | Real-money mode | **User-controlled; source defaults are shadow-safe** | Actual runtime mode is logged/checkpointed. Live requires `KALSHI_SHADOW_ONLY=false`, `KALSHI_LIVE_ENABLED=true`, and an explicit workflow `live_enabled=true` request |
 
-### Configurable fixed maximum share size
+### Base-linked or fixed maximum share size
 
-The optional Actions input **`max_share_cap`** is a **fixed maximum number of
-shares per market**, not a multiplier. Enter `100`, `200`, or another positive
-finite value with at most two decimal places, no smaller than the configured
-starting base. Leaving it blank preserves the saved cap (100.00 by default).
+The reviewed production profile enables **`max_cap_per_base_share=100.00`**.
+The effective cap is `permanent_base × 100.00`, rounded to two decimals. Thus a
+base increase from 1.00 to 2.00 raises the cap from 100 to 200 without changing
+the 2.50× recovery multiplier. `max_share_cap` is the fixed-cap value used when
+base linking is explicitly disabled. Enter `max_cap_per_base_share=0` to disable
+linking; blank inputs preserve the last successfully checkpointed values.
 
 At base 1.00 and recovery multiplier 2.50, the quantities are calculated from
 `base × 2.50 ** exponent`, rounded HALF_UP to 0.01, then limited to the hard cap:
 
-| Recovery exponent | Cap 100 | Cap 200 |
-| ---: | ---: | ---: |
-| 0 | 1.00 | 1.00 |
-| 1 | 2.50 | 2.50 |
-| 2 | 6.25 | 6.25 |
-| 3 | 15.63 | 15.63 |
-| 4 | 39.06 | 39.06 |
-| 5 | 97.66 | 97.66 |
-| 6+ (while unrecovered) | 100.00 | 200.00 |
+| Recovery exponent | Base 1.00 / cap 100 | Base 1.50 / cap 150 | Base 2.00 / cap 200 |
+| ---: | ---: | ---: | ---: |
+| 0 | 1.00 | 1.50 | 2.00 |
+| 1 | 2.50 | 3.75 | 5.00 |
+| 2 | 6.25 | 9.38 | 12.50 |
+| 3 | 15.63 | 23.44 | 31.25 |
+| 4 | 39.06 | 58.59 | 78.13 |
+| 5 | 97.66 | 146.48 | 195.31 |
+| 6+ (while unrecovered) | 100.00 | 150.00 | 200.00 |
 
-The cap **does not increase when permanent base increases**. Recovery exponent
-advances after every filled completed trade while total recovery-cycle net P&L
-is negative, including an individual profitable trade that has not recovered
-the deficit. Only cycle P&L >= 0 resets to base. Zero fills change neither state.
-Funding checks and loss breakers are unchanged; a larger cap does not supply
-additional buying power or guarantee recovery.
+The cap changes only with the permanent base; a recovery exponent never changes
+it. Recovery exponent advances after every filled completed trade while total
+recovery-cycle net P&L is negative, including an individual profitable trade
+that has not recovered the deficit. Only cycle P&L >= 0 resets to base. Zero
+fills change neither state. Funding checks and loss breakers are unchanged; a
+larger cap does not supply additional buying power or guarantee recovery.
 
-The input maps directly to `--max-position`, persisted as a Decimal
-string `max_position` in the chosen configuration, cycle parameters,
-and each signal's configuration snapshot. Each market also stores
+The two inputs map to `--max-position` and
+`--max-position-per-base-share`, persisted as Decimal strings in the chosen
+configuration, cycle parameters, and each signal's configuration snapshot. Each market also stores
 `effective_position_cap` and `effective_position_cap_after`; heartbeats print
 `cap`. Both historical reference replay and live/shadow execution use the same
-fixed cap calculation. Optimizer exports preserve the selected cap instead of
-silently substituting 100. Historical results are not reclassified.
+effective-cap calculation. Optimizer exports explicitly preserve fixed versus
+base-linked semantics instead of silently substituting 100. Historical results
+are not reclassified.
 
 **Blank means preserve**, including on watchdog restarts and normal handoffs. An
-existing configuration keeps its `max_position`;
-publishing the code does not silently expand active live risk. A cap change
-is accepted only with no outstanding order/position. A negative recovery cycle
-continues using its saved old parameters; the new cap applies to a fresh cycle.
+existing configuration keeps both cap fields; publishing the code does not
+reinterpret an active order or negative recovery cycle. The narrowly reviewed
+legacy-state migration enables 100 contracts per base share only for a fresh
+cycle; frozen records keep their creation parameters. A requested cap change is
+accepted only with no outstanding order/position.
 No live/shadow state is reset. The next worker checks out `main` and restores only
 durable data/configuration, never an older runner source file.
 
 ### Frozen observed-ledger selection evidence
 
-The v12 choice is based on the supplied frozen replay of the delayed cohort with a maximum filled entry of 57¢, the ask-minus-1¢ entry, 51/52/50 hybrid stop, 1.00 starting share, 2.50× recovery, and 100-share cap:
+The v12 choice is based on the supplied frozen replay of the delayed cohort with a maximum filled entry of 57¢, the ask-minus-1¢ entry, 51/52/50 hybrid stop, 1.00 starting share, 2.50× recovery, and a 100-share initial cap:
 
 | Metric | Frozen replay |
 | --- | ---: |
@@ -108,7 +112,7 @@ The v12 choice is based on the supplied frozen replay of the delayed cohort with
 
 Those last three fields cannot be reconstructed accurately from aggregate counts, so this README does not invent them. They are calculated prospectively from actual filled quantity, actual average entry, realized net P&L, and fees in the durable ledger and printed for all trades plus rolling 20- and 50-trade windows.
 
-These are observed-ledger/replay results, not live fills and not a guaranteed return. The positive 2.50× result is nonlinear and highly sequence-dependent; 52 of 73 directional winners were stopped before settlement. Fees, queue position, partial fills, and live stop slippage were not established by those headline figures. A $150 deposit exceeds the reported $50.77 historical drawdown and can fund the configured maximum 100-share order at the 57¢ ceiling before fees, but that does **not** prove $150 survival outside the 135-trade sample. The worker therefore retains funding checks, the 100-share cap, continuous exchange reconciliation, and persistent loss circuit breakers.
+These are observed-ledger/replay results, not live fills and not a guaranteed return. The positive 2.50× result is nonlinear and highly sequence-dependent; 52 of 73 directional winners were stopped before settlement. Fees, queue position, partial fills, and live stop slippage were not established by those headline figures. A $150 deposit exceeds the reported $50.77 historical drawdown and can fund the initial 100-share cap at the 57¢ ceiling before fees, but that does **not** prove $150 survival outside the 135-trade sample or fund every later base-linked cap. The worker therefore retains funding checks, the effective cap, continuous exchange reconciliation, and persistent loss circuit breakers.
 
 ### Delayed maker entry and hybrid stop
 
@@ -118,11 +122,41 @@ At open, the pre-subscribed WebSocket freezes the earliest fresh **price-only** 
 
 The worker submits one deterministic GTC/post-only buy for the selected side. `maker_order_time_in_force=good_till_canceled`, `entry_order_lifetime=until_filled_or_market_close`, and `entry_timeout_seconds=0` are fail-closed contracts. The order rests until fully filled, market close, or confirmed cancellation required by a stop. Live mode uses Kalshi orders and fills as authoritative. Shadow mode requires a post-submission public trade at or below the buy limit; a displayed touch or submission is never called a fill. Partial fills create only the observed exposure and all P&L/recovery accounting uses that quantity.
 
-For the default 50¢ hard stop, an executable selected-side bid ≤51¢ first cancels and confirms any unfilled entry remainder and starts a post-only/reduce-only maker sale at 52¢. If bid reaches ≤50¢ before that maker exit completely fills, the worker confirms the maker cancellation, reconciles its fills, and sends a reduce-only IOC only for the remaining position. Unknown cancellation or position state blocks only new exposure while the worker stays online and continues risk management. A partial maker exit can never cause the IOC to sell the original full quantity again.
+For the default 50¢ hard stop, an executable selected-side bid ≤51¢ first
+**durably latches the protective-exit obligation**, then cancels and confirms
+any unfilled entry remainder and starts a post-only/reduce-only maker sale at
+52¢. The latch is written before the cancellation request, so a cancellation
+404/timeout, price rebound, process restart, or worker handoff cannot return the
+trade to a normal hold-to-settlement path. If bid reaches ≤50¢ before that maker
+exit completely fills, the worker confirms the maker cancellation, reconciles
+its fills, and sends a reduce-only IOC only for the authoritative remaining
+position. Unknown cancellation or position state blocks only new exposure while
+the worker stays online and continues risk management. A partial maker exit can
+never cause the IOC to sell the original full quantity again.
 
-Live-stop safety contract 1 adds a durable exit-order intent **before** each POST. A lost response is recovered using the exact client order ID, not retried blindly with a new ID. An empty lookup does not prove rejection. Definitive HTTP 400/404 entry rejections are terminal for that market and do not halt later markets. An ambiguous response starts a continuously reconciled entry interlock: the process and WebSocket remain alive, the exact client ID/order/fills/position are checked every reconciliation interval, a discovered order or position is adopted, and a no-order case becomes zero-fill only after market close proves it cannot create later exposure. Failed maker attempts cannot leave a fictitious uncanceled order blocking the hard stop.
+Live-stop safety contract 2 adds a durable exit-order intent **before** each POST and latches the 51¢ protective trigger before the entry-cancel request. A lost response is recovered using the exact client order ID, not retried blindly with a new ID. An empty lookup does not prove rejection. Definitive HTTP 400/404 entry rejections are terminal for that market and do not halt later markets. An ambiguous response starts a continuously reconciled entry interlock: the process and WebSocket remain alive, the exact client ID/order/fills/position are checked every reconciliation interval, a discovered order or position is adopted, and a no-order case becomes zero-fill only after market close proves it cannot create later exposure. Failed maker attempts cannot leave a fictitious uncanceled order blocking the hard stop.
 
-A price gap straight to ≤50¢ bypasses the maker attempt and starts the hard exit in the same management pass, after entry cancellation. Once triggered, the hard stop remains latched through price recovery and process restarts. A hard-stop IOC is terminal even when partially filled; the adapter then re-reads the authoritative position and submits a new price-protected reduce-only IOC for only the residual. It does **not** turn the unfilled IOC remainder into GTC, because a stale resting exit can later oversell after another retry. IOC fills/fees are refreshed before sizing any residual retry. The trigger price is not a guaranteed execution price: gaps, unavailable liquidity, exchange pauses, disconnects and unknown cancellations can delay or worsen an exit. These paths are covered by offline fault-injection tests in `tests/test_live_stop_safety.py`; passing those tests is not evidence of successful real exchange fills.
+A price gap straight to ≤50¢ bypasses the maker attempt and starts the hard exit
+in the same management pass, after entry cancellation. Once triggered, the hard
+stop remains latched through price recovery and process restarts. A hard-stop
+IOC is terminal even when partially filled; the adapter then re-reads the
+authoritative position and submits a new price-protected reduce-only IOC for
+only the residual. It does **not** turn the unfilled IOC remainder into GTC,
+because a stale resting exit can later oversell after another retry. IOC
+fills/fees are refreshed before sizing any residual retry. If a latched exit is
+still non-flat at market close, the ledger records a critical protective-exit
+incident and refuses to disguise it as an ordinary settlement; if settlement
+ultimately flattens it, the classification remains
+`PROTECTIVE_EXIT_FAILURE_*` or `HARD_STOP_EXIT_FAILURE_*`.
+
+The 50¢ threshold is not a guaranteed 50¢ execution. No client can guarantee an
+exit when the exchange is unavailable, the market is paused/closed, the book
+gaps below the limit, or no buyer exists. The worker instead makes the strongest
+safe effort available without risking a reverse position: durable intent,
+ticker-scoped V2 order and fill reconciliation, authoritative position reads,
+reduce-only exits, and bounded residual IOC retries. These paths are covered by
+offline fault-injection tests in `tests/test_live_stop_safety.py`; passing those
+tests is not evidence of successful real exchange fills.
 
 `ENTRY_FILTERED` is a strategy decision, not an exchange rejection. For example, a qualifying ask of 60¢ implies a 59¢ limit, exceeding the 57¢ ceiling. The heartbeat now retains that observed ask, derived limit and filter reason even when no order was submitted. Separate `analytics_only=true` fills do not affect the executable strategy balance. Live activation still requires the user-controlled gates; this safety patch does not turn on real-money trading.
 
@@ -132,7 +166,7 @@ Deployment does **not** enable real-money orders. After reviewing the strategy a
 
 1. Repository **Settings → Secrets and variables → Actions → Variables**: set `KALSHI_LIVE_ENABLED=true` and `KALSHI_SHADOW_ONLY=false`. Keep `KALSHI_MAINTENANCE_MODE=false`. These are permission gates; on a shadow deployment they do not start live trading by themselves.
 2. **Actions → Kalshi KXBTC15M Hybrid Live → Run workflow**, branch `main`: check **LIVE SWITCH** (`live_enabled`), leave **READ-ONLY CHECK** (`reconcile_only`) unchecked.
-3. For the frozen defaults, initial shares = `1.00`, scaling multiplier = `2.50`, profit threshold = `350.00`, shares added = `0.50`, hard stop = `50`. Blank inputs preserve the durable configuration, not necessarily the original defaults. Do not request sizing changes during active exposure/recovery.
+3. For the frozen defaults, initial shares = `1.00`, scaling multiplier = `2.50`, cap per base share = `100.00`, profit threshold = `350.00`, shares added = `0.50`, hard stop = `50`. Blank inputs preserve the durable configuration, not necessarily the original defaults. Do not request sizing changes during active exposure/recovery.
 4. Verify the worker logs **`MODE=LIVE`**, a successful authenticated reconciliation, then accepted exchange order IDs and actual fills. `DRY_RUN`, `RECONCILE_ONLY`, `ENTRY_FILTERED` and `analytics_only=true` are not proof of a real trade. A blocked live request now fails instead of silently becoming shadow.
 
 If a shadow worker is still running, the singleton queues a normal live dispatch; it does not interrupt it. To transition sooner, use **Controlled Restart — Kalshi KXBTC15M Hybrid** with its current `source_run_id` and `target_live=true`. This refuses handoff unless the checkpoint is flat and the market is within the safe 1–14 minute window. Never force-cancel a live worker managing an order or position. The watchdog resumes the last explicitly selected trading mode and uses current `main`; read-only audits do not change that selection. To revoke live permission, restore `KALSHI_SHADOW_ONLY=true` and `KALSHI_LIVE_ENABLED=false`; changing repository variables does not instantly change an already running process, so existing exposure still needs its manager.
@@ -160,7 +194,8 @@ confirmation that a requested change has persisted remotely.
 | --- | --- |
 | `initial_shares` | Initial base for a brand-new strategy state; does not overwrite an existing permanent base. |
 | `scaling_multiplier` | Recovery multiplier and geometric threshold-growth multiplier. `2.5` and `2.50` mean the same value. |
-| `max_share_cap` | Fixed absolute share ceiling, independent of permanent-base increases. |
+| `max_share_cap` | Fixed absolute share ceiling used when base-linked capping is disabled. |
+| `max_cap_per_base_share` | Contracts of cap per permanent-base share; default 100. Set 0 to disable linking and use `max_share_cap`. |
 | `profit_threshold` | First scaling threshold for new state; does not erase an existing accumulated profit/next threshold. |
 | `shares_added_after_profit_threshold` | Permanent base increment after realized net profit crosses the current threshold. |
 | `max_stop_loss_cents` | Hard stop, 10–50¢; trigger is +1¢ and maker exit +2¢. Blank preserves the saved stop, not necessarily 50¢. |
@@ -641,12 +676,12 @@ The optimizer uses common random numbers for competing configurations, keeps eve
 
 - The live engine and historical replay share the recovery/base-sizing transitions. A filled trade updates realized net P&L; a zero fill is exactly $0 and changes neither the recovery exponent nor permanent base.
 - Recovery exponent increases after **every filled closed trade** while cumulative recovery-cycle P&L remains negative. It resets only when that cumulative amount reaches at least $0.
-- `max_recovery_exponent=0` is the explicit disabled sentinel. The shared shadow/live engine does not stop the 2.50× sequence at an arbitrary exponent; the independent 100-share position limit, funding check, recovery-loss breaker, and daily-loss breaker remain active.
+- `max_recovery_exponent=0` is the explicit disabled sentinel. The shared shadow/live engine does not stop the 2.50× sequence at an arbitrary exponent; the effective base-linked position limit, funding check, recovery-loss breaker, and daily-loss breaker remain active.
 - Permanent-base steps use realized net P&L only. No unrealized value, cancelled order, or zero fill can scale the base.
 - Startup reconciles Kalshi balance, open managed orders, positions, fills, and settlements before any entry. During runtime, an ambiguous entry response leaves the worker and risk management online while only new exposure is interlocked. Exact client-order, fill and position checks repeat every reconciliation interval; known orders/positions are adopted and closed-market no-order cases automatically resume later entries. Kalshi remains authoritative.
 - Client order IDs are deterministic, partial fills use actual quantities, exits are reduce-only where supported, and the same market cannot be counted twice after restart.
 - The worker discovers a bounded previous/current/upcoming market window every second using `min_close_ts`/`max_close_ts`, subscribes the API-provided successor before open, and keeps the ending market subscribed for final 99¢ executable-bid inference. The first complete opening ask establishes eligibility; the first fresh qualifying ask at/after 60 seconds freezes one deterministic ask-minus-1¢ GTC order. There is no IOC entry fallback and later quotes cannot move the limit.
-- The hybrid stop defaults to 51¢ trigger / 52¢ maker sale / 50¢ hard-stop threshold. The one hard-stop workflow input moves all three together; entry price never shifts them. A partial hard IOC is followed by a fresh authoritative position read and another reduce-only IOC for only the residual—never a stale GTC conversion. Actual entry and exit fills, quantities, fees, and residual exposure drive accounting.
+- The hybrid stop defaults to 51¢ trigger / 52¢ maker sale / 50¢ hard-stop threshold. The protective obligation is persisted before entry cancellation; it cannot be unlatched by a cancel error, quote rebound, or restart. The one hard-stop workflow input moves all three together; entry price never shifts them. A partial hard IOC is followed by a fresh authoritative position read and another reduce-only IOC for only the residual—never a stale GTC conversion. Actual entry and exit fills, quantities, fees, and residual exposure drive accounting.
 - Shadow and live state are isolated at `data/kalshi_shadow_delayed_band_v12_*` and `data/kalshi_live_delayed_band_v12_*`. The v12 shadow lane starts at $1,000 and the configured initial base (1.00 share by default), and tracks realized P&L, peak equity, maximum drawdown, entry filtering, false stops, and timing.
 - Every audit JSONL record is appended, flushed, and `fsync`ed before the worker resumes order/position management. Its companion strategy state is atomically written and `fsync`ed immediately after every audit event; therefore a state transition, fill observation, stop event, funding failure, settlement, reconciliation result, and handoff is checkpointed locally while the worker is running—not merely at its end. Remote checkpoints are coalesced every 30 seconds and force-update one parentless `runtime-state-kxbtc15m-delayed-v12` snapshot with an exact lease. Snapshot schema v2 deterministically gzip-compresses each durable file in independent 8 MiB source chunks, verifies every compressed and uncompressed digest/size on restore, and reuses unchanged append-only ledger chunks. This prevents GitHub's 100 MiB single-blob limit from breaking a handoff as the ledger grows. The branch contains only allow-listed KXBTC15M payload chunks plus its manifest; it cannot accumulate ordinary code history or inherit older strategy state.
 - Each market ledger record includes the immutable first price-only opening reference, its completeness status, separately timed first displayed-depth book, derived limit, exchange/client order IDs, partial fills, and maker/taker status where exposed. Timing includes exchange-price lag, worker-observation lag, depth-after-price lag, market-open-to-submission, market-open-to-first-fill, submission-to-first-fill, entry completion, first-fill-to-trigger, trigger-to-maker submission, and trigger-to-observed-flat position. Heartbeats use separate bounded `ORDER HEALTH`, `LIVE ACCOUNT`, `HEARTBEAT`, `ENTRY STATUS`, `LIVE PERFORMANCE`, `STOP STATUS`, and `RESEARCH COHORT` lines so GitHub does not truncate safety-critical fields. `LIVE PERFORMANCE` includes actual fees and rolling payoff-implied break-even rates. Five-minute tables print every 40–49¢ level, winner capture/misses, drawdown buckets, and hybrid-stop outcomes. They also print, separately for every hypothetical stop from 40¢ through 49¢, the number/rate of frozen initial prices at or below that stop, plus exact-price and actual configured safety-rejection counts. Those are no-entry diagnostics, not the retired directional loss-skip rule and not ordinary GTC zero-fills.
@@ -655,7 +690,7 @@ The optimizer uses common random numbers for competing configurations, keeps eve
 
 ### GitHub Actions inputs
 
-The production worker presents eight manual inputs. Blank strategy values preserve the version already stored in `runtime-state-kxbtc15m-delayed-v12`, so watchdog and five-hour handoffs cannot overwrite a deliberate setting with an old default.
+The production worker presents nine manual inputs. Blank strategy values preserve the version already stored in `runtime-state-kxbtc15m-delayed-v12`, so watchdog and five-hour handoffs cannot overwrite a deliberate setting with an old default.
 
 | Input | Meaning |
 | --- | --- |
@@ -663,7 +698,8 @@ The production worker presents eight manual inputs. Blank strategy values preser
 | `reconcile_only` | Reconcile authoritative Kalshi state without opening exposure |
 | `initial_shares` | Two-decimal starting base for a brand-new state; current default `1.00` |
 | `scaling_multiplier` | Sets both recovery sizing and geometric profit-threshold growth |
-| `max_share_cap` | Fixed absolute maximum quantity; blank preserves the durable cap and it does not scale with permanent base |
+| `max_share_cap` | Fixed absolute maximum quantity used only when base-linked capping is disabled; blank preserves it |
+| `max_cap_per_base_share` | Cap per permanent-base share; default 100, so base 1 → cap 100 and base 2 → cap 200; 0 selects fixed-cap mode; blank preserves |
 | `profit_threshold` | First realized-net-profit threshold for a permanent base increase |
 | `shares_added_after_profit_threshold` | Two-decimal permanent base increment after each threshold crossing |
 | `max_stop_loss_cents` | Hard-stop price `H` from 10 through 50; trigger is `H+1` and maker exit is `H+2`; current default 50 |

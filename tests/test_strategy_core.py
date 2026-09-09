@@ -266,7 +266,8 @@ class StrategyCoreTests(unittest.TestCase):
         self.assertIn("BTC_TARGET_CAPTURE_CONTRACT_VERSION == 2", worker)
         self.assertIn("DELAYED_ENTRY_LADDER_CONTRACT_VERSION == 3", worker)
         self.assertIn('c = load_config(', worker)
-        self.assertIn('CONFIGURED_FIXED_SHARE_CAP=', worker)
+        self.assertIn('CONFIGURED_INITIAL_SHARE_CAP=', worker)
+        self.assertIn('CONFIGURED_CAP_PER_BASE_SHARE=', worker)
         self.assertIn("CANONICAL_DELAYED_BAND_STRATEGY_CONTRACT=OK", worker)
         self.assertIn("opening_ask_below=53c", worker)
         self.assertIn("first_qualifying_ask>=53c", worker)
@@ -319,6 +320,7 @@ class StrategyCoreTests(unittest.TestCase):
             "live_enabled", "reconcile_only", "initial_shares", "scaling_multiplier",
             "profit_threshold", "shares_added_after_profit_threshold", "max_stop_loss_cents",
             "max_share_cap",
+            "max_cap_per_base_share",
         })
         controlled_inputs = set(__import__("re").findall(
             r"^      [a-zA-Z0-9_]+:\s*$",
