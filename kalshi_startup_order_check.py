@@ -7,10 +7,13 @@ proves: the create was acknowledged, the exact order cancellation was
 acknowledged, remaining quantity is zero, no fill exists, and the position is
 flat.  The durable intent is checkpointed before the non-idempotent POST.
 
-The check never retries creation. It can clear only the legacy
-``maker_entry_submission_unknown`` breaker after exact closed-market V2
-order/fill/position proof; every other breaker remains fail-closed. It is
-deliberately unavailable in shadow and reconciliation-only modes.
+The check never retries creation. It can clear a terminal maker-entry breaker
+only after exact closed-market V2 order/fill/position proof.  That covers both
+an old unknown POST response and a definitive HTTP rejection: neither is
+allowed to become a permanent 24/7 halt after the source market has closed,
+but neither may be discarded without authoritative exchange proof.  Every
+other breaker remains fail-closed. It is deliberately unavailable in shadow
+and reconciliation-only modes.
 """
 from __future__ import annotations
 
@@ -55,7 +58,7 @@ def enabled_live_environment() -> bool:
 
 
 def load_strategy_safety_state(
-    path: Path, config_path: Path, *, allow_legacy_unknown_breaker: bool = False,
+    path: Path, config_path: Path, *, allow_recoverable_entry_breaker: bool = False,
 ) -> dict:
     if path.is_symlink():
         raise SafetyError("Live strategy state is symlinked; startup order check blocked")
@@ -76,9 +79,12 @@ def load_strategy_safety_state(
     breaker = value.get("circuit_breaker")
     if not isinstance(breaker, dict):
         raise SafetyError("Strategy breaker state is unavailable; startup order check blocked")
+    recoverable_reasons = {
+        "maker_entry_submission_unknown", "maker_entry_submission_rejected",
+    }
     if breaker.get("blocked") and not (
-        allow_legacy_unknown_breaker
-        and breaker.get("reason") == "maker_entry_submission_unknown"
+        allow_recoverable_entry_breaker
+        and breaker.get("reason") in recoverable_reasons
     ):
         reason = str(breaker.get("reason") or "unknown")
         raise SafetyError(f"Strategy circuit breaker remains active ({reason}); reconcile it before any probe")
@@ -87,7 +93,7 @@ def load_strategy_safety_state(
     return value
 
 
-def _unknown_entry_intents(state: dict) -> list[tuple[dict, dict]]:
+def _recoverable_entry_intents(state: dict, reason: str) -> list[tuple[dict, dict]]:
     result = []
     for record in state.get("markets", {}).values():
         if not isinstance(record, dict):
@@ -95,20 +101,27 @@ def _unknown_entry_intents(state: dict) -> list[tuple[dict, dict]]:
         for order in record.get("entry_orders", []):
             if not isinstance(order, dict):
                 continue
-            if (
-                not order.get("order_id")
-                and order.get("status") in {"submitting", "submit_failed"}
+            unknown = (
+                reason == "maker_entry_submission_unknown"
                 and order.get("submission_outcome") != "rejected"
-            ):
+            )
+            rejected = (
+                reason == "maker_entry_submission_rejected"
+                and order.get("submission_outcome") == "rejected"
+                and order.get("http_status") in {400, 401, 403, 404, 422}
+            )
+            if (not order.get("order_id")
+                    and order.get("status") in {"submitting", "submit_failed"}
+                    and (unknown or rejected)):
                 result.append((record, order))
     return result
 
 
-async def resolve_legacy_unknown_breaker(
+async def resolve_terminal_entry_breaker(
     args: argparse.Namespace, api: SmokeApi, state: dict, journal: Journal,
     *, publisher=None,
 ) -> dict:
-    """Clear only a terminal legacy unknown-POST breaker after exact REST proof.
+    """Clear a terminal entry-submission breaker after exact REST proof.
 
     A missing HTTP acknowledgment is not proof of rejection.  Resolution
     therefore requires all-shard-2 preflight to have proved no resting orders
@@ -123,11 +136,12 @@ async def resolve_legacy_unknown_breaker(
     breaker = state.get("circuit_breaker", {})
     if not breaker.get("blocked"):
         return state
-    if breaker.get("reason") != "maker_entry_submission_unknown":
-        raise SafetyError("Only the legacy maker-entry unknown breaker has an automatic proof path")
-    intents = _unknown_entry_intents(state)
+    reason = str(breaker.get("reason") or "")
+    if reason not in {"maker_entry_submission_unknown", "maker_entry_submission_rejected"}:
+        raise SafetyError("Only a maker-entry submission breaker has an automatic proof path")
+    intents = _recoverable_entry_intents(state, reason)
     if not intents:
-        raise SafetyError("Legacy breaker has no exact persisted submission intent; manual review required")
+        raise SafetyError("Entry breaker has no exact persisted submission intent; manual review required")
 
     resolved = []
     for record, intent in intents:
@@ -136,12 +150,12 @@ async def resolve_legacy_unknown_breaker(
         market_payload = await api.request("GET", "/markets/" + ticker)
         market = market_payload.get("market")
         if not isinstance(market, dict) or market.get("ticker") != ticker:
-            raise SafetyError("Legacy intent market metadata could not be verified")
+            raise SafetyError("Entry intent market metadata could not be verified")
         close_at = epoch(market.get("close_time"))
         if market.get("status") in {"active", "open"} and time.time() < close_at:
-            raise SafetyError("Legacy unknown intent market remains tradable; manual review required")
+            raise SafetyError("Entry intent market remains tradable; reconciliation must wait for close")
         if shard(market.get("exchange_index")) != 2:
-            raise SafetyError("Legacy unknown intent is not on the expected market shard")
+            raise SafetyError("Entry intent is not on the expected market shard")
 
         orders = await pages(
             api, "/portfolio/orders", "orders", exchange_index=2,
@@ -149,7 +163,7 @@ async def resolve_legacy_unknown_breaker(
         )
         matches = [row for row in orders if row.get("client_order_id") == client_id]
         if len(matches) > 1:
-            raise SafetyError("Multiple exchange orders match the legacy intent")
+            raise SafetyError("Multiple exchange orders match the entry intent")
         order_ids = set()
         if matches:
             order = matches[0]
@@ -161,7 +175,7 @@ async def resolve_legacy_unknown_breaker(
             if filled != 0 or remaining != 0 or status not in {
                 "canceled", "cancelled", "expired", "executed", "filled",
             }:
-                raise SafetyError("Legacy exchange order is not proven terminal and unfilled")
+                raise SafetyError("Exchange order is not proven terminal and unfilled")
 
         fills = await pages(
             api, "/portfolio/fills", "fills", exchange_index=2,
@@ -172,7 +186,7 @@ async def resolve_legacy_unknown_breaker(
             or (row.get("order_id") and row.get("order_id") in order_ids)
         )]
         if linked_fills:
-            raise SafetyError("A fill exists for the legacy unknown submission; preserve state for accounting")
+            raise SafetyError("A fill exists for the entry submission; preserve state for accounting")
 
         # The shard-wide position/open-order preflight was already flat.  This
         # exact history proves this closed market's unknown POST created no
@@ -186,7 +200,7 @@ async def resolve_legacy_unknown_breaker(
         })
         if record.get("status") in {"ERROR_RECONCILIATION", "RECONCILIATION_PENDING"}:
             record.update({
-                "status": "ZERO_FILL", "status_reason": "legacy_unknown_submission_proven_unfilled",
+                "status": "ZERO_FILL", "status_reason": "entry_submission_proven_terminal_unfilled",
                 "updated_at": utc_now(),
             })
         resolved.append({"ticker": ticker, "client_order_id": client_id})
@@ -194,7 +208,8 @@ async def resolve_legacy_unknown_breaker(
     state["circuit_breaker"] = {
         "blocked": False, "reason": None, "triggered_at": None,
         "last_resolution": {
-            "at": utc_now(), "kind": "legacy_maker_entry_unknown_proven_terminal_unfilled",
+            "at": utc_now(), "kind": "maker_entry_submission_proven_terminal_unfilled",
+            "original_breaker_reason": reason,
             "resolved_intents": len(resolved), "exchange_index": 2,
         },
     }
@@ -218,14 +233,15 @@ async def resolve_legacy_unknown_breaker(
     }
     save_state(args.state_file, state)
     append_audit(args.audit_ledger, {
-        "event": "legacy_submission_breaker_resolved", "at": utc_now(),
+        "event": "entry_submission_breaker_resolved", "at": utc_now(),
         "reason": "v2_order_fill_position_proof", "exchange_index": 2,
+        "original_breaker_reason": reason,
         "resolved_intents": resolved, "orders_sent": 0,
     })
-    publisher(args, journal, "legacy-maker-entry-breaker-resolved")
+    publisher(args, journal, "maker-entry-breaker-resolved")
     emit(
-        action="LEGACY_BREAKER_RESOLVED", reason="terminal_no_order_no_fill_no_position",
-        resolved_intents=len(resolved), exchange_index=2, orders_sent=0,
+        action="ENTRY_BREAKER_RESOLVED", reason="terminal_no_order_no_fill_no_position",
+        original_breaker_reason=reason, resolved_intents=len(resolved), exchange_index=2, orders_sent=0,
     )
     return state
 
@@ -314,7 +330,7 @@ async def run_startup_check(
     if not WORKER_ID.fullmatch(args.worker_id or ""):
         raise SafetyError("A valid durable GitHub worker ID is required")
     state = load_strategy_safety_state(
-        args.state_file, args.config, allow_legacy_unknown_breaker=True,
+        args.state_file, args.config, allow_recoverable_entry_breaker=True,
     )
 
     fingerprint = hashlib.sha256(api.key_id.encode()).hexdigest()
@@ -335,7 +351,7 @@ async def run_startup_check(
     # write scope, shard-specific balance, all resting orders, and all positions.
     market = await preflight_current_when_safe(api)
     if state["circuit_breaker"].get("blocked"):
-        state = await resolve_legacy_unknown_breaker(
+        state = await resolve_terminal_entry_breaker(
             args, api, state, journal, publisher=publisher,
         )
         # Refuse to rely on the state mutation alone. Re-run the strict local

@@ -896,8 +896,13 @@ def record_submission_failure(record: dict[str, Any], exc: Exception) -> None:
         payload = json.loads(body) if isinstance(body, (str, bytes)) else body
         error = payload.get("error", payload) if isinstance(payload, dict) else {}
         code = error.get("code") if isinstance(error, dict) else None
-        if code in {"user_not_found", "insufficient_balance", "insufficient_funds",
-                    "authentication_error", "unauthorized", "market_closed"}:
+        if code in {
+            "user_not_found", "insufficient_balance", "insufficient_funds",
+            "available_balance_too_low", "authentication_error", "unauthorized",
+            "market_closed", "market_not_open", "post_only_order_would_take",
+            "post_only_order_would_cross", "post_only_would_cross",
+            "invalid_post_only_order", "price_crosses_spread", "order_would_cross",
+        }:
             record["error_code"] = code
     except (ValueError, TypeError):
         pass
@@ -2225,6 +2230,8 @@ class KalshiREST:
                       record["http_status"], record.get("error_code"), record["error_type"])
             return record
         record["order_id"] = str(field(response, "order_id") or "") or None
+        record["submission_outcome"] = "accepted"
+        record["exchange_processed_at_ms"] = field(response, "ts_ms")
         record["fill_count"] = round(order_fill_count(response), 2)
         record["remaining_count"] = round(order_remaining_count(response) if order_remaining_count(response) is not None else quantity - record["fill_count"], 2)
         record["average_fill_price"] = order_average_position_price(response, side, position_price)
@@ -2254,6 +2261,13 @@ class KalshiREST:
                  record["status"].upper(), ticker, side.upper(), position_price, quantity,
                  record["fill_count"], record["remaining_count"], record["order_id"] or "?",
                  record["routing_exchange_index"])
+        LOG.warning(
+            "LIVE ORDER ACK | purpose=ENTRY ticker=%s side=%s order_id=%s client_order_id=%s "
+            "price=$%.4f quantity=%.2f fill=%.2f remaining=%.2f status=%s shard=%s",
+            ticker, side.upper(), record["order_id"], record["client_order_id"], position_price,
+            quantity, record["fill_count"], record["remaining_count"], record["status"],
+            record["routing_exchange_index"],
+        )
         return record
 
     async def create_reduce_only_exit(
@@ -2326,6 +2340,8 @@ class KalshiREST:
                       record["http_status"], record["error_type"])
             return record
         record["order_id"] = str(field(response, "order_id") or "") or None
+        record["submission_outcome"] = "accepted"
+        record["exchange_processed_at_ms"] = field(response, "ts_ms")
         record["fill_count"] = round(order_fill_count(response), 2)
         record["remaining_count"] = round(
             order_remaining_count(response) if order_remaining_count(response) is not None else quantity - record["fill_count"], 2,
@@ -2337,6 +2353,12 @@ class KalshiREST:
             "REDUCE-ONLY EXIT %s | %s %s bid=$%.4f x %.2f fill=%.2f remaining=%.2f id=%s",
             record["status"].upper(), ticker, held_side.upper(), economic_exit_price, quantity,
             record["fill_count"], record["remaining_count"], record["order_id"] or "?",
+        )
+        LOG.warning(
+            "LIVE ORDER ACK | purpose=HARD_STOP_IOC ticker=%s side=%s order_id=%s "
+            "price=$%.4f quantity=%.2f fill=%.2f remaining=%s status=%s reduce_only=true",
+            ticker, held_side.upper(), record["order_id"], economic_exit_price, quantity,
+            record["fill_count"], record["remaining_count"], record["status"],
         )
         return record
 
@@ -2394,6 +2416,8 @@ class KalshiREST:
                       record["http_status"], record["error_type"])
             return record
         record["order_id"] = str(field(response, "order_id") or "") or None
+        record["submission_outcome"] = "accepted"
+        record["exchange_processed_at_ms"] = field(response, "ts_ms")
         record["fill_count"] = round(order_fill_count(response), 2)
         remaining = order_remaining_count(response)
         record["remaining_count"] = round(remaining if remaining is not None else quantity - record["fill_count"], 2)
@@ -2406,6 +2430,12 @@ class KalshiREST:
             "REDUCE-ONLY MAKER EXIT %s | %s %s @ $%.4f x %.2f fill=%.2f remaining=%.2f id=%s",
             record["status"].upper(), ticker, held_side.upper(), economic_exit_price, quantity,
             record["fill_count"], record["remaining_count"], record["order_id"] or "?",
+        )
+        LOG.warning(
+            "LIVE ORDER ACK | purpose=MAKER_STOP_GTC ticker=%s side=%s order_id=%s "
+            "price=$%.4f quantity=%.2f fill=%.2f remaining=%s status=%s reduce_only=true",
+            ticker, held_side.upper(), record["order_id"], economic_exit_price, quantity,
+            record["fill_count"], record["remaining_count"], record["status"],
         )
         return record
 

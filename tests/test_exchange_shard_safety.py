@@ -177,6 +177,19 @@ class ExchangeShardSafetyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(record["status_reason"], "market_exchange_funding_unavailable")
         self.assertNotIn("mock-secret-never-log", engine.state_path.read_text() + engine.ledger_path.read_text())
 
+    async def test_heartbeat_balance_telemetry_failure_does_not_stop_worker(self):
+        engine, _record, _feed, _now = self.entry()
+        rest = EntryRest()
+        rest.balance_decimal = AsyncMock(side_effect=RuntimeError("mock-secret-never-log"))
+        rest.market_entry_funding = AsyncMock(side_effect=RuntimeError("mock-secret-never-log"))
+
+        status = await engine.refresh_live_account_status(rest, self.ticker)
+
+        self.assertEqual(status["read_status"], "ALL_READS_FAILED")
+        self.assertIsNone(status["aggregate_balance"])
+        self.assertIsNone(status["market_shard_available"])
+        self.assertNotIn("mock-secret-never-log", json.dumps(status))
+
     async def test_funded_shard_retains_exact_gtc_price_quantity_and_direction(self):
         engine, record, feed, now = self.entry()
         rest = EntryRest()
@@ -188,6 +201,25 @@ class ExchangeShardSafetyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rest.calls[0]["quantity"], 1.0)
         self.assertEqual(rest.calls[0]["tif"], "good_till_canceled")
         self.assertTrue(rest.calls[0]["post_only"])
+        self.assertEqual(record["status"], "ENTRY_PENDING")
+
+    async def test_post_only_cross_is_prevented_and_same_frozen_limit_remains_retryable(self):
+        engine, record, feed, now = self.entry()
+        rest = EntryRest()
+        self.assertEqual(engine.freeze_delayed_band_entry_price(feed, record, now), Decimal("0.53"))
+        feed.current_ask = 53  # frozen maker price is now also 53c: would cross
+        await engine.submit_entry(rest, feed, record, now)
+        self.assertEqual(rest.calls, [])
+        self.assertEqual(record["status"], "SIGNAL_PENDING")
+        self.assertFalse(record.get("maker_entry_submission_attempted", False))
+        self.assertEqual(record["maker_entry_wait"]["reason"], "frozen_post_only_limit_would_cross")
+        self.assertEqual(record["entry_limit_cents"], 53)
+
+        feed.current_ask = 54
+        feed.current_epoch += 1
+        await engine.submit_entry(rest, feed, record, now + 1)
+        self.assertEqual(len(rest.calls), 1)
+        self.assertEqual(rest.calls[0]["position_price"], .53)
         self.assertEqual(record["status"], "ENTRY_PENDING")
 
     async def test_existing_breaker_is_never_cleared_by_new_funding(self):
@@ -210,6 +242,68 @@ class ExchangeShardSafetyTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(engine.state["circuit_breaker"]["blocked"])
         self.assertEqual(engine.entry_submission_health()["unresolved_submissions"], 1)
 
+    async def test_unknown_create_is_adopted_in_process_and_entries_resume(self):
+        engine, record, feed, now = self.entry()
+        rest = EntryRest()
+        async def unknown_create(**kwargs):
+            return {
+                "status": "submit_failed", "submission_outcome": "unknown",
+                "client_order_id": kwargs["client_order_id_override"],
+                "quantity": "1", "fill_count": "0", "remaining_count": "1",
+            }
+        rest.create_order = AsyncMock(side_effect=unknown_create)
+        await engine.submit_entry(rest, feed, record, now)
+        self.assertEqual(record["status"], "RECONCILIATION_PENDING")
+        client_id = record["entry_orders"][0]["client_order_id"]
+
+        async def raw(path, _params):
+            if path == "/portfolio/orders":
+                return {"orders": [{
+                    "ticker": self.ticker, "client_order_id": client_id,
+                    "order_id": "recovered-live-order", "fill_count": "0.00",
+                    "remaining_count": "1.00", "price": "0.5300", "status": "resting",
+                }]}
+            if path == "/portfolio/fills":
+                return {"fills": []}
+            raise AssertionError(path)
+
+        rest.get_raw_json = AsyncMock(side_effect=raw)
+        rest.position_for_ticker = AsyncMock(return_value=Decimal("0"))
+        await engine.reconcile_uncertain_record(rest, record)
+        self.assertEqual(record["status"], "ENTRY_PENDING")
+        self.assertEqual(record["entry_orders"][0]["order_id"], "recovered-live-order")
+        self.assertFalse(engine.state["circuit_breaker"]["blocked"])
+        self.assertEqual(
+            engine.state["circuit_breaker"]["last_resolution"]["resolution"],
+            "resting_order_adopted",
+        )
+
+    async def test_unknown_create_keeps_worker_online_until_closed_market_proves_no_order(self):
+        engine, record, feed, now = self.entry()
+        rest = EntryRest()
+        async def unknown_create(**kwargs):
+            return {
+                "status": "submit_failed", "submission_outcome": "unknown",
+                "client_order_id": kwargs["client_order_id_override"],
+                "quantity": "1", "fill_count": "0", "remaining_count": "1",
+            }
+        rest.create_order = AsyncMock(side_effect=unknown_create)
+        await engine.submit_entry(rest, feed, record, now)
+        rest.get_raw_json = AsyncMock(side_effect=lambda path, _params: {
+            "orders": []
+        } if path == "/portfolio/orders" else {"fills": []})
+        rest.position_for_ticker = AsyncMock(return_value=Decimal("0"))
+
+        await engine.reconcile_uncertain_record(rest, record)
+        self.assertEqual(record["status"], "RECONCILIATION_PENDING")
+        self.assertTrue(engine.state["circuit_breaker"]["blocked"])
+
+        record["market_close_epoch"] = time.time() - 1
+        await engine.reconcile_uncertain_record(rest, record)
+        self.assertEqual(record["status"], "ZERO_FILL")
+        self.assertFalse(engine.state["circuit_breaker"]["blocked"])
+        self.assertEqual(record["entry_orders"][0]["status"], "reconciled_terminal_no_fill")
+
     async def test_explicit_rejection_is_distinguished_and_not_blindly_retried(self):
         engine, record, feed, now = self.entry()
         rest = EntryRest()
@@ -221,6 +315,19 @@ class ExchangeShardSafetyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(engine.state["circuit_breaker"]["reason"], "maker_entry_submission_rejected")
         self.assertEqual(engine.entry_submission_health()["definitive_rejections"], 1)
         self.assertEqual(engine.entry_submission_health()["exchange_acknowledgments"], 0)
+
+    async def test_definitive_400_is_market_scoped_and_does_not_halt_future_markets(self):
+        engine, record, feed, now = self.entry()
+        rest = EntryRest()
+        rest.create_order = AsyncMock(return_value={
+            "status": "submit_failed", "submission_outcome": "rejected", "http_status": 400,
+            "quantity": "1", "fill_count": "0", "remaining_count": "0",
+        })
+        await engine.submit_entry(rest, feed, record, now)
+        self.assertEqual(record["status"], "ZERO_FILL")
+        self.assertEqual(record["status_reason"], "maker_entry_definitively_rejected")
+        self.assertFalse(engine.state["circuit_breaker"]["blocked"])
+        self.assertTrue(record["entry_rejection"]["definitively_no_exchange_order"])
 
     async def test_buy_routing_and_side_mapping_remain_correct(self):
         for side, book_side, price in (("yes", "bid", "0.5300"), ("no", "ask", "0.4700")):

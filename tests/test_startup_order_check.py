@@ -128,19 +128,23 @@ class StartupOrderCheckTests(unittest.IsolatedAsyncioTestCase):
             await self.run_check()
         self.assertEqual(self.api.calls, [])
 
-    def seed_legacy_unknown(self):
+    def seed_entry_breaker(self, reason="maker_entry_submission_unknown"):
         ticker = "KXBTC15M-legacy-closed"
         client_id = "11111111-1111-4111-8111-111111111111"
         value = default_state(load_config(self.config))
         value["circuit_breaker"].update(
-            blocked=True, reason="maker_entry_submission_unknown", triggered_at="2026-01-01T00:00:00Z",
+            blocked=True, reason=reason, triggered_at="2026-01-01T00:00:00Z",
         )
         value["markets"][ticker] = {
             "ticker": ticker, "status": "RECONCILIATION_PENDING", "signal_side": "yes",
             "market_close_epoch": 1,
             "entry_orders": [{
                 "order_id": None, "client_order_id": client_id, "status": "submit_failed",
-                "submission_outcome": "unknown", "quantity": "1.00", "position_price": "0.52",
+                "submission_outcome": (
+                    "rejected" if reason == "maker_entry_submission_rejected" else "unknown"
+                ),
+                "http_status": 400 if reason == "maker_entry_submission_rejected" else None,
+                "quantity": "1.00", "position_price": "0.52",
             }],
         }
         save_state(self.state, value)
@@ -158,7 +162,7 @@ class StartupOrderCheckTests(unittest.IsolatedAsyncioTestCase):
         return ticker, client_id
 
     async def test_legacy_unknown_breaker_clears_only_after_v2_terminal_flat_proof(self):
-        ticker, _ = self.seed_legacy_unknown()
+        ticker, _ = self.seed_entry_breaker()
         await self.run_check("legacy-recovery")
         value = __import__("json").loads(self.state.read_text())
         self.assertFalse(value["circuit_breaker"]["blocked"])
@@ -168,10 +172,22 @@ class StartupOrderCheckTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(value["markets"][ticker]["status"], "ZERO_FILL")
         self.assertEqual(self.api.post_count, 1)
-        self.assertIn("legacy-maker-entry-breaker-resolved", [item[0] for item in self.publications])
+        self.assertIn("maker-entry-breaker-resolved", [item[0] for item in self.publications])
+
+    async def test_definitive_rejection_breaker_clears_only_after_terminal_flat_proof(self):
+        ticker, _ = self.seed_entry_breaker("maker_entry_submission_rejected")
+        await self.run_check("rejected-recovery")
+        value = __import__("json").loads(self.state.read_text())
+        self.assertFalse(value["circuit_breaker"]["blocked"])
+        self.assertEqual(
+            value["circuit_breaker"]["last_resolution"]["original_breaker_reason"],
+            "maker_entry_submission_rejected",
+        )
+        self.assertEqual(value["markets"][ticker]["status"], "ZERO_FILL")
+        self.assertEqual(self.api.post_count, 1)
 
     async def test_legacy_unknown_breaker_preserved_when_exact_fill_exists(self):
-        ticker, client_id = self.seed_legacy_unknown()
+        ticker, client_id = self.seed_entry_breaker()
         self.api.fills = [{
             "fill_id": "old-fill", "order_id": "old-order", "client_order_id": client_id,
             "ticker": ticker, "count_fp": "1.00", "yes_price_dollars": "0.52",
