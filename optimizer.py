@@ -115,20 +115,20 @@ def export_selected_live_strategy(path: Path, row: dict[str, Any], *, selection_
     result, not an unattended-live default.
     """
 
-    if row.get("execution_profile") != "delayed_53_57_stop_50":
+    if row.get("execution_profile") != "delayed_53_57_exit_51":
         raise ValueError(
-            "live export requires execution_profile=delayed_53_57_stop_50; "
-            "settlement-only optimizer rows cannot prove delayed fills or hybrid stops"
+            "live export requires execution_profile=delayed_53_57_exit_51; "
+            "settlement-only optimizer rows cannot prove delayed fills or protective exits"
         )
     stop = row.get("stop_price")
-    if stop in {None, "no_stop"} or round(float(stop), 2) != 0.50:
-        raise ValueError("v12 production exports only the reviewed 50c hard-stop profile")
+    if stop in {None, "no_stop"} or round(float(stop), 2) != 0.51:
+        raise ValueError("v13 production exports only the reviewed direct 51c exit profile")
     if round(float(row.get("entry_price", 0)), 2) != 0.52:
-        raise ValueError("v12 entry_price is the 52c minimum reference for the delayed limit band")
-    shadow_profile = "delayed_53_57_stop_50"
+        raise ValueError("v13 entry_price is the 52c minimum reference for the delayed limit band")
+    shadow_profile = "delayed_53_57_exit_51"
     config = {
-        "config_schema_version": 12,
-        "strategy_version": "kxbtc15m-delayed-band-live-v12",
+        "config_schema_version": 13,
+        "strategy_version": "kxbtc15m-delayed-band-live-v13",
         "selection_basis": selection_basis,
         "series": "KXBTC15M",
         "signal_delay_seconds": 0,
@@ -136,11 +136,11 @@ def export_selected_live_strategy(path: Path, row: dict[str, Any], *, selection_
         "shadow_profile": shadow_profile,
         "entry_price": f"{float(row['entry_price']):.2f}",
         "stop_price": f"{float(stop):.2f}",
-        "stop_policy": "hybrid_maker_then_hard_stop",
+        "stop_policy": "direct_ioc_at_trigger",
         "hybrid_stop_enabled": True,
         "hybrid_stop_trigger_cents": 51,
-        "hybrid_maker_exit_cents": 52,
-        "hybrid_hard_stop_cents": 50,
+        "hybrid_maker_exit_cents": 51,
+        "hybrid_hard_stop_cents": 51,
         "stop_baseline_entry_price": "0.50",
         "entry_execution_mode": "delayed_threshold_band_maker",
         "maker_order_time_in_force": "good_till_canceled",
@@ -848,7 +848,7 @@ def run_optimization(
     # row explicitly tagged with that execution profile.
     selected_live = {
         "exported": False,
-        "reason": "settlement_execution_optimizer_does_not_model_delayed_53_57_stop_50_profile",
+        "reason": "settlement_execution_optimizer_does_not_model_delayed_53_57_exit_51_profile",
     }
     lines = [
         "# Kalshi hybrid backtest optimization summary",

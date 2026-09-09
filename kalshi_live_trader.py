@@ -62,14 +62,16 @@ ORDER_PREFIX = "kxbtc15m-hybrid-v1-"
 # silently reinterpret an older selected configuration after a restart or a
 # watchdog handoff.  Bump both values deliberately with a reviewed migration
 # whenever the shared live/backtest strategy semantics change.
-# v12 is a hard compatibility boundary for the delayed >=53c cohort: the
+# v13 is a hard compatibility boundary for the delayed >=53c cohort: the
 # immutable opening ask must be below 53c; the first fresh qualifying ask at
 # or after 60 seconds freezes one post-only GTC limit one cent lower; limits
-# above 57c are filtered; and filled exposure uses the 51/52/50 hybrid stop.
+# above 57c are filtered; and filled exposure uses a direct, reduce-only IOC
+# protective exit once the executable selected-side bid reaches 51c or lower.
 # An older worker cannot silently load this
-# configuration; it fails closed before it can submit an order.
-ACTIVE_STRATEGY_VERSION = "kxbtc15m-delayed-band-live-v12"
-ACTIVE_CONFIG_SCHEMA_VERSION = 12
+# configuration or runtime namespace; it fails closed before it can submit an
+# order.
+ACTIVE_STRATEGY_VERSION = "kxbtc15m-delayed-band-live-v13"
+ACTIVE_CONFIG_SCHEMA_VERSION = 13
 # Operational release guard used by the production workflow.  Version 3 means
 # opening entry prices come from the buffered price-only stream, not the first
 # later complete-depth book.  This can advance without reinterpreting recovery
@@ -81,14 +83,15 @@ OPENING_PRICE_CAPTURE_CONTRACT_VERSION = 3
 BTC_TARGET_CAPTURE_CONTRACT_VERSION = 2
 # v3 freezes an analytics-only resting limit one cent below the delayed
 # threshold ask.  It requires subsequent public-trade volume for a fill and
-# consumes that volume only once across the direct order and ladder rungs. It
-# also applies the partial-fill-safe 51/52/50 delayed hybrid-stop contract.
-DELAYED_ENTRY_LADDER_CONTRACT_VERSION = 3
-LIVE_STOP_SAFETY_CONTRACT_VERSION = 2
+# consumes that volume only once across the direct order and ladder rungs. v4
+# replaces the non-executing 52c maker-exit experiment with the same direct
+# 51c protective-exit rule used by live and primary shadow execution.
+DELAYED_ENTRY_LADDER_CONTRACT_VERSION = 4
+LIVE_STOP_SAFETY_CONTRACT_VERSION = 3
 POSITION_CAP_CONTRACT_VERSION = 2
 DELAYED_HYBRID_STOP_TRIGGER_CENTS = 51
-DELAYED_HYBRID_MAKER_EXIT_CENTS = 52
-DELAYED_HYBRID_HARD_STOP_CENTS = 50
+DELAYED_HYBRID_MAKER_EXIT_CENTS = 51
+DELAYED_HYBRID_HARD_STOP_CENTS = 51
 BTC_TARGET_RECORD_FIELDS = (
     "btc_target_capture_version",
     "btc_target_status",
@@ -337,8 +340,9 @@ SHADOW_STOP_PROFILE_PRICES = {
     "sticky_stop_35": Decimal("0.35"),
     "sticky_stop_40": Decimal("0.40"),
     "delayed_53_57_stop_50": Decimal("0.50"),
+    "delayed_53_57_exit_51": Decimal("0.51"),
 }
-CANONICAL_LIVE_SHADOW_PROFILE = "delayed_53_57_stop_50"
+CANONICAL_LIVE_SHADOW_PROFILE = "delayed_53_57_exit_51"
 
 
 def price_to_cents(value: Decimal | str, name: str = "price") -> int:
@@ -475,7 +479,7 @@ def assert_active_strategy_contract(value: dict[str, Any]) -> None:
 
 
 def validate_entry_price_contract(value: dict[str, Any]) -> None:
-    """Validate the immutable maker-entry and hybrid-stop contract."""
+    """Validate the immutable maker-entry and direct protective-exit contract."""
 
     entry = decimal(value["entry_price"])
     offset = decimal(value["maker_price_offset"])
@@ -497,8 +501,6 @@ def validate_entry_price_contract(value: dict[str, Any]) -> None:
         raise ValueError(
             "max_recovery_exponent must be 0; the active strategy disables the exponent circuit breaker"
         )
-    if value.get("stop_policy") != "hybrid_maker_then_hard_stop":
-        raise ValueError("the active strategy requires stop_policy=hybrid_maker_then_hard_stop")
     if stop_baseline != Decimal("0.50"):
         raise ValueError("the hybrid strategy requires stop_baseline_entry_price to equal exactly 0.50")
     profile = str(value.get("shadow_profile") or CANONICAL_LIVE_SHADOW_PROFILE)
@@ -514,6 +516,11 @@ def validate_entry_price_contract(value: dict[str, Any]) -> None:
     trading_mode = str(value.get("trading_mode") or "shadow")
     if profile != CANONICAL_LIVE_SHADOW_PROFILE and trading_mode != "shadow":
         raise ValueError("comparison stop profiles are shadow-only and cannot be loaded in live mode")
+    if profile == CANONICAL_LIVE_SHADOW_PROFILE:
+        if value.get("stop_policy") != "direct_ioc_at_trigger":
+            raise ValueError("the active strategy requires stop_policy=direct_ioc_at_trigger")
+    elif value.get("stop_policy") != "hybrid_maker_then_hard_stop":
+        raise ValueError("legacy comparison profiles require stop_policy=hybrid_maker_then_hard_stop")
     if int(value["entry_limit_offset_cents"]) < 0:
         raise ValueError("entry_limit_offset_cents cannot be negative")
     level_min = int(value["shadow_entry_level_min_cents"])
@@ -524,19 +531,13 @@ def validate_entry_price_contract(value: dict[str, Any]) -> None:
     trigger = int(value["hybrid_stop_trigger_cents"])
     maker_exit = int(value["hybrid_maker_exit_cents"])
     hard_stop = int(value["hybrid_hard_stop_cents"])
-    if maker_exit <= hard_stop:
-        raise ValueError("hybrid_maker_exit_cents must exceed hybrid_hard_stop_cents")
-    if trigger < hard_stop:
-        raise ValueError("hybrid_stop_trigger_cents must be at least hybrid_hard_stop_cents")
-    if not 1 <= hard_stop <= trigger < maker_exit <= 99:
-        raise ValueError("hybrid stop prices must be valid integer-cent ticks")
+    if not 1 <= trigger <= 99:
+        raise ValueError("direct protective-exit price must be a valid integer-cent tick")
     if profile == CANONICAL_LIVE_SHADOW_PROFILE:
-        if not 10 <= hard_stop <= 50 or (trigger, maker_exit) != (hard_stop + 1, hard_stop + 2):
-            raise ValueError(
-                "the canonical delayed band requires a 10c-50c hard stop with trigger/maker exactly 1c/2c higher"
-            )
-        if stop != cents_price(hard_stop):
-            raise ValueError("the canonical delayed band stop_price must equal hybrid_hard_stop_cents")
+        if not 10 <= trigger <= 51 or (maker_exit, hard_stop) != (trigger, trigger):
+            raise ValueError("the canonical delayed band requires one direct 10c-51c protective-exit price")
+        if stop != cents_price(trigger):
+            raise ValueError("the canonical delayed band stop_price must equal the direct trigger")
     else:
         profile_cents = price_to_cents(expected_profile_stop, "shadow profile stop")
         if (hard_stop, trigger, maker_exit) != (
@@ -547,9 +548,9 @@ def validate_entry_price_contract(value: dict[str, Any]) -> None:
                 "at profile/profile+1c/profile+2c"
             )
     if not _bool(value.get("hybrid_stop_enabled", True)):
-        raise ValueError("the active v12 strategy requires hybrid_stop_enabled=true")
+        raise ValueError("the active v13 strategy requires protective exit monitoring")
     if value.get("shadow_fill_model") != "conservative_public_trade_through":
-        raise ValueError("v12 shadow mode requires conservative_public_trade_through")
+        raise ValueError("v13 shadow mode requires conservative_public_trade_through")
     if offset < Decimal("0"):
         raise ValueError("maker_price_offset cannot be negative")
     if int(value["opening_quote_max_observations"]) < 1:
@@ -625,7 +626,7 @@ def load_config(path: Path) -> dict[str, Any]:
     value.setdefault("shadow_fill_model", "conservative_public_trade_through")
     value.setdefault("starting_shadow_balance", "1000.00")
     value.setdefault("maker_price_offset", "0.01")
-    value.setdefault("stop_policy", "hybrid_maker_then_hard_stop")
+    value.setdefault("stop_policy", "direct_ioc_at_trigger")
     value.setdefault("entry_execution_mode", "delayed_threshold_band_maker")
     value.setdefault("maker_order_time_in_force", "good_till_canceled")
     value.setdefault("stop_baseline_entry_price", "0.50")
@@ -668,8 +669,8 @@ def load_config(path: Path) -> dict[str, Any]:
     value.setdefault("shadow_entry_level_step_cents", 1)
     value.setdefault("hybrid_stop_enabled", True)
     value.setdefault("hybrid_stop_trigger_cents", 51)
-    value.setdefault("hybrid_maker_exit_cents", 52)
-    value.setdefault("hybrid_hard_stop_cents", 50)
+    value.setdefault("hybrid_maker_exit_cents", 51)
+    value.setdefault("hybrid_hard_stop_cents", 51)
     value.setdefault("trading_mode", "shadow")
     # State and audit writes are fsynced locally for every material event.
     # This only bounds GitHub checkpoint publication, avoiding a Git push for
@@ -755,7 +756,7 @@ def load_config_from_value(value: dict[str, Any]) -> dict[str, Any]:
     temporary.setdefault("shadow_fill_model", "conservative_public_trade_through")
     temporary.setdefault("starting_shadow_balance", "1000.00")
     temporary.setdefault("maker_price_offset", "0.01")
-    temporary.setdefault("stop_policy", "hybrid_maker_then_hard_stop")
+    temporary.setdefault("stop_policy", "direct_ioc_at_trigger")
     temporary.setdefault("entry_execution_mode", "delayed_threshold_band_maker")
     temporary.setdefault("maker_order_time_in_force", "good_till_canceled")
     temporary.setdefault("stop_baseline_entry_price", "0.50")
@@ -780,8 +781,8 @@ def load_config_from_value(value: dict[str, Any]) -> dict[str, Any]:
     temporary.setdefault("shadow_entry_level_step_cents", 1)
     temporary.setdefault("hybrid_stop_enabled", True)
     temporary.setdefault("hybrid_stop_trigger_cents", 51)
-    temporary.setdefault("hybrid_maker_exit_cents", 52)
-    temporary.setdefault("hybrid_hard_stop_cents", 50)
+    temporary.setdefault("hybrid_maker_exit_cents", 51)
+    temporary.setdefault("hybrid_hard_stop_cents", 51)
     temporary.setdefault("trading_mode", "shadow")
     validate_entry_price_contract(temporary)
     validate_sizing_config(temporary)
@@ -1119,7 +1120,7 @@ class LiveEngine:
             checkpoint_paths.insert(0, config_path)
         startup_order_check_journal = Path(os.getenv(
             "KALSHI_STARTUP_ORDER_CHECK_JOURNAL",
-            "data/.kalshi_live_delayed_band_v12_startup_order_check/order-smoke-test.json",
+            "data/.kalshi_live_delayed_band_v13_startup_order_check/order-smoke-test.json",
         ))
         if not dry_run and startup_order_check_journal.exists():
             # Once the pre-worker create/cancel proof succeeds, retain it in
@@ -1606,6 +1607,9 @@ class LiveEngine:
             "stop_policy": self.config["stop_policy"],
             "stop_floor_price": self.config["stop_price"],
             "stop_baseline_entry_price": self.config["stop_baseline_entry_price"],
+            # The historical field name remains schema-compatible, but v13
+            # never submits a maker exit. All three prices are 51c and the
+            # direct reduce-only IOC path owns every protective close.
             "hybrid_stop": {
                 "enabled": bool(self.config["hybrid_stop_enabled"]),
                 "trigger_cents": int(self.config["hybrid_stop_trigger_cents"]),
@@ -1750,13 +1754,21 @@ class LiveEngine:
             provisional.get("final_yes_bid"), provisional.get("final_no_bid"),
             provisional.get("quote_age_seconds"),
         )
+        exit_description = (
+            f"direct_ioc_at_or_below_{self.config['hybrid_stop_trigger_cents']}c"
+            if self.config["stop_policy"] == "direct_ioc_at_trigger"
+            else (
+                f"hybrid_{self.config['hybrid_stop_trigger_cents']}c/"
+                f"{self.config['hybrid_maker_exit_cents']}c/"
+                f"{self.config['hybrid_hard_stop_cents']}c"
+            )
+        )
         LOG.warning(
             "NEW MARKET SIGNAL | ticker=%s source=%s provisional=%s prior_side=%s transition=%s "
-            "prediction=%s btc_target=%s comparison=%s qty=%s entry_mode=%s hybrid=%sc/%sc/%sc",
+            "prediction=%s btc_target=%s comparison=%s qty=%s entry_mode=%s exit_policy=%s",
             ticker, provisional["ticker"], source.upper(), prior_side and prior_side.upper(), directional_transition,
             side.upper(), record.get("btc_target_price_display"), record.get("btc_target_comparison"),
-            quantity, self.config["entry_execution_mode"], self.config["hybrid_stop_trigger_cents"],
-            self.config["hybrid_maker_exit_cents"], self.config["hybrid_hard_stop_cents"],
+            quantity, self.config["entry_execution_mode"], exit_description,
         )
         self.checkpoint("signal_created")
         return record
@@ -2064,7 +2076,7 @@ class LiveEngine:
     def freeze_delayed_band_entry_price(
         self, feed: KalshiLiveFeed, record: dict[str, Any], now: float,
     ) -> Decimal | None:
-        """Freeze the v12 post-60-second >=53c ask-minus-1c entry.
+        """Freeze the v13 post-60-second >=53c ask-minus-1c entry.
 
         The immutable opening selected-side ask is used only to establish that
         this market belongs to the delayed cohort.  Execution waits until the
@@ -2212,9 +2224,18 @@ class LiveEngine:
             str(record["signal_side"]).upper(), limit_cents, record["intended_quantity"],
             int(self.config["delayed_entry_max_limit_cents"]),
         )
-        LOG.warning("HYBRID STOP: trigger=%sc maker_exit=%sc hard_stop=%sc",
-                    record["hybrid_stop"]["trigger_cents"], record["hybrid_stop"]["maker_exit_cents"],
-                    record["hybrid_stop"]["hard_stop_cents"])
+        if record.get("stop_policy", self.config["stop_policy"]) == "direct_ioc_at_trigger":
+            LOG.warning(
+                "DIRECT PROTECTIVE EXIT: executable selected-side bid <=%sc | "
+                "reduce_only=true tif=immediate_or_cancel residual_retries=authoritative_position",
+                record["hybrid_stop"]["trigger_cents"],
+            )
+        else:
+            LOG.warning(
+                "HYBRID STOP: trigger=%sc maker_exit=%sc hard_stop=%sc",
+                record["hybrid_stop"]["trigger_cents"], record["hybrid_stop"]["maker_exit_cents"],
+                record["hybrid_stop"]["hard_stop_cents"],
+            )
         LOG.warning("=" * 60)
         self.checkpoint("delayed_entry_price_frozen")
         return limit_price
@@ -2746,7 +2767,7 @@ class LiveEngine:
     def advance_delayed_direct_hybrid_stop(
         self, feed: KalshiLiveFeed, record: dict[str, Any], delayed: dict[str, Any], now: float,
     ) -> bool:
-        """Advance the analytics-only 51/52/50 stop for actual simulated entry quantity.
+        """Advance the analytics-only protective exit for simulated entry quantity.
 
         A selected-side executable bid at or below 51c freezes the filled entry
         quantity and cancels the unfilled direct-limit remainder. The 52c maker
@@ -2756,7 +2777,8 @@ class LiveEngine:
         deterministic without claiming queue priority or historical fills.
         """
 
-        if int(delayed.get("ladder_contract_version") or 1) < 3:
+        contract_version = int(delayed.get("ladder_contract_version") or 1)
+        if contract_version < 3:
             return False
         lane = delayed.get("ladder")
         if not isinstance(lane, dict):
@@ -2791,6 +2813,47 @@ class LiveEngine:
                 quote_rows.append((quote_epoch, bid_cents, quote))
         quote_rows.sort(key=lambda row: row[0])
         changed = False
+        if contract_version >= 4:
+            if stop.get("state") != "ARMED":
+                return False
+            trigger_row = next(
+                (row for row in quote_rows if row[1] <= int(stop["trigger_cents"])), None,
+            )
+            if trigger_row is None:
+                return False
+            trigger_epoch, trigger_bid, trigger_quote = trigger_row
+            trigger_timestamp = datetime.fromtimestamp(trigger_epoch, timezone.utc).isoformat()
+            target_quantity = filled
+            exit_price_cents = min(int(stop["trigger_cents"]), trigger_bid)
+            entry_cost = target_quantity * cents_price(int(order["price_cents"]))
+            proceeds = target_quantity * cents_price(exit_price_cents)
+            stop.update({
+                "state": "CLOSED",
+                "trigger_timestamp": trigger_timestamp,
+                "trigger_exchange_epoch": trigger_epoch,
+                "trigger_bid_cents": trigger_bid,
+                "trigger_quote_id": trigger_quote.get("quote_id"),
+                "entry_quantity_at_trigger": format(target_quantity, "f"),
+                "direct_requested_quantity": format(target_quantity, "f"),
+                "direct_filled_quantity": format(target_quantity, "f"),
+                "direct_fill_price_cents": exit_price_cents,
+                "direct_fill_timestamp": trigger_timestamp,
+                "hard_filled_quantity": format(target_quantity, "f"),
+                "hard_fill_price_cents": exit_price_cents,
+                "hard_fill_timestamp": trigger_timestamp,
+                "closed_quantity": format(target_quantity, "f"),
+                "exit_classification": "DIRECT_PROTECTIVE_EXIT",
+                "gross_pnl": format(proceeds - entry_cost, "f"),
+                "closed_at": trigger_timestamp,
+                "execution_assumption": (
+                    "analytics_only_full_exit_at_observed_executable_bid; live_and_primary_shadow_"
+                    "paths_use_authoritative_or_displayed-depth_residual_reconciliation"
+                ),
+            })
+            order["fill_ceiling_quantity"] = format(target_quantity, "f")
+            if target_quantity < Decimal(str(order.get("requested_quantity") or "0")):
+                order["status"] = "CANCELLED_REMAINDER_FOR_STOP"
+            return True
         if stop.get("state") == "ARMED":
             trigger_row = next(
                 (row for row in quote_rows if row[1] <= int(stop["trigger_cents"])), None,
@@ -3239,6 +3302,7 @@ class LiveEngine:
                         },
                         "direct_hybrid_stop": {
                             "enabled": True,
+                            "policy": "direct_ioc_at_trigger",
                             "trigger_cents": DELAYED_HYBRID_STOP_TRIGGER_CENTS,
                             "maker_exit_cents": DELAYED_HYBRID_MAKER_EXIT_CENTS,
                             "hard_stop_cents": DELAYED_HYBRID_HARD_STOP_CENTS,
@@ -3716,7 +3780,9 @@ class LiveEngine:
                     cohort["hybrid_partial_then_hard"] += int(
                         classification == "MAKER_EXIT_PARTIAL_THEN_HARD_STOP"
                     )
-                    cohort["hybrid_hard_only"] += int(classification == "HARD_STOP_ONLY")
+                    cohort["hybrid_hard_only"] += int(
+                        classification in {"HARD_STOP_ONLY", "DIRECT_PROTECTIVE_EXIT"}
+                    )
                     cohort["hybrid_false_stops"] += int(bool(
                         direct_stop.get("stopped_then_eventual_winner")
                     ))
@@ -3754,7 +3820,9 @@ class LiveEngine:
                 hybrid_partial_hard += int(
                     classification == "MAKER_EXIT_PARTIAL_THEN_HARD_STOP"
                 )
-                hybrid_hard_only += int(classification == "HARD_STOP_ONLY")
+                hybrid_hard_only += int(
+                    classification in {"HARD_STOP_ONLY", "DIRECT_PROTECTIVE_EXIT"}
+                )
                 hybrid_false_stops += int(bool(
                     direct_stop.get("stopped_then_eventual_winner")
                 ))
@@ -3859,6 +3927,7 @@ class LiveEngine:
                 if resolved_filled_entries else None
             ),
             "hybrid_stop_contract": {
+                "policy": "direct_ioc_at_trigger",
                 "trigger_cents": DELAYED_HYBRID_STOP_TRIGGER_CENTS,
                 "maker_exit_cents": DELAYED_HYBRID_MAKER_EXIT_CENTS,
                 "hard_stop_cents": DELAYED_HYBRID_HARD_STOP_CENTS,
@@ -3926,8 +3995,8 @@ class LiveEngine:
             result["threshold_after_open_seconds_max"], result["legacy_contract_entries"],
         )
         LOG.warning(
-            "DELAYED HYBRID 51/52/50 | resolved=%d triggers=%d maker_full=%d "
-            "partial_then_hard=%d hard_only=%d false_stops=%d gross_pnl=$%s EV_per_fill=%s",
+            "DELAYED DIRECT 51C EXIT | resolved=%d triggers=%d legacy_maker_full=%d "
+            "legacy_partial_then_hard=%d direct_or_hard=%d false_stops=%d gross_pnl=$%s EV_per_fill=%s",
             result["hybrid_resolved_entries"], result["hybrid_stop_triggers"],
             result["hybrid_maker_exit_full"], result["hybrid_partial_then_hard"],
             result["hybrid_hard_only"], result["hybrid_false_stops"],
@@ -4659,14 +4728,16 @@ class LiveEngine:
         )
 
     def update_effective_stop_price(self, record: dict[str, Any]) -> Decimal | None:
-        """Persist the immutable v11 hybrid maker-exit trigger."""
+        """Persist the immutable protective-exit trigger."""
 
         average = self.average_filled_entry_price(record)
         if average is None:
             return None
         floor = Decimal(str(record.get("stop_floor_price") or self.config["stop_price"]))
         baseline = Decimal(str(record.get("stop_baseline_entry_price") or self.config["stop_baseline_entry_price"]))
-        if record.get("stop_policy", self.config["stop_policy"]) != "hybrid_maker_then_hard_stop":
+        if record.get("stop_policy", self.config["stop_policy"]) not in {
+            "hybrid_maker_then_hard_stop", "direct_ioc_at_trigger",
+        }:
             self.trip("unsupported_persisted_stop_policy")
             return None
         effective = cents_price(int(record.get("hybrid_stop", {}).get("trigger_cents") or self.config["hybrid_stop_trigger_cents"]))
@@ -6240,7 +6311,7 @@ class LiveEngine:
         elif self.config["entry_execution_mode"] == "signal_price_minus_offset_maker":
             # Retained only for unit-level regression tests and forensic replay
             # of v11 state.  Current configuration validation rejects this mode,
-            # so a production v12 worker cannot select it.
+            # so a production v13 worker cannot select it.
             maker_price = self.freeze_initial_signal_price(feed, record, now)
         else:
             maker_price = None
@@ -6455,7 +6526,7 @@ class LiveEngine:
         if now >= float(record["market_close_epoch"]):
             self.finish_entry_attempt(record, Decimal("0"), "market_closed_before_delayed_entry")
             return
-        # Current config validation permits only v12.  The v11 name remains
+        # Current config validation permits only v13.  The v11 name remains
         # reachable for pinned regression fixtures that instantiate LiveEngine
         # directly; it cannot be loaded by a production worker.
         if self.config["entry_execution_mode"] not in {
@@ -6765,14 +6836,20 @@ class LiveEngine:
                 return
             residual = abs(signed)
         if residual <= 0:
-            classification = ("MAKER_EXIT_PARTIAL_THEN_HARD_STOP" if maker_filled > 0
-                              else "HARD_STOP_ONLY") if prior_hard_orders else "MAKER_EXIT_FULL"
+            direct = record.get("stop_policy", self.config["stop_policy"]) == "direct_ioc_at_trigger"
+            classification = (
+                "DIRECT_PROTECTIVE_EXIT" if direct else
+                (("MAKER_EXIT_PARTIAL_THEN_HARD_STOP" if maker_filled > 0
+                  else "HARD_STOP_ONLY") if prior_hard_orders else "MAKER_EXIT_FULL")
+            )
             record["exit_classification"] = classification
             record["hybrid_stop"]["state"] = classification
             await self.finalize_stop(record)
             return
+        direct = record.get("stop_policy", self.config["stop_policy"]) == "direct_ioc_at_trigger"
+        exit_key = "direct-protective-exit" if direct else "hybrid-hard-stop"
         client_id = deterministic_client_order_id(
-            record["ticker"], side, f"hybrid-hard-stop-{len(prior_hard_orders)}", self.config,
+            record["ticker"], side, f"{exit_key}-{len(prior_hard_orders)}", self.config,
         )
         if self.dry_run:
             displayed = Decimal(str((quote or {}).get("displayed_depth") or "0"))
@@ -6792,7 +6869,7 @@ class LiveEngine:
             intent = self.persist_exit_intent(record, client_id, "hard_stop", residual, executable_bid)
             order = await rest.create_reduce_only_exit(
                 ticker=record["ticker"], held_side=side, economic_exit_price=float(executable_bid),
-                quantity=float(residual), dry_run=False, order_key=f"hybrid-hard-stop-{len(prior_hard_orders)}",
+                quantity=float(residual), dry_run=False, order_key=f"{exit_key}-{len(prior_hard_orders)}",
                 client_order_id_override=client_id,
             )
             order["exit_phase"] = "hard_stop"
@@ -6808,9 +6885,13 @@ class LiveEngine:
             Decimal("0"),
         )
         record["hybrid_stop"].update({"state": "HARD_STOP_PENDING", "hard_filled_quantity": format(hard_filled, "f")})
-        self.transition(record, "HARD_STOP_PENDING", "hybrid_hard_stop_submitted")
+        self.transition(
+            record, "HARD_STOP_PENDING",
+            "direct_protective_exit_submitted" if direct else "hybrid_hard_stop_submitted",
+        )
         self.audit(
-            "hybrid_hard_stop_submitted", ticker=record["ticker"], side=side,
+            "direct_protective_exit_submitted" if direct else "hybrid_hard_stop_submitted",
+            ticker=record["ticker"], side=side,
             executable_bid=format(executable_bid, "f"), requested_residual=format(residual, "f"),
             filled_quantity=order.get("fill_count"), maker_filled_quantity=format(maker_filled, "f"),
             client_order_id=client_id, exchange_order_id=order.get("order_id"), shadow=self.dry_run,
@@ -6821,7 +6902,11 @@ class LiveEngine:
             refreshed = await rest.position_for_ticker(record["ticker"])
             remaining = abs(Decimal(str(refreshed))) if refreshed is not None else residual
         if remaining <= 0:
-            classification = "MAKER_EXIT_PARTIAL_THEN_HARD_STOP" if maker_filled > 0 else "HARD_STOP_ONLY"
+            classification = (
+                "DIRECT_PROTECTIVE_EXIT"
+                if record.get("stop_policy", self.config["stop_policy"]) == "direct_ioc_at_trigger"
+                else "MAKER_EXIT_PARTIAL_THEN_HARD_STOP" if maker_filled > 0 else "HARD_STOP_ONLY"
+            )
             record["exit_classification"] = classification
             record["hybrid_stop"]["state"] = classification
             await self.finalize_stop(record)
@@ -6835,7 +6920,7 @@ class LiveEngine:
             rest, record, next_action="stop", executable_bid=executable_bid,
         ):
             return
-        # The feed is required for conservative shadow depth. Normal v12
+        # The feed is required for conservative shadow depth. Normal v13
         # execution calls ``submit_hybrid_hard_stop`` directly from manage_stop.
         if self.dry_run:
             raise RuntimeError("shadow hybrid hard stop requires the live feed adapter")
@@ -6949,6 +7034,28 @@ class LiveEngine:
         self.note_stop_monitor_quote(record, bid, trigger)
         status = str(record.get("status"))
         maker_order = self.hybrid_maker_exit_order(record)
+        direct_exit = record.get("stop_policy", self.config["stop_policy"]) == "direct_ioc_at_trigger"
+        if direct_exit:
+            if status in {"ENTRY_PARTIAL", "POSITION_OPEN"} and bid is not None and (
+                bid <= trigger or record.get("hybrid_stop", {}).get("stop_exit_latched")
+            ):
+                record["hybrid_stop"]["stop_exit_latched"] = True
+                record["hybrid_stop"]["hard_stop_latched"] = True
+                self.note_stop_trigger(
+                    record, bid, trigger, self.local_remaining_position(record), shadow=self.dry_run,
+                )
+                if not await self.cancel_entry_orders_and_confirm(
+                    rest, record, next_action="stop", executable_bid=bid,
+                ):
+                    return
+                if not self.dry_run:
+                    await self.refresh_entry(rest, record)
+                await self.submit_hybrid_hard_stop(rest, feed, record, bid)
+                return
+            if status == "HARD_STOP_PENDING" or record.get("hybrid_stop", {}).get("stop_exit_latched"):
+                if bid is not None:
+                    await self.submit_hybrid_hard_stop(rest, feed, record, bid)
+                return
         if status in {"ENTRY_PARTIAL", "POSITION_OPEN"}:
             if bid is not None and (bid <= hard or record.get("hybrid_stop", {}).get("hard_stop_latched")):
                 record["hybrid_stop"]["stop_exit_latched"] = True
@@ -7257,7 +7364,10 @@ class LiveEngine:
         ]
         full = sum(record.get("exit_classification") == "MAKER_EXIT_FULL" for record in rows)
         partial_hard = sum(record.get("exit_classification") == "MAKER_EXIT_PARTIAL_THEN_HARD_STOP" for record in rows)
-        hard_only = sum(record.get("exit_classification") == "HARD_STOP_ONLY" for record in rows)
+        hard_only = sum(
+            record.get("exit_classification") in {"HARD_STOP_ONLY", "DIRECT_PROTECTIVE_EXIT"}
+            for record in rows
+        )
         false_stops = sum(bool(record.get("stopped_then_eventual_winner")) for record in rows)
         false_stop_maker = sum(
             bool(record.get("stopped_then_eventual_winner")) and record.get("exit_classification") == "MAKER_EXIT_FULL"
@@ -7272,7 +7382,10 @@ class LiveEngine:
             (Decimal(str(record.get("hypothetical_lost_settlement_profit_due_to_stop") or "0")) for record in rows),
             Decimal("0"),
         )
-        maker_attempts = len(rows)
+        maker_attempts = sum(
+            any(order.get("exit_phase") == "maker_exit" for order in record.get("exit_orders", []))
+            for record in rows
+        )
         maker_filled = [
             Decimal(str(record.get("hybrid_stop", {}).get("maker_filled_quantity") or "0")) for record in rows
         ]
@@ -7318,13 +7431,18 @@ class LiveEngine:
     def log_hybrid_stop_performance(self) -> None:
         result = self.hybrid_stop_performance()
         rate = result["false_stop_rate"]
-        LOG.warning("================ HYBRID STOP PERFORMANCE ================")
+        direct = self.config["stop_policy"] == "direct_ioc_at_trigger"
         LOG.warning(
-            "triggers=%s maker_attempts=%s maker_full=%s partial_then_hard=%s hard_only=%s "
+            "================ %s PERFORMANCE ================",
+            "DIRECT 51C PROTECTIVE EXIT" if direct else "HYBRID STOP",
+        )
+        LOG.warning(
+            "policy=%s triggers=%s maker_attempts=%s maker_full=%s partial_then_hard=%s hard_or_direct=%s "
             "hard_fallbacks=%s false_stops=%s (maker=%s hard=%s) false_stop_rate=%s "
             "maker_avg_price=%s hard_avg_price=%s false_stop_max_adverse=%s "
             "lost_settlement_profit=%s average_stopped_pnl=%s",
-            result["stop_triggers"], result["maker_exits_attempted"], result["maker_exits_fully_filled"],
+            self.config["stop_policy"], result["stop_triggers"], result["maker_exits_attempted"],
+            result["maker_exits_fully_filled"],
             result["maker_exits_partially_then_hard_stop"], result["hard_stop_only"], result["hard_stop_fallbacks"],
             result["stopped_then_eventual_winner"], result["stopped_then_eventual_winner_maker"],
             result["stopped_then_eventual_winner_hard"], "n/a" if rate is None else f"{100 * rate:.2f}%",
@@ -8092,8 +8210,8 @@ class LiveEngine:
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
     result.add_argument("--config", type=Path, default=Path("live_strategy_config.json"))
-    result.add_argument("--state-file", type=Path, default=Path("data/kalshi_live_delayed_band_v12_state.json"))
-    result.add_argument("--audit-ledger", type=Path, default=Path("data/kalshi_live_delayed_band_v12_audit.jsonl"))
+    result.add_argument("--state-file", type=Path, default=Path("data/kalshi_live_delayed_band_v13_state.json"))
+    result.add_argument("--audit-ledger", type=Path, default=Path("data/kalshi_live_delayed_band_v13_audit.jsonl"))
     result.add_argument("--run-seconds", type=float, default=19_200)
     result.add_argument("--persist-config", action="store_true")
     result.add_argument("--reconcile-only", action="store_true")

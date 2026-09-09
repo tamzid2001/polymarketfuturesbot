@@ -55,7 +55,7 @@ class StartupOrderCheckTests(unittest.IsolatedAsyncioTestCase):
         return argparse.Namespace(
             execute=True, worker_id=worker_id, config=self.config,
             state_file=self.state, audit_ledger=self.audit,
-            runtime_ref="runtime-state-kxbtc15m-delayed-v12",
+            runtime_ref="runtime-state-kxbtc15m-delayed-v13",
         )
 
     def publisher(self, args, journal, reason):

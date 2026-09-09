@@ -13,7 +13,7 @@ from unittest.mock import patch
 
 from audit_ledger import append_audit
 from live_checkpoint import (
-    DELAYED_V12_RUNTIME_STATE_REF, DEFAULT_RUNTIME_STATE_REF,
+    DELAYED_V12_RUNTIME_STATE_REF, DELAYED_V13_RUNTIME_STATE_REF, DEFAULT_RUNTIME_STATE_REF,
     RUNTIME_PAYLOAD_PREFIX, RUNTIME_STATE_MANIFEST,
     RUNTIME_STATE_OWNER, RUNTIME_STATE_SCHEMA_VERSION,
     MaterialCheckpointPublisher, publish_runtime_snapshot, validate_runtime_paths,
@@ -232,12 +232,13 @@ class LiveExecutionTests(unittest.TestCase):
     def setUp(self) -> None:
         self.config = load_config(ROOT / "live_strategy_config.json")
         # Most cases in this long-running module intentionally pin the v11
-        # opening-entry behavior.  Production-v12 behavior has a separate
+        # opening-entry behavior.  Production-v13 behavior has a separate
         # contract suite so changing the selected config cannot mutate the
         # meaning of these historical regression fixtures.
         self.config.update({
             "entry_execution_mode": "signal_price_minus_offset_maker",
             "shadow_profile": "sticky_stop_40",
+            "stop_policy": "hybrid_maker_then_hard_stop",
             "entry_price": "0.49",
             "stop_price": "0.40",
             "hybrid_stop_trigger_cents": 45,
@@ -1415,7 +1416,7 @@ class LiveExecutionTests(unittest.TestCase):
         self.assertEqual(tracker["threshold_observed_ask_cents"], 54)
         self.assertEqual(tracker["entry_limit_cents"], 53)
         self.assertIsNone(tracker["first_entry_price_cents"])
-        self.assertEqual(tracker["ladder"]["contract_version"], 3)
+        self.assertEqual(tracker["ladder"]["contract_version"], 4)
 
         for seconds, price, quantity in (
             (68, "0.53", "1.00"),
@@ -1539,6 +1540,11 @@ class LiveExecutionTests(unittest.TestCase):
         feed.push_trade("0.53", "1.00", market_open + 66.1)
         engine.observe_price_analytics(feed, record)
 
+        record["delayed_entry_tracking"]["ladder_contract_version"] = 3
+        record["delayed_entry_tracking"]["ladder"]["direct_hybrid_stop"].update(
+            trigger_cents=51, maker_exit_cents=52, hard_stop_cents=50,
+        )
+
         feed.push_price("0.52", market_open + 70, bid="0.51")
         engine.observe_price_analytics(feed, record)
         stop = record["delayed_entry_tracking"]["ladder"]["direct_hybrid_stop"]
@@ -1569,6 +1575,11 @@ class LiveExecutionTests(unittest.TestCase):
         feed.push_price("0.53", market_open + 66, bid="0.52")
         feed.push_trade("0.53", "2.00", market_open + 66.1)
         engine.observe_price_analytics(feed, record)
+
+        record["delayed_entry_tracking"]["ladder_contract_version"] = 3
+        record["delayed_entry_tracking"]["ladder"]["direct_hybrid_stop"].update(
+            trigger_cents=51, maker_exit_cents=52, hard_stop_cents=50,
+        )
 
         feed.push_price("0.52", market_open + 70, bid="0.51")
         engine.observe_price_analytics(feed, record)
@@ -1609,6 +1620,10 @@ class LiveExecutionTests(unittest.TestCase):
         feed.push_price("0.53", market_open + 66, bid="0.52")
         feed.push_trade("0.53", "2.00", market_open + 66.1)
         engine.observe_price_analytics(feed, record)
+        record["delayed_entry_tracking"]["ladder_contract_version"] = 3
+        record["delayed_entry_tracking"]["ladder"]["direct_hybrid_stop"].update(
+            trigger_cents=51, maker_exit_cents=52, hard_stop_cents=50,
+        )
         feed.push_price("0.52", market_open + 70, bid="0.51")
         engine.observe_price_analytics(feed, record)
         feed.push_trade("0.52", "0.50", market_open + 71)
@@ -2048,6 +2063,10 @@ class LiveExecutionTests(unittest.TestCase):
             validate_runtime_ref(DELAYED_V12_RUNTIME_STATE_REF),
             DELAYED_V12_RUNTIME_STATE_REF,
         )
+        self.assertEqual(
+            validate_runtime_ref(DELAYED_V13_RUNTIME_STATE_REF),
+            DELAYED_V13_RUNTIME_STATE_REF,
+        )
         self.assertEqual(validate_runtime_ref("runtime-state-stop-20"), "runtime-state-stop-20")
         with self.assertRaisesRegex(ValueError, "non-owned durable paths"):
             validate_runtime_paths("runtime-state-kxbtc15m", ["state.json"])
@@ -2063,6 +2082,16 @@ class LiveExecutionTests(unittest.TestCase):
                 "data/kalshi_live_delayed_band_v12_audit.jsonl",
                 "data/kalshi_shadow_delayed_band_v12_state.json",
                 "data/kalshi_shadow_delayed_band_v12_audit.jsonl",
+            ],
+        )
+        validate_runtime_paths(
+            DELAYED_V13_RUNTIME_STATE_REF,
+            [
+                "selected_live_strategy.json",
+                "data/kalshi_live_delayed_band_v13_state.json",
+                "data/kalshi_live_delayed_band_v13_audit.jsonl",
+                "data/kalshi_shadow_delayed_band_v13_state.json",
+                "data/kalshi_shadow_delayed_band_v13_audit.jsonl",
             ],
         )
         with self.assertRaisesRegex(ValueError, "non-owned durable paths"):
