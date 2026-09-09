@@ -657,6 +657,32 @@ class LiveExecutionTests(unittest.TestCase):
             altered = dict(state, **mutation)
             self.assertFalse(startup_order_check_allows_worker(altered, "202"))
 
+    def test_fresh_reset_allows_signal_only_but_blocks_managed_risk(self) -> None:
+        from kalshi_live_trader import state_has_reset_blocking_risk
+
+        signal_only = {
+            "current_order_id": None,
+            "current_position": "0.00",
+            "active_market": "KXBTC15M-signal-only",
+            "markets": {
+                "KXBTC15M-signal-only": {
+                    "status": "SIGNAL_PENDING",
+                    "actual_quantity": "0.00",
+                    "entry_orders": [],
+                    "exit_orders": [],
+                },
+            },
+        }
+        self.assertFalse(state_has_reset_blocking_risk(signal_only))
+        for record_change in (
+            {"status": "ENTRY_PENDING"},
+            {"actual_quantity": "0.01"},
+            {"entry_orders": [{"order_id": "live", "remaining_count": "1.00", "fill_count": "0"}]},
+        ):
+            altered = __import__("copy").deepcopy(signal_only)
+            altered["markets"]["KXBTC15M-signal-only"].update(record_change)
+            self.assertTrue(state_has_reset_blocking_risk(altered))
+
     def test_v9_refuses_a_v8_checkpoint_instead_of_reinterpreting_recovery(self) -> None:
         temporary = Path(tempfile.mkdtemp()) / "state.json"
         state = default_state(self.config)

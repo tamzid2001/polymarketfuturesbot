@@ -108,6 +108,15 @@ class WorkflowConfigurationTests(unittest.TestCase):
         journal = "data/.kalshi_live_delayed_band_v12_startup_order_check/order-smoke-test.json"
         self.assertGreaterEqual(workflow.count(journal), 2)
 
+    def test_fresh_state_reset_is_explicit_live_only_and_not_forwarded(self):
+        workflow = (ROOT / ".github/workflows/kalshi_btc15m_average_down.yml").read_text()
+        self.assertIn("fresh_state_reset:", workflow)
+        self.assertIn('FRESH_STATE_RESET: ${{ inputs.fresh_state_reset || false }}', workflow)
+        self.assertIn('[ "$FRESH_STATE_RESET" = "true" ] && args+=(--reset-state)', workflow)
+        self.assertIn("fresh_state_reset requires live_enabled=true and reconcile_only=false", workflow)
+        handoff = workflow[workflow.index("name: Queue the next five-hour worker only after a safe handoff"):]
+        self.assertNotIn("fresh_state_reset=true", handoff)
+
     def test_controlled_restart_distinguishes_terminal_rejection_from_unknown_order(self):
         workflow = (ROOT / ".github/workflows/kalshi_btc15m_controlled_restart.yml").read_text()
         self.assertIn("def definitively_rejected_without_exchange_order(record):", workflow)

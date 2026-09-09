@@ -192,6 +192,7 @@ confirmation that a requested change has persisted remotely.
 
 | Input | Meaning |
 | --- | --- |
+| `fresh_state_reset` | One-run, default-off live reset. Only after local and authoritative exchange-flat checks, starts base/recovery/P&L/fees/metrics fresh while retaining the append-only audit ledger. It is never forwarded to the next worker. |
 | `initial_shares` | Initial base for a brand-new strategy state; does not overwrite an existing permanent base. |
 | `scaling_multiplier` | Recovery multiplier and geometric threshold-growth multiplier. `2.5` and `2.50` mean the same value. |
 | `max_share_cap` | Fixed absolute share ceiling used when base-linked capping is disabled. |
@@ -209,6 +210,9 @@ The `live_enabled` and `reconcile_only` checkboxes are separate per-dispatch
 controls, **not numeric defaults**: live still requires both repository gates,
 and reconciliation-only sends no orders. The watchdog retains the guarded
 previous mode; changing a numeric input cannot itself activate live trading.
+The `fresh_state_reset` checkbox is deliberately non-persistent: it applies to
+one explicitly live dispatch, records the previous counters in the audit
+ledger, and the automatic five-hour successor starts normally with reset off.
 
 Startup logs print `CONFIG SAVED LOCALLY` with the selected numeric settings
 and configuration hash. Confirm the remote checkpoint step also succeeds.
