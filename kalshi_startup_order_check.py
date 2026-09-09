@@ -373,6 +373,24 @@ async def run_startup_check(
         # create no probe: its mandatory startup reconciliation adopts the
         # exchange's order/fill/position truth and manages exits before the
         # existing breaker can ever allow new exposure.
+        deferred = {
+            "state": "DEFERRED_TO_RISK_RECOVERY",
+            "worker_id": args.worker_id,
+            "breaker_reason": breaker_reason,
+            "orders_sent": 0,
+            "strategy_entries_allowed": False,
+            "recovery_worker_allowed": True,
+            "checked_at": utc_now(),
+        }
+        state["startup_order_check"] = deferred
+        save_state(args.state_file, state)
+        append_audit(args.audit_ledger, {
+            "event": "startup_order_check_deferred_to_risk_recovery",
+            **deferred,
+        })
+        # The authorization and the unchanged breaker/risk evidence must be
+        # durable before the separate worker process is allowed to start.
+        publisher(args, journal, "startup-order-check-deferred-risk-recovery")
         emit(
             action="STARTUP_ORDER_CHECK_DEFERRED_TO_RISK_RECOVERY",
             worker_id=args.worker_id, breaker_reason=breaker_reason,
