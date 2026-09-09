@@ -118,6 +118,8 @@ def default_state(config: dict[str, Any]) -> dict[str, Any]:
         "delayed_entry_performance": {},
         "hybrid_stop_performance": {},
         "fee_metrics": {"entry_fees_paid": "0", "exit_fees_paid": "0", "total_fees_paid": "0"},
+        "live_performance": {},
+        "live_account_status": {},
         "circuit_breaker": {"blocked": False, "reason": None, "triggered_at": None},
         "daily_realized": {},
         "shadow_metrics": {},

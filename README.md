@@ -1,6 +1,6 @@
 # KXBTC15M hybrid Kalshi strategy
 
-This repository’s active Kalshi path is a KXBTC15M **sticky-direction shadow strategy** with a shared historical-replay and live state engine. The research method is:
+This repository’s active Kalshi path is a KXBTC15M **sticky-direction, live-capable strategy** with a shared historical-replay and execution state engine. Every startup and heartbeat states `LIVE`, `DRY_RUN`, or `RECONCILE_ONLY`; a research result is never labeled as a live fill.
 
 > **Historical Kalshi settlement replay with empirically calibrated Monte Carlo execution-path simulation.**
 
@@ -104,8 +104,11 @@ The v12 choice is based on the supplied frozen replay of the delayed cohort with
 | Path-dependent 2.50× P&L from a $1,000 reference balance | **+$353.21** |
 | Reference return | **+35.32%** |
 | Maximum observed drawdown | **$50.77** |
+| Quantity-weighted average entry / average stopped loss / fee-adjusted break-even WR | **Not retained in the frozen summary** |
 
-These are observed-ledger/replay results, not live fills and not a guaranteed return. The positive 2.50× result is nonlinear and highly sequence-dependent; 52 of 73 directional winners were stopped before settlement. Fees, queue position, partial fills, and live stop slippage were not established by those headline figures. A $150 deposit exceeds the reported $50.77 historical drawdown and can fund the configured maximum 100-share order at the 57¢ ceiling before fees, but that does **not** prove $150 survival outside the 135-trade sample. The worker therefore retains funding checks, the 100-share cap, reconciliation, and persistent loss circuit breakers.
+Those last three fields cannot be reconstructed accurately from aggregate counts, so this README does not invent them. They are calculated prospectively from actual filled quantity, actual average entry, realized net P&L, and fees in the durable ledger and printed for all trades plus rolling 20- and 50-trade windows.
+
+These are observed-ledger/replay results, not live fills and not a guaranteed return. The positive 2.50× result is nonlinear and highly sequence-dependent; 52 of 73 directional winners were stopped before settlement. Fees, queue position, partial fills, and live stop slippage were not established by those headline figures. A $150 deposit exceeds the reported $50.77 historical drawdown and can fund the configured maximum 100-share order at the 57¢ ceiling before fees, but that does **not** prove $150 survival outside the 135-trade sample. The worker therefore retains funding checks, the 100-share cap, continuous exchange reconciliation, and persistent loss circuit breakers.
 
 ### Delayed maker entry and hybrid stop
 
@@ -115,9 +118,11 @@ At open, the pre-subscribed WebSocket freezes the earliest fresh **price-only** 
 
 The worker submits one deterministic GTC/post-only buy for the selected side. `maker_order_time_in_force=good_till_canceled`, `entry_order_lifetime=until_filled_or_market_close`, and `entry_timeout_seconds=0` are fail-closed contracts. The order rests until fully filled, market close, or confirmed cancellation required by a stop. Live mode uses Kalshi orders and fills as authoritative. Shadow mode requires a post-submission public trade at or below the buy limit; a displayed touch or submission is never called a fill. Partial fills create only the observed exposure and all P&L/recovery accounting uses that quantity.
 
-For the default 50¢ hard stop, an executable selected-side bid ≤51¢ first cancels and confirms any unfilled entry remainder and starts a post-only/reduce-only maker sale at 52¢. If bid reaches ≤50¢ before that maker exit completely fills, the worker confirms the maker cancellation, reconciles its fills, and sends a reduce-only IOC only for the remaining position. Unknown cancellation or position state blocks new exposure. A partial maker exit can never cause the IOC to sell the original full quantity again.
+For the default 50¢ hard stop, an executable selected-side bid ≤51¢ first cancels and confirms any unfilled entry remainder and starts a post-only/reduce-only maker sale at 52¢. If bid reaches ≤50¢ before that maker exit completely fills, the worker confirms the maker cancellation, reconciles its fills, and sends a reduce-only IOC only for the remaining position. Unknown cancellation or position state blocks only new exposure while the worker stays online and continues risk management. A partial maker exit can never cause the IOC to sell the original full quantity again.
 
-Live-stop safety contract 1 adds a durable exit-order intent **before** each POST. A lost response is recovered using the exact client order ID, not retried blindly with a new ID. An empty lookup does not prove rejection. Definitive HTTP rejections are recorded separately from uncertain timeouts/server failures; failed maker attempts cannot leave a fictitious uncanceled order blocking the hard stop. A price gap straight to ≤50¢ bypasses the maker attempt and starts the hard exit in the same management pass, after entry cancellation. Once triggered, the hard stop remains latched through price recovery and process restarts. IOC fills/fees are refreshed before sizing any residual retry. The trigger price is not a guaranteed execution price: gaps, unavailable liquidity, exchange pauses, disconnects and unknown cancellations can delay or worsen an exit. These paths are covered by offline fault-injection tests in `tests/test_live_stop_safety.py`; passing those tests is not evidence of successful real exchange fills.
+Live-stop safety contract 1 adds a durable exit-order intent **before** each POST. A lost response is recovered using the exact client order ID, not retried blindly with a new ID. An empty lookup does not prove rejection. Definitive HTTP 400/404 entry rejections are terminal for that market and do not halt later markets. An ambiguous response starts a continuously reconciled entry interlock: the process and WebSocket remain alive, the exact client ID/order/fills/position are checked every reconciliation interval, a discovered order or position is adopted, and a no-order case becomes zero-fill only after market close proves it cannot create later exposure. Failed maker attempts cannot leave a fictitious uncanceled order blocking the hard stop.
+
+A price gap straight to ≤50¢ bypasses the maker attempt and starts the hard exit in the same management pass, after entry cancellation. Once triggered, the hard stop remains latched through price recovery and process restarts. A hard-stop IOC is terminal even when partially filled; the adapter then re-reads the authoritative position and submits a new price-protected reduce-only IOC for only the residual. It does **not** turn the unfilled IOC remainder into GTC, because a stale resting exit can later oversell after another retry. IOC fills/fees are refreshed before sizing any residual retry. The trigger price is not a guaranteed execution price: gaps, unavailable liquidity, exchange pauses, disconnects and unknown cancellations can delay or worsen an exit. These paths are covered by offline fault-injection tests in `tests/test_live_stop_safety.py`; passing those tests is not evidence of successful real exchange fills.
 
 `ENTRY_FILTERED` is a strategy decision, not an exchange rejection. For example, a qualifying ask of 60¢ implies a 59¢ limit, exceeding the 57¢ ceiling. The heartbeat now retains that observed ask, derived limit and filter reason even when no order was submitted. Separate `analytics_only=true` fills do not affect the executable strategy balance. Live activation still requires the user-controlled gates; this safety patch does not turn on real-money trading.
 
@@ -202,11 +207,12 @@ definitive rejections and uncertain submissions, with the persisted breaker
 reason. Analytical threshold hits are not order acknowledgments. Raw SDK
 exception bodies/headers are not retained for entry or cancellation failures.
 
-Credential rotation does not alter an existing worker's environment or clear
-a persisted breaker. Changing funds/credentials is not permission to discard
-order uncertainty: the operator must resolve account funding and reconcile
-orders, fills and positions before any explicit recovery. This patch has no
-automatic transfer, breaker reset or worker restart mechanism.
+Credential rotation does not alter an existing worker's environment. Changing
+funds/credentials is not evidence that an ambiguous order disappeared. The
+running worker nevertheless stays online and continuously resolves a narrow
+entry-submission interlock from exact orders, fills and positions; no manual
+reset is needed after that evidence is conclusive. This code has no automatic
+fund transfer mechanism.
 
 An independent operator-run [Codespaces shard admin tool](kalshi_shard_admin.py)
 supports authenticated read-only checks, an exact-amount transfer to an explicit
@@ -235,12 +241,13 @@ reconciled. The same GitHub run ID cannot create a second probe after a retry.
 Shadow and reconciliation-only runs never execute this check.
 
 This startup probe is intentionally not sent when an unrelated strategy
-breaker, open order, position, stale quote, wrong shard, insufficient shard
-balance, missing write scope, old unresolved probe or checkpoint failure
-exists. Those are fail-closed results—not permission to keep trying different
-real orders. The one legacy exception is an old
-`maker_entry_submission_unknown` breaker: before any probe, the startup tool
-may clear it only after V2 order/fill history, the closed source market, the
+loss/accounting breaker, open order, position, stale quote, wrong shard,
+insufficient shard balance, missing write scope, old unresolved probe or
+checkpoint failure exists. Those conditions pause new exposure while the
+worker/restart path keeps reconciling—they are not permission to try unrelated
+orders. A persisted `maker_entry_submission_unknown` or legacy
+`maker_entry_submission_rejected` interlock is automatically released before
+the probe only after V2 order/fill history, the closed source market, the
 shard-wide open-order scan and the shard-wide position scan jointly prove that
 the exact durable client-order intent is terminal, unfilled and flat. The old
 intent is retained and annotated rather than deleted. A successful 1¢
@@ -471,6 +478,32 @@ Older rung evidence supplies conditional depth shape. The loss-side counters wer
 
 `calibration.py` writes observed-versus-simulated errors for both the joint 40¢ cohorts and the conditional rung WRs. The automated regression test requires the simulator to reproduce these targets approximately while preserving path nesting.
 
+### Current v12 delayed-cohort checkpoint (September 9, 2026)
+
+This is a separate, small operational-research sample from the durable delayed tracker. It is not the frozen 135-trade selection and not a claim of live execution. The 33 resolved analytics records include qualifying limits above the production 57¢ ceiling, so they measure the tracker rather than the exact executable 52–57¢ band.
+
+| Metric | Current delayed tracker |
+| --- | ---: |
+| Resolved / directional W-L / WR | 33 / 19-14 / **57.58%** |
+| Quantity-weighted average modeled entry | **56.94¢** |
+| Gross no-stop P&L / EV per fill | **+$1.755 / +5.32¢** |
+| Gross 51/52/50 hybrid P&L / EV per fill | **+$0.215 / +0.65¢** |
+| Hybrid realized positive / negative / flat | 6 / 25 / 2 |
+| Average gross positive / average gross loss per share | **50.00¢ / 11.14¢** |
+| Payoff-implied gross break-even realized WR | **18.22%** |
+
+The independent ladder lanes below use their own fixed quantities and conservative tracked fill evidence. “Win rate” is the eventual selected-direction settlement rate among modeled filled records; it is not the realized stop-exit win rate.
+
+| Analytics limit | Modeled fills | Directional W/L | Directional WR |
+| ---: | ---: | ---: | ---: |
+| 50¢ | 26 | 13 / 13 | **50.00%** |
+| 40¢ | 22 | 9 / 13 | **40.91%** |
+| 30¢ | 18 | 5 / 13 | **27.78%** |
+| 20¢ | 15 | 2 / 13 | **13.33%** |
+| 10¢ | 15 | 2 / 13 | **13.33%** |
+
+These checkpoint figures will change as the append-only ledger grows. Live heartbeats now derive `LIVE PERFORMANCE` from actual completed filled trades only: count-based realized W/L, fee-adjusted realized WR, average net win/loss per actual share, payoff-implied break-even WR, WR-minus-break-even edge, quantity-weighted average entry, directional W/L, total net P&L, and total fees for all history and the last 20 trades.
+
 The current base-case calibration check used 100,000 replications with seed `42`; errors below are simulated minus observed and are percentage points.
 
 | Calibration statistic | Observed | Simulated | Error (pp) |
@@ -610,19 +643,19 @@ The optimizer uses common random numbers for competing configurations, keeps eve
 - Recovery exponent increases after **every filled closed trade** while cumulative recovery-cycle P&L remains negative. It resets only when that cumulative amount reaches at least $0.
 - `max_recovery_exponent=0` is the explicit disabled sentinel. The shared shadow/live engine does not stop the 2.50× sequence at an arbitrary exponent; the independent 100-share position limit, funding check, recovery-loss breaker, and daily-loss breaker remain active.
 - Permanent-base steps use realized net P&L only. No unrealized value, cancelled order, or zero fill can scale the base.
-- Startup reconciles Kalshi balance, open managed orders, positions, fills, and settlements before any entry. Unknown or ambiguous ownership fails closed; Kalshi is authoritative.
+- Startup reconciles Kalshi balance, open managed orders, positions, fills, and settlements before any entry. During runtime, an ambiguous entry response leaves the worker and risk management online while only new exposure is interlocked. Exact client-order, fill and position checks repeat every reconciliation interval; known orders/positions are adopted and closed-market no-order cases automatically resume later entries. Kalshi remains authoritative.
 - Client order IDs are deterministic, partial fills use actual quantities, exits are reduce-only where supported, and the same market cannot be counted twice after restart.
 - The worker discovers a bounded previous/current/upcoming market window every second using `min_close_ts`/`max_close_ts`, subscribes the API-provided successor before open, and keeps the ending market subscribed for final 99¢ executable-bid inference. The first complete opening ask establishes eligibility; the first fresh qualifying ask at/after 60 seconds freezes one deterministic ask-minus-1¢ GTC order. There is no IOC entry fallback and later quotes cannot move the limit.
-- The hybrid stop defaults to 51¢ trigger / 52¢ maker sale / 50¢ hard-stop threshold. The one hard-stop workflow input moves all three together; entry price never shifts them. Actual entry and exit fills, quantities, fees, and residual exposure drive accounting.
+- The hybrid stop defaults to 51¢ trigger / 52¢ maker sale / 50¢ hard-stop threshold. The one hard-stop workflow input moves all three together; entry price never shifts them. A partial hard IOC is followed by a fresh authoritative position read and another reduce-only IOC for only the residual—never a stale GTC conversion. Actual entry and exit fills, quantities, fees, and residual exposure drive accounting.
 - Shadow and live state are isolated at `data/kalshi_shadow_delayed_band_v12_*` and `data/kalshi_live_delayed_band_v12_*`. The v12 shadow lane starts at $1,000 and the configured initial base (1.00 share by default), and tracks realized P&L, peak equity, maximum drawdown, entry filtering, false stops, and timing.
 - Every audit JSONL record is appended, flushed, and `fsync`ed before the worker resumes order/position management. Its companion strategy state is atomically written and `fsync`ed immediately after every audit event; therefore a state transition, fill observation, stop event, funding failure, settlement, reconciliation result, and handoff is checkpointed locally while the worker is running—not merely at its end. Remote checkpoints are coalesced every 30 seconds and force-update one parentless `runtime-state-kxbtc15m-delayed-v12` snapshot with an exact lease. Snapshot schema v2 deterministically gzip-compresses each durable file in independent 8 MiB source chunks, verifies every compressed and uncompressed digest/size on restore, and reuses unchanged append-only ledger chunks. This prevents GitHub's 100 MiB single-blob limit from breaking a handoff as the ledger grows. The branch contains only allow-listed KXBTC15M payload chunks plus its manifest; it cannot accumulate ordinary code history or inherit older strategy state.
-- Each market ledger record includes the immutable first price-only opening reference, its completeness status, separately timed first displayed-depth book, derived limit, exchange/client order IDs, partial fills, and maker/taker status where exposed. Timing includes exchange-price lag, worker-observation lag, depth-after-price lag, market-open-to-submission, market-open-to-first-fill, submission-to-first-fill, entry completion, first-fill-to-trigger, trigger-to-maker submission, and trigger-to-observed-flat position. Heartbeats report `first_price_quote_lag`, `first_depth_quote_lag`, and `opening_price_coverage` separately; delayed or missing price history is never relabeled as a complete opening quote. Five-minute tables print every 40–49¢ level, winner capture/misses, drawdown buckets, and hybrid-stop outcomes. They also print, separately for every hypothetical stop from 40¢ through 49¢, the number/rate of frozen initial prices at or below that stop, plus exact-price and actual configured safety-rejection counts. Those are no-entry diagnostics, not the retired directional loss-skip rule and not ordinary GTC zero-fills.
+- Each market ledger record includes the immutable first price-only opening reference, its completeness status, separately timed first displayed-depth book, derived limit, exchange/client order IDs, partial fills, and maker/taker status where exposed. Timing includes exchange-price lag, worker-observation lag, depth-after-price lag, market-open-to-submission, market-open-to-first-fill, submission-to-first-fill, entry completion, first-fill-to-trigger, trigger-to-maker submission, and trigger-to-observed-flat position. Heartbeats use separate bounded `ORDER HEALTH`, `LIVE ACCOUNT`, `HEARTBEAT`, `ENTRY STATUS`, `LIVE PERFORMANCE`, `STOP STATUS`, and `RESEARCH COHORT` lines so GitHub does not truncate safety-critical fields. `LIVE PERFORMANCE` includes actual fees and rolling payoff-implied break-even rates. Five-minute tables print every 40–49¢ level, winner capture/misses, drawdown buckets, and hybrid-stop outcomes. They also print, separately for every hypothetical stop from 40¢ through 49¢, the number/rate of frozen initial prices at or below that stop, plus exact-price and actual configured safety-rejection counts. Those are no-entry diagnostics, not the retired directional loss-skip rule and not ordinary GTC zero-fills.
 - A five-hour worker checkpoints and queues its successor only in the middle 13 minutes of a market—from one minute after open through one minute before close. One concurrency group serializes the strategy, and the watchdog is mode-preserving and v12-lane-only; it cannot restore v11 or convert shadow into live.
 - Workflow-dispatch parameter overrides are validated and written back to `selected_live_strategy.json` before execution, then included in the material-event and end-of-run checkpoints. A change is accepted only while exchange/order state is flat. If recovery P&L is negative, its saved multiplier/base parameters remain authoritative until that recovery cycle resets; the new settings then govern the fresh cycle. Any non-approved config-hash difference still fails closed. The watchdog is the sole five-minute scheduler; the long worker has no independent cron, preventing redundant five-hour jobs from accumulating behind the singleton concurrency group.
 
 ### GitHub Actions inputs
 
-The production worker presents only seven manual inputs. Blank strategy values preserve the version already stored in `runtime-state-kxbtc15m-delayed-v12`, so watchdog and five-hour handoffs cannot overwrite a deliberate setting with an old default.
+The production worker presents eight manual inputs. Blank strategy values preserve the version already stored in `runtime-state-kxbtc15m-delayed-v12`, so watchdog and five-hour handoffs cannot overwrite a deliberate setting with an old default.
 
 | Input | Meaning |
 | --- | --- |
@@ -630,13 +663,14 @@ The production worker presents only seven manual inputs. Blank strategy values p
 | `reconcile_only` | Reconcile authoritative Kalshi state without opening exposure |
 | `initial_shares` | Two-decimal starting base for a brand-new state; current default `1.00` |
 | `scaling_multiplier` | Sets both recovery sizing and geometric profit-threshold growth |
+| `max_share_cap` | Fixed absolute maximum quantity; blank preserves the durable cap and it does not scale with permanent base |
 | `profit_threshold` | First realized-net-profit threshold for a permanent base increase |
 | `shares_added_after_profit_threshold` | Two-decimal permanent base increment after each threshold crossing |
 | `max_stop_loss_cents` | Hard-stop price `H` from 10 through 50; trigger is `H+1` and maker exit is `H+2`; current default 50 |
 
 The controlled-restart workflow exposes only `source_run_id` and `target_live`. Run duration, sticky-direction lane, GTC order lifetime, quote timing, 40–49¢ analytics, checkpoint cadence, maximum position, and all other safety limits remain canonical configuration rather than routine UI knobs.
 
-`KALSHI_SHADOW_ONLY=true` is the current repository setting and hard-forces `MODE=DRY_RUN` in both workflow and Python code. To switch deliberately, set `KALSHI_SHADOW_ONLY=false` and `KALSHI_LIVE_ENABLED=true`, then run the controlled-restart workflow with `target_live=true` while the named source lane is flat. The handoff refuses boundary timing or persisted exposure, dispatches the current `main`, preserves state, and the replacement reconciles before creating risk. Reversing either repository gate disables live placement again. Credentials are referenced only by the names `KALSHI_PROD_API_KEY` and `KALSHI_PRIVATE_KEY`; they are never written to state, logs, artifacts, source, or README.
+`KALSHI_SHADOW_ONLY=true` hard-forces `MODE=DRY_RUN`; `KALSHI_SHADOW_ONLY=false` does not independently enable live trading. To switch deliberately, set `KALSHI_SHADOW_ONLY=false` and `KALSHI_LIVE_ENABLED=true`, then run the controlled-restart workflow with `target_live=true` while the named source lane is flat. The handoff refuses boundary timing or persisted exposure, dispatches the current `main`, preserves state, and the replacement reconciles before creating risk. Reversing either repository gate disables live placement again. Credentials are referenced only by the names `KALSHI_PROD_API_KEY` and `KALSHI_PRIVATE_KEY`; they are never written to state, logs, artifacts, source, or README.
 
 ## Tests and operational commands
 

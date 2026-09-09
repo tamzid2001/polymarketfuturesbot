@@ -165,6 +165,42 @@ class LiveStopSafetyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(record["status"], "CLOSED")
         self.assertEqual(Decimal(record["realized_net_pnl"]), Decimal("-0.06"))
 
+    async def test_partial_hard_ioc_reconciles_position_and_retries_only_residual(self):
+        engine, record, rest, feed = self.setup_trade()
+        feed.bid = Decimal("0.50")
+        original = rest.create_reduce_only_exit
+
+        async def partial_then_full(**kwargs):
+            if rest.hard_creates == 0:
+                rest.hard_creates += 1
+                requested = Decimal(str(kwargs["quantity"]))
+                filled = Decimal("0.40")
+                rest.position = requested - filled
+                return {
+                    "order_id": "hard-partial", "client_order_id": kwargs["client_order_id_override"],
+                    "held_side": kwargs["held_side"], "side": kwargs["held_side"],
+                    "exit_phase": "hard_stop", "order_type": "reduce_only_exit_ioc",
+                    "quantity": str(requested), "position_price": str(kwargs["economic_exit_price"]),
+                    "fill_count": str(filled),
+                    # Kalshi V2 IOC reports zero remaining after canceling the
+                    # unfilled part. The authoritative position is still 0.60.
+                    "remaining_count": "0.00", "average_fill_price": str(kwargs["economic_exit_price"]),
+                    "fees_paid": "0", "post_only": False, "reduce_only": True,
+                    "submission_outcome": "accepted", "status": "partial",
+                }
+            return await original(**kwargs)
+
+        rest.create_reduce_only_exit = partial_then_full
+        rest.refresh_exit_order = AsyncMock(return_value=True)
+        await engine.manage_stop(rest, feed, record)
+        self.assertEqual(record["status"], "HARD_STOP_PENDING")
+        self.assertEqual(rest.position, Decimal("0.60"))
+        await engine.manage_stop(rest, feed, record)
+        self.assertEqual([Decimal(str(row["quantity"])) for row in record["exit_orders"]],
+                         [Decimal("1.00"), Decimal("0.60")])
+        self.assertEqual(rest.position, Decimal("0"))
+        self.assertEqual(record["status"], "CLOSED")
+
     async def test_adapter_empty_lookup_cannot_prove_rejection(self):
         rest = object.__new__(KalshiREST)
         rest.orders = SimpleNamespace(get_orders=AsyncMock(return_value={"orders": [], "cursor": ""}))
@@ -202,6 +238,34 @@ class LiveStopSafetyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(order_fee_total({"fill_count": "0", "average_fee_paid": "0.015"}), 0)
         self.assertEqual(order_fee_total({"fill_count": "2.50", "average_fee_paid": "0.015",
                                          "taker_fees_dollars": "0.04", "maker_fees_dollars": "0.01"}), .05)
+
+    def test_rolling_performance_uses_realized_net_per_actual_share(self):
+        engine, _record, _rest, _feed = self.setup_trade()
+        engine.state["markets"] = {
+            "win": {
+                "ticker": "win", "signal_side": "yes", "settlement_outcome": "yes",
+                "actual_quantity": "1.00", "actual_average_entry_price": "0.55",
+                "realized_net_pnl": "0.40", "completed_at": "2026-01-01T00:00:00+00:00",
+                "entry_orders": [{"fees_paid": "0.01"}], "exit_orders": [],
+            },
+            "loss": {
+                "ticker": "loss", "signal_side": "yes", "settlement_outcome": "no",
+                "actual_quantity": "2.00", "actual_average_entry_price": "0.52",
+                "realized_net_pnl": "-0.20", "completed_at": "2026-01-01T00:15:00+00:00",
+                "entry_orders": [], "exit_orders": [{"fees_paid": "0.02"}],
+            },
+        }
+        metrics = engine.realized_performance_metrics()["all"]
+        self.assertEqual((metrics["realized_wins"], metrics["realized_losses"]), (1, 1))
+        self.assertEqual(Decimal(metrics["realized_win_rate"]), Decimal("0.5"))
+        self.assertEqual(Decimal(metrics["average_net_win_per_share"]), Decimal("0.4"))
+        self.assertEqual(Decimal(metrics["average_net_loss_per_share"]), Decimal("0.1"))
+        self.assertEqual(Decimal(metrics["fee_adjusted_break_even_win_rate"]), Decimal("0.2"))
+        self.assertEqual(Decimal(metrics["win_rate_edge"]), Decimal("0.3"))
+        self.assertEqual(Decimal(metrics["quantity_weighted_average_entry"]), Decimal("0.53"))
+        self.assertEqual(Decimal(metrics["total_realized_net_pnl"]), Decimal("0.20"))
+        self.assertEqual(Decimal(metrics["total_fees_paid"]), Decimal("0.03"))
+        self.assertEqual((metrics["directional_wins"], metrics["directional_losses"]), (1, 1))
 
     async def test_yes_and_no_stop_adapter_use_correct_book_side_and_price(self):
         for side, book_side, api_price in (("yes", "ask", "0.5200"), ("no", "bid", "0.4800")):
