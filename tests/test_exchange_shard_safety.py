@@ -56,7 +56,7 @@ class ExchangeShardSafetyTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(rest.base_url, expected)
 
     def entry(self):
-        fixture = band_fixtures.DelayedBandV12Tests()
+        fixture = band_fixtures.DelayedBandV13Tests()
         fixture.setUp()
         engine = fixture.engine(dry_run=False)
         opened = time.time() - 61
@@ -432,7 +432,7 @@ class ExchangeShardSafetyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rest.calls, [])
 
     async def test_shadow_entry_does_not_call_authenticated_funding_or_orders(self):
-        fixture = band_fixtures.DelayedBandV12Tests()
+        fixture = band_fixtures.DelayedBandV13Tests()
         fixture.setUp()
         engine = fixture.engine(dry_run=True)
         opened = time.time() - 61

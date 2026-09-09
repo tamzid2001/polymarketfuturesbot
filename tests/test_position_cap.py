@@ -260,8 +260,8 @@ class PositionCapTests(unittest.TestCase):
 
     def test_optimizer_export_preserves_cap_instead_of_hardcoding_100(self):
         self.assertEqual(ParameterSet(2.5, 350, .5, max_position=200.25).reference_configuration().max_position, D("200.25"))
-        row = {"execution_profile": "delayed_53_57_stop_50", "entry_price": .52,
-               "stop_price": .50, "recovery_multiplier": 2.50, "first_base_threshold": 350,
+        row = {"execution_profile": "delayed_53_57_exit_51", "entry_price": .52,
+               "stop_price": .51, "recovery_multiplier": 2.50, "first_base_threshold": 350,
                "threshold_growth_multiplier": 2.50, "base_increment": .5, "max_position": "200.25"}
         with TemporaryDirectory() as directory:
             path = Path(directory) / "config.json"

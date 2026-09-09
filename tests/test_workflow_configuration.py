@@ -11,7 +11,7 @@ import unittest
 from unittest.mock import patch
 
 from kalshi_live_trader import LiveEngine, apply_overrides, load_config, save_config, strategy_parameters
-from live_checkpoint import DELAYED_V12_RUNTIME_STATE_REF, publish_runtime_snapshot, restore_runtime_snapshot
+from live_checkpoint import DELAYED_V13_RUNTIME_STATE_REF, publish_runtime_snapshot, restore_runtime_snapshot
 from live_state import default_state, load_state, save_state
 from strategy_core import apply_realized_filled_trade
 
@@ -31,7 +31,7 @@ class WorkflowConfigurationTests(unittest.TestCase):
                      max_position="200.00", max_position_per_base_share="125.00",
                      first_base_threshold="400", base_increment="0.25",
                      stop_price="0.40", hybrid_hard_stop_cents=40,
-                     hybrid_stop_trigger_cents=41, hybrid_maker_exit_cents=42)
+                     hybrid_stop_trigger_cents=40, hybrid_maker_exit_cents=40)
         changed = apply_overrides(config, argparse.Namespace(**names))
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -43,10 +43,10 @@ class WorkflowConfigurationTests(unittest.TestCase):
             before = deepcopy(changed)
             save_config(path, changed)
             self.assertEqual(changed, before)  # atomic save must not mutate config/hash
-            publish_runtime_snapshot((path,), "operator-inputs", root=work, runtime_ref=DELAYED_V12_RUNTIME_STATE_REF)
-            sha = subprocess.check_output(["git", "ls-remote", str(remote), "refs/heads/" + DELAYED_V12_RUNTIME_STATE_REF], text=True).split()[0]
+            publish_runtime_snapshot((path,), "operator-inputs", root=work, runtime_ref=DELAYED_V13_RUNTIME_STATE_REF)
+            sha = subprocess.check_output(["git", "ls-remote", str(remote), "refs/heads/" + DELAYED_V13_RUNTIME_STATE_REF], text=True).split()[0]
             path.unlink()  # disposable test fixture, not real runtime state
-            restore_runtime_snapshot(sha, root=work, runtime_ref=DELAYED_V12_RUNTIME_STATE_REF)
+            restore_runtime_snapshot(sha, root=work, runtime_ref=DELAYED_V13_RUNTIME_STATE_REF)
             for blank in (None, ""):
                 next_run = apply_overrides(load_config(path), argparse.Namespace(**dict.fromkeys(names, blank)))
                 for key, value in names.items():
@@ -61,7 +61,7 @@ class WorkflowConfigurationTests(unittest.TestCase):
         original = deepcopy(state["sizing"])
         updated = apply_overrides(config, argparse.Namespace(starting_base="2.00", recovery_multiplier="1.75",
             threshold_growth_multiplier="1.75", max_position="200", stop_price="0.40",
-            hybrid_hard_stop_cents=40, hybrid_stop_trigger_cents=41, hybrid_maker_exit_cents=42))
+            hybrid_hard_stop_cents=40, hybrid_stop_trigger_cents=40, hybrid_maker_exit_cents=40))
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "state.json"
             save_state(path, state)
@@ -86,7 +86,7 @@ class WorkflowConfigurationTests(unittest.TestCase):
     def test_workflow_tests_source_defaults_before_restoring_operator_settings(self):
         text = (ROOT / ".github/workflows/kalshi_btc15m_average_down.yml").read_text()
         self.assertLess(text.index("name: Verify shared live strategy engine"), text.index("name: Restore latest bounded runtime state"))
-        self.assertLess(text.index("name: Restore latest bounded runtime state"), text.index("name: Assert canonical hybrid strategy contract"))
+        self.assertLess(text.index("name: Restore latest bounded runtime state"), text.index("name: Assert canonical direct-exit strategy contract"))
         self.assertIn("steps.runtime_restore.outcome == 'success'", text)
         self.assertNotIn('--stop-price "$profile_stop"', text)
         self.assertIn("ref: main", text)
@@ -95,7 +95,7 @@ class WorkflowConfigurationTests(unittest.TestCase):
     def test_live_startup_probe_is_gated_ordered_and_durable(self):
         workflow = (ROOT / ".github/workflows/kalshi_btc15m_average_down.yml").read_text()
         probe = "name: Verify live create and cancel path on the market shard"
-        worker = "name: Run KXBTC15M hybrid worker"
+        worker = "name: Run KXBTC15M direct-exit worker"
         self.assertLess(workflow.index(probe), workflow.index(worker))
         probe_block = workflow[workflow.index(probe):workflow.index(worker)]
         self.assertIn("!inputs.reconcile_only", probe_block)
@@ -105,7 +105,7 @@ class WorkflowConfigurationTests(unittest.TestCase):
         self.assertIn("kalshi_startup_order_check.py --execute", probe_block)
         worker_block = workflow[workflow.index(worker):]
         self.assertIn('KALSHI_STARTUP_ORDER_CHECK_ENABLED: "true"', worker_block)
-        journal = "data/.kalshi_live_delayed_band_v12_startup_order_check/order-smoke-test.json"
+        journal = "data/.kalshi_live_delayed_band_v13_startup_order_check/order-smoke-test.json"
         self.assertGreaterEqual(workflow.count(journal), 2)
 
     def test_fresh_state_reset_is_explicit_live_only_and_not_forwarded(self):
@@ -139,12 +139,12 @@ class WorkflowConfigurationTests(unittest.TestCase):
                                 ["git", "-C", str(work), "config", "user.useConfigOnly", "true"],
                                 ["git", "-C", str(work), "remote", "add", "origin", str(remote)]):
                     subprocess.run(command, capture_output=True, check=True)
-                state = work / "data/kalshi_live_delayed_band_v12_state.json"
+                state = work / "data/kalshi_live_delayed_band_v13_state.json"
                 state.parent.mkdir()
                 state.write_text('{"test":"early_failure"}\n')
                 self.assertTrue(publish_runtime_snapshot((state,), "early-failure", root=work,
-                                                       runtime_ref=DELAYED_V12_RUNTIME_STATE_REF))
+                                                       runtime_ref=DELAYED_V13_RUNTIME_STATE_REF))
                 author = subprocess.check_output(["git", "--git-dir", str(remote), "show", "-s",
-                                                  "--format=%an <%ae>", DELAYED_V12_RUNTIME_STATE_REF], text=True).strip()
+                                                  "--format=%an <%ae>", DELAYED_V13_RUNTIME_STATE_REF], text=True).strip()
                 self.assertEqual(author, "github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>")
                 self.assertNotIn("GIT_AUTHOR_NAME", os.environ)

@@ -17,20 +17,100 @@ LiveHybridRest = fixtures.LiveHybridRest
 
 class LiveStopSafetyTests(unittest.IsolatedAsyncioTestCase):
     def test_production_safety_contract_versions_prevent_old_worker_semantics(self):
-        self.assertEqual(LIVE_STOP_SAFETY_CONTRACT_VERSION, 2)
+        self.assertEqual(LIVE_STOP_SAFETY_CONTRACT_VERSION, 3)
         self.assertEqual(POSITION_CAP_CONTRACT_VERSION, 2)
 
     def setup_trade(self, *, shadow=False):
         fixture = fixtures.MakerHybridV11Tests()
         fixture.setUp()
-        fixture.config.update(hybrid_stop_trigger_cents=51, hybrid_maker_exit_cents=52,
-                              hybrid_hard_stop_cents=50, stop_price="0.50")
+        fixture.config.update(
+            stop_policy="hybrid_maker_then_hard_stop",
+            hybrid_stop_trigger_cents=51, hybrid_maker_exit_cents=52,
+            hybrid_hard_stop_cents=50, stop_price="0.50",
+        )
         engine = fixture.engine(dry_run=shadow)
         record = fixture.filled_record(engine)
         record["entry_orders"][0]["average_fill_price"] = "0.54"
         rest = LiveHybridRest()
         rest.refresh_order = AsyncMock()
         return engine, record, rest, BookFeed("0.54", "0.51", "10")
+
+    def setup_direct_trade(self, *, shadow=False):
+        engine, record, rest, feed = self.setup_trade(shadow=shadow)
+        engine.config.update(
+            stop_policy="direct_ioc_at_trigger",
+            hybrid_stop_trigger_cents=51,
+            hybrid_maker_exit_cents=51,
+            hybrid_hard_stop_cents=51,
+            stop_price="0.51",
+        )
+        record.update(stop_policy="direct_ioc_at_trigger", stop_floor_price="0.51")
+        record["hybrid_stop"].update(trigger_cents=51, maker_exit_cents=51, hard_stop_cents=51)
+        return engine, record, rest, feed
+
+    async def test_v13_direct_exit_has_no_maker_phase_and_flattens_at_trigger(self):
+        for shadow in (False, True):
+            engine, record, rest, feed = self.setup_direct_trade(shadow=shadow)
+            await engine.manage_stop(rest, feed, record)
+            self.assertEqual(rest.maker_creates, 0)
+            self.assertEqual(len(record["exit_orders"]), 1)
+            self.assertEqual(record["exit_orders"][0]["time_in_force"], "immediate_or_cancel")
+            self.assertTrue(record["exit_orders"][0]["reduce_only"])
+            self.assertEqual(record["status"], "CLOSED")
+            self.assertEqual(record["exit_classification"], "DIRECT_PROTECTIVE_EXIT")
+
+    async def test_v13_direct_exit_does_not_trigger_above_51c(self):
+        engine, record, rest, feed = self.setup_direct_trade()
+        feed.bid = Decimal("0.52")
+        await engine.manage_stop(rest, feed, record)
+        self.assertEqual(rest.maker_creates, 0)
+        self.assertEqual(rest.hard_creates, 0)
+        self.assertEqual(record["status"], "POSITION_OPEN")
+
+    async def test_v13_direct_partial_ioc_retries_only_authoritative_residual(self):
+        engine, record, rest, feed = self.setup_direct_trade()
+        original = rest.create_reduce_only_exit
+
+        async def partial_then_full(**kwargs):
+            if rest.hard_creates == 0:
+                rest.hard_creates += 1
+                requested = Decimal(str(kwargs["quantity"]))
+                filled = Decimal("0.40")
+                rest.position = requested - filled
+                return {
+                    "order_id": "direct-partial",
+                    "client_order_id": kwargs["client_order_id_override"],
+                    "held_side": kwargs["held_side"],
+                    "side": kwargs["held_side"],
+                    "exit_phase": "hard_stop",
+                    "order_type": "reduce_only_exit_ioc",
+                    "quantity": str(requested),
+                    "position_price": str(kwargs["economic_exit_price"]),
+                    "fill_count": str(filled),
+                    "remaining_count": "0.60",
+                    "average_fill_price": str(kwargs["economic_exit_price"]),
+                    "fees_paid": "0",
+                    "post_only": False,
+                    "reduce_only": True,
+                    "submission_outcome": "accepted",
+                    "status": "partial",
+                }
+            return await original(**kwargs)
+
+        rest.create_reduce_only_exit = partial_then_full
+        rest.refresh_exit_order = AsyncMock(return_value=True)
+        await engine.manage_stop(rest, feed, record)
+        self.assertEqual(record["status"], "HARD_STOP_PENDING")
+        self.assertEqual(rest.maker_creates, 0)
+        self.assertEqual(rest.position, Decimal("0.60"))
+        await engine.manage_stop(rest, feed, record)
+        self.assertEqual(
+            [Decimal(str(row["quantity"])) for row in record["exit_orders"]],
+            [Decimal("1.00"), Decimal("0.60")],
+        )
+        self.assertEqual(rest.position, Decimal("0"))
+        self.assertEqual(record["status"], "CLOSED")
+        self.assertEqual(record["exit_classification"], "DIRECT_PROTECTIVE_EXIT")
 
     async def test_gap_through_hard_stop_exits_same_pass_without_maker(self):
         for shadow in (False, True):

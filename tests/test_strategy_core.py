@@ -82,8 +82,8 @@ class StrategyCoreTests(unittest.TestCase):
 
     def test_optimizer_live_export_round_trips_without_reinterpreting_decimals(self) -> None:
         row = {
-            "execution_profile": "delayed_53_57_stop_50",
-            "entry_price": .52, "stop_price": .50, "recovery_multiplier": 2.50,
+            "execution_profile": "delayed_53_57_exit_51",
+            "entry_price": .52, "stop_price": .51, "recovery_multiplier": 2.50,
             "first_base_threshold": 350, "threshold_growth_multiplier": 2.50, "base_increment": .50,
         }
         with TemporaryDirectory() as directory:
@@ -105,10 +105,10 @@ class StrategyCoreTests(unittest.TestCase):
         self.assertEqual(config["delayed_entry_max_limit_cents"], 57)
         self.assertEqual(config["entry_limit_offset_cents"], 1)
         self.assertEqual(config["max_recovery_exponent"], 0)
-        self.assertEqual(config["stop_policy"], "hybrid_maker_then_hard_stop")
+        self.assertEqual(config["stop_policy"], "direct_ioc_at_trigger")
         self.assertEqual(
             (config["hybrid_stop_trigger_cents"], config["hybrid_maker_exit_cents"], config["hybrid_hard_stop_cents"]),
-            (51, 52, 50),
+            (51, 51, 51),
         )
         self.assertEqual(config["stop_baseline_entry_price"], "0.50")
         self.assertEqual(config["strategy_version"], ACTIVE_STRATEGY_VERSION)
@@ -121,7 +121,7 @@ class StrategyCoreTests(unittest.TestCase):
         }
         with TemporaryDirectory() as directory:
             path = Path(directory) / "selected_live_strategy.json"
-            with self.assertRaisesRegex(ValueError, "execution_profile=delayed_53_57_stop_50"):
+            with self.assertRaisesRegex(ValueError, "execution_profile=delayed_53_57_exit_51"):
                 export_selected_live_strategy(path, row, selection_basis="test")
 
     def test_delayed_entry_band_is_a_pure_terminal_decision(self) -> None:
@@ -242,6 +242,7 @@ class StrategyCoreTests(unittest.TestCase):
                 hybrid_hard_stop_cents=cents,
                 hybrid_stop_trigger_cents=cents + 1,
                 hybrid_maker_exit_cents=cents + 2,
+                stop_policy="hybrid_maker_then_hard_stop",
                 trading_mode="shadow",
             ))
             self.assertEqual(profile["shadow_profile"], f"sticky_stop_{cents}")
@@ -251,7 +252,7 @@ class StrategyCoreTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, r"profile/profile\+1c/profile\+2c"):
                 load_config_from_value(dict(profile, hybrid_stop_trigger_cents=cents))
 
-    def test_production_workflows_pin_v12_and_never_dispatch_retired_lanes(self) -> None:
+    def test_production_workflows_pin_v13_and_never_dispatch_retired_lanes(self) -> None:
         worker = (ROOT / ".github/workflows/kalshi_btc15m_average_down.yml").read_text(encoding="utf-8")
         watchdog = (ROOT / ".github/workflows/kalshi_btc15m_watchdog.yml").read_text(encoding="utf-8")
         controlled = (ROOT / ".github/workflows/kalshi_btc15m_controlled_restart.yml").read_text(encoding="utf-8")
@@ -264,7 +265,9 @@ class StrategyCoreTests(unittest.TestCase):
         self.assertIn('entry_timeout_seconds"] == 0', worker)
         self.assertIn("OPENING_PRICE_CAPTURE_CONTRACT_VERSION == 3", worker)
         self.assertIn("BTC_TARGET_CAPTURE_CONTRACT_VERSION == 2", worker)
-        self.assertIn("DELAYED_ENTRY_LADDER_CONTRACT_VERSION == 3", worker)
+        self.assertIn("DELAYED_ENTRY_LADDER_CONTRACT_VERSION == 4", worker)
+        self.assertIn("LIVE_STOP_SAFETY_CONTRACT_VERSION == 3", worker)
+        self.assertNotIn("LIVE_STOP_SAFETY_CONTRACT_VERSION == 2", worker)
         self.assertIn('c = load_config(', worker)
         self.assertIn('CONFIGURED_INITIAL_SHARE_CAP=', worker)
         self.assertIn('CONFIGURED_CAP_PER_BASE_SHARE=', worker)
@@ -274,8 +277,8 @@ class StrategyCoreTests(unittest.TestCase):
         self.assertIn("entry=ask_minus_1c", worker)
         self.assertIn("max_limit=57c", worker)
         self.assertNotIn("--entry-timeout-seconds", worker)
-        self.assertIn("hybrid=validated_config", worker)
-        self.assertIn("kalshi_shadow_delayed_band_v12", worker)
+        self.assertIn("protective_exit=direct_reduce_only_ioc_at_51c", worker)
+        self.assertIn("kalshi_shadow_delayed_band_v13", worker)
         self.assertIn("--persist-config", worker)
         self.assertIn('--starting-base "$INITIAL_SHARES"', worker)
         self.assertIn('--recovery-multiplier "$SCALING_MULTIPLIER"', worker)
@@ -284,13 +287,13 @@ class StrategyCoreTests(unittest.TestCase):
         self.assertIn('--base-increment "$SHARES_ADDED_AFTER_PROFIT_THRESHOLD"', worker)
         self.assertIn('--hybrid-hard-stop-cents "$MAX_STOP_LOSS_CENTS"', worker)
         self.assertIn("RUNTIME_STATE_RESTORED=$runtime_ref", worker)
-        self.assertIn("runtime_ref=runtime-state-kxbtc15m-delayed-v12", worker)
+        self.assertIn("runtime_ref=runtime-state-kxbtc15m-delayed-v13", worker)
         self.assertNotIn("legacy_runtime_ref=runtime-state", worker)
-        self.assertIn("RUNTIME_STATE_OWNER=kalshi-kxbtc15m-delayed-v12", worker)
+        self.assertIn("RUNTIME_STATE_OWNER=kalshi-kxbtc15m-delayed-v13", worker)
         self.assertIn('live_checkpoint.py --restore-sha "$restore_sha" --runtime-ref "$runtime_ref"', worker)
         self.assertIn('c["durable_checkpoint_interval_seconds"] == 30.0', worker)
         self.assertIn(
-            "python live_checkpoint.py --reason end-of-run --runtime-ref runtime-state-kxbtc15m-delayed-v12",
+            "python live_checkpoint.py --reason end-of-run --runtime-ref runtime-state-kxbtc15m-delayed-v13",
             worker,
         )
         self.assertLess(
@@ -300,9 +303,9 @@ class StrategyCoreTests(unittest.TestCase):
         self.assertNotIn("git push origin HEAD:main", worker)
         self.assertNotIn("chore: checkpoint KXBTC15M hybrid state", worker)
         self.assertIn("RUNTIME_STATE_RESTORED=$runtime_ref", controlled)
-        self.assertIn("runtime_ref=runtime-state-kxbtc15m-delayed-v12", controlled)
+        self.assertIn("runtime_ref=runtime-state-kxbtc15m-delayed-v13", controlled)
         self.assertNotIn("legacy_runtime_ref=runtime-state", controlled)
-        self.assertIn("RUNTIME_STATE_OWNER=kalshi-kxbtc15m-delayed-v12", controlled)
+        self.assertIn("RUNTIME_STATE_OWNER=kalshi-kxbtc15m-delayed-v13", controlled)
         self.assertIn('live_checkpoint.py --restore-sha "$restore_sha" --runtime-ref "$runtime_ref"', controlled)
         self.assertIn('record.get("status") == "SIGNAL_PENDING"', controlled)
         self.assertIn("and breaker_blocked", controlled)

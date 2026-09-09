@@ -109,7 +109,7 @@ class EntryRest:
         }
 
 
-class DelayedBandV12Tests(unittest.TestCase):
+class DelayedBandV13Tests(unittest.TestCase):
     def setUp(self) -> None:
         self.config = load_config(ROOT / "selected_live_strategy.json")
 
@@ -128,7 +128,7 @@ class DelayedBandV12Tests(unittest.TestCase):
         )
 
     def test_exact_production_contract_is_shadow_safe_by_default(self) -> None:
-        self.assertEqual(self.config["strategy_version"], "kxbtc15m-delayed-band-live-v12")
+        self.assertEqual(self.config["strategy_version"], "kxbtc15m-delayed-band-live-v13")
         self.assertEqual(self.config["entry_execution_mode"], "delayed_threshold_band_maker")
         self.assertEqual(Decimal(self.config["recovery_multiplier"]), Decimal("2.50"))
         self.assertEqual(Decimal(self.config["starting_base"]), Decimal("1.00"))
@@ -136,8 +136,9 @@ class DelayedBandV12Tests(unittest.TestCase):
         self.assertEqual(
             (self.config["hybrid_stop_trigger_cents"], self.config["hybrid_maker_exit_cents"],
              self.config["hybrid_hard_stop_cents"]),
-            (51, 52, 50),
+            (51, 51, 51),
         )
+        self.assertEqual(self.config["stop_policy"], "direct_ioc_at_trigger")
         self.assertFalse(self.config["live_enabled"])
         self.assertTrue(self.config["dry_run"])
         self.assertEqual(self.config["trading_mode"], "shadow")

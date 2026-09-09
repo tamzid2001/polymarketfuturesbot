@@ -123,10 +123,11 @@ class MakerHybridV11Tests(unittest.TestCase):
         self.config = load_config(ROOT / "selected_live_strategy.json")
         # This module is an archived regression suite for the v11 opening-entry
         # contract.  Keep exercising those retained helpers without allowing
-        # the production v12 config to reinterpret the scenarios.
+        # the production v13 config to reinterpret the scenarios.
         self.config.update({
             "entry_execution_mode": "signal_price_minus_offset_maker",
             "shadow_profile": "sticky_stop_40",
+            "stop_policy": "hybrid_maker_then_hard_stop",
             "entry_price": "0.49",
             "stop_price": "0.40",
             "hybrid_stop_trigger_cents": 45,

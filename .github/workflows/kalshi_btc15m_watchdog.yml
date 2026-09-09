@@ -1,9 +1,9 @@
-name: Kalshi KXBTC15M Hybrid Live Watchdog
+name: Kalshi KXBTC15M Direct 51c Live Watchdog
 
-# A recovery safety net for the hybrid trader. Normal five-hour workers only
+# A recovery safety net for the direct-exit trader. Normal five-hour workers only
 # hand off in the middle 13 minutes of a KXBTC15M market. This workflow is a
 # recovery path for a failed/missing worker; it never bypasses the live gate.
-# While KALSHI_SHADOW_ONLY=true, only the canonical delayed 53-57c v12 lane is
+# While KALSHI_SHADOW_ONLY=true, only the canonical delayed 53-57c v13 lane is
 # maintained. Older opening-entry and comparison-stop lanes are never dispatched.
 on:
   schedule:
@@ -11,7 +11,7 @@ on:
     # scheduled jobs under load.
     - cron: "2-59/5 * * * *"
   workflow_run:
-    workflows: ["Kalshi KXBTC15M Hybrid Live"]
+    workflows: ["Kalshi KXBTC15M Direct 51c Live"]
     types: [completed]
   workflow_dispatch:
 
@@ -24,7 +24,7 @@ permissions:
   contents: read
 
 jobs:
-  ensure-hybrid-runner:
+  ensure-direct-exit-runner:
     # A successful worker queues its own safe handoff. Failed workers and an
     # absent scheduled worker are recovered in their prior/safe mode.
     if: >-
@@ -58,7 +58,7 @@ jobs:
             --json databaseId,status,conclusion,updatedAt,displayTitle,event)"
 
           if [ "$KALSHI_SHADOW_ONLY" = "true" ]; then
-              profile=delayed_53_57_stop_50
+              profile=delayed_53_57_exit_51
               profile_runs="$(jq --arg title "DRY_RUN $profile" '[.[] | select((.displayTitle // "") | contains($title))]' <<<"$runs")"
               active="$(jq '[.[] | select(.status == "in_progress" or .status == "queued" or .status == "waiting")] | length' <<<"$profile_runs")"
               if [ "$active" -gt 0 ]; then
@@ -85,19 +85,19 @@ jobs:
 
           active="$(jq '[.[] | select(.status == "in_progress" or .status == "queued" or .status == "waiting")] | length' <<<"$runs")"
           if [ "$active" -gt 0 ]; then
-            echo "WATCHDOG HOLD | active_or_queued_hybrid_runs=$active; refusing overlap."
+            echo "WATCHDOG HOLD | active_or_queued_production_runs=$active; refusing overlap."
             exit 0
           fi
-          latest="$(jq -c '[.[] | select((.displayTitle // "") | test("(DRY_RUN|LIVE) delayed_53_57_stop_50$"))] | sort_by(.updatedAt // "") | last // {}' <<<"$runs")"
-          prior_live="$(jq -r '(.displayTitle // "") | endswith("LIVE delayed_53_57_stop_50")' <<<"$latest")"
+          latest="$(jq -c '[.[] | select((.displayTitle // "") | test("(DRY_RUN|LIVE) delayed_53_57_exit_51$"))] | sort_by(.updatedAt // "") | last // {}' <<<"$runs")"
+          prior_live="$(jq -r '(.displayTitle // "") | endswith("LIVE delayed_53_57_exit_51")' <<<"$latest")"
           # Repository flags grant permission; they are not a start command.
           # Live recovery requires a prior explicitly requested LIVE worker.
           if [ "$KALSHI_LIVE_ENABLED" = "true" ] && [ "$KALSHI_SHADOW_ONLY" = "false" ] && [ "$prior_live" = "true" ]; then
             gh workflow run kalshi_btc15m_average_down.yml --repo "$REPOSITORY" --ref main \
               -f live_enabled=true -f reconcile_only=false
-            echo "WATCHDOG DISPATCHED | gated live hybrid recovery queued."
+            echo "WATCHDOG DISPATCHED | gated live direct-exit recovery queued."
           else
             gh workflow run kalshi_btc15m_average_down.yml --repo "$REPOSITORY" --ref main \
               -f live_enabled=false -f reconcile_only=false
-            echo "WATCHDOG DISPATCHED | shadow hybrid recovery queued."
+            echo "WATCHDOG DISPATCHED | shadow direct-exit recovery queued."
           fi
