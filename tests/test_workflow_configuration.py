@@ -28,7 +28,8 @@ class WorkflowConfigurationTests(unittest.TestCase):
     def test_changed_inputs_and_blank_next_run_roundtrip_through_runtime_branch(self):
         config = load_config(ROOT / "selected_live_strategy.json")
         names = dict(starting_base="2.00", recovery_multiplier="2.5", threshold_growth_multiplier="2.5",
-                     max_position="200.00", first_base_threshold="400", base_increment="0.25",
+                     max_position="200.00", max_position_per_base_share="125.00",
+                     first_base_threshold="400", base_increment="0.25",
                      stop_price="0.40", hybrid_hard_stop_cents=40,
                      hybrid_stop_trigger_cents=41, hybrid_maker_exit_cents=42)
         changed = apply_overrides(config, argparse.Namespace(**names))

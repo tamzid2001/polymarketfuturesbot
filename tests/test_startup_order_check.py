@@ -128,6 +128,34 @@ class StartupOrderCheckTests(unittest.IsolatedAsyncioTestCase):
             await self.run_check()
         self.assertEqual(self.api.calls, [])
 
+    async def test_protective_exit_breaker_starts_recovery_worker_without_probe_order(self):
+        value = default_state(load_config(self.config))
+        value["circuit_breaker"].update(
+            blocked=True, reason="entry_cancellation_unconfirmed",
+        )
+        value["current_order_id"] = "possibly-resting-entry"
+        value["current_position"] = "16.74"
+        save_state(self.state, value)
+        await self.run_check("risk-recovery")
+        self.assertEqual(self.api.calls, [])
+        self.assertEqual(self.api.post_count, 0)
+        self.assertIn(
+            "STARTUP_ORDER_CHECK_DEFERRED_TO_RISK_RECOVERY",
+            self.output.getvalue(),
+        )
+
+    async def test_any_breaker_with_managed_exposure_starts_recovery_worker(self):
+        value = default_state(load_config(self.config))
+        value["circuit_breaker"].update(
+            blocked=True, reason="hard_stop_position_reconciliation_failed",
+        )
+        value["current_position"] = "1.00"
+        save_state(self.state, value)
+        await self.run_check("generic-risk-recovery")
+        self.assertEqual(self.api.calls, [])
+        self.assertEqual(self.api.post_count, 0)
+        self.assertIn("recovery_worker_allowed", self.output.getvalue())
+
     def seed_entry_breaker(self, reason="maker_entry_submission_unknown"):
         ticker = "KXBTC15M-legacy-closed"
         client_id = "11111111-1111-4111-8111-111111111111"

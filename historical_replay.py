@@ -33,6 +33,7 @@ class ReplayConfiguration:
     fee_per_share: Decimal = ZERO
     starting_base: Decimal = Decimal("1.00")
     max_position: Decimal = Decimal("100.00")
+    max_position_per_base_share: Decimal | None = None
     starting_bankroll: Decimal = Decimal("100.00")
 
     def __post_init__(self) -> None:
@@ -47,6 +48,10 @@ class ReplayConfiguration:
         object.__setattr__(self, "fee_per_share", decimal(self.fee_per_share))
         object.__setattr__(self, "starting_base", decimal(self.starting_base))
         object.__setattr__(self, "max_position", decimal(self.max_position))
+        object.__setattr__(
+            self, "max_position_per_base_share",
+            None if self.max_position_per_base_share is None else decimal(self.max_position_per_base_share),
+        )
         object.__setattr__(self, "starting_bankroll", decimal(self.starting_bankroll))
         if not ZERO < self.entry_price < ONE:
             raise ValueError("entry_price must be between zero and one")
@@ -193,6 +198,7 @@ def replay_one(
         threshold_growth_multiplier=configuration.threshold_growth_multiplier,
         base_share_count=configuration.starting_base,
         max_position=configuration.max_position,
+        max_position_per_base_share=configuration.max_position_per_base_share,
     )
     gross_pnl = net_pnl = ZERO
     peak = running_pnl = max_drawdown = ZERO

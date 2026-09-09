@@ -29,6 +29,7 @@ class RecoverySizingState:
     threshold_growth_multiplier: Decimal | None = None
     base_share_count: Decimal = Decimal("1.00")
     max_position: Decimal = DEFAULT_MAX_POSITION
+    max_position_per_base_share: Decimal | None = None
     recovery_cycle_pnl: Decimal = ZERO
     recovery_exponent: int = 0
     profit_since_last_base_scale: Decimal = ZERO
@@ -50,6 +51,16 @@ class RecoverySizingState:
         self.max_position = decimal(self.max_position)
         if not self.max_position.is_finite() or self.max_position <= ZERO or self.max_position != round_shares(self.max_position):
             raise ValueError("max_position must be finite, positive, and at most two decimal places")
+        if self.max_position_per_base_share is not None:
+            self.max_position_per_base_share = decimal(self.max_position_per_base_share)
+            if (
+                not self.max_position_per_base_share.is_finite()
+                or self.max_position_per_base_share < Decimal("1.00")
+                or self.max_position_per_base_share != round_shares(self.max_position_per_base_share)
+            ):
+                raise ValueError(
+                    "max_position_per_base_share must be at least 1.00 and at most two decimal places"
+                )
         self.recovery_cycle_pnl = decimal(self.recovery_cycle_pnl)
         self.profit_since_last_base_scale = decimal(self.profit_since_last_base_scale)
         self.next_base_threshold = decimal(self.next_base_threshold or self.first_base_threshold)
@@ -69,7 +80,11 @@ class RecoverySizingState:
         return self._last_quantity_was_capped
 
     def prescribed_quantity(self) -> Decimal:
-        cap = self.max_position
+        cap = (
+            self.max_position
+            if self.max_position_per_base_share is None
+            else round_shares(self.base_share_count * self.max_position_per_base_share)
+        )
         # Bound the power before quantizing. This also works for configurable
         # caps and m=1; an arbitrary exponent cutoff would not be equivalent.
         exponent = self.recovery_exponent

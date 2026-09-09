@@ -32,6 +32,7 @@ from kalshi_btc15m_average_down import (
     KalshiREST,
     field,
     market_result,
+    normalized_order_status,
     order_average_position_price,
     order_fee_total,
     order_fill_count,
@@ -83,7 +84,8 @@ BTC_TARGET_CAPTURE_CONTRACT_VERSION = 2
 # consumes that volume only once across the direct order and ladder rungs. It
 # also applies the partial-fill-safe 51/52/50 delayed hybrid-stop contract.
 DELAYED_ENTRY_LADDER_CONTRACT_VERSION = 3
-LIVE_STOP_SAFETY_CONTRACT_VERSION = 1
+LIVE_STOP_SAFETY_CONTRACT_VERSION = 2
+POSITION_CAP_CONTRACT_VERSION = 2
 DELAYED_HYBRID_STOP_TRIGGER_CENTS = 51
 DELAYED_HYBRID_MAKER_EXIT_CENTS = 52
 DELAYED_HYBRID_HARD_STOP_CENTS = 50
@@ -233,6 +235,7 @@ DECIMAL_CONFIG_FIELDS = {
     "max_recovery_cycle_loss", "max_daily_realized_loss", "starting_shadow_balance", "maker_price_offset",
     "stop_baseline_entry_price",
 }
+OPTIONAL_DECIMAL_CONFIG_FIELDS = {"max_position_per_base_share"}
 INTEGER_CONFIG_FIELDS = {
     "signal_delay_seconds", "entry_timeout_seconds", "entry_lateness_seconds", "outcome_observation_seconds",
     "max_recovery_exponent", "max_api_failures", "handoff_guard_seconds", "opening_quote_max_observations",
@@ -497,8 +500,8 @@ def validate_sizing_config(value: dict[str, Any]) -> None:
     if base_increment != round_shares(base_increment):
         raise ValueError("base_increment must have at most two decimal places")
     strategy_parameters(value)  # shared finite, positive, two-decimal cap validation
-    if starting_base <= Decimal("0") or starting_base > max_position:
-        raise ValueError("starting_base must be positive and no greater than max_position")
+    if starting_base <= Decimal("0"):
+        raise ValueError("starting_base must be positive")
     if decimal(value["recovery_multiplier"]) < Decimal("1"):
         raise ValueError("recovery_multiplier must be at least 1")
     if decimal(value["threshold_growth_multiplier"]) < Decimal("1"):
@@ -524,6 +527,10 @@ def load_config(path: Path) -> dict[str, Any]:
     missing = required - value.keys()
     if missing:
         raise ValueError(f"live strategy configuration is missing: {', '.join(sorted(missing))}")
+    # New and legacy configs default to the reviewed permanent-base-linked
+    # cap.  An operator can persist an explicit JSON null (workflow value 0)
+    # to retain a fixed ``max_position`` instead.
+    value.setdefault("max_position_per_base_share", "100.00")
     assert_active_strategy_contract(value)
     if value["series"] != "KXBTC15M":
         raise ValueError("this production runner is intentionally limited to KXBTC15M")
@@ -621,6 +628,11 @@ def apply_overrides(config: dict[str, Any], args: argparse.Namespace) -> dict[st
         value = getattr(args, name, None)
         if value not in (None, ""):
             updated[name] = str(value) if name in DECIMAL_CONFIG_FIELDS else value
+    for name in OPTIONAL_DECIMAL_CONFIG_FIELDS:
+        value = getattr(args, name, None)
+        if value not in (None, ""):
+            amount = decimal(value)
+            updated[name] = None if amount == 0 else format(amount, "f")
     for name in ("allow_capital_downsize", "hybrid_stop_enabled"):
         value = getattr(args, name, None)
         if value is not None:
@@ -639,6 +651,12 @@ def load_config_from_value(value: dict[str, Any]) -> dict[str, Any]:
     # Keep validation identical for a persisted config and command overrides.
     for name in DECIMAL_CONFIG_FIELDS & temporary.keys():
         temporary[name] = _decimal_string(temporary[name], name)
+    for name in OPTIONAL_DECIMAL_CONFIG_FIELDS:
+        raw = temporary.get(name, "100.00")
+        if raw in (None, "", "0", "0.00"):
+            temporary[name] = None
+        else:
+            temporary[name] = _decimal_string(raw, name)
     for name in INTEGER_CONFIG_FIELDS & temporary.keys():
         temporary[name] = int(temporary[name])
     for name in FLOAT_CONFIG_FIELDS & temporary.keys():
@@ -715,6 +733,11 @@ def strategy_parameters(config: dict[str, Any]) -> StrategyParameters:
         base_increment=Decimal(config["base_increment"]),
         starting_base=Decimal(config["starting_base"]),
         max_position=Decimal(config["max_position"]),
+        max_position_per_base_share=(
+            None
+            if config.get("max_position_per_base_share") in (None, "", "0", "0.00")
+            else Decimal(str(config["max_position_per_base_share"]))
+        ),
     )
 
 
@@ -973,7 +996,7 @@ class LiveEngine:
             "workflow_run_id": os.getenv("GITHUB_RUN_ID"),
             "source_commit": os.getenv("KALSHI_SOURCE_SHA") or os.getenv("GITHUB_SHA"),
             "stop_safety_contract": LIVE_STOP_SAFETY_CONTRACT_VERSION,
-            "position_cap_contract": 1,
+            "position_cap_contract": POSITION_CAP_CONTRACT_VERSION,
             "observed_at": utc_now(),
         }
         self.parameters = strategy_parameters(config)
@@ -1094,6 +1117,11 @@ class LiveEngine:
 
     def transition(self, record: dict[str, Any], status: str, reason: str | None = None) -> None:
         prior = record.get("status")
+        if prior == status and (reason is None or record.get("status_reason") == reason):
+            # Reconciliation is polled continuously.  Repeating an identical
+            # state is not a transition and previously produced thousands of
+            # duplicate ledger rows while an order cancellation was pending.
+            return
         record["status"] = status
         record["updated_at"] = utc_now()
         if reason:
@@ -1124,12 +1152,15 @@ class LiveEngine:
         original_reason = str(breaker.get("reason") or "")
         if not breaker.get("blocked") or original_reason not in {
             "maker_entry_submission_unknown", "maker_entry_submission_rejected",
+            "entry_cancellation_unconfirmed",
+            "hard_stop_unflattened_at_market_close",
         }:
             return False
         unresolved = [
             str(item.get("ticker") or "")
             for item in self.state.get("markets", {}).values()
             if isinstance(item, dict)
+            and item is not record
             and item.get("status") in {"ERROR_RECONCILIATION", "RECONCILIATION_PENDING"}
         ]
         if unresolved:
@@ -1157,14 +1188,20 @@ class LiveEngine:
     def current_parameters(self) -> StrategyParameters:
         cycle = self.state.get("cycle_strategy_parameters")
         if isinstance(cycle, dict) and Decimal(str(self.state.get("sizing", {}).get("recovery_cycle_pnl", "0"))) < 0:
-            return StrategyParameters(**{key: Decimal(value) for key, value in cycle.items()})
+            return StrategyParameters(**{
+                key: (None if value is None else Decimal(str(value)))
+                for key, value in cycle.items()
+            })
         return self.parameters
 
     def record_parameters(self, record: dict[str, Any]) -> StrategyParameters:
         snapshot = record.get("config_snapshot")
         if isinstance(snapshot, dict):
             try:
-                return StrategyParameters(**{key: Decimal(str(value)) for key, value in snapshot.items()})
+                return StrategyParameters(**{
+                    key: (None if value is None else Decimal(str(value)))
+                    for key, value in snapshot.items()
+                })
             except (ArithmeticError, TypeError, ValueError):
                 self.trip("invalid_persisted_record_configuration")
         return self.current_parameters()
@@ -1399,6 +1436,8 @@ class LiveEngine:
         })
         parameters = self.current_parameters()
         quantity, capped = prescribed_quantity(parameters, self.state.get("sizing"))
+        base_before = sizing_state(parameters, self.state.get("sizing")).base_share_count
+        effective_cap = parameters.effective_max_position(base_before)
         record = {
             "ticker": ticker,
             "market_open_epoch": market["open_epoch"], "market_close_epoch": market["close_epoch"],
@@ -1408,9 +1447,11 @@ class LiveEngine:
             "signal_mode": self.config["signal_mode"], "prior_signal_side": prior_side,
             "directional_transition": directional_transition,
             "signal_timestamp": utc_now(), "intended_quantity": format(quantity, "f"),
-            "quantity_capped": capped, "base_before": format(sizing_state(parameters, self.state.get("sizing")).base_share_count, "f"),
-            "position_cap_mode": "fixed",
-            "effective_position_cap": format(parameters.max_position, "f"),
+            "quantity_capped": capped, "base_before": format(base_before, "f"),
+            "position_cap_mode": (
+                "permanent_base_linked" if parameters.max_position_per_base_share is not None else "fixed"
+            ),
+            "effective_position_cap": format(effective_cap, "f"),
             "recovery_exponent_before": sizing_state(parameters, self.state.get("sizing")).recovery_exponent,
             "recovery_cycle_pnl_before": str(self.state.get("sizing", {}).get("recovery_cycle_pnl", "0")),
             "status": "SIGNAL_PENDING", "entry_orders": [], "exit_orders": [], "actual_quantity": "0.00",
@@ -4858,7 +4899,9 @@ class LiveEngine:
         for order in orders:
             record = {
                 "order_id": str(field(order, "order_id") or ""),
+                "ticker": str(field(order, "ticker") or ""),
                 "remaining_count": field(order, "remaining_count", "remaining_count_fp", "count") or "0",
+                "routing_exchange_index": field(order, "exchange_index"),
             }
             if not record["order_id"]:
                 continue
@@ -5339,6 +5382,260 @@ class LiveEngine:
         self.note_entry_execution_summary(record, "exchange_order_refresh")
         return total
 
+    @staticmethod
+    async def portfolio_pages(
+        rest: KalshiREST, path: str, key: str, params: dict[str, Any],
+    ) -> list[Any]:
+        """Read a complete bounded portfolio result set for exact reconciliation."""
+
+        rows: list[Any] = []
+        cursor: str | None = None
+        seen: set[str] = set()
+        for _ in range(20):
+            request = dict(params, limit=1000)
+            if cursor:
+                request["cursor"] = cursor
+            payload = await rest.get_raw_json(path, request)
+            page = payload.get(key, []) if isinstance(payload, dict) else []
+            if not isinstance(page, list):
+                raise RuntimeError("unexpected reconciliation page")
+            rows.extend(page)
+            next_cursor = str(payload.get("cursor") or "") if isinstance(payload, dict) else ""
+            if not next_cursor:
+                return rows
+            if next_cursor in seen:
+                raise RuntimeError("repeated reconciliation cursor")
+            seen.add(next_cursor)
+            cursor = next_cursor
+        raise RuntimeError("reconciliation pagination exceeded bound")
+
+    async def reconcile_failed_entry_cancellation(
+        self, rest: KalshiREST, record: dict[str, Any], order: dict[str, Any],
+    ) -> bool:
+        """Prove a failed-cancel entry can no longer create more exposure.
+
+        A Cancel V2 404 is not itself permission to sell: the order may have
+        completed during the cancel race.  Kalshi guarantees every resting
+        order remains visible through ``GET /portfolio/orders``.  Therefore a
+        complete ticker-scoped read, exact fill read, and authoritative
+        position read can distinguish a still-resting order from a terminal
+        one while also capturing any fill that raced the cancel request.
+        """
+
+        if self.dry_run or not hasattr(rest, "get_raw_json"):
+            return False
+        ticker = str(record.get("ticker") or "")
+        order_id = str(order.get("order_id") or "")
+        client_id = str(order.get("client_order_id") or "")
+        if not ticker or (not order_id and not client_id):
+            return False
+
+        try:
+            order_rows, fill_rows, position = await asyncio.gather(
+                self.portfolio_pages(rest, "/portfolio/orders", "orders", {"ticker": ticker}),
+                self.portfolio_pages(
+                    rest,
+                    "/portfolio/fills", "fills",
+                    {"ticker": ticker, **({"order_id": order_id} if order_id else {})},
+                ),
+                rest.position_for_ticker(ticker),
+            )
+        except Exception as exc:
+            order["cancel_reconciliation"] = {
+                "at": utc_now(), "status": "READ_UNAVAILABLE", "error_type": type(exc).__name__,
+            }
+            return False
+        if position is None:
+            order["cancel_reconciliation"] = {"at": utc_now(), "status": "POSITION_UNKNOWN"}
+            return False
+
+        exact_orders = [
+            item for item in order_rows
+            if str(field(item, "ticker") or "") == ticker
+            and (
+                (order_id and str(field(item, "order_id") or "") == order_id)
+                or (client_id and str(field(item, "client_order_id") or "") == client_id)
+            )
+        ]
+        if len({str(field(item, "order_id") or "") for item in exact_orders}) > 1:
+            self.trip("entry_cancel_reconciliation_multiple_orders")
+            return False
+
+        exchange_order = exact_orders[0] if exact_orders else None
+        if exchange_order is not None:
+            exchange_remaining = order_remaining_count(exchange_order)
+            exchange_status = normalized_order_status(field(exchange_order, "status"))
+            if exchange_status == "resting" and (exchange_remaining is None or exchange_remaining > 0):
+                order["cancel_reconciliation"] = {
+                    "at": utc_now(), "status": "STILL_RESTING",
+                    "remaining_count": None if exchange_remaining is None else format(Decimal(str(exchange_remaining)), "f"),
+                }
+                return False
+            if exchange_remaining is None and exchange_status not in {"canceled", "cancelled", "executed", "filled"}:
+                order["cancel_reconciliation"] = {
+                    "at": utc_now(), "status": "ORDER_TERMINALITY_UNKNOWN",
+                    "exchange_status": exchange_status,
+                }
+                return False
+            exchange_fill = Decimal(str(order_fill_count(exchange_order)))
+            order.update({
+                "fill_count": format(max(Decimal(str(order.get("fill_count") or "0")), exchange_fill), "f"),
+                "average_fill_price": format(Decimal(str(order_average_position_price(
+                    exchange_order, str(record.get("signal_side")),
+                    float(order.get("position_price") or self.config["entry_price"]),
+                ))), "f"),
+                "fees_paid": format(max(
+                    Decimal(str(order.get("fees_paid") or "0")), Decimal(str(order_fee_total(exchange_order))),
+                ), "f"),
+                "exchange_terminal_status": exchange_status,
+            })
+
+        exact_fills = [
+            item for item in fill_rows
+            if str(field(item, "ticker", "market_ticker") or "") == ticker
+            and (
+                (order_id and str(field(item, "order_id") or "") == order_id)
+                or (client_id and str(field(item, "client_order_id") or "") == client_id)
+            )
+        ]
+        signed_position = Decimal(str(position))
+        side = str(record.get("signal_side") or "")
+        if (side == "yes" and signed_position < 0) or (side == "no" and signed_position > 0):
+            self.trip("entry_cancel_reconciliation_position_direction_mismatch")
+            return False
+
+        self.reconstruct_entry_accounting_from_fills(record, exact_fills, abs(signed_position))
+        accounted = sum(
+            (Decimal(str(item.get("fill_count") or "0")) for item in record.get("entry_orders", [])),
+            Decimal("0"),
+        )
+        actual = max(Decimal(str(record.get("actual_quantity") or "0")), accounted, abs(signed_position))
+        record["actual_quantity"] = format(actual, "f")
+        record["authoritative_open_quantity"] = format(abs(signed_position), "f")
+        self.state["current_position"] = format(abs(signed_position), "f")
+        order.update({
+            "remaining_count": "0", "status": "cancel_reconciled_not_resting",
+            "canceled_at": utc_now(), "cancel_reconciled_after_failure": True,
+            "cancel_reconciliation": {
+                "at": utc_now(), "status": "CONFIRMED_NOT_RESTING",
+                "exchange_order_found": exchange_order is not None,
+                "exact_fill_records": len(exact_fills),
+                "authoritative_position": format(signed_position, "f"),
+                "accounted_entry_quantity": format(accounted, "f"),
+            },
+        })
+        self.audit(
+            "entry_cancel_reconciled", ticker=ticker, order_id=order_id,
+            exchange_order_found=exchange_order is not None, exact_fill_records=len(exact_fills),
+            authoritative_position=format(signed_position, "f"),
+            accounted_entry_quantity=format(accounted, "f"),
+        )
+        LOG.warning(
+            "ENTRY CANCEL RECONCILED | ticker=%s order_id=%s not_resting=true "
+            "exchange_order_found=%s fills=%d position=%s accounted=%s next=risk_management",
+            ticker, order_id, exchange_order is not None, len(exact_fills),
+            format(signed_position, "f"), format(accounted, "f"),
+        )
+        return True
+
+    async def reconcile_failed_maker_exit_cancellation(
+        self, rest: KalshiREST, record: dict[str, Any], order: dict[str, Any],
+    ) -> bool:
+        """Resolve a maker-exit cancel race before sending a residual IOC.
+
+        A failed DELETE can mean the maker exit filled or became terminal just
+        before the request reached the matching engine.  A complete current
+        order read proves whether it can still sell, while exact fills and the
+        authoritative position determine the only safe IOC residual.
+        """
+
+        if self.dry_run or not hasattr(rest, "get_raw_json"):
+            return False
+        ticker = str(record.get("ticker") or "")
+        order_id = str(order.get("order_id") or "")
+        client_id = str(order.get("client_order_id") or "")
+        if not ticker or (not order_id and not client_id):
+            return False
+        try:
+            order_rows, fill_rows, position = await asyncio.gather(
+                self.portfolio_pages(rest, "/portfolio/orders", "orders", {"ticker": ticker}),
+                self.portfolio_pages(
+                    rest, "/portfolio/fills", "fills",
+                    {"ticker": ticker, **({"order_id": order_id} if order_id else {})},
+                ),
+                rest.position_for_ticker(ticker),
+            )
+        except Exception as exc:
+            order["cancel_reconciliation"] = {
+                "at": utc_now(), "status": "READ_UNAVAILABLE", "error_type": type(exc).__name__,
+            }
+            return False
+        if position is None:
+            order["cancel_reconciliation"] = {"at": utc_now(), "status": "POSITION_UNKNOWN"}
+            return False
+
+        exact_orders = [
+            item for item in order_rows
+            if str(field(item, "ticker") or "") == ticker
+            and (
+                (order_id and str(field(item, "order_id") or "") == order_id)
+                or (client_id and str(field(item, "client_order_id") or "") == client_id)
+            )
+        ]
+        if len({str(field(item, "order_id") or "") for item in exact_orders}) > 1:
+            self.trip("maker_exit_cancel_reconciliation_multiple_orders")
+            return False
+        exchange_order = exact_orders[0] if exact_orders else None
+        if exchange_order is not None:
+            exchange_remaining = order_remaining_count(exchange_order)
+            exchange_status = normalized_order_status(field(exchange_order, "status"))
+            if exchange_status == "resting" and (exchange_remaining is None or exchange_remaining > 0):
+                order["cancel_reconciliation"] = {
+                    "at": utc_now(), "status": "STILL_RESTING",
+                    "remaining_count": (
+                        None if exchange_remaining is None
+                        else format(Decimal(str(exchange_remaining)), "f")
+                    ),
+                }
+                return False
+            if exchange_remaining is None and exchange_status not in {
+                "canceled", "cancelled", "executed", "filled",
+            }:
+                order["cancel_reconciliation"] = {
+                    "at": utc_now(), "status": "ORDER_TERMINALITY_UNKNOWN",
+                    "exchange_status": exchange_status,
+                }
+                return False
+
+        side = str(record.get("signal_side") or "")
+        signed_position = Decimal(str(position))
+        if (side == "yes" and signed_position < 0) or (side == "no" and signed_position > 0):
+            self.trip("maker_exit_cancel_reconciliation_position_direction_mismatch")
+            return False
+        self.reconstruct_exit_accounting_from_fills(record, fill_rows)
+        order.update({
+            "remaining_count": "0", "status": "cancel_reconciled_not_resting",
+            "canceled_at": utc_now(), "cancel_reconciled_after_failure": True,
+            "cancel_reconciliation": {
+                "at": utc_now(), "status": "CONFIRMED_NOT_RESTING",
+                "exchange_order_found": exchange_order is not None,
+                "authoritative_position": format(signed_position, "f"),
+            },
+        })
+        record["authoritative_open_quantity"] = format(abs(signed_position), "f")
+        self.state["current_position"] = format(abs(signed_position), "f")
+        self.audit(
+            "maker_exit_cancel_reconciled", ticker=ticker, order_id=order_id,
+            exchange_order_found=exchange_order is not None,
+            authoritative_position=format(signed_position, "f"),
+        )
+        LOG.warning(
+            "MAKER EXIT CANCEL RECONCILED | ticker=%s order_id=%s not_resting=true "
+            "position=%s next=residual_hard_stop",
+            ticker, order_id, format(signed_position, "f"),
+        )
+        return True
+
     async def cancel_entry_orders_and_confirm(
         self, rest: KalshiREST, record: dict[str, Any], *, next_action: str, executable_bid: Decimal | None = None,
     ) -> bool:
@@ -5379,6 +5676,8 @@ class LiveEngine:
             except Exception as exc:  # Defensive: adapters must never turn an exception into permission to replace.
                 order["cancel_error"] = type(exc).__name__
                 acknowledged = False
+            if not acknowledged and not self.dry_run:
+                acknowledged = await self.reconcile_failed_entry_cancellation(rest, record, order)
             confirmed = bool(acknowledged) or Decimal(str(order.get("remaining_count") or "0")) <= 0
             if not confirmed:
                 unconfirmed.append({
@@ -5391,15 +5690,18 @@ class LiveEngine:
             record["entry_cancellation_confirmed_at"] = utc_now()
             return True
 
+        first_unconfirmed = record.get("status") != "ENTRY_CANCEL_UNCONFIRMED"
         record["entry_cancel_pending"] = {
             "at": utc_now(), "next_action": next_action, "orders": unconfirmed,
             "executable_bid": None if executable_bid is None else format(executable_bid, "f"),
         }
         self.trip("entry_cancellation_unconfirmed")
         self.transition(record, "ENTRY_CANCEL_UNCONFIRMED", "entry_cancellation_unconfirmed")
-        self.audit(
-            "entry_cancellation_unconfirmed", ticker=record["ticker"], next_action=next_action, orders=unconfirmed,
-        )
+        if first_unconfirmed:
+            self.audit(
+                "entry_cancellation_unconfirmed", ticker=record["ticker"],
+                next_action=next_action, orders=unconfirmed,
+            )
         return False
 
     async def resume_unconfirmed_entry_cancellation(
@@ -5429,17 +5731,20 @@ class LiveEngine:
         if action == "stop":
             if filled > 0:
                 self.finish_entry_attempt(record, filled, "entry_cancel_confirmed_before_hybrid_stop")
+                self.clear_resolved_entry_interlock(record, "entry_cancel_confirmed_before_hybrid_stop")
                 # Re-evaluate fresh executable pricing, never the stale bid
                 # saved before the failed cancellation. Hard-stop latch stays.
                 await self.manage_stop(rest, feed, record)
             else:
                 self.finish_entry_attempt(record, filled, "entry_cancel_confirmed_before_stop")
+                self.clear_resolved_entry_interlock(record, "entry_cancel_confirmed_before_stop")
             return True
 
         # An uncertain cancellation is never followed by an IOC replacement.
         # Once it is resolved we either manage the confirmed position or count
         # a strict zero fill, preserving the recovery state in the latter case.
         self.finish_entry_attempt(record, filled, "entry_cancel_confirmed_without_replacement")
+        self.clear_resolved_entry_interlock(record, "entry_cancel_confirmed_without_replacement")
         return True
 
     def refresh_shadow_entry(self, feed: KalshiLiveFeed, record: dict[str, Any]) -> Decimal:
@@ -5871,7 +6176,8 @@ class LiveEngine:
         # Revalidate against the signal's frozen fixed cap, not a later
         # base, recovery exponent or requested configuration. Existing
         # position/order guards below still prohibit additive/duplicate risk.
-        cap = self.record_parameters(record).max_position
+        record_parameters = self.record_parameters(record)
+        cap = record_parameters.effective_max_position(record.get("base_before"))
         if self.state["circuit_breaker"].get("blocked"):
             self.transition(record, "ERROR_RECONCILIATION", "invalid_prescribed_entry_configuration")
             return
@@ -6183,6 +6489,17 @@ class LiveEngine:
     ) -> None:
         if self.hybrid_maker_exit_order(record) is not None:
             return
+        # Latch the protective-exit obligation before attempting to cancel a
+        # still-resting entry.  A cancel timeout/404 must not erase the fact
+        # that the executable bid crossed the trigger, and a later price
+        # rebound or process restart must not return this exposure to a normal
+        # hold-to-settlement path.
+        hybrid = record.setdefault("hybrid_stop", {})
+        hybrid["stop_exit_latched"] = True
+        trigger = cents_price(int(hybrid["trigger_cents"]))
+        self.note_stop_trigger(
+            record, executable_bid, trigger, self.local_remaining_position(record), shadow=self.dry_run,
+        )
         if not entries_confirmed and not await self.cancel_entry_orders_and_confirm(
             rest, record, next_action="stop", executable_bid=executable_bid,
         ):
@@ -6206,7 +6523,6 @@ class LiveEngine:
             self.note_entry_execution_summary(record, "stop_entry_cancel_position_reconciliation")
         if quantity <= 0:
             return
-        trigger = cents_price(int(record["hybrid_stop"]["trigger_cents"]))
         maker_price = cents_price(int(record["hybrid_stop"]["maker_exit_cents"]))
         self.note_stop_trigger(record, executable_bid, trigger, quantity, shadow=self.dry_run)
         client_id = deterministic_client_order_id(record["ticker"], side, "hybrid-maker-exit", self.config)
@@ -6307,6 +6623,8 @@ class LiveEngine:
             # history view before calculating the residual hard-stop size.
             if await rest.refresh_exit_order(order) is False:
                 acknowledged = False
+        if not acknowledged:
+            acknowledged = await self.reconcile_failed_maker_exit_cancellation(rest, record, order)
         if not acknowledged or Decimal(str(order.get("remaining_count") or "0")) > 0:
             record["hybrid_stop"]["state"] = "MAKER_EXIT_CANCEL_UNCONFIRMED"
             self.trip("hybrid_maker_exit_cancellation_unconfirmed")
@@ -6317,7 +6635,9 @@ class LiveEngine:
     async def submit_hybrid_hard_stop(
         self, rest: KalshiREST, feed: KalshiLiveFeed, record: dict[str, Any], executable_bid: Decimal,
     ) -> None:
-        record.setdefault("hybrid_stop", {})["hard_stop_latched"] = True
+        hybrid = record.setdefault("hybrid_stop", {})
+        hybrid["stop_exit_latched"] = True
+        hybrid["hard_stop_latched"] = True
         if not await self.cancel_hybrid_maker_exit_and_confirm(rest, record):
             return
         prior_hard_orders = [order for order in record.get("exit_orders", []) if order.get("exit_phase") == "hard_stop"]
@@ -6325,11 +6645,24 @@ class LiveEngine:
             for previous in prior_hard_orders:
                 if previous.get("submission_outcome") in {"rejected", "not_submitted"}:
                     continue
+                accepted_ioc = (
+                    previous.get("submission_outcome") == "accepted"
+                    and previous.get("order_id")
+                    and previous.get("time_in_force", "immediate_or_cancel") == "immediate_or_cancel"
+                )
+                if accepted_ioc:
+                    # An acknowledged IOC can never remain on the book.  A
+                    # positive V2 ``remaining_count`` is the unfilled portion
+                    # canceled by that IOC, not a resting order. Refresh is
+                    # best-effort; the authoritative position below determines
+                    # the next exact residual and reduce_only prevents a flip.
+                    await rest.refresh_exit_order(previous)
+                    continue
                 if not previous.get("order_id") or previous.get("status") in {"submitting", "submit_failed", "paused"}:
                     confirmed = await rest.recover_exit_submission(previous)
                 else:
                     confirmed = await rest.refresh_exit_order(previous)
-                if confirmed is False or Decimal(str(previous.get("remaining_count") or "0")) > 0:
+                if confirmed is False:
                     self.trip("hard_stop_previous_submission_unresolved")
                     self.checkpoint("hard_stop_previous_submission_unresolved")
                     return
@@ -6487,7 +6820,9 @@ class LiveEngine:
             "realized_net_pnl": format(net, "f"), "realized_method": method, "completed_at": utc_now(),
             "recovery_cycle_pnl_after": after["recovery_cycle_pnl"], "recovery_exponent_after": after["recovery_exponent"],
             "base_after": after["base_share_count"], "next_base_threshold_after": after["next_base_threshold"],
-            "effective_position_cap_after": format(self.current_parameters().max_position, "f"),
+            "effective_position_cap_after": format(
+                self.current_parameters().effective_max_position(after["base_share_count"]), "f"
+            ),
         })
         self.realized_performance_metrics()
         self.transition(record, "CLOSED", method)
@@ -6541,6 +6876,7 @@ class LiveEngine:
         maker_order = self.hybrid_maker_exit_order(record)
         if status in {"ENTRY_PARTIAL", "POSITION_OPEN"}:
             if bid is not None and (bid <= hard or record.get("hybrid_stop", {}).get("hard_stop_latched")):
+                record["hybrid_stop"]["stop_exit_latched"] = True
                 record["hybrid_stop"]["hard_stop_latched"] = True
                 self.note_stop_trigger(record, bid, trigger, self.local_remaining_position(record), shadow=self.dry_run)
                 if not await self.cancel_entry_orders_and_confirm(rest, record, next_action="stop", executable_bid=bid):
@@ -6548,7 +6884,9 @@ class LiveEngine:
                 if not self.dry_run:
                     await self.refresh_entry(rest, record)
                 await self.submit_hybrid_hard_stop(rest, feed, record, bid)
-            elif bid is not None and bid <= trigger:
+            elif bid is not None and (
+                bid <= trigger or record.get("hybrid_stop", {}).get("stop_exit_latched")
+            ):
                 await self.start_hybrid_maker_exit(rest, feed, record, bid)
             return
         if maker_order is not None:
@@ -6920,6 +7258,53 @@ class LiveEngine:
             result["average_realized_stopped_pnl"],
         )
 
+    def protective_exit_health(self) -> dict[str, Any]:
+        """Summarize durable hard-stop outcomes without hiding settlement leaks."""
+
+        rows = [record for record in self.state.get("markets", {}).values() if isinstance(record, dict)]
+        protective_latched = [
+            record for record in rows
+            if (
+                record.get("hybrid_stop", {}).get("stop_exit_latched")
+                or record.get("hybrid_stop", {}).get("hard_stop_latched")
+            )
+        ]
+        latched = [record for record in rows if record.get("hybrid_stop", {}).get("hard_stop_latched")]
+        settled_after_latch = [
+            record for record in protective_latched if record.get("realized_method") == "settlement"
+        ]
+        pending = [
+            record for record in protective_latched
+            if record.get("status") in {
+                "ENTRY_CANCEL_UNCONFIRMED", "MAKER_EXIT_CANCEL_UNCONFIRMED", "HARD_STOP_PENDING",
+                "POSITION_OPEN", "ENTRY_PARTIAL", "SETTLEMENT_PENDING",
+            }
+        ]
+        result = {
+            "protective_exit_latched": len(protective_latched),
+            "hard_stop_latched": len(latched),
+            "closed_by_stop": sum(
+                record.get("realized_method") == "stop" for record in protective_latched
+            ),
+            "pending_flatten": len(pending),
+            "settled_after_protective_exit_latch": len(settled_after_latch),
+            # Retain the prior key for backward-compatible checkpoint readers.
+            "settled_after_hard_stop_latch": sum(
+                record.get("realized_method") == "settlement" for record in latched
+            ),
+            "entry_cancel_races_reconciled": sum(
+                any(bool(order.get("cancel_reconciled_after_failure")) for order in record.get("entry_orders", []))
+                for record in rows
+            ),
+            "maker_cancel_races_reconciled": sum(
+                any(bool(order.get("cancel_reconciled_after_failure")) for order in record.get("exit_orders", []))
+                for record in rows
+            ),
+            "updated_at": utc_now(),
+        }
+        self.state["protective_exit_health"] = result
+        return result
+
     def fee_metrics(self) -> dict[str, str]:
         entry_fees = exit_fees = Decimal("0")
         for record in self.state.get("markets", {}).values():
@@ -7011,6 +7396,12 @@ class LiveEngine:
             "realized_win_rate": None if realized_rate is None else format(realized_rate, "f"),
             "average_net_win_per_share": None if average_win is None else format(average_win, "f"),
             "average_net_loss_per_share": None if average_loss is None else format(average_loss, "f"),
+            "average_actual_gain_cents_per_share": (
+                None if average_win is None else format(average_win * Decimal("100"), "f")
+            ),
+            "average_actual_loss_cents_per_share": (
+                None if average_loss is None else format(average_loss * Decimal("100"), "f")
+            ),
             "fee_adjusted_break_even_win_rate": None if break_even is None else format(break_even, "f"),
             "win_rate_edge": (
                 None if realized_rate is None or break_even is None else format(realized_rate - break_even, "f")
@@ -7092,6 +7483,48 @@ class LiveEngine:
             return
         if now < float(record["market_close_epoch"]):
             return
+        # A latched protective exit must remain an exit-management incident until
+        # Kalshi reports the position flat.  Do not silently relabel known
+        # unflattened exposure as an ordinary hold-to-settlement trade.
+        if (
+            not self.dry_run
+            and (
+                record.get("hybrid_stop", {}).get("stop_exit_latched")
+                or record.get("hybrid_stop", {}).get("hard_stop_latched")
+            )
+            and self.local_remaining_position(record) > 0
+        ):
+            authoritative = await rest.position_for_ticker(record["ticker"])
+            if authoritative is None:
+                self.trip("hard_stop_close_position_reconciliation_failed")
+                return
+            if abs(Decimal(str(authoritative))) > 0:
+                incident = record.setdefault("hard_stop_exit_deadline_incident", {})
+                first = not incident
+                incident.update({
+                    "first_detected_at": incident.get("first_detected_at") or utc_now(),
+                    "last_detected_at": utc_now(),
+                    "authoritative_position": format(abs(Decimal(str(authoritative))), "f"),
+                    "market_close_epoch": record["market_close_epoch"],
+                    "status": "UNFLATTENED_AFTER_MARKET_CLOSE",
+                })
+                self.trip("hard_stop_unflattened_at_market_close")
+                if first:
+                    self.audit(
+                        "hard_stop_unflattened_at_market_close", ticker=record["ticker"],
+                        authoritative_position=incident["authoritative_position"],
+                    )
+                LOG.critical(
+                    "PROTECTIVE EXIT INCIDENT | ticker=%s stop_exit_latched=true hard_stop_latched=%s "
+                    "position=%s market_closed=true action=continue_authoritative_reconciliation",
+                    record["ticker"], bool(record.get("hybrid_stop", {}).get("hard_stop_latched")),
+                    incident["authoritative_position"],
+                )
+                return
+            record.setdefault("hard_stop_exit_deadline_incident", {}).update({
+                "flattened_or_settled_at": utc_now(), "authoritative_position": "0",
+            })
+            self.clear_resolved_entry_interlock(record, "hard_stop_position_now_flat")
         status = str(record.get("status") or "")
         if status in {"SIGNAL_PENDING", "ENTRY_PENDING", "ENTRY_PARTIAL", "ENTRY_CANCEL_UNCONFIRMED"}:
             if not await self.cancel_entry_orders_and_confirm(rest, record, next_action="finish_entry"):
@@ -7123,6 +7556,19 @@ class LiveEngine:
         net = payout + proceeds - exit_fees - self.entry_cost(record)
         maker_filled = Decimal(str((maker_exit or {}).get("fill_count") or "0"))
         classification = "SETTLEMENT_WIN" if outcome == record.get("signal_side") else "SETTLEMENT_LOSS"
+        if (
+            record.get("hybrid_stop", {}).get("stop_exit_latched")
+            or record.get("hybrid_stop", {}).get("hard_stop_latched")
+        ):
+            prefix = (
+                "HARD_STOP_EXIT_FAILURE_"
+                if record.get("hybrid_stop", {}).get("hard_stop_latched")
+                else "PROTECTIVE_EXIT_FAILURE_"
+            )
+            classification = prefix + classification
+            record["protective_exit_failed_before_settlement"] = True
+            if record.get("hybrid_stop", {}).get("hard_stop_latched"):
+                record["hard_stop_exit_failed_before_settlement"] = True
         if maker_filled > 0:
             classification = "MAKER_EXIT_PARTIAL_THEN_" + classification
         record["exit_classification"] = classification
@@ -7421,6 +7867,7 @@ class LiveEngine:
                 eligibility = self.entry_price_performance()["initial_stop_eligibility"]
                 delayed_metrics = self.delayed_entry_performance()
                 health = self.entry_submission_health()
+                exit_health = self.protective_exit_health()
                 performance = self.realized_performance_metrics()
                 account = await self.refresh_live_account_status(
                     rest, active["ticker"] if active else None,
@@ -7463,7 +7910,8 @@ class LiveEngine:
                     "DRY_RUN" if self.dry_run else "LIVE",
                     active and active["ticker"], record.get("status"), record.get("signal_side"),
                     sizing.base_share_count, sizing.recovery_exponent, sizing.prescribed_quantity(),
-                    self.current_parameters().max_position, sizing.recovery_cycle_pnl,
+                    self.current_parameters().effective_max_position(sizing.base_share_count),
+                    sizing.recovery_cycle_pnl,
                     sizing.next_base_threshold, self.state.get("active_market"), gtc_market_close_in,
                 )
                 LOG.warning(
@@ -7489,14 +7937,15 @@ class LiveEngine:
                     stats = performance[window_name]
                     LOG.warning(
                         "LIVE PERFORMANCE | window=%s completed=%s realized_wl=%s/%s flat=%s "
-                        "win_rate=%s break_even=%s edge=%s avg_entry=%s avg_win_per_share=%s "
-                        "avg_loss_per_share=%s directional_wl=%s/%s directional_wr=%s net=$%s fees=$%s",
+                        "win_rate=%s break_even=%s edge=%s avg_entry=%s avg_gain_cents=%s "
+                        "avg_loss_cents=%s directional_wl=%s/%s directional_wr=%s net=$%s fees=$%s",
                         window_name, stats["completed_trades"], stats["realized_wins"],
                         stats["realized_losses"], stats["realized_flat"],
                         percentage(stats["realized_win_rate"]),
                         percentage(stats["fee_adjusted_break_even_win_rate"]),
                         percentage(stats["win_rate_edge"]), stats["quantity_weighted_average_entry"],
-                        stats["average_net_win_per_share"], stats["average_net_loss_per_share"],
+                        stats["average_actual_gain_cents_per_share"],
+                        stats["average_actual_loss_cents_per_share"],
                         stats["directional_wins"], stats["directional_losses"],
                         percentage(stats["directional_win_rate"]), stats["total_realized_net_pnl"],
                         stats["total_fees_paid"],
@@ -7509,6 +7958,18 @@ class LiveEngine:
                     hybrid.get("state"), record.get("exit_classification"),
                     record.get("actual_quantity"), hybrid.get("maker_filled_quantity"),
                     hybrid.get("hard_filled_quantity"), stop_latency.get("median_seconds"),
+                )
+                LOG.warning(
+                    "PROTECTIVE EXIT HEALTH | protective_latched=%s hard_latched=%s "
+                    "closed_by_stop=%s pending_flatten=%s settled_after_protective_latch=%s "
+                    "settled_after_hard_latch=%s entry_cancel_races_reconciled=%s "
+                    "maker_cancel_races_reconciled=%s",
+                    exit_health["protective_exit_latched"], exit_health["hard_stop_latched"],
+                    exit_health["closed_by_stop"], exit_health["pending_flatten"],
+                    exit_health["settled_after_protective_exit_latch"],
+                    exit_health["settled_after_hard_stop_latch"],
+                    exit_health["entry_cancel_races_reconciled"],
+                    exit_health["maker_cancel_races_reconciled"],
                 )
                 LOG.warning(
                     "RESEARCH COHORT | delayed53_resolved=%s directional_wl=%s/%s wr=%s "
@@ -7570,7 +8031,9 @@ def parser() -> argparse.ArgumentParser:
         "--shadow-profile", choices=sorted(SHADOW_STOP_PROFILE_PRICES),
         help="isolated dry-run stop/profile identity; must agree with --stop-price",
     )
-    for name in sorted(DECIMAL_CONFIG_FIELDS | INTEGER_CONFIG_FIELDS | FLOAT_CONFIG_FIELDS):
+    for name in sorted(
+        DECIMAL_CONFIG_FIELDS | OPTIONAL_DECIMAL_CONFIG_FIELDS | INTEGER_CONFIG_FIELDS | FLOAT_CONFIG_FIELDS
+    ):
         result.add_argument("--" + name.replace("_", "-"), dest=name)
     result.add_argument("--allow-capital-downsize", action=argparse.BooleanOptionalAction, default=None)
     result.add_argument("--hybrid-stop-enabled", action=argparse.BooleanOptionalAction, default=None)
@@ -7634,11 +8097,13 @@ async def async_main(args: argparse.Namespace) -> int:
         save_config(args.config, config)
         LOG.warning(
             "CONFIG SAVED LOCALLY | initial_shares=%s recovery_multiplier=%s threshold_growth_multiplier=%s "
-            "fixed_share_cap=%s first_profit_threshold=%s shares_added=%s hard_stop_cents=%s "
+            "initial_or_fixed_share_cap=%s cap_per_base_share=%s first_profit_threshold=%s "
+            "shares_added=%s hard_stop_cents=%s "
             "mode=%s hash=%s | blank_inputs=preserve_restored_values remote_persistence=requires_successful_checkpoint "
             "existing_base_and_recovery=preserved",
             config["starting_base"], config["recovery_multiplier"], config["threshold_growth_multiplier"],
-            config["max_position"], config["first_base_threshold"], config["base_increment"],
+            config["max_position"], config.get("max_position_per_base_share"),
+            config["first_base_threshold"], config["base_increment"],
             config["hybrid_hard_stop_cents"], expected_mode, config_hash(config)[:12],
         )
     migrations = state.get("config_migrations", [])

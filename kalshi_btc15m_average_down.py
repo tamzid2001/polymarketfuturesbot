@@ -1902,21 +1902,7 @@ class KalshiREST:
         read-only preflight: missing metadata/balances fail closed, and this
         adapter never moves money between exchanges or provisions accounts.
         """
-        payload = await self.get_raw_json(f"/markets/{ticker}")
-        market = payload.get("market", {})
-        if not isinstance(market, dict) or market.get("ticker") != ticker:
-            raise ValueError("Entry funding market metadata mismatch")
-        exchange_index = market.get("exchange_index")
-        if type(exchange_index) is not int or exchange_index < 0:
-            raise ValueError("Entry funding requires an authoritative exchange index")
-        # Kalshi documents that an existing market does not migrate shards.
-        # Only exchange metadata populates this cache; never infer from ticker
-        # spelling, account balance, or a caller's default exchange setting.
-        indexes = getattr(self, "_market_exchange_indexes", {})
-        if len(indexes) >= 256 and ticker not in indexes:
-            indexes.pop(next(iter(indexes)))
-        indexes[ticker] = exchange_index
-        self._market_exchange_indexes = indexes
+        exchange_index = await self.market_exchange_index(ticker)
         payload = await self.get_raw_json("/portfolio/balance", {"exchange_index": exchange_index})
         dollars = payload.get("balance_dollars")
         cents = payload.get("balance")
@@ -1926,6 +1912,26 @@ class KalshiREST:
         if not balance.is_finite() or balance < 0:
             raise ValueError("Invalid market exchange balance")
         return exchange_index, balance
+
+    async def market_exchange_index(self, ticker: str) -> int:
+        """Resolve and cache the authoritative shard without moving funds."""
+
+        cached = getattr(self, "_market_exchange_indexes", {}).get(ticker)
+        if type(cached) is int and cached >= 0:
+            return cached
+        payload = await self.get_raw_json(f"/markets/{ticker}")
+        market = payload.get("market", {})
+        if not isinstance(market, dict) or market.get("ticker") != ticker:
+            raise ValueError("Market exchange metadata mismatch")
+        exchange_index = market.get("exchange_index")
+        if type(exchange_index) is not int or exchange_index < 0:
+            raise ValueError("Market requires an authoritative exchange index")
+        indexes = getattr(self, "_market_exchange_indexes", {})
+        if len(indexes) >= 256 and ticker not in indexes:
+            indexes.pop(next(iter(indexes)))
+        indexes[ticker] = exchange_index
+        self._market_exchange_indexes = indexes
+        return exchange_index
 
     def order_exchange_index(self, ticker: str) -> int:
         """Use verified metadata or require ticker-based exchange auto-routing.
@@ -2001,8 +2007,9 @@ class KalshiREST:
             try:
                 if ticker == "?":
                     raise ValueError("Cancellation requires market ticker for exchange routing")
+                exchange_index = await self.market_exchange_index(ticker)
                 await self.orders.cancel_order_v2(
-                    order_id, market_ticker=ticker, exchange_index=self.order_exchange_index(ticker),
+                    order_id, exchange_index=exchange_index,
                 )
                 canceled += 1
                 LOG.warning(
@@ -2578,9 +2585,18 @@ class KalshiREST:
             LOG.error("CANCEL BLOCKED | id=%s reason=missing_market_ticker_for_exchange_routing", order_id)
             return False
         try:
-            record["cancel_routing_exchange_index"] = self.order_exchange_index(ticker)
+            recorded_index = record.get("routing_exchange_index")
+            if type(recorded_index) is int and recorded_index >= 0:
+                exchange_index = recorded_index
+            else:
+                exchange_index = await self.market_exchange_index(ticker)
+            record["cancel_routing_exchange_index"] = exchange_index
+            # The documented Cancel Order V2 query accepts subaccount and
+            # exchange_index.  Supplying the verified shard directly avoids
+            # relying on the SDK-only market_ticker extension during a
+            # latency-sensitive partial-fill cancellation.
             response = await self.orders.cancel_order_v2(
-                order_id, market_ticker=ticker, exchange_index=record["cancel_routing_exchange_index"],
+                order_id, exchange_index=exchange_index,
             )
             canceled = field(response, "order") or response
             if canceled is not None:
@@ -2596,7 +2612,11 @@ class KalshiREST:
             record["status"] = "canceled"
             record["canceled_at"] = now_iso()
             record["remaining_count"] = 0.0
-            LOG.info("CANCELED | %s", order_id)
+            record["cancel_reduced_by"] = field(response, "reduced_by")
+            LOG.info(
+                "CANCELED | %s ticker=%s shard=%s reduced_by=%s",
+                order_id, ticker, exchange_index, record.get("cancel_reduced_by"),
+            )
             return True
         except Exception as exc:  # noqa: BLE001
             # Closed markets reject cancellation after the exchange has already
@@ -2604,7 +2624,12 @@ class KalshiREST:
             # the uncertainty explicit to the caller; it must reconcile before
             # it may place a replacement or an exit.
             record["cancel_error"] = type(exc).__name__
-            LOG.warning("Cancel failed for %s: %s", order_id, type(exc).__name__)
+            record["cancel_http_status"] = getattr(exc, "status", None)
+            LOG.warning(
+                "CANCEL REQUIRES RECONCILIATION | id=%s ticker=%s shard=%s http_status=%s error_type=%s",
+                order_id, ticker, record.get("cancel_routing_exchange_index"),
+                record.get("cancel_http_status"), type(exc).__name__,
+            )
             return False
 
 

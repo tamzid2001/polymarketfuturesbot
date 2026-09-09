@@ -11,9 +11,11 @@ The check never retries creation. It can clear a terminal maker-entry breaker
 only after exact closed-market V2 order/fill/position proof.  That covers both
 an old unknown POST response and a definitive HTTP rejection: neither is
 allowed to become a permanent 24/7 halt after the source market has closed,
-but neither may be discarded without authoritative exchange proof.  Every
-other breaker remains fail-closed. It is deliberately unavailable in shadow
-and reconciliation-only modes.
+but neither may be discarded without authoritative exchange proof.  A
+breaker accompanied by durable managed exposure suppresses this diagnostic
+order and hands control to the risk-recovery worker; every other breaker remains
+fail-closed. It is deliberately unavailable in shadow and reconciliation-only
+modes.
 """
 from __future__ import annotations
 
@@ -45,6 +47,32 @@ DEFAULT_AUDIT = Path("data/kalshi_live_delayed_band_v12_audit.jsonl")
 WORKER_ID = re.compile(r"[A-Za-z0-9_.:-]{1,128}\Z")
 TERMINAL_PASS = "CANCELED_NO_FILL"
 BOUNDARY_WAIT_SECONDS = 90
+RECOVERY_ONLY_BREAKERS = {
+    "entry_cancellation_unconfirmed",
+    "hybrid_maker_exit_cancellation_unconfirmed",
+    "hybrid_maker_exit_submission_unresolved",
+    "hard_stop_previous_submission_unresolved",
+    "hard_stop_unflattened_at_market_close",
+}
+ACTIVE_RISK_STATES = {
+    "ENTRY_PENDING", "ENTRY_PARTIAL", "ENTRY_CANCEL_UNCONFIRMED",
+    "POSITION_OPEN", "MAKER_EXIT_PENDING", "MAKER_EXIT_PARTIAL",
+    "MAKER_EXIT_CANCEL_UNCONFIRMED", "HARD_STOP_PENDING",
+    "SETTLEMENT_PENDING", "ACCOUNTING_RECONCILIATION_PENDING",
+}
+
+
+def state_requires_risk_recovery(value: dict) -> bool:
+    """Return true when a worker, not a diagnostic probe, must own the state."""
+
+    if value.get("current_order_id"):
+        return True
+    if Decimal(str(value.get("current_position") or "0")) != 0:
+        return True
+    return any(
+        isinstance(record, dict) and record.get("status") in ACTIVE_RISK_STATES
+        for record in value.get("markets", {}).values()
+    )
 
 
 def enabled_live_environment() -> bool:
@@ -81,14 +109,19 @@ def load_strategy_safety_state(
         raise SafetyError("Strategy breaker state is unavailable; startup order check blocked")
     recoverable_reasons = {
         "maker_entry_submission_unknown", "maker_entry_submission_rejected",
-    }
+    } | RECOVERY_ONLY_BREAKERS
+    risk_recovery = state_requires_risk_recovery(value)
     if breaker.get("blocked") and not (
         allow_recoverable_entry_breaker
-        and breaker.get("reason") in recoverable_reasons
+        and (breaker.get("reason") in recoverable_reasons or risk_recovery)
     ):
         reason = str(breaker.get("reason") or "unknown")
         raise SafetyError(f"Strategy circuit breaker remains active ({reason}); reconcile it before any probe")
-    if value.get("current_order_id") or Decimal(str(value.get("current_position") or "0")) != 0:
+    recovery_only = bool(breaker.get("blocked") and risk_recovery)
+    if (
+        not recovery_only
+        and (value.get("current_order_id") or Decimal(str(value.get("current_position") or "0")) != 0)
+    ):
         raise SafetyError("Strategy state reports an order or position; startup probe requires no strategy exposure")
     return value
 
@@ -332,6 +365,21 @@ async def run_startup_check(
     state = load_strategy_safety_state(
         args.state_file, args.config, allow_recoverable_entry_breaker=True,
     )
+
+    breaker_reason = str(state.get("circuit_breaker", {}).get("reason") or "")
+    if state.get("circuit_breaker", {}).get("blocked") and state_requires_risk_recovery(state):
+        # The diagnostic 1c order is inappropriate while durable state may
+        # represent real exposure.  Permit the strategy process to start, but
+        # create no probe: its mandatory startup reconciliation adopts the
+        # exchange's order/fill/position truth and manages exits before the
+        # existing breaker can ever allow new exposure.
+        emit(
+            action="STARTUP_ORDER_CHECK_DEFERRED_TO_RISK_RECOVERY",
+            worker_id=args.worker_id, breaker_reason=breaker_reason,
+            orders_sent=0, strategy_entries_allowed=False,
+            recovery_worker_allowed=True,
+        )
+        return
 
     fingerprint = hashlib.sha256(api.key_id.encode()).hexdigest()
     prior = journal.load(KIND)

@@ -363,11 +363,12 @@ class ExchangeShardSafetyTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_cancel_routes_by_ticker_and_missing_ticker_fails_closed(self):
         rest = self.adapter()
+        rest._market_exchange_indexes = {self.ticker: 2}
         record = {"order_id": "mock-only", "ticker": self.ticker, "quantity": 1.0,
                   "fill_count": 0.0, "remaining_count": 1.0}
         self.assertTrue(await rest.cancel_order(record, False))
         rest.orders.cancel_order_v2.assert_awaited_once_with(
-            "mock-only", market_ticker=self.ticker, exchange_index=-1)
+            "mock-only", exchange_index=2)
         rest.orders.cancel_order_v2.reset_mock()
         record.pop("ticker")
         record["remaining_count"] = 1.0
@@ -376,6 +377,7 @@ class ExchangeShardSafetyTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_cancel_failure_never_logs_raw_exception_or_assumes_flat(self):
         rest = self.adapter()
+        rest._market_exchange_indexes = {self.ticker: 2}
         rest.orders.cancel_order_v2.side_effect = RuntimeError("mock-secret-never-log")
         record = {"order_id": "mock-only", "ticker": self.ticker, "remaining_count": 1.0}
         with self.assertLogs(level="WARNING") as logs:

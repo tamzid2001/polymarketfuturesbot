@@ -146,6 +146,10 @@ class StrategyParameters:
     base_increment: Decimal
     starting_base: Decimal = Decimal("1.00")
     max_position: Decimal = DEFAULT_MAX_POSITION
+    # Optional cap schedule expressed as contracts of maximum exposure per
+    # permanent base share.  For example, 100 with base 1.00/2.00 produces an
+    # effective cap of 100.00/200.00.  ``None`` retains the fixed cap.
+    max_position_per_base_share: Decimal | None = None
 
     def __post_init__(self) -> None:
         for name in (
@@ -161,10 +165,37 @@ class StrategyParameters:
             raise ValueError("base_increment must have at most two decimal places")
         if self.max_position <= ZERO or self.max_position != round_shares(self.max_position):
             raise ValueError("max_position must be positive and have at most two decimal places")
+        linked_cap = self.max_position_per_base_share
+        if linked_cap is not None:
+            linked_cap = decimal(linked_cap)
+            object.__setattr__(self, "max_position_per_base_share", linked_cap)
+            if (
+                not linked_cap.is_finite()
+                or linked_cap < Decimal("1.00")
+                or linked_cap != round_shares(linked_cap)
+            ):
+                raise ValueError(
+                    "max_position_per_base_share must be at least 1.00 and have at most two decimal places"
+                )
         if self.starting_base <= ZERO or self.starting_base > self.max_position:
             raise ValueError("starting_base must be positive and no greater than max_position")
+        if self.starting_base > self.effective_max_position(self.starting_base):
+            raise ValueError("starting_base must be no greater than its effective position cap")
 
-    def as_dict(self) -> dict[str, str]:
+    def effective_max_position(self, base_share_count: Decimal | str | None = None) -> Decimal:
+        """Return the deterministic cap for the supplied permanent base.
+
+        The fixed cap remains the compatibility fallback.  A configured
+        per-base-share cap is deliberately independent of the recovery
+        exponent; only realized-profit permanent-base scaling can raise it.
+        """
+
+        if self.max_position_per_base_share is None:
+            return self.max_position
+        base = self.starting_base if base_share_count is None else decimal(base_share_count)
+        return round_shares(base * self.max_position_per_base_share)
+
+    def as_dict(self) -> dict[str, str | None]:
         return {
             "recovery_multiplier": format(self.recovery_multiplier, "f"),
             "first_base_threshold": format(self.first_base_threshold, "f"),
@@ -172,6 +203,11 @@ class StrategyParameters:
             "base_increment": format(self.base_increment, "f"),
             "starting_base": format(self.starting_base, "f"),
             "max_position": format(self.max_position, "f"),
+            "max_position_per_base_share": (
+                None
+                if self.max_position_per_base_share is None
+                else format(self.max_position_per_base_share, "f")
+            ),
         }
 
 
@@ -179,13 +215,18 @@ def sizing_state(parameters: StrategyParameters, snapshot: dict[str, Any] | None
     """Rehydrate the one authoritative sizing state from a JSON-safe snapshot."""
 
     snapshot = snapshot or {}
+    base_share_count = snapshot.get("base_share_count", parameters.starting_base)
     return RecoverySizingState(
         recovery_multiplier=parameters.recovery_multiplier,
         first_base_threshold=parameters.first_base_threshold,
         base_increment=parameters.base_increment,
         threshold_growth_multiplier=parameters.threshold_growth_multiplier,
-        base_share_count=snapshot.get("base_share_count", parameters.starting_base),
-        max_position=parameters.max_position,
+        base_share_count=base_share_count,
+        max_position=parameters.effective_max_position(base_share_count),
+        # ``max_position`` above is already the effective cap for this
+        # snapshot.  Rehydration is intentionally fixed at that value; the
+        # pure transition wrapper rebuilds it after any permanent-base change.
+        max_position_per_base_share=None,
         recovery_cycle_pnl=snapshot.get("recovery_cycle_pnl", ZERO),
         recovery_exponent=int(snapshot.get("recovery_exponent", 0)),
         profit_since_last_base_scale=snapshot.get("profit_since_last_base_scale", ZERO),
