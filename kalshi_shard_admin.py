@@ -4,6 +4,8 @@ This utility has no order endpoint, breaker reset, worker restart, withdrawal,
 or API-key creation capability. Writes require --execute, --workers-paused,
 and an interactive confirmation of the exact operation after fresh preflight.
 Transfers POST once, with an fsynced intent journal and read-only status polling.
+The explicit ``transfer`` command accepts an exact dollar amount and destination
+shard; ``transfer-all`` retains the guarded balance-sweep behavior.
 Keep .kalshi-shard-admin/: losing that journal loses local duplicate protection.
 """
 from __future__ import annotations
@@ -37,6 +39,11 @@ TRANSFERS = "/portfolio/intra_exchange_instance_transfers"
 ALLOCATION = "/portfolio/target_balance_allocation"
 JOURNAL_DIR = Path(".kalshi-shard-admin")
 CENTICENTS = Decimal("10000")
+EXCHANGE_INSTANCE = "event_contract"
+TRANSFER_REQUEST_FIELDS = frozenset({
+    "source", "destination", "amount", "source_exchange_shard",
+    "destination_exchange_shard", "source_subaccount", "destination_subaccount",
+})
 SAFE_CODES = {"user_not_found", "available_balance_too_low", "insufficient_balance",
               "insufficient_funds", "authentication_error", "unauthorized", "forbidden",
               "invalid_parameters", "rate_limit_exceeded"}
@@ -106,6 +113,53 @@ def shard(value: Any) -> int:
     if type(value) is not int or not 0 <= value <= 100:
         raise SafetyError("Invalid exchange index; expected an integer from 0 through 100")
     return value
+
+
+def transfer_request(amount_dollars: Any, source: int, destination: int) -> dict:
+    """Build the exact current V2 event-contract transfer request.
+
+    The POST uses an integer centicent amount. Transfer-history GET responses
+    instead report their ``amount`` as fixed-point dollars, so the two wire
+    representations must not be interchanged.
+    """
+
+    source, destination = shard(source), shard(destination)
+    if source == destination:
+        raise SafetyError("Source and destination exchange shards are identical")
+    amount = centicents(amount_dollars)
+    if amount <= 0:
+        raise SafetyError("Transfer amount must be greater than zero")
+    request = {
+        "source": EXCHANGE_INSTANCE,
+        "destination": EXCHANGE_INSTANCE,
+        "amount": amount,
+        "source_exchange_shard": source,
+        "destination_exchange_shard": destination,
+        "source_subaccount": 0,
+        "destination_subaccount": 0,
+    }
+    validate_transfer_request(request)
+    return request
+
+
+def validate_transfer_request(request: Any) -> None:
+    """Reject drift from Kalshi's authenticated V2 transfer schema."""
+
+    if not isinstance(request, dict) or set(request) != TRANSFER_REQUEST_FIELDS:
+        raise SafetyError("Transfer request does not match the current V2 schema")
+    if request["source"] != EXCHANGE_INSTANCE or request["destination"] != EXCHANGE_INSTANCE:
+        raise SafetyError("This tool permits only event-contract to event-contract transfers")
+    amount = request["amount"]
+    if type(amount) is not int or not 0 < amount <= 2**63 - 1:
+        raise SafetyError("Transfer amount must be a positive int64 number of centicents")
+    shard(request["source_exchange_shard"])
+    shard(request["destination_exchange_shard"])
+    if request["source_exchange_shard"] == request["destination_exchange_shard"]:
+        raise SafetyError("Source and destination exchange shards are identical")
+    if (type(request["source_subaccount"]) is not int or request["source_subaccount"] != 0
+            or type(request["destination_subaccount"]) is not int
+            or request["destination_subaccount"] != 0):
+        raise SafetyError("This tool permits only primary subaccount transfers")
 
 
 def epoch(value: Any) -> float:
@@ -407,10 +461,18 @@ def allocation_map(payload: dict) -> dict[int, int]:
     return result
 
 
-async def inspect_account(api: Api, *, ticker=None, series="KXBTC15M", source=0) -> dict:
+async def inspect_account(api: Api, *, ticker=None, series="KXBTC15M", source=0,
+                          destination_shard=None) -> dict:
     shard(source)
-    market = await market_metadata(api, ticker, series)
-    destination = market["exchange_index"]
+    if destination_shard is None:
+        market = await market_metadata(api, ticker, series)
+        destination = market["exchange_index"]
+        market_ticker = market["ticker"]
+        destination_source = "market_metadata"
+    else:
+        destination = shard(destination_shard)
+        market_ticker = None
+        destination_source = "explicit_argument"
     total = await api.request("GET", "/portfolio/balance")
     total_balance = money(total.get("balance_dollars"))
     breakdown = total.get("balance_breakdown")
@@ -436,8 +498,9 @@ async def inspect_account(api: Api, *, ticker=None, series="KXBTC15M", source=0)
         pass  # A balance read proves authentication, not write permission.
     allocation = allocation_map(await api.request("GET", ALLOCATION))
     return {"api_auth": "PASS", "api_key_write": write_scope, "unrestricted_primary_key": unrestricted,
-            "region_attestation": region, "market_ticker": market["ticker"],
+            "region_attestation": region, "market_ticker": market_ticker,
             "market_exchange_index": destination, "source_exchange_index": source,
+            "destination_source": destination_source,
             "account_exchange_indexes": sorted(indexes | {source, destination}),
             "total_balance": format(total_balance, "f"), "shard_balances": balances,
             "target_allocation": allocation, "bot_breaker": "NOT_MODIFIED_OR_CLEARED",
@@ -626,24 +689,28 @@ async def verify_transfer(api: Api, journal: Journal, operation: dict, *, timeou
         await asyncio.sleep(2)
 
 
-async def transfer_all(api: Api, journal: Journal, *, ticker=None, series="KXBTC15M", source=0,
-                       execute=False, workers_paused=False, answer=None, timeout=120) -> dict:
+async def transfer_funds(api: Api, journal: Journal, *, ticker=None, series="KXBTC15M", source=0,
+                         destination_shard=None, amount_dollars=None, execute=False,
+                         workers_paused=False, answer=None, timeout=120) -> dict:
     previous = journal.load("transfer")
     if previous:
         if previous.get("transfer_id"):
             return await verify_transfer(api, journal, previous, timeout=timeout)
         raise SafetyError("Existing transfer intent has no confirmed ID; use resume-transfer after manual lookup, not another POST")
-    snapshot = await inspect_account(api, ticker=ticker, series=series, source=source)
+    snapshot = await inspect_account(
+        api, ticker=ticker, series=series, source=source,
+        destination_shard=destination_shard,
+    )
     emit(action="READ_ONLY_PREFLIGHT", **snapshot)
     destination = snapshot["market_exchange_index"]
-    if source == destination:
-        raise SafetyError("Source and destination exchange are identical")
-    amount = centicents(snapshot["shard_balances"][source])
-    if amount <= 0:
+    available = money(snapshot["shard_balances"][source])
+    if available <= 0:
         raise SafetyError("Source shard has no available cash to transfer")
-    request = {"source": "event_contract", "destination": "event_contract", "amount": amount,
-               "source_exchange_shard": source, "destination_exchange_shard": destination,
-               "source_subaccount": 0, "destination_subaccount": 0}
+    requested_dollars = available if amount_dollars is None else money(amount_dollars)
+    if requested_dollars > available:
+        raise SafetyError("Requested transfer exceeds the authenticated source-shard balance")
+    request = transfer_request(requested_dollars, source, destination)
+    amount = request["amount"]
     emit(action="TRANSFER_PREVIEW", amount_dollars=str(Decimal(amount) / CENTICENTS), request=request, execute=execute)
     if execute and not workers_paused:
         raise SafetyError("Pause all trading workers/watchdogs yourself, then provide --workers-paused")
@@ -659,12 +726,16 @@ async def transfer_all(api: Api, journal: Journal, *, ticker=None, series="KXBTC
     confirm(phrase, answer)
     # Recheck after the operator has read/typed the confirmation. Do not sweep
     # a newly increased balance or tolerate a decreased balance silently.
-    fresh = await inspect_account(api, ticker=snapshot["market_ticker"], source=source)
+    fresh = await inspect_account(
+        api, ticker=snapshot["market_ticker"], series=series, source=source,
+        destination_shard=(destination if snapshot["destination_source"] == "explicit_argument" else None),
+    )
     if fresh["market_exchange_index"] != destination or fresh["shard_balances"] != snapshot["shard_balances"] or fresh["target_allocation"] != snapshot["target_allocation"]:
         raise SafetyError("Funding/routing changed during confirmation; nothing submitted, rerun preview")
     fresh_assessment = await assert_quiet_account(api, fresh)
     operation = {"schema_version": 1, "kind": "transfer", "status": "SUBMITTING", "created_at": utc_now(),
-                 "market_ticker": snapshot["market_ticker"], "request": request,
+                 "market_ticker": snapshot["market_ticker"],
+                 "destination_source": snapshot["destination_source"], "request": request,
                  "balances_before": snapshot["shard_balances"],
                  "pending_incoming_margin_transfer_ids": fresh_assessment["pending_incoming_margin_transfer_ids"]}
     journal.save(operation)  # Durable BEFORE the only POST; no client idempotency field is documented.
@@ -679,6 +750,17 @@ async def transfer_all(api: Api, journal: Journal, *, ticker=None, series="KXBTC
         journal.save(operation)
         raise SafetyError("Transfer response is unconfirmed. Preserve journal, inspect Kalshi history, and never blindly repeat POST") from None
     return await verify_transfer(api, journal, operation, timeout=timeout)
+
+
+async def transfer_all(api: Api, journal: Journal, *, ticker=None, series="KXBTC15M", source=0,
+                       destination_shard=None, execute=False, workers_paused=False,
+                       answer=None, timeout=120) -> dict:
+    return await transfer_funds(
+        api, journal, ticker=ticker, series=series, source=source,
+        destination_shard=destination_shard, amount_dollars=None,
+        execute=execute, workers_paused=workers_paused, answer=answer,
+        timeout=timeout,
+    )
 
 
 async def allocation_all(api: Api, journal: Journal, *, ticker=None, series="KXBTC15M", source=0,
@@ -730,10 +812,14 @@ async def allocation_all(api: Api, journal: Journal, *, ticker=None, series="KXB
 
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
-    result.add_argument("command", nargs="?", default="status", choices=("status", "auth-check", "transfers", "transfer-all", "resume-transfer", "allocation-all"))
+    result.add_argument("command", nargs="?", default="status", choices=("status", "auth-check", "transfers", "transfer", "transfer-all", "resume-transfer", "allocation-all"))
     result.add_argument("--ticker", help="Optional API-discovered market ticker; otherwise discover the active series market")
     result.add_argument("--series", default="KXBTC15M")
     result.add_argument("--source-shard", type=int, default=0)
+    result.add_argument("--destination-shard", type=int,
+                        help="Explicit destination exchange shard; required by transfer, optional for transfer-all")
+    result.add_argument("--amount-dollars",
+                        help="Exact fixed-point dollar amount; required by transfer and converted to integer centicents")
     result.add_argument("--execute", action="store_true", help="Permit ONLY the selected admin write, after interactive confirmation")
     result.add_argument("--workers-paused", action="store_true", help="Operator attestation: all account workers/watchdogs were paused manually")
     result.add_argument("--transfer-id", help="For read-only recovery of a saved uncertain transfer; must match amount, routing and time")
@@ -747,11 +833,20 @@ async def run(args, api=None, *, root=JOURNAL_DIR) -> None:
         raise SafetyError("--key-file is only for standalone read-only auth-check; it cannot authorize an admin write")
     if args.transfer_id and args.command != "resume-transfer":
         raise SafetyError("--transfer-id is only for read-only resume-transfer; it is not a POST idempotency key")
-    if args.execute and args.command not in {"transfer-all", "allocation-all"}:
+    if args.execute and args.command not in {"transfer", "transfer-all", "allocation-all"}:
         raise SafetyError("This command is read-only and does not accept --execute")
     if not 0 <= args.timeout <= 600:
         raise SafetyError("Timeout must be between 0 and 600 seconds")
     shard(args.source_shard)
+    if args.destination_shard is not None:
+        shard(args.destination_shard)
+    if args.command == "transfer":
+        if args.destination_shard is None or args.amount_dollars is None:
+            raise SafetyError("transfer requires --destination-shard and --amount-dollars")
+    elif args.amount_dollars is not None:
+        raise SafetyError("--amount-dollars is only valid with the transfer command")
+    if args.destination_shard is not None and args.command not in {"status", "transfer", "transfer-all"}:
+        raise SafetyError("--destination-shard is not valid for this command")
     if args.command == "auth-check":
         if args.key_file:
             api = Api.for_file_auth_check(args.key_file)
@@ -765,7 +860,10 @@ async def run(args, api=None, *, root=JOURNAL_DIR) -> None:
         await report_transfers(api)
         return
     if args.command == "status":
-        emit(action="READ_ONLY_STATUS", **await inspect_account(api, ticker=args.ticker, series=args.series, source=args.source_shard))
+        emit(action="READ_ONLY_STATUS", **await inspect_account(
+            api, ticker=args.ticker, series=args.series, source=args.source_shard,
+            destination_shard=args.destination_shard,
+        ))
         return
     with operation_lock(root) as journal:
         if args.command == "resume-transfer":
@@ -773,9 +871,14 @@ async def run(args, api=None, *, root=JOURNAL_DIR) -> None:
             if not operation:
                 raise SafetyError("No saved transfer intent to resume")
             await verify_transfer(api, journal, operation, timeout=args.timeout, transfer_id=args.transfer_id)
-        elif args.command == "transfer-all":
-            await transfer_all(api, journal, ticker=args.ticker, series=args.series, source=args.source_shard,
-                               execute=args.execute, workers_paused=args.workers_paused, timeout=args.timeout)
+        elif args.command in {"transfer", "transfer-all"}:
+            await transfer_funds(
+                api, journal, ticker=args.ticker, series=args.series,
+                source=args.source_shard, destination_shard=args.destination_shard,
+                amount_dollars=(args.amount_dollars if args.command == "transfer" else None),
+                execute=args.execute, workers_paused=args.workers_paused,
+                timeout=args.timeout,
+            )
         else:
             await allocation_all(api, journal, ticker=args.ticker, series=args.series, source=args.source_shard,
                                  execute=args.execute, workers_paused=args.workers_paused)

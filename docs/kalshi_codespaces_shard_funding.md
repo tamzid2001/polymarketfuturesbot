@@ -13,10 +13,10 @@ development. Only read-only account diagnostics and offline mocked tests were ru
 
 ## 1. Load the reviewed code and secrets
 
-While this remains draft PR #87, open this repository in a Codespace and run:
+Open this repository in a Codespace and run from the cloned repository root:
 
 ```bash
-gh pr checkout 87
+git switch main
 git pull --ff-only
 python -m venv .venv
 source .venv/bin/activate
@@ -44,6 +44,7 @@ and store the replacement only through the appropriate secret settings.
 python kalshi_shard_admin.py status
 python kalshi_shard_admin.py transfers
 python kalshi_shard_admin.py transfer-all
+python kalshi_shard_admin.py transfer --source-shard 0 --destination-shard 2 --amount-dollars 100.0000
 ```
 
 The status reports authentication, the **current key's** write scope, whether it
@@ -62,6 +63,13 @@ available cash. They remain unresolved; this distinction does not pretend that
 Kalshi completed them. Age alone never makes a pending transfer safe to ignore.
 Resolve blocking transfers through Kalshi rather than deleting a journal or
 bypassing the check. The transfer preview runs the full read-only account preflight.
+
+`transfer-all` defaults to the `KXBTC15M` market's API-reported destination;
+`--destination-shard 2` can make that route explicit. The `transfer` command
+requires both `--destination-shard` and `--amount-dollars` and does not depend on
+market discovery. Its amount must be an exact multiple of $0.0001; it is rejected
+rather than rounded if it cannot be represented in centicents. Both commands are
+previews unless `--execute` is also present.
 
 The default series is `KXBTC15M`; `--ticker` accepts an explicitly API-discovered
 market instead of discovering the current active market. Do not use an old market
@@ -158,7 +166,7 @@ prompted ID, modify secrets, or allow `--key-file` with a transfer/allocation.
   private keys or signed headers. Access restrictions must be resolved with
   Kalshi; this utility will not change hosts, locations, proxies or IPs to evade them.
 
-## 3. One-time transfer of all available shard-0 cash
+## 3. One-time transfer
 
 First pause account trading workers and their watchdogs **yourself**, with a
 graceful handoff only when safe. A maintenance flag can stop new workflow dispatch
@@ -169,6 +177,15 @@ resting orders, open/unknown positions, or conflicting pending/unknown transfers
 Only after the workers really are paused:
 
 ```bash
+# Transfer an exact amount using an explicit route (recommended):
+python kalshi_shard_admin.py transfer \
+  --source-shard 0 \
+  --destination-shard 2 \
+  --amount-dollars 100.0000 \
+  --execute \
+  --workers-paused
+
+# Or transfer the entire authenticated available source-shard balance:
 python kalshi_shard_admin.py transfer-all --execute --workers-paused
 ```
 
@@ -184,6 +201,23 @@ allocation after confirmation. A changed balance aborts instead of silently
 transferring a different amount. An allocation other than disabled or 100% to
 the destination blocks the transfer because it could automatically undo it.
 
+The authenticated POST is exactly
+`/trade-api/v2/portfolio/intra_exchange_instance_transfer`. Its request always
+includes the officially required `source` and `destination` values even though
+one documentation curl example omits them:
+
+```json
+{
+  "source": "event_contract",
+  "destination": "event_contract",
+  "amount": 1000000,
+  "source_exchange_shard": 0,
+  "destination_exchange_shard": 2,
+  "source_subaccount": 0,
+  "destination_subaccount": 0
+}
+```
+
 Requests use exact Decimal arithmetic: **$1 = 10,000 centicents**. An available
 balance of $120.4724 would become integer `1204724`, not cents and not rounded
 binary float. Both exchange types are `event_contract`; both subaccounts are 0.
@@ -192,8 +226,10 @@ No margin, external withdrawal or non-primary subaccount transfer is supported.
 
 ## 4. Verify asynchronous completion and preserve the journal
 
-A 200 POST response is only acceptance. The tool polls the returned transfer ID,
-verifies source/destination/amount/time, and waits for official `status=complete`.
+A 200 POST response containing `transfer_id` is only asynchronous acceptance.
+The tool polls that returned transfer ID through the authenticated transfer-history
+endpoint, verifies source/destination/amount/time, and waits for official
+`status=complete`.
 It then reads both balances and checks them against the saved plan. A mismatch
 is reported for manual review, never used as a reason to resend the transfer.
 For example, a separate pending incoming credit may settle after confirmation:
