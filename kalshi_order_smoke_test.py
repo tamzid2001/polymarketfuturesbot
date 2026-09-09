@@ -97,7 +97,10 @@ class SmokeFeed(KalshiLiveFeed):
         old = self.quotes.get(ticker)
         if old and q["exchange_epoch"] <= old["exchange_epoch"]:
             return
-        if not 0 < q["yes_bid"] <= q["yes_ask"] < 1:
+        # Kalshi can legitimately publish a 0.00 bid or 1.00 ask near the
+        # binary outcome.  Those are valid book endpoints, and rejecting the
+        # whole quote can hide the opposite, safely testable side.
+        if not 0 <= q["yes_bid"] <= q["yes_ask"] <= 1:
             return
         self.quotes[ticker] = q
         self.update_count += 1
@@ -130,7 +133,11 @@ class SmokeFeed(KalshiLiveFeed):
             raise SafetyError("No fresh two-sided WebSocket quote; no new order permitted")
         ask = q["yes_ask"] if side == "yes" else 1 - q["yes_bid"]
         bid = q["yes_bid"] if side == "yes" else 1 - q["yes_ask"]
-        if ask - PRICE < MIN_QUOTE_GAP or bid <= PRICE:
+        # A post-only BUY at PRICE is non-crossing when the selected-side ask
+        # is strictly above PRICE.  The extra gap keeps this diagnostic order
+        # deliberately deep.  The selected bid may validly be 0.00 and is not
+        # the executable price against which a new bid would cross.
+        if ask - PRICE < MIN_QUOTE_GAP:
             raise SafetyError("1-cent order is not sufficiently deep for this side; no new order permitted")
         return {**q, "selected_bid": bid, "selected_ask": ask}
 
@@ -146,17 +153,26 @@ async def quote_stream(api, ticker, side):
             if task.done():
                 await task
                 raise SafetyError("WebSocket ended without a quote")
-            try:
-                feed.fresh(ticker, side)
+            sides = ("yes", "no") if side is None else (side,)
+            if any(_fresh_without_error(feed, ticker, candidate) for candidate in sides):
                 break
-            except SafetyError:
-                await feed.wait_for_update(0.2, feed.update_count)
-        feed.fresh(ticker, side)
+            await feed.wait_for_update(0.2, feed.update_count)
+        sides = ("yes", "no") if side is None else (side,)
+        if not any(_fresh_without_error(feed, ticker, candidate) for candidate in sides):
+            raise SafetyError("No safely deep fresh quote on either side; no new order permitted")
         yield feed
     finally:
         task.cancel()
         with suppress(asyncio.CancelledError, SafetyError):
             await task
+
+
+def _fresh_without_error(feed, ticker, side):
+    try:
+        feed.fresh(ticker, side)
+        return True
+    except SafetyError:
+        return False
 
 
 def validate_market(market, side):

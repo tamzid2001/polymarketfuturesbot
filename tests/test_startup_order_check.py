@@ -79,6 +79,17 @@ class StartupOrderCheckTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.publications[-1][0], "startup-order-check-passed")
         self.assertIn("STARTUP_ORDER_CHECK_PASS", self.output.getvalue())
 
+    def test_probe_selects_side_by_non_crossing_ask_distance(self):
+        class EndpointFeed:
+            def fresh(self, ticker, side):
+                if side == "yes":
+                    raise SafetyError("1-cent order is not sufficiently deep for this side; no new order permitted")
+                return {"selected_bid": Decimal("0.99"), "selected_ask": Decimal("1.00")}
+
+        side, quote = startup.choose_safe_side(EndpointFeed(), self.api.market)
+        self.assertEqual(side, "no")
+        self.assertEqual(quote["selected_ask"], Decimal("1.00"))
+
     async def test_near_close_startup_waits_for_next_market_without_writing(self):
         calls = 0
         original = startup.preflight
