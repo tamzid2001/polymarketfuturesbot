@@ -628,6 +628,35 @@ class LiveExecutionTests(unittest.TestCase):
             altered = dict(check, **{key: value})
             self.assertFalse(startup_order_check_allows_worker({"startup_order_check": altered}, "101"), key)
 
+    def test_live_worker_accepts_only_current_durable_risk_recovery_handoff(self) -> None:
+        state = {
+            "startup_order_check": {
+                "state": "DEFERRED_TO_RISK_RECOVERY",
+                "worker_id": "202",
+                "breaker_reason": "entry_cancellation_unconfirmed",
+                "recovery_worker_allowed": True,
+                "strategy_entries_allowed": False,
+            },
+            "circuit_breaker": {
+                "blocked": True,
+                "reason": "entry_cancellation_unconfirmed",
+            },
+            "current_order_id": "possibly-resting-entry",
+            "current_position": "0.00",
+            "markets": {},
+        }
+        self.assertTrue(startup_order_check_allows_worker(state, "202"))
+        self.assertFalse(startup_order_check_allows_worker(state, "older-worker"))
+        for mutation in (
+            {"current_order_id": None},
+            {"circuit_breaker": {"blocked": False, "reason": None}},
+            {"startup_order_check": dict(
+                state["startup_order_check"], strategy_entries_allowed=True,
+            )},
+        ):
+            altered = dict(state, **mutation)
+            self.assertFalse(startup_order_check_allows_worker(altered, "202"))
+
     def test_v9_refuses_a_v8_checkpoint_instead_of_reinterpreting_recovery(self) -> None:
         temporary = Path(tempfile.mkdtemp()) / "state.json"
         state = default_state(self.config)

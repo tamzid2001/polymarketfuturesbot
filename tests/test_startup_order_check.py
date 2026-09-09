@@ -139,6 +139,18 @@ class StartupOrderCheckTests(unittest.IsolatedAsyncioTestCase):
         await self.run_check("risk-recovery")
         self.assertEqual(self.api.calls, [])
         self.assertEqual(self.api.post_count, 0)
+        value = __import__("json").loads(self.state.read_text())
+        self.assertEqual(
+            value["startup_order_check"]["state"],
+            "DEFERRED_TO_RISK_RECOVERY",
+        )
+        self.assertEqual(value["startup_order_check"]["worker_id"], "risk-recovery")
+        self.assertTrue(value["startup_order_check"]["recovery_worker_allowed"])
+        self.assertFalse(value["startup_order_check"]["strategy_entries_allowed"])
+        self.assertEqual(
+            self.publications[-1][0],
+            "startup-order-check-deferred-risk-recovery",
+        )
         self.assertIn(
             "STARTUP_ORDER_CHECK_DEFERRED_TO_RISK_RECOVERY",
             self.output.getvalue(),

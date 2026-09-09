@@ -164,6 +164,33 @@ def startup_order_check_allows_worker(state: dict[str, Any], worker_id: str) -> 
     check = state.get("startup_order_check")
     if not isinstance(check, dict) or not worker_id or check.get("worker_id") != worker_id:
         return False
+    if check.get("state") == "DEFERRED_TO_RISK_RECOVERY":
+        # A startup probe must never be placed while durable state may still
+        # represent exposure.  The checker persists this narrowly scoped
+        # authorization for the *current* Actions run so the strategy worker
+        # can reconcile/flatten risk.  Its still-latched breaker prevents new
+        # entries until that reconciliation is authoritative.
+        breaker = state.get("circuit_breaker", {})
+        try:
+            has_position = Decimal(str(state.get("current_position") or "0")) != 0
+        except (ArithmeticError, TypeError, ValueError):
+            return False
+        has_managed_risk = bool(
+            state.get("current_order_id")
+            or has_position
+            or any(
+                isinstance(record, dict) and record.get("status") in ACTIVE_STATES
+                for record in state.get("markets", {}).values()
+            )
+        )
+        return bool(
+            check.get("recovery_worker_allowed") is True
+            and check.get("strategy_entries_allowed") is False
+            and breaker.get("blocked") is True
+            and str(check.get("breaker_reason") or "")
+            == str(breaker.get("reason") or "")
+            and has_managed_risk
+        )
     try:
         zero = all(
             Decimal(str(check.get(key))) == 0
