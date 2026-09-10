@@ -12,6 +12,8 @@ from unittest.mock import AsyncMock, patch
 
 import kalshi_btc15m_average_down as trader
 from kalshi_btc15m_average_down import KalshiREST, record_submission_failure
+from kalshi_live_trader import deterministic_client_order_id
+from strategy_core import full_snapshot, sizing_state
 from tests import test_delayed_band_v12 as band_fixtures
 
 BandFeed = band_fixtures.BandFeed
@@ -154,7 +156,9 @@ class ExchangeShardSafetyTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_unfunded_shard_blocks_post_and_preserves_sizing(self):
         engine, record, feed, now = self.entry()
-        before = dict(engine.state["sizing"])
+        before = full_snapshot(
+            sizing_state(engine.current_parameters(), engine.state.get("sizing"))
+        )
         rest = EntryRest()
         rest.balance_decimal = AsyncMock(return_value=Decimal("120.4724"))
         rest.market_entry_funding = AsyncMock(return_value=(2, Decimal("0")))
@@ -164,7 +168,10 @@ class ExchangeShardSafetyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(record["status"], "FUNDING_FAILURE")
         self.assertEqual(record["funding_failure"]["exchange_index"], 2)
         self.assertEqual(record["funding_failure"]["required_cash"], "0.5300")
-        self.assertEqual(engine.state["sizing"], before)
+        after = full_snapshot(
+            sizing_state(engine.current_parameters(), engine.state.get("sizing"))
+        )
+        self.assertEqual(after, before)
         saved = json.loads(engine.state_path.read_text())["markets"][self.ticker]
         self.assertEqual(saved["funding_failure"], record["funding_failure"])
 
@@ -304,30 +311,144 @@ class ExchangeShardSafetyTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(engine.state["circuit_breaker"]["blocked"])
         self.assertEqual(record["entry_orders"][0]["status"], "reconciled_terminal_no_fill")
 
-    async def test_explicit_rejection_is_distinguished_and_not_blindly_retried(self):
+    async def test_nonretryable_rejection_is_market_scoped_and_worker_continues(self):
         engine, record, feed, now = self.entry()
         rest = EntryRest()
         rest.create_order = AsyncMock(return_value={"status": "submit_failed", "submission_outcome": "rejected",
-                                                    "quantity": "1", "fill_count": "0", "remaining_count": "0"})
+                                                    "http_status": 422, "quantity": "1",
+                                                    "fill_count": "0", "remaining_count": "0"})
         await engine.submit_entry(rest, feed, record, now)
         await engine.submit_entry(rest, feed, record, now + 1)
         self.assertEqual(rest.create_order.await_count, 1)
-        self.assertEqual(engine.state["circuit_breaker"]["reason"], "maker_entry_submission_rejected")
+        self.assertEqual(record["status"], "ZERO_FILL")
+        self.assertEqual(record["status_reason"], "maker_entry_non_retryable_rejection")
+        self.assertFalse(engine.state["circuit_breaker"]["blocked"])
         self.assertEqual(engine.entry_submission_health()["definitive_rejections"], 1)
         self.assertEqual(engine.entry_submission_health()["exchange_acknowledgments"], 0)
 
-    async def test_definitive_400_is_market_scoped_and_does_not_halt_future_markets(self):
+    async def test_definitive_400_retries_same_intent_with_unique_deterministic_id(self):
         engine, record, feed, now = self.entry()
+        rest = EntryRest()
+        accepted = await EntryRest().create_order(
+            ticker=self.ticker, side="yes", position_price=.53, quantity=1.0,
+            tif="good_till_canceled", expiration_time=None, dry_run=False,
+            order_key="entry", post_only=True, client_order_id_override="placeholder",
+        )
+        rest.create_order = AsyncMock(side_effect=[{
+                "status": "submit_failed", "submission_outcome": "rejected", "http_status": 400,
+                "quantity": "1", "fill_count": "0", "remaining_count": "0",
+            }, accepted])
+        await engine.submit_entry(rest, feed, record, now)
+        self.assertEqual(record["status"], "SIGNAL_PENDING")
+        self.assertEqual(record["entry_retry"]["status"], "RETRY_PENDING")
+        self.assertEqual(record["entry_retry"]["attempt_count"], 1)
+        await engine.submit_entry(rest, feed, record, now + .5)
+        self.assertEqual(rest.create_order.await_count, 1)
+        feed.current_epoch += 1.1
+        await engine.submit_entry(rest, feed, record, now + 1.1)
+        self.assertEqual(record["status"], "ENTRY_PENDING")
+        self.assertEqual(rest.create_order.await_count, 2)
+        first_id = rest.create_order.await_args_list[0].kwargs["client_order_id_override"]
+        second_id = rest.create_order.await_args_list[1].kwargs["client_order_id_override"]
+        self.assertNotEqual(first_id, second_id)
+        for key in ("ticker", "side", "position_price", "quantity", "tif", "post_only"):
+            self.assertEqual(
+                rest.create_order.await_args_list[0].kwargs[key],
+                rest.create_order.await_args_list[1].kwargs[key],
+            )
+        self.assertFalse(engine.state["circuit_breaker"]["blocked"])
+        self.assertTrue(record["entry_rejection"]["definitively_no_exchange_order"])
+        self.assertEqual(record["entry_retry"]["status"], "ACCEPTED")
+        self.assertEqual(engine.entry_submission_health()["market_scoped_retries"], 1)
+
+    async def test_rejected_entry_is_abandoned_when_fresh_ask_reaches_51c(self):
+        engine, record, feed, now = self.entry()
+        before = full_snapshot(
+            sizing_state(engine.current_parameters(), engine.state.get("sizing"))
+        )
         rest = EntryRest()
         rest.create_order = AsyncMock(return_value={
             "status": "submit_failed", "submission_outcome": "rejected", "http_status": 400,
             "quantity": "1", "fill_count": "0", "remaining_count": "0",
         })
         await engine.submit_entry(rest, feed, record, now)
+        feed.current_ask = 51
+        feed.current_epoch += 1.1
+        await engine.submit_entry(rest, feed, record, now + 1.1)
+        self.assertEqual(rest.create_order.await_count, 1)
         self.assertEqual(record["status"], "ZERO_FILL")
-        self.assertEqual(record["status_reason"], "maker_entry_definitively_rejected")
+        self.assertEqual(record["status_reason"], "entry_abandoned_at_or_below_51c")
+        self.assertEqual(record["entry_retry"]["fresh_selected_side_ask"], "0.51")
+        after = full_snapshot(
+            sizing_state(engine.current_parameters(), engine.state.get("sizing"))
+        )
+        self.assertEqual(after, before)
+        self.assertEqual(engine.entry_submission_health()["abandoned_at_or_below_51c"], 1)
+
+    async def test_delayed_entry_is_skipped_at_51c_before_first_post(self):
+        engine, record, feed, now = self.entry()
+        before = full_snapshot(
+            sizing_state(engine.current_parameters(), engine.state.get("sizing"))
+        )
+        self.assertEqual(engine.freeze_delayed_band_entry_price(feed, record, now), Decimal("0.53"))
+        feed.current_ask = 51
+        rest = EntryRest()
+        await engine.submit_entry(rest, feed, record, now + .1)
+        self.assertEqual(len(rest.calls), 0)
+        self.assertEqual(record["status"], "ZERO_FILL")
+        self.assertEqual(record["status_reason"], "entry_abandoned_at_or_below_51c")
+        after = full_snapshot(
+            sizing_state(engine.current_parameters(), engine.state.get("sizing"))
+        )
+        self.assertEqual(after, before)
+
+    async def test_local_exchange_pause_retries_without_latching_breaker(self):
+        engine, record, feed, now = self.entry()
+        rest = EntryRest()
+        accepted = await EntryRest().create_order(
+            ticker=self.ticker, side="yes", position_price=.53, quantity=1.0,
+            tif="good_till_canceled", expiration_time=None, dry_run=False,
+            order_key="entry", post_only=True, client_order_id_override="placeholder",
+        )
+        rest.create_order = AsyncMock(side_effect=[{
+            "status": "paused", "submission_outcome": "not_submitted",
+            "quantity": "1", "fill_count": "0", "remaining_count": "0",
+        }, accepted])
+        await engine.submit_entry(rest, feed, record, now)
+        self.assertEqual(record["status"], "SIGNAL_PENDING")
+        self.assertEqual(record["entry_retry"]["status"], "RETRY_PENDING")
+        self.assertEqual(record["entry_retry"]["reason"], "exchange_pause_before_post")
         self.assertFalse(engine.state["circuit_breaker"]["blocked"])
-        self.assertTrue(record["entry_rejection"]["definitively_no_exchange_order"])
+        feed.current_epoch += 1.1
+        await engine.submit_entry(rest, feed, record, now + 1.1)
+        self.assertEqual(rest.create_order.await_count, 2)
+        self.assertEqual(record["status"], "ENTRY_PENDING")
+        self.assertEqual(len(record["entry_orders"]), 1)
+        self.assertEqual(record["entry_retry"]["status"], "ACCEPTED")
+        self.assertFalse(engine.state["circuit_breaker"]["blocked"])
+
+    async def test_restart_resumes_pre_submit_intent_with_same_id_without_duplicate_local_order(self):
+        engine, record, feed, now = self.entry()
+        maker_price = engine.freeze_delayed_band_entry_price(feed, record, now)
+        self.assertEqual(maker_price, Decimal("0.53"))
+        client_id = deterministic_client_order_id(
+            record["ticker"], record["signal_side"], "entry", engine.config,
+        )
+        record["entry_orders"].append({
+            "order_id": None, "client_order_id": client_id,
+            "ticker": record["ticker"], "side": record["signal_side"],
+            "quantity": record["intended_quantity"], "position_price": "0.53",
+            "fill_count": "0", "remaining_count": record["intended_quantity"],
+            "status": "submitting", "submission_outcome": "unknown",
+            "entry_phase": "maker",
+        })
+        rest = EntryRest()
+        await engine.submit_entry(rest, feed, record, now)
+        self.assertEqual(len(rest.calls), 1)
+        self.assertEqual(rest.calls[0]["client_order_id_override"], client_id)
+        self.assertEqual(len(record["entry_orders"]), 1)
+        self.assertEqual(record["entry_orders"][0]["client_order_id"], client_id)
+        self.assertEqual(record["status"], "ENTRY_PENDING")
 
     async def test_buy_routing_and_side_mapping_remain_correct(self):
         for side, book_side, price in (("yes", "bid", "0.5300"), ("no", "ask", "0.4700")):

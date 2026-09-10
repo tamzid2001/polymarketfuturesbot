@@ -89,6 +89,14 @@ BTC_TARGET_CAPTURE_CONTRACT_VERSION = 2
 DELAYED_ENTRY_LADDER_CONTRACT_VERSION = 4
 LIVE_STOP_SAFETY_CONTRACT_VERSION = 3
 POSITION_CAP_CONTRACT_VERSION = 2
+ENTRY_DELIVERY_CONTRACT_VERSION = 1
+# A definitive HTTP rejection proves that the matching engine did not create
+# an order. Keep the frozen strategy intent alive and retry it at a bounded
+# cadence while the same market remains safe. Unknown POST outcomes are never
+# handled by this path: they must first be reconciled by exact client ID.
+ENTRY_REJECTION_RETRY_SECONDS = 1.0
+ENTRY_RETRY_ABANDON_ASK_CENTS = 51
+ENTRY_RETRYABLE_REJECTION_HTTP_STATUSES = frozenset({400, 404})
 DELAYED_HYBRID_STOP_TRIGGER_CENTS = 51
 DELAYED_HYBRID_MAKER_EXIT_CENTS = 51
 DELAYED_HYBRID_HARD_STOP_CENTS = 51
@@ -1306,6 +1314,23 @@ class LiveEngine:
             "recorded_entry_attempts": len(orders),
             "exchange_acknowledgments": sum(bool(order.get("order_id")) for order in orders),
             "definitive_rejections": sum(order.get("submission_outcome") == "rejected" for order in orders),
+            "market_scoped_retries": sum(
+                max(0, int(record.get("entry_retry", {}).get("retry_submission_count", 0)))
+                for record in self.state.get("markets", {}).values()
+                if isinstance(record, dict) and isinstance(record.get("entry_retry"), dict)
+            ),
+            "retry_pending_markets": sum(
+                isinstance(record, dict)
+                and record.get("status") == "SIGNAL_PENDING"
+                and isinstance(record.get("entry_retry"), dict)
+                and record["entry_retry"].get("status") == "RETRY_PENDING"
+                for record in self.state.get("markets", {}).values()
+            ),
+            "abandoned_at_or_below_51c": sum(
+                isinstance(record, dict)
+                and record.get("status_reason") == "entry_abandoned_at_or_below_51c"
+                for record in self.state.get("markets", {}).values()
+            ),
             "unresolved_submissions": sum(
                 not order.get("order_id") and order.get("status") in {"submit_failed", "submitting"}
                 and order.get("submission_outcome") != "rejected" for order in orders
@@ -5121,6 +5146,12 @@ class LiveEngine:
             deterministic_client_order_id(record["ticker"], side, "market-fallback", self.config),
             deterministic_client_order_id(record["ticker"], side, "market-entry", self.config),
         })
+        retry_client_id = (
+            str(record.get("entry_retry", {}).get("client_order_id") or "")
+            if isinstance(record.get("entry_retry"), dict) else ""
+        )
+        if retry_client_id:
+            entry_ids.add(retry_client_id)
         groups: dict[str, dict[str, Any]] = {}
         seen: set[str] = set()
         for fill in fills:
@@ -5312,7 +5343,23 @@ class LiveEngine:
             maker_client_id = deterministic_client_order_id(ticker, side, "entry", self.config) if side in {"yes", "no"} else ""
             fallback_client_id = deterministic_client_order_id(ticker, side, "market-fallback", self.config) if side in {"yes", "no"} else ""
             market_entry_client_id = deterministic_client_order_id(ticker, side, "market-entry", self.config) if side in {"yes", "no"} else ""
-            entry_client_ids = {maker_client_id, fallback_client_id, market_entry_client_id} - {""}
+            # Retry attempts use distinct deterministic client IDs and are
+            # persisted before any successful handoff. Recognize every exact
+            # persisted entry ID so startup can adopt a resting retry order;
+            # ticker-only matching remains prohibited.
+            persisted_entry_client_ids = {
+                str(item.get("client_order_id") or "")
+                for item in record.get("entry_orders", [])
+                if isinstance(item, dict)
+            }
+            if isinstance(record.get("entry_retry"), dict):
+                persisted_entry_client_ids.add(
+                    str(record["entry_retry"].get("client_order_id") or "")
+                )
+            entry_client_ids = {
+                maker_client_id, fallback_client_id, market_entry_client_id,
+                *persisted_entry_client_ids,
+            } - {""}
             if client_id in entry_client_ids:
                 # A timed-out POST can still have created a resting maker.
                 # Recover its exchange ID before any entry/stop management so
@@ -5339,7 +5386,9 @@ class LiveEngine:
                     # event.  An ordinary expected Actions restart with a
                     # known resting maker is not itself a discrepancy.
                     self.trip("unconfirmed_managed_entry_recovered")
-                if record.get("status") in {"ERROR_RECONCILIATION", "RECONCILIATION_PENDING"}:
+                if record.get("status") in {
+                    "SIGNAL_PENDING", "ERROR_RECONCILIATION", "RECONCILIATION_PENDING",
+                }:
                     self.transition(record, "ENTRY_PENDING", "startup_recovered_unconfirmed_resting_entry")
                 continue
             maker_exit_client_id = deterministic_client_order_id(ticker, side, "hybrid-maker-exit", self.config) if side in {"yes", "no"} else ""
@@ -6302,10 +6351,48 @@ class LiveEngine:
     async def submit_signal_maker_entry(
         self, rest: KalshiREST, feed: KalshiLiveFeed, record: dict[str, Any], now: float,
     ) -> None:
-        """Place exactly one immutable post-only GTC entry for the active mode."""
+        """Submit the immutable post-only GTC intent until Kalshi accepts it.
 
-        if record.get("entry_orders") or record.get("maker_entry_submission_attempted"):
+        A definitive rejection contains proof that no exchange order exists,
+        so retrying with a new deterministic attempt ID cannot duplicate
+        exposure. A missing/unknown response is categorically different and
+        remains interlocked behind exact order/fill/position reconciliation.
+        """
+
+        # Any accepted or ambiguous attempt owns the intent. Only attempts
+        # explicitly proven rejected by Kalshi, or locally deferred before a
+        # POST was made, may permit another POST.
+        if any(
+            isinstance(order, dict)
+            and (
+                order.get("order_id")
+                or (
+                    order.get("submission_outcome") not in {"rejected", "not_submitted"}
+                    and order.get("status") != "submitting"
+                )
+            )
+            for order in record.get("entry_orders", [])
+        ):
             return
+        retry = record.get("entry_retry")
+        rejected_attempts = sum(
+            isinstance(order, dict) and order.get("submission_outcome") == "rejected"
+            for order in record.get("entry_orders", [])
+        )
+        locally_deferred_attempt = any(
+            isinstance(order, dict) and order.get("submission_outcome") == "not_submitted"
+            for order in record.get("entry_orders", [])
+        )
+        retry_cycle_active = rejected_attempts > 0 or locally_deferred_attempt or (
+            isinstance(retry, dict) and retry.get("status") == "RETRY_PENDING"
+        )
+        if isinstance(retry, dict):
+            try:
+                next_attempt_epoch = float(retry.get("next_attempt_epoch") or 0)
+            except (TypeError, ValueError):
+                next_attempt_epoch = float("inf")
+            if now < next_attempt_epoch:
+                return
         if self.config["entry_execution_mode"] == "delayed_threshold_band_maker":
             maker_price = self.freeze_delayed_band_entry_price(feed, record, now)
         elif self.config["entry_execution_mode"] == "signal_price_minus_offset_maker":
@@ -6395,6 +6482,41 @@ class LiveEngine:
                 fresh_ask = Decimal(str(fresh_quote["economic_price"]))
             except (ArithmeticError, KeyError, TypeError, ValueError):
                 fresh_ask = None
+        abandon_price = cents_price(ENTRY_RETRY_ABANDON_ASK_CENTS)
+        # The v13 delayed-band strategy freezes only after observing >=53c.
+        # If a fresh executable ask has already fallen to the 51c protective
+        # exit level, opening new risk is pointless even before the first POST.
+        # Keep the condition mode-scoped so forensic v11 replay semantics do
+        # not change retroactively.
+        abandon_allowed = retry_cycle_active or (
+            self.config["entry_execution_mode"] == "delayed_threshold_band_maker"
+        )
+        if abandon_allowed and fresh_ask is not None and fresh_ask <= abandon_price:
+            record["entry_retry"] = {
+                **(retry if isinstance(retry, dict) else {}),
+                "status": "ABANDONED_AT_OR_BELOW_51C",
+                "abandoned_at": utc_now(),
+                "fresh_selected_side_ask": format(fresh_ask, "f"),
+                "abandon_ask_cents": ENTRY_RETRY_ABANDON_ASK_CENTS,
+            }
+            self.audit(
+                "entry_abandoned_at_or_below_51c", ticker=record["ticker"], side=side,
+                frozen_limit=format(maker_price, "f"),
+                fresh_selected_side_ask=format(fresh_ask, "f"),
+                abandon_ask_cents=ENTRY_RETRY_ABANDON_ASK_CENTS,
+                attempted_orders=len(record.get("entry_orders", [])),
+            )
+            LOG.warning(
+                "ENTRY ABANDONED | ticker=%s side=%s frozen_limit=$%s "
+                "fresh_ask=$%s threshold=%sc prior_rejection=%s recovery_unchanged=true",
+                record["ticker"], side.upper(), format(maker_price, "f"),
+                format(fresh_ask, "f"), ENTRY_RETRY_ABANDON_ASK_CENTS,
+                rejected_attempts > 0,
+            )
+            self.finish_entry_attempt(
+                record, Decimal("0"), "entry_abandoned_at_or_below_51c",
+            )
+            return
         if fresh_ask is None or fresh_ask <= maker_price:
             wait_reason = (
                 "fresh_book_unavailable" if fresh_ask is None
@@ -6429,11 +6551,11 @@ class LiveEngine:
         if now + max(0.0, time.monotonic() - preflight_started) >= float(record["market_close_epoch"]):
             self.finish_entry_attempt(record, Decimal("0"), "market_closed_before_gtc_submission")
             return
-        client_id = deterministic_client_order_id(record["ticker"], side, "entry", self.config)
+        purpose = "entry" if rejected_attempts == 0 else f"entry-retry-{rejected_attempts}"
+        client_id = deterministic_client_order_id(record["ticker"], side, purpose, self.config)
         maker_tif = str(self.config["maker_order_time_in_force"])
-        # This flag is set only at the non-idempotent boundary. Waiting for a
-        # maker-safe book above must remain retryable with the same frozen
-        # price; once a POST is consumed, the deterministic intent is final.
+        # Historical telemetry only. Retry authority comes from each persisted
+        # order's explicit submission_outcome and deterministic client ID.
         record["maker_entry_submission_attempted"] = True
         if self.dry_run:
             order = {
@@ -6446,18 +6568,102 @@ class LiveEngine:
                 "submitted_at": utc_now(),
             }
         else:
-            order = await rest.create_order(
+            # Persist the exact non-idempotent intent before calling Kalshi.
+            # If the process dies after the POST, startup can recover the
+            # order/fill using this client ID instead of submitting again.
+            order = next((
+                item for item in record.get("entry_orders", [])
+                if isinstance(item, dict)
+                and item.get("client_order_id") == client_id
+                and item.get("status") in {"submitting", "paused"}
+                and item.get("submission_outcome") in {"unknown", "not_submitted"}
+                and not item.get("order_id")
+            ), None)
+            resumed_pre_submit_intent = order is not None
+            if order is None:
+                order = {
+                    "order_id": None, "client_order_id": client_id,
+                    "ticker": record["ticker"], "side": side,
+                    "quantity": format(quantity, "f"),
+                    "position_price": format(maker_price, "f"),
+                    "time_in_force": maker_tif, "post_only": True,
+                    "reduce_only": False, "expiration_time": None,
+                    "fill_count": "0", "remaining_count": format(quantity, "f"),
+                    "fees_paid": "0", "entry_phase": "maker",
+                    "status": "submitting", "submission_outcome": "unknown",
+                    "submitted_at": utc_now(),
+                }
+                record["entry_orders"].append(order)
+                self.note_entry_order_submitted(record, order, "maker")
+            else:
+                order.update(
+                    status="submitting", submission_outcome="unknown",
+                    submitted_at=utc_now(),
+                )
+            if rejected_attempts > 0:
+                prior_retry = retry if isinstance(retry, dict) else {}
+                record["entry_retry"] = {
+                    **prior_retry,
+                    "status": "SUBMITTING_RETRY",
+                    "client_order_id": client_id,
+                    "retry_ordinal": rejected_attempts,
+                    "retry_submission_count": int(prior_retry.get("retry_submission_count", 0)) + 1,
+                    "submission_intent_at": utc_now(),
+                    "frozen_limit": format(maker_price, "f"),
+                    "frozen_quantity": format(quantity, "f"),
+                }
+            self.audit(
+                "maker_entry_submission_intent", ticker=record["ticker"], side=side,
+                client_order_id=client_id, retry_ordinal=rejected_attempts,
+                frozen_limit=format(maker_price, "f"), frozen_quantity=format(quantity, "f"),
+                post_only=True, time_in_force=maker_tif,
+                resumed_pre_submit_intent=resumed_pre_submit_intent,
+            )
+            response = await rest.create_order(
                 ticker=record["ticker"], side=side, position_price=float(maker_price), quantity=float(quantity),
                 tif=maker_tif, expiration_time=None, dry_run=False,
                 order_key="signal-minus-offset-entry", post_only=True, client_order_id_override=client_id,
             )
+            order.update(response)
+            # The request ID is the persisted idempotency authority. A V2
+            # response normally echoes it, but an absent/malformed echo must
+            # never break restart linkage to the exact submitted intent.
+            order["client_order_id"] = client_id
             order["entry_phase"] = "maker"
             if not order.get("order_id") and order.get("status") not in {"submit_failed", "paused", "direction_mismatch"}:
                 order.update(status="submit_failed", submission_outcome="unknown")
             if order.get("status") in {"submit_failed", "paused", "direction_mismatch"} or not order.get("order_id"):
-                record["entry_orders"].append(order)
-                self.note_entry_order_submitted(record, order, "maker")
-                if order.get("submission_outcome") == "rejected":
+                if order.get("submission_outcome") == "not_submitted":
+                    prior_retry = (
+                        record.get("entry_retry")
+                        if isinstance(record.get("entry_retry"), dict) else {}
+                    )
+                    record["entry_retry"] = {
+                        **prior_retry,
+                        "status": "RETRY_PENDING",
+                        "attempt_count": rejected_attempts,
+                        "last_deferred_at": utc_now(),
+                        "next_attempt_epoch": now + ENTRY_REJECTION_RETRY_SECONDS,
+                        "retry_interval_seconds": ENTRY_REJECTION_RETRY_SECONDS,
+                        "client_order_id": client_id,
+                        "frozen_limit": format(maker_price, "f"),
+                        "frozen_quantity": format(quantity, "f"),
+                        "reason": "exchange_pause_before_post",
+                    }
+                    self.audit(
+                        "maker_entry_retry_deferred", ticker=record["ticker"],
+                        side=side, next_attempt_epoch=record["entry_retry"]["next_attempt_epoch"],
+                        frozen_limit=format(maker_price, "f"),
+                        frozen_quantity=format(quantity, "f"),
+                        reason="exchange_pause_before_post",
+                    )
+                    LOG.warning(
+                        "ENTRY RETRY DEFERRED | ticker=%s side=%s frozen_limit=$%s "
+                        "qty=%s retry_in=%.1fs reason=exchange_pause_before_post",
+                        record["ticker"], side.upper(), format(maker_price, "f"),
+                        format(quantity, "f"), ENTRY_REJECTION_RETRY_SECONDS,
+                    )
+                elif order.get("submission_outcome") == "rejected":
                     status = order.get("http_status")
                     record["entry_rejection"] = {
                         "at": utc_now(), "http_status": status,
@@ -6471,19 +6677,55 @@ class LiveEngine:
                         requested_quantity=format(quantity, "f"), http_status=status,
                         error_code=order.get("error_code"),
                     )
-                    # HTTP 400/404 is a terminal no-order result for this
-                    # market, not ambiguous live exposure. Preserve it as a
-                    # zero-fill and continue future markets. Authentication or
-                    # schema/validation rejection remains a global fail-close.
-                    if status in {400, 404}:
-                        self.finish_entry_attempt(
-                            record, Decimal("0"), "maker_entry_definitively_rejected",
+                    # A market-scoped 400/404 definitively created no order.
+                    # Keep the immutable price/side/quantity and try again
+                    # after a short durable delay. Each attempt has a distinct
+                    # deterministic ID. Authentication/schema failures are
+                    # not hammered; they end only this market's entry while the
+                    # long-running worker remains available for later markets.
+                    if status in ENTRY_RETRYABLE_REJECTION_HTTP_STATUSES:
+                        attempt_count = rejected_attempts + 1
+                        prior_retry = record.get("entry_retry") if isinstance(record.get("entry_retry"), dict) else {}
+                        record["entry_retry"] = {
+                            **prior_retry,
+                            "status": "RETRY_PENDING",
+                            "attempt_count": attempt_count,
+                            "last_rejected_at": utc_now(),
+                            "last_http_status": status,
+                            "last_error_code": order.get("error_code"),
+                            "next_attempt_epoch": now + ENTRY_REJECTION_RETRY_SECONDS,
+                            "retry_interval_seconds": ENTRY_REJECTION_RETRY_SECONDS,
+                            "client_order_id": client_id,
+                            "frozen_limit": format(maker_price, "f"),
+                            "frozen_quantity": format(quantity, "f"),
+                        }
+                        self.audit(
+                            "maker_entry_retry_scheduled", ticker=record["ticker"],
+                            side=side, attempt_count=attempt_count,
+                            next_attempt_epoch=record["entry_retry"]["next_attempt_epoch"],
+                            retry_interval_seconds=ENTRY_REJECTION_RETRY_SECONDS,
+                            frozen_limit=format(maker_price, "f"),
+                            frozen_quantity=format(quantity, "f"),
+                        )
+                        LOG.warning(
+                            "ENTRY RETRY SCHEDULED | ticker=%s side=%s attempt=%s "
+                            "frozen_limit=$%s qty=%s retry_in=%.1fs abandon_if_ask<=%sc",
+                            record["ticker"], side.upper(), attempt_count,
+                            format(maker_price, "f"), format(quantity, "f"),
+                            ENTRY_REJECTION_RETRY_SECONDS, ENTRY_RETRY_ABANDON_ASK_CENTS,
                         )
                     else:
-                        self.trip("maker_entry_submission_rejected")
-                        self.transition(
-                            record, "RECONCILIATION_PENDING",
-                            "maker_entry_submission_rejected",
+                        prior_retry = record.get("entry_retry") if isinstance(record.get("entry_retry"), dict) else {}
+                        record["entry_retry"] = {
+                            **prior_retry,
+                            "status": "NON_RETRYABLE_REJECTION",
+                            "attempt_count": rejected_attempts + 1,
+                            "last_rejected_at": utc_now(),
+                            "last_http_status": status,
+                            "last_error_code": order.get("error_code"),
+                        }
+                        self.finish_entry_attempt(
+                            record, Decimal("0"), "maker_entry_non_retryable_rejection",
                         )
                 else:
                     self.trip("maker_entry_submission_unknown")
@@ -6492,8 +6734,15 @@ class LiveEngine:
                         "maker_entry_submission_unknown",
                     )
                 return
-        record["entry_orders"].append(order)
-        self.note_entry_order_submitted(record, order, "maker")
+        if self.dry_run:
+            record["entry_orders"].append(order)
+            self.note_entry_order_submitted(record, order, "maker")
+        if isinstance(record.get("entry_retry"), dict):
+            record["entry_retry"].update({
+                "status": "ACCEPTED", "accepted_at": utc_now(),
+                "accepted_client_order_id": client_id,
+                "accepted_order_id": order.get("order_id"),
+            })
         self.note_entry_execution_summary(record, "maker_limit_submitted")
         self.state["current_order_id"] = order.get("order_id")
         self.transition(record, "ENTRY_PENDING", "delayed_band_post_only_gtc_limit_submitted")
@@ -8079,9 +8328,12 @@ class LiveEngine:
                 # safety-critical fact is hidden at the end of one giant line.
                 LOG.warning(
                     "ORDER HEALTH | mode=%s attempts=%s exchange_acks=%s rejected=%s "
-                    "unresolved=%s breaker=%s reason=%s",
+                    "retries=%s retry_pending=%s retry_skip_51c=%s unresolved=%s "
+                    "breaker=%s reason=%s",
                     health["mode"], health["recorded_entry_attempts"],
                     health["exchange_acknowledgments"], health["definitive_rejections"],
+                    health["market_scoped_retries"], health["retry_pending_markets"],
+                    health["abandoned_at_or_below_51c"],
                     health["unresolved_submissions"], health["breaker_blocked"],
                     health["breaker_reason"],
                 )

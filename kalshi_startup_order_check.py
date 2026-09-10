@@ -332,7 +332,7 @@ def choose_safe_side(feed, market: dict):
 
 
 async def preflight_current_when_safe(api: SmokeApi) -> dict:
-    """Wait across one boundary only when the current market is too near close."""
+    """Wait across one boundary while market discovery is transiently ambiguous."""
 
     deadline = time.monotonic() + BOUNDARY_WAIT_SECONDS
     waiting_logged = False
@@ -340,14 +340,23 @@ async def preflight_current_when_safe(api: SmokeApi) -> dict:
         try:
             return await preflight(api, None, "yes")
         except SafetyError as exc:
-            if str(exc) != "Market is not open or has less than 60 seconds remaining":
+            reason = str(exc)
+            retryable = reason in {
+                "Market is not open or has less than 60 seconds remaining",
+                "Cannot identify exactly one active market; provide --ticker with an API-discovered ticker",
+            }
+            if not retryable:
                 raise
             if time.monotonic() >= deadline:
                 raise SafetyError("No safely open KXBTC15M market appeared within the boundary wait") from None
             if not waiting_logged:
                 emit(
                     action="STARTUP_ORDER_CHECK_WAITING_FOR_NEXT_MARKET",
-                    reason="current_market_has_less_than_60_seconds_remaining",
+                    reason=(
+                        "active_market_discovery_temporarily_ambiguous"
+                        if reason.startswith("Cannot identify exactly one active market")
+                        else "current_market_has_less_than_60_seconds_remaining"
+                    ),
                     maximum_wait_seconds=BOUNDARY_WAIT_SECONDS, orders_sent=0,
                 )
                 waiting_logged = True
