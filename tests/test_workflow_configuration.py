@@ -128,6 +128,13 @@ class WorkflowConfigurationTests(unittest.TestCase):
         self.assertIn('== "maker_entry_submission_rejected"', workflow)
         self.assertNotIn('== "maker_entry_submission_unknown"\n                  and not has_order_work(record)', workflow)
 
+    def test_production_workflow_pins_resilient_entry_delivery_contract(self):
+        workflow = (ROOT / ".github/workflows/kalshi_btc15m_average_down.yml").read_text()
+        self.assertIn("ENTRY_DELIVERY_CONTRACT_VERSION == 1", workflow)
+        self.assertIn("definitive_400_404=retry_each_second", workflow)
+        self.assertIn("local_pause=retry", workflow)
+        self.assertIn("abandon=fresh_ask_at_or_below_51c", workflow)
+
     def test_checkpoint_does_not_require_runner_git_identity_setup(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

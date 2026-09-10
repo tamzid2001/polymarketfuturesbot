@@ -238,9 +238,17 @@ needed to reduce risk. Cancellation always includes `market_ticker`, so an order
 ID alone cannot silently route to exchange 0. The routing cache is bounded and
 never hard-codes a shard from the ticker's spelling. The short
 `ORDER HEALTH` line separates recorded attempts, exchange acknowledgments,
-definitive rejections and uncertain submissions, with the persisted breaker
-reason. Analytical threshold hits are not order acknowledgments. Raw SDK
-exception bodies/headers are not retained for entry or cancellation failures.
+definitive rejections, safe market-scoped retries, 51¢ retry abandonments and
+uncertain submissions, with the persisted breaker reason. A definitive 400/404
+no-order response retains the immutable side, size and limit and is retried once
+per second with a distinct deterministic client ID. Before every retry the bot
+rechecks shard funding, position, market time and a fresh executable quote. It
+does not submit (or stops retrying) and records a zero-fill—without changing
+recovery—when the fresh selected-side ask is 51¢ or lower or when the market closes. Unknown POST
+outcomes are never blindly retried; exact client-order, fill and position
+reconciliation prevents duplicate exposure. Analytical threshold hits are not
+order acknowledgments. Raw SDK exception bodies/headers are not retained for
+entry or cancellation failures.
 
 Credential rotation does not alter an existing worker's environment. Changing
 funds/credentials is not evidence that an ambiguous order disappeared. The

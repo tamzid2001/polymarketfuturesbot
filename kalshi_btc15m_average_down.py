@@ -2209,6 +2209,10 @@ class KalshiREST:
         if self.trading_pause_active():
             record["status"] = "paused"
             record["error"] = self.pause_reason or "scheduled Kalshi trading pause"
+            # This branch runs before the SDK POST. Persist the distinction so
+            # the live engine may safely retry the same deterministic intent.
+            record["submission_outcome"] = "not_submitted"
+            record["remaining_count"] = 0.0
             LOG.info("ORDER DEFERRED FOR PAUSE | %s %s @ $%.2f", ticker, side.upper(), position_price)
             return record
         kwargs = {

@@ -111,6 +111,29 @@ class StartupOrderCheckTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.api.post_count, 0)
         self.assertIn("STARTUP_ORDER_CHECK_WAITING_FOR_NEXT_MARKET", self.output.getvalue())
 
+    async def test_boundary_discovery_ambiguity_waits_instead_of_failing_worker(self):
+        calls = 0
+        original = startup.preflight
+
+        async def ambiguous_then_open(api, ticker, side):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise SafetyError(
+                    "Cannot identify exactly one active market; provide --ticker with an API-discovered ticker"
+                )
+            return await original(api, ticker, side)
+
+        with (
+            patch.object(startup, "preflight", side_effect=ambiguous_then_open),
+            patch.object(startup.asyncio, "sleep", return_value=None),
+        ):
+            market = await startup.preflight_current_when_safe(self.api)
+        self.assertEqual(market["ticker"], self.api.market["ticker"])
+        self.assertEqual(calls, 2)
+        self.assertEqual(self.api.post_count, 0)
+        self.assertIn("active_market_discovery_temporarily_ambiguous", self.output.getvalue())
+
     async def test_same_worker_is_idempotent_but_next_worker_gets_one_new_probe(self):
         await self.run_check("100")
         await self.run_check("100")
