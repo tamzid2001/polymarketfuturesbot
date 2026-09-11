@@ -346,6 +346,45 @@ class StartupOrderCheckTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(SafetyError):
                 startup.load_strategy_safety_state(self.state, self.config)
 
+    def test_terminal_zero_remaining_order_pointer_is_repaired_before_probe(self):
+        value = default_state(load_config(self.config))
+        value["current_order_id"] = "confirmed-canceled-order"
+        value["markets"]["KXBTC15M-closed"] = {
+            "ticker": "KXBTC15M-closed",
+            "status": "ZERO_FILL",
+            "entry_orders": [{
+                "order_id": "confirmed-canceled-order",
+                "status": "canceled",
+                "remaining_count": "0.00",
+                "fill_count": "0.00",
+            }],
+            "exit_orders": [],
+        }
+        save_state(self.state, value)
+
+        repaired = startup.load_strategy_safety_state(self.state, self.config)
+
+        self.assertIsNone(repaired["current_order_id"])
+        self.assertEqual(
+            repaired["state_repairs"][-1]["kind"],
+            "clear_terminal_current_order_pointer_before_startup_probe",
+        )
+
+    def test_unknown_or_nonterminal_order_pointer_remains_recovery_work(self):
+        for order in (
+            {"order_id": "risk", "status": "resting", "remaining_count": "1.00"},
+            {"order_id": "risk", "status": "unknown", "remaining_count": "0.00"},
+        ):
+            value = default_state(load_config(self.config))
+            value["current_order_id"] = "risk"
+            value["markets"]["KXBTC15M-risk"] = {
+                "ticker": "KXBTC15M-risk", "status": "CLOSED",
+                "entry_orders": [order], "exit_orders": [],
+            }
+            save_state(self.state, value)
+            with self.assertRaisesRegex(SafetyError, "order or position"):
+                startup.load_strategy_safety_state(self.state, self.config)
+
 
 if __name__ == "__main__":
     unittest.main()

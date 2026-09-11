@@ -29,6 +29,10 @@ TUNABLE_STRATEGY_FIELDS = {
     "hybrid_stop_trigger_cents",
     "hybrid_maker_exit_cents",
     "hybrid_hard_stop_cents",
+    "stop_baseline_entry_price",
+    "opposite_take_profit_cents",
+    "shadow_profile",
+    "selection_basis",
 }
 TUNABLE_OPERATIONAL_FIELDS = {"trading_mode"}
 CONFIG_TUNING_ACTIVE_STATES = {
@@ -46,6 +50,56 @@ CONFIG_TUNING_ACTIVE_STATES = {
     "MAKER_EXIT_CANCEL_UNCONFIRMED",
     "HARD_STOP_PENDING",
 }
+
+TERMINAL_ORDER_STATUSES = frozenset({
+    "canceled", "cancelled", "expired", "executed", "filled",
+    "cancel_reconciled_not_resting", "reconciled_terminal_no_fill",
+    "rejected_terminal", "not_submitted", "dry_run_canceled",
+    "shadow_cancelled",
+})
+
+
+def current_order_pointer_requires_recovery(value: dict[str, Any]) -> bool:
+    """Return whether ``current_order_id`` can still represent live work.
+
+    The pointer is an index into durable per-market order facts, not an
+    independent exchange order.  A prior worker can checkpoint immediately
+    after a confirmed cancellation and leave this pointer populated.  Treat it
+    as stale only when exactly one matching durable order is terminal and has
+    zero remaining quantity.  Missing, duplicate, malformed, or non-terminal
+    evidence remains risk-bearing and must be reconciled.
+    """
+
+    current_order_id = str(value.get("current_order_id") or "")
+    if not current_order_id:
+        return False
+    matches: list[dict[str, Any]] = []
+    for record in value.get("markets", {}).values():
+        if not isinstance(record, dict):
+            continue
+        for key in ("entry_orders", "exit_orders"):
+            for order in record.get(key, []):
+                if isinstance(order, dict) and str(order.get("order_id") or "") == current_order_id:
+                    matches.append(order)
+    if len(matches) != 1:
+        return True
+    order = matches[0]
+    try:
+        remaining = Decimal(str(order.get("remaining_count") or "0"))
+    except (InvalidOperation, TypeError, ValueError):
+        return True
+    status = str(order.get("status") or "").strip().lower()
+    return remaining != 0 or status not in TERMINAL_ORDER_STATUSES
+
+
+def clear_stale_current_order_pointer(value: dict[str, Any]) -> str | None:
+    """Clear and return a provably terminal top-level order pointer."""
+
+    current_order_id = str(value.get("current_order_id") or "")
+    if current_order_id and not current_order_pointer_requires_recovery(value):
+        value["current_order_id"] = None
+        return current_order_id
+    return None
 
 
 def utc_now() -> str:
@@ -65,7 +119,7 @@ def _flat_for_config_tuning(value: dict[str, Any]) -> bool:
             return False
     except (InvalidOperation, TypeError, ValueError):
         return False
-    if value.get("current_order_id"):
+    if current_order_pointer_requires_recovery(value):
         return False
     return not any(
         isinstance(record, dict) and record.get("status") in CONFIG_TUNING_ACTIVE_STATES
@@ -333,6 +387,14 @@ def load_state(path: Path, config: dict[str, Any]) -> dict[str, Any]:
         value["active_config_snapshot"] = dict(config)
     for key, default in default_state(config).items():
         value.setdefault(key, default)
+    cleared_order_id = clear_stale_current_order_pointer(value)
+    if cleared_order_id:
+        value.setdefault("state_repairs", []).append({
+            "at": utc_now(),
+            "kind": "clear_terminal_current_order_pointer",
+            "order_id": cleared_order_id,
+            "policy": "matched durable order was terminal with zero remaining quantity",
+        })
     return value
 
 

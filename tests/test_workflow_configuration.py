@@ -123,7 +123,7 @@ class WorkflowConfigurationTests(unittest.TestCase):
     def test_production_workflow_pins_resilient_entry_delivery_contract(self):
         workflow = (ROOT / ".github/workflows/kalshi_btc15m_average_down.yml").read_text()
         self.assertIn("ENTRY_DELIVERY_CONTRACT_VERSION == 1", workflow)
-        self.assertIn("OPPOSITE_LADDER_CONTRACT_VERSION == 1", workflow)
+        self.assertIn("OPPOSITE_LADDER_CONTRACT_VERSION == 2", workflow)
         self.assertIn("orders=ask-1@1x,40@2x,30@4x,20@8x,10@16x", workflow)
 
     def test_checkpoint_does_not_require_runner_git_identity_setup(self):

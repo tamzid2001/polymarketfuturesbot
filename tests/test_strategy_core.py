@@ -20,6 +20,7 @@ from strategy_core import (
 from kalshi_live_trader import (
     ACTIVE_CONFIG_SCHEMA_VERSION,
     ACTIVE_STRATEGY_VERSION,
+    enforce_active_runtime_config,
     load_config,
     load_config_from_value,
 )
@@ -82,7 +83,7 @@ class StrategyCoreTests(unittest.TestCase):
 
     def test_optimizer_live_export_round_trips_without_reinterpreting_decimals(self) -> None:
         row = {
-            "execution_profile": "opposite_ladder_53_58_take_profit_50",
+            "execution_profile": "opposite_ladder_53_58_flatten_51",
             "starting_base": "2.50",
         }
         with TemporaryDirectory() as directory:
@@ -108,14 +109,14 @@ class StrategyCoreTests(unittest.TestCase):
         self.assertEqual(config["stop_policy"], "opposite_side_take_profit_ioc")
         self.assertEqual(
             (config["hybrid_stop_trigger_cents"], config["hybrid_maker_exit_cents"], config["hybrid_hard_stop_cents"]),
-            (50, 50, 50),
+            (51, 51, 51),
         )
         self.assertFalse(config["recovery_enabled"])
         self.assertFalse(config["base_scaling_enabled"])
         self.assertNotIn("max_position", config)
         self.assertNotIn("max_position_per_base_share", config)
         self.assertNotIn("position_cap_enabled", config)
-        self.assertEqual(config["stop_baseline_entry_price"], "0.50")
+        self.assertEqual(config["stop_baseline_entry_price"], "0.51")
         self.assertEqual(config["strategy_version"], ACTIVE_STRATEGY_VERSION)
         self.assertEqual(config["config_schema_version"], ACTIVE_CONFIG_SCHEMA_VERSION)
 
@@ -126,8 +127,40 @@ class StrategyCoreTests(unittest.TestCase):
         }
         with TemporaryDirectory() as directory:
             path = Path(directory) / "selected_live_strategy.json"
-            with self.assertRaisesRegex(ValueError, "execution_profile=opposite_ladder_53_58_take_profit_50"):
+            with self.assertRaisesRegex(ValueError, "execution_profile=opposite_ladder_53_58_flatten_51"):
                 export_selected_live_strategy(path, row, selection_basis="test")
+
+    def test_runtime_restore_upgrades_only_exact_v14_50c_contract_to_51c(self) -> None:
+        config = load_config(ROOT / "selected_live_strategy.json")
+        prior = dict(config)
+        prior.update({
+            "stop_price": "0.50",
+            "stop_baseline_entry_price": "0.50",
+            "hybrid_stop_trigger_cents": 50,
+            "hybrid_maker_exit_cents": 50,
+            "hybrid_hard_stop_cents": 50,
+            "opposite_take_profit_cents": 50,
+            "shadow_profile": "opposite_ladder_53_58_take_profit_50",
+            "selection_basis": "prior-reviewed-v14-contract",
+        })
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "selected_live_strategy.json"
+            path.write_text(__import__("json").dumps(prior), encoding="utf-8")
+            upgraded = enforce_active_runtime_config(path)
+            persisted = __import__("json").loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(upgraded["opposite_take_profit_cents"], 51)
+        self.assertEqual(upgraded["shadow_profile"], "opposite_ladder_53_58_flatten_51")
+        self.assertEqual(persisted["stop_price"], "0.51")
+        self.assertIn("either_side_touches_51", persisted["selection_basis"])
+
+    def test_runtime_restore_refuses_unrecognized_exit_contract(self) -> None:
+        config = load_config(ROOT / "selected_live_strategy.json")
+        unrecognized = dict(config, opposite_take_profit_cents=52)
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "selected_live_strategy.json"
+            path.write_text(__import__("json").dumps(unrecognized), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "unrecognized runtime exit contract"):
+                enforce_active_runtime_config(path)
 
     def test_delayed_entry_band_is_a_pure_terminal_decision(self) -> None:
         self.assertEqual(delayed_band_entry_decision(
@@ -258,15 +291,15 @@ class StrategyCoreTests(unittest.TestCase):
         self.assertIn('maker_order_time_in_force"] == "good_till_canceled"', worker)
         self.assertIn('entry_order_lifetime"] == "until_filled_or_market_close"', worker)
         self.assertIn('entry_timeout_seconds"] == 0', worker)
-        self.assertIn("OPPOSITE_LADDER_CONTRACT_VERSION == 1", worker)
+        self.assertIn("OPPOSITE_LADDER_CONTRACT_VERSION == 2", worker)
         self.assertIn("ENTRY_DELIVERY_CONTRACT_VERSION == 1", worker)
-        self.assertIn('c=load_config(', worker)
-        self.assertIn("OPPOSITE_LADDER_V14_CONTRACT=OK", worker)
+        self.assertIn('c=enforce_active_runtime_config(', worker)
+        self.assertIn("OPPOSITE_LADDER_V14_REV2_CONTRACT=OK", worker)
         self.assertIn("sticky_band=53..58", worker)
         self.assertIn("trade_side=opposite", worker)
         self.assertIn("orders=ask-1@1x,40@2x,30@4x,20@8x,10@16x", worker)
         self.assertNotIn("--entry-timeout-seconds", worker)
-        self.assertIn("trade_bid>=50_or_sticky_ask<=50", worker)
+        self.assertIn("trade_bid>=51_or_sticky_ask<=51", worker)
         self.assertIn("kalshi_shadow_opposite_ladder_v14", worker)
         self.assertIn("--persist-config", worker)
         self.assertIn('--starting-base "$INITIAL_SHARES"', worker)

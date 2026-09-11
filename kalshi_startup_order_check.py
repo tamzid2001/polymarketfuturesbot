@@ -37,7 +37,13 @@ from kalshi_order_smoke_test import (
 )
 from kalshi_shard_admin import ApiError, Journal, epoch, money, operation_lock, pages, shard
 from live_checkpoint import DELAYED_V13_RUNTIME_STATE_REF, publish_runtime_snapshot
-from live_state import default_state, save_state, utc_now
+from live_state import (
+    clear_stale_current_order_pointer,
+    current_order_pointer_requires_recovery,
+    default_state,
+    save_state,
+    utc_now,
+)
 
 
 DEFAULT_ROOT = Path("data/.kalshi_live_opposite_ladder_v14_startup_order_check")
@@ -65,7 +71,7 @@ ACTIVE_RISK_STATES = {
 def state_requires_risk_recovery(value: dict) -> bool:
     """Return true when a worker, not a diagnostic probe, must own the state."""
 
-    if value.get("current_order_id"):
+    if current_order_pointer_requires_recovery(value):
         return True
     if Decimal(str(value.get("current_position") or "0")) != 0:
         return True
@@ -104,6 +110,15 @@ def load_strategy_safety_state(
         raise SafetyError("Live strategy state is unreadable; startup order check blocked") from None
     if not isinstance(value, dict):
         raise SafetyError("Live strategy state is invalid; startup order check blocked")
+    cleared_order_id = clear_stale_current_order_pointer(value)
+    if cleared_order_id:
+        value.setdefault("state_repairs", []).append({
+            "at": utc_now(),
+            "kind": "clear_terminal_current_order_pointer_before_startup_probe",
+            "order_id": cleared_order_id,
+            "policy": "matched durable order was terminal with zero remaining quantity",
+        })
+        save_state(path, value)
     breaker = value.get("circuit_breaker")
     if not isinstance(breaker, dict):
         raise SafetyError("Strategy breaker state is unavailable; startup order check blocked")
@@ -120,7 +135,10 @@ def load_strategy_safety_state(
     recovery_only = bool(breaker.get("blocked") and risk_recovery)
     if (
         not recovery_only
-        and (value.get("current_order_id") or Decimal(str(value.get("current_position") or "0")) != 0)
+        and (
+            current_order_pointer_requires_recovery(value)
+            or Decimal(str(value.get("current_position") or "0")) != 0
+        )
     ):
         raise SafetyError("Strategy state reports an order or position; startup probe requires no strategy exposure")
     return value

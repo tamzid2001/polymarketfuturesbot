@@ -168,7 +168,7 @@ class OppositeLadderLiveTests(unittest.TestCase):
             self.assertEqual(len(rest.calls), 5)
         asyncio.run(scenario())
 
-    def test_shadow_50c_bid_cancels_unfilled_rungs_and_exits_only_fills(self):
+    def test_shadow_51c_bid_cancels_unfilled_rungs_and_exits_only_fills(self):
         async def scenario():
             opened = time.time() - 61
             engine, feed, rest = self.engine(), OppositeFeed(opened), Rest()
@@ -183,7 +183,7 @@ class OppositeLadderLiveTests(unittest.TestCase):
             feed.observed = trade_epoch
             await engine.manage_entry(rest, feed, record, trade_epoch)
             self.assertEqual(Decimal(record["actual_quantity"]), Decimal("3.00"))
-            feed.bids["yes"] = Decimal("0.50")
+            feed.bids["yes"] = Decimal("0.51")
             await engine.manage_stop(rest, feed, record)
             self.assertTrue(record["opposite_ladder"]["exit_latched"])
             self.assertEqual(record["status"], "CLOSED")
@@ -192,7 +192,7 @@ class OppositeLadderLiveTests(unittest.TestCase):
             self.assertTrue(all(Decimal(row["remaining_count"]) == 0 for row in record["entry_orders"]))
         asyncio.run(scenario())
 
-    def test_sticky_50c_ask_also_latches_cancel_and_flatten(self):
+    def test_sticky_51c_ask_also_latches_cancel_and_flatten(self):
         async def scenario():
             opened = time.time() - 61
             engine, feed, rest = self.engine(), OppositeFeed(opened), Rest()
@@ -209,11 +209,11 @@ class OppositeLadderLiveTests(unittest.TestCase):
             feed.observed = trade_epoch
             await engine.manage_entry(rest, feed, record, trade_epoch)
             self.assertEqual(Decimal(record["actual_quantity"]), Decimal("1.00"))
-            feed.asks["no"] = Decimal("0.50")
-            feed.bids["yes"] = Decimal("0.49")
+            feed.asks["no"] = Decimal("0.51")
+            feed.bids["yes"] = Decimal("0.50")
             await engine.manage_stop(rest, feed, record)
             self.assertTrue(record["opposite_ladder"]["exit_latched"])
-            self.assertEqual(record["opposite_ladder"]["trigger_sticky_ask_cents"], 50)
+            self.assertEqual(record["opposite_ladder"]["trigger_sticky_ask_cents"], 51)
             self.assertEqual(record["status"], "CLOSED")
             self.assertEqual(
                 sum(Decimal(row["fill_count"]) for row in record["exit_orders"]),
@@ -272,7 +272,7 @@ class OppositeLadderLiveTests(unittest.TestCase):
             record["entry_orders"][0].update(fill_count="1.00", average_fill_price="0.47")
             record["entry_orders"][1].update(fill_count="2.00", average_fill_price="0.40")
             rest.position = Decimal("3.00")
-            feed.bids["yes"] = Decimal("0.50")
+            feed.bids["yes"] = Decimal("0.51")
             await engine.manage_stop(rest, feed, record)
             self.assertEqual(rest.position, Decimal("2.00"))
             self.assertEqual(record["status"], "HARD_STOP_PENDING")

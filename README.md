@@ -37,7 +37,7 @@ namespaces contain evidence only and cannot be restored into this worker.
 | Initial order | Post-only GTC at the opposite-side executable ask minus 1¢, quantity `1 × base` |
 | Preposted rungs | Post-only GTC orders at 40/30/20/10¢, quantities `2/4/8/16 × base` |
 | Submission timing | All five immutable order intents are persisted and submitted in the same event-loop pass |
-| Exit boundary | Opposite-side bid ≥50¢ or equivalent sticky-side ask ≤50¢ |
+| Exit boundary | Opposite/held-side executable bid ≥51¢ **or** sticky/predicted-side executable ask ≤51¢ |
 | Exit action | Latch, cancel/reconcile every unfilled rung, then reduce-only IOC only the authoritative filled exposure; repeat residual reconciliation until flat |
 | Recovery/base scaling | Disabled |
 | Position cap | None; the complete ladder is exactly `31 × base` shares |
@@ -67,14 +67,16 @@ blindly duplicated: the worker continuously reconciles its exact durable client
 ID against exchange orders, fills and position, then resumes only after the
 result is known. Retrying an unknown order without reconciliation could create
 duplicate exposure and is deliberately forbidden. Retries stop at market close
-or once the 50¢ exit boundary is latched.
+or once the two-sided 51¢ exit boundary is latched.
 
 The GTC orders have no strategy timeout. They remain until filled, market close,
-or the 50¢ boundary. A submission is never counted as a fill. Live exposure and
+or the 51¢ boundary. A submission is never counted as a fill. Live exposure and
 fees come only from exchange fills; shadow fills require conservative public
 trade-through evidence. Partial fills contribute only their actual quantity.
 
-The exit latch is durable and has priority over new entries. The bot first
+The two 51¢ observations are independent triggers; they are deliberately not
+treated as complementary-price aliases. The exit latch is durable and has
+priority over new entries. The bot first
 cancels and confirms all still-resting ladder quantities, refreshes fills and
 the authoritative market position, and then submits a reduce-only IOC at the
 current executable price. If it fills partly, the next reconciliation submits
@@ -778,10 +780,10 @@ the pure `opposite_ladder_core.py` plan between live and shadow adapters.
   accepted rungs. An unknown response pauses only additional exposure for that
   unresolved intent while exact order/fill/position reconciliation continues;
   this prevents a blind retry from duplicating a real order.
-- GTC entry remainders remain until fill, the 50¢ boundary or market close.
+- GTC entry remainders remain until fill, the 51¢ boundary or market close.
   Cancellations are confirmed before an exit is sized. Live fills and fees are
   exchange-authoritative; partial fills never become fictional full exposure.
-- The 50¢ boundary latch survives price recovery, process restart and worker
+- The two-sided 51¢ boundary latch survives price recovery, process restart and worker
   handoff. Reduce-only IOC attempts are sized from the refreshed authoritative
   position, and a partial IOC causes another refresh and residual-only retry.
 - There is no recovery exponent, permanent-base scaling or position-cap field
@@ -816,7 +818,7 @@ not replace it with an older default.
 
 The controlled-restart workflow exposes only `source_run_id` and `target_live`.
 Run duration, sticky signal, 53–58¢ gate, prices, GTC lifetime, ladder
-multiples, 50¢ boundary and checkpoint cadence are immutable configuration,
+multiples, 51¢ boundary and checkpoint cadence are immutable configuration,
 not routine UI knobs.
 
 `KALSHI_SHADOW_ONLY=true` hard-forces `MODE=DRY_RUN`; `KALSHI_SHADOW_ONLY=false` does not independently enable live trading. To switch deliberately, set `KALSHI_SHADOW_ONLY=false` and `KALSHI_LIVE_ENABLED=true`, then run the controlled-restart workflow with `target_live=true` while the named source lane is flat. The handoff refuses boundary timing or persisted exposure, dispatches the current `main`, preserves state, and the replacement reconciles before creating risk. Reversing either repository gate disables live placement again. Credentials are referenced only by the names `KALSHI_PROD_API_KEY` and `KALSHI_PRIVATE_KEY`; they are never written to state, logs, artifacts, source, or README.
@@ -832,7 +834,7 @@ KALSHI_API_KEY_ID=... KALSHI_PEM_PATH=kalshi_private_key.pem \
   .venv/bin/python kalshi_live_trader.py --config selected_live_strategy.json \
   --state-file data/kalshi_shadow_opposite_ladder_v14_state.json \
   --audit-ledger data/kalshi_shadow_opposite_ladder_v14_audit.jsonl \
-  --shadow-profile opposite_ladder_53_58_take_profit_50 \
+  --shadow-profile opposite_ladder_53_58_flatten_51 \
   --trading-mode shadow --dry-run --run-seconds 120
 
 # Read-only reconciliation; it never creates an entry.
@@ -846,7 +848,7 @@ KALSHI_API_KEY_ID=... KALSHI_PEM_PATH=kalshi_private_key.pem \
 The suite covers sticky hold/flip transitions, exact Decimal ladder sizing,
 simultaneous five-order delivery, rejection retry without rung suppression,
 unknown-response reconciliation, funding checks, deterministic idempotency,
-partial fills, cancel-before-exit ordering, either-side 50¢ boundary detection,
+partial fills, cancel-before-exit ordering, either-side 51¢ boundary detection,
 partial-IOC residual retries, restart recovery, shadow/live parity, workflow
 anti-regression assertions, checkpoint integrity, and the hard live gates.
 
