@@ -32,9 +32,9 @@ namespaces contain evidence only and cannot be restored into this worker.
 | --- | --- |
 | Series | `KXBTC15M`, discovered from exchange metadata |
 | Sticky signal | Seed inverse; keep a losing prediction; flip only after that prediction wins |
-| Qualification | At/after 60 seconds, sticky-side executable ask must be 53–58¢ inclusive |
+| Qualification | First fresh executable quote pair at/after 60 seconds: sticky-side ask must be 53–57¢ inclusive; otherwise terminal skip |
 | Traded side | The side opposite the sticky prediction |
-| Initial order | Post-only GTC at the opposite-side executable ask minus 1¢, quantity `1 × base` |
+| Initial order | Exact complement `100 − sticky ask`, therefore 47–43¢, post-only GTC, quantity `1 × base` |
 | Preposted rungs | Post-only GTC orders at 40/30/20/10¢, quantities `2/4/8/16 × base` |
 | Submission timing | All five immutable order intents are persisted and submitted in the same event-loop pass |
 | Exit boundary | Opposite/held-side executable bid ≥51¢ **or** sticky/predicted-side executable ask ≤51¢ |
@@ -44,8 +44,8 @@ namespaces contain evidence only and cannot be restored into this worker.
 | Workflow input | Only `initial_shares` changes strategy sizing; blank preserves the durable base |
 | Live gates | Explicit workflow live switch plus `KALSHI_LIVE_ENABLED=true` and `KALSHI_SHADOW_ONLY=false` |
 
-For base `1.00`, a qualifying sticky NO ask of 53¢ implies an opposite YES
-ask of 48¢ and the exact plan is:
+For base `1.00`, a qualifying sticky NO ask of 53¢ freezes the opposite YES
+initial bid at exactly 47¢ and the exact plan is:
 
 ```text
 BUY YES  1.00 @ 47¢ GTC post-only
@@ -55,8 +55,9 @@ BUY YES  8.00 @ 20¢ GTC post-only
 BUY YES 16.00 @ 10¢ GTC post-only
 ```
 
-The same mapping is symmetric when the sticky prediction is YES: the worker
-buys NO. A base of `2.00` produces quantities `2/4/8/16/32`; it does not enable
+The 53/54/55/56/57¢ sticky asks map respectively to 47/46/45/44/43¢ first
+orders. The same mapping is symmetric when the sticky prediction is YES: the
+worker buys NO. A base of `2.00` produces quantities `2/4/8/16/32`; it does not enable
 a recovery multiplier or a cap. Funding preflight uses the maximum cash needed
 for all five orders before any intent is sent.
 
@@ -773,6 +774,14 @@ the pure `opposite_ladder_core.py` plan between live and shadow adapters.
 - The pure `opposite_ladder_core.py` plan fixes integer-cent prices and
   two-decimal `Decimal` quantities. Live and shadow modes consume the same plan;
   only their execution adapters differ.
+- The first fresh executable quote pair at or after 60 seconds is the market's
+  one terminal eligibility decision. The sticky/directional side must be
+  53–57¢ inclusive; 52¢ or lower and 58¢ or higher are logged as
+  `ENTRY_FILTERED`, submit zero orders, and cannot become eligible later.
+- An eligible sticky ask maps exactly to the opposite-side first GTC bid as
+  `100 - sticky ask`: 53/54/55/56/57¢ therefore becomes 47/46/45/44/43¢.
+  The first order is 1× the configured base (1.00 share by default), followed
+  by the unchanged 40/30/20/10¢ orders at 2×/4×/8×/16×.
 - At qualification, all five order intents are saved before submission and all
   five are attempted in the same event-loop pass. Each role has its own
   deterministic client-order ID, acknowledgment, fill and retry history.
@@ -817,7 +826,8 @@ not replace it with an older default.
 | `initial_shares` | Two-decimal starting base for a brand-new state; current default `1.00` |
 
 The controlled-restart workflow exposes only `source_run_id` and `target_live`.
-Run duration, sticky signal, 53–58¢ gate, prices, GTC lifetime, ladder
+Run duration, sticky signal, terminal post-60-second 53–57¢ gate, exact
+47–43¢ complementary first entry, GTC lifetime, ladder
 multiples, 51¢ boundary and checkpoint cadence are immutable configuration,
 not routine UI knobs.
 
@@ -834,7 +844,7 @@ KALSHI_API_KEY_ID=... KALSHI_PEM_PATH=kalshi_private_key.pem \
   .venv/bin/python kalshi_live_trader.py --config selected_live_strategy.json \
   --state-file data/kalshi_shadow_opposite_ladder_v14_state.json \
   --audit-ledger data/kalshi_shadow_opposite_ladder_v14_audit.jsonl \
-  --shadow-profile opposite_ladder_53_58_flatten_51 \
+  --shadow-profile opposite_ladder_53_57_flatten_51 \
   --trading-mode shadow --dry-run --run-seconds 120
 
 # Read-only reconciliation; it never creates an entry.

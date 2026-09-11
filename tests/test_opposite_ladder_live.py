@@ -168,6 +168,39 @@ class OppositeLadderLiveTests(unittest.TestCase):
             self.assertEqual(len(rest.calls), 5)
         asyncio.run(scenario())
 
+    def test_first_post60_quote_outside_band_is_terminal_no_entry(self):
+        async def scenario(sticky_ask):
+            opened = time.time() - 61
+            engine, feed, rest = self.engine(dry_run=False), OppositeFeed(opened), Rest()
+            feed.asks["no"] = Decimal(sticky_ask) / Decimal(100)
+            feed.asks["yes"] = Decimal("0.50")
+            record = self.signal(engine, opened)
+            await engine.submit_entry(rest, feed, record, opened + 60.3)
+            self.assertEqual(record["status"], "ENTRY_FILTERED")
+            self.assertEqual(record["delayed_entry_decision"]["status"], "REJECTED")
+            self.assertEqual(rest.calls, [])
+            # A later in-band quote cannot reopen this market.
+            feed.asks["no"] = Decimal("0.55")
+            await engine.submit_entry(rest, feed, record, opened + 61.3)
+            self.assertEqual(rest.calls, [])
+
+        for sticky_ask in (52, 58, 59):
+            asyncio.run(scenario(sticky_ask))
+
+    def test_wide_spread_still_freezes_exact_sticky_complement(self):
+        async def scenario():
+            opened = time.time() - 61
+            engine, feed, rest = self.engine(dry_run=False), OppositeFeed(opened), Rest()
+            feed.asks["no"] = Decimal("0.57")
+            feed.asks["yes"] = Decimal("0.49")
+            record = self.signal(engine, opened)
+            await engine.submit_entry(rest, feed, record, opened + 60.3)
+            self.assertEqual(record["delayed_entry_decision"]["sticky_ask_cents"], 57)
+            self.assertEqual(record["entry_limit_cents"], 43)
+            self.assertEqual(round(rest.calls[0]["position_price"] * 100), 43)
+            self.assertEqual(rest.calls[0]["quantity"], 1.0)
+        asyncio.run(scenario())
+
     def test_shadow_51c_bid_cancels_unfilled_rungs_and_exits_only_fills(self):
         async def scenario():
             opened = time.time() - 61

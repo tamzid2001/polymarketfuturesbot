@@ -74,10 +74,12 @@ ORDER_PREFIX = "kxbtc15m-hybrid-v1-"
 # watchdog handoff.  Bump both values deliberately with a reviewed migration
 # whenever the shared live/backtest strategy semantics change.
 # v14 is a hard compatibility boundary.  At/after 60 seconds, a sticky-side
-# ask in the inclusive 53c..58c band freezes five post-only GTC BUY orders on
-# the opposite side: opposite ask minus 1c at 1x base and 40/30/20/10c at
+# ask in the inclusive 53c..57c band freezes five post-only GTC BUY orders on
+# the opposite side: exact complement 100-minus-sticky-ask (47c..43c) at 1x
+# base and 40/30/20/10c at
 # 2/4/8/16x base.  Recovery, permanent-base scaling, and position caps are not
-# part of this contract. Contract revision 2 latches the flatten path when the
+# part of this contract. Contract revision 3 preserves revision 2's flatten
+# path, which latches when the
 # held-side executable bid reaches 51c OR the sticky-side executable ask falls
 # to 51c. An older revision cannot load the revised canonical configuration.
 ACTIVE_STRATEGY_VERSION = "kxbtc15m-opposite-ladder-live-v14"
@@ -100,7 +102,11 @@ DELAYED_ENTRY_LADDER_CONTRACT_VERSION = 4
 LIVE_STOP_SAFETY_CONTRACT_VERSION = 3
 POSITION_CAP_CONTRACT_VERSION = 2
 ENTRY_DELIVERY_CONTRACT_VERSION = 1
-OPPOSITE_LADDER_CONTRACT_VERSION = 2
+# v3 makes the first post-60-second sticky-side quote a terminal 53c..57c
+# eligibility decision and derives the opposite-side initial tick exactly as
+# 100 - sticky ask (47c..43c). This prevents spread-dependent out-of-band
+# initial orders while retaining the reviewed v2 two-sided 51c flatten logic.
+OPPOSITE_LADDER_CONTRACT_VERSION = 3
 # A definitive HTTP rejection proves that the matching engine did not create
 # an order. Keep the frozen strategy intent alive and retry it at a bounded
 # cadence while the same market remains safe. Unknown POST outcomes are never
@@ -341,7 +347,8 @@ INTEGER_CONFIG_FIELDS = {
     "shadow_entry_level_step_cents", "hybrid_stop_trigger_cents", "hybrid_maker_exit_cents",
     "hybrid_hard_stop_cents", "opening_quote_capture_seconds", "delayed_entry_threshold_cents",
     "delayed_entry_start_seconds", "delayed_entry_max_limit_cents",
-    "delayed_entry_max_trigger_cents", "opposite_take_profit_cents",
+    "delayed_entry_max_trigger_cents", "opposite_initial_limit_min_cents",
+    "opposite_initial_limit_max_cents", "opposite_take_profit_cents",
 }
 FLOAT_CONFIG_FIELDS = {
     "stop_poll_interval", "reconciliation_interval", "max_outcome_quote_age_seconds", "max_stale_quote_seconds",
@@ -363,8 +370,9 @@ SHADOW_STOP_PROFILE_PRICES = {
     "delayed_53_57_exit_51": Decimal("0.51"),
     "opposite_ladder_53_58_take_profit_50": Decimal("0.50"),
     "opposite_ladder_53_58_flatten_51": Decimal("0.51"),
+    "opposite_ladder_53_57_flatten_51": Decimal("0.51"),
 }
-CANONICAL_LIVE_SHADOW_PROFILE = "opposite_ladder_53_58_flatten_51"
+CANONICAL_LIVE_SHADOW_PROFILE = "opposite_ladder_53_57_flatten_51"
 
 
 def price_to_cents(value: Decimal | str, name: str = "price") -> int:
@@ -542,8 +550,8 @@ def validate_entry_price_contract(value: dict[str, Any]) -> None:
         raise ValueError("v14 accepts only the opposite-side ladder profile")
     if value.get("stop_policy") != "opposite_side_take_profit_ioc":
         raise ValueError("the active strategy requires stop_policy=opposite_side_take_profit_ioc")
-    if int(value["entry_limit_offset_cents"]) < 0:
-        raise ValueError("entry_limit_offset_cents cannot be negative")
+    if int(value["entry_limit_offset_cents"]) != 1:
+        raise ValueError("the active opposite ladder requires entry_limit_offset_cents=1")
     level_min = int(value["shadow_entry_level_min_cents"])
     level_max = int(value["shadow_entry_level_max_cents"])
     level_step = int(value["shadow_entry_level_step_cents"])
@@ -572,10 +580,14 @@ def validate_entry_price_contract(value: dict[str, Any]) -> None:
         raise ValueError("the active analytics contract requires delayed_entry_threshold_cents=53")
     if int(value.get("delayed_entry_start_seconds", -1)) != 60:
         raise ValueError("the active delayed entry contract requires delayed_entry_start_seconds=60")
-    if int(value.get("delayed_entry_max_trigger_cents", 0)) != 58:
-        raise ValueError("the active opposite ladder requires a 58c inclusive sticky-side trigger ceiling")
+    if int(value.get("delayed_entry_max_trigger_cents", 0)) != 57:
+        raise ValueError("the active opposite ladder requires a 57c inclusive sticky-side trigger ceiling")
+    if int(value.get("opposite_initial_limit_min_cents", 0)) != 43:
+        raise ValueError("the active opposite ladder requires a 43c initial-limit floor")
+    if int(value.get("opposite_initial_limit_max_cents", 0)) != 47:
+        raise ValueError("the active opposite ladder requires a 47c initial-limit ceiling")
     if int(value.get("delayed_entry_max_limit_cents", 0)) != 57:
-        raise ValueError("the compatibility limit ceiling must remain 57c")
+        raise ValueError("the compatibility delayed-entry limit ceiling must remain 57c")
     if not _bool(value.get("opposite_ladder_enabled", False)):
         raise ValueError("opposite_ladder_enabled must be true")
     if _bool(value.get("recovery_enabled", True)):
@@ -608,6 +620,7 @@ def load_config(path: Path) -> dict[str, Any]:
         "stop_policy", "stop_baseline_entry_price", "entry_execution_mode", "entry_limit_offset_cents",
         "maker_order_time_in_force", "entry_order_lifetime", "entry_timeout_seconds",
         "opening_quote_capture_seconds", "delayed_entry_start_seconds", "delayed_entry_max_limit_cents",
+        "opposite_initial_limit_min_cents", "opposite_initial_limit_max_cents",
         "delayed_entry_max_trigger_cents", "opposite_take_profit_cents",
         "shadow_fill_model", "shadow_entry_level_min_cents", "shadow_entry_level_max_cents",
         "shadow_entry_level_step_cents", "hybrid_stop_enabled", "hybrid_stop_trigger_cents",
@@ -660,7 +673,9 @@ def load_config(path: Path) -> dict[str, Any]:
     value.setdefault("delayed_entry_threshold_cents", 53)
     value.setdefault("delayed_entry_start_seconds", 60)
     value.setdefault("delayed_entry_max_limit_cents", 57)
-    value.setdefault("delayed_entry_max_trigger_cents", 58)
+    value.setdefault("delayed_entry_max_trigger_cents", 57)
+    value.setdefault("opposite_initial_limit_min_cents", 43)
+    value.setdefault("opposite_initial_limit_max_cents", 47)
     value.setdefault("opposite_take_profit_cents", 51)
     value.setdefault("opposite_ladder_enabled", True)
     value.setdefault("recovery_enabled", False)
@@ -719,14 +734,13 @@ def save_config(path: Path, config: dict[str, Any]) -> None:
 
 
 def enforce_active_runtime_config(path: Path) -> dict[str, Any]:
-    """Upgrade only the reviewed v14 boundary fields restored at handoff.
+    """Upgrade only reviewed v14 opposite-ladder contracts at handoff.
 
-    Runtime checkpoints intentionally persist operator configuration.  That
-    means the first worker after this release can restore the prior 50c
-    contract over the repository's new defaults.  Accept only the exact v14
-    opposite-ladder shape, then atomically replace the boundary fields with
-    revision 2's two-sided 51c contract.  Any unrelated or unrecognized
-    configuration remains a hard error.
+    A runtime checkpoint can restore revision 2's 53c..58c band over the
+    repository default.  Accept only that exact predecessor (or revision 3
+    itself), then atomically install the terminal 53c..57c decision and its
+    exact complementary 43c..47c initial-entry band.  Unrelated configuration
+    remains a hard error.
     """
 
     raw = json.loads(path.read_text(encoding="utf-8"))
@@ -737,7 +751,6 @@ def enforce_active_runtime_config(path: Path) -> dict[str, Any]:
         "config_schema_version": ACTIVE_CONFIG_SCHEMA_VERSION,
         "entry_execution_mode": "opposite_side_doubling_ladder",
         "delayed_entry_threshold_cents": 53,
-        "delayed_entry_max_trigger_cents": 58,
         "delayed_entry_start_seconds": 60,
         "entry_limit_offset_cents": 1,
         "maker_order_time_in_force": "good_till_canceled",
@@ -750,7 +763,7 @@ def enforce_active_runtime_config(path: Path) -> dict[str, Any]:
     }
     if mismatches:
         raise ValueError(f"refusing to rewrite noncanonical runtime config: {mismatches}")
-    prior_boundary = (
+    prior_contract = (
         str(raw.get("stop_price")),
         str(raw.get("stop_baseline_entry_price")),
         int(raw.get("hybrid_stop_trigger_cents", 0)),
@@ -758,19 +771,23 @@ def enforce_active_runtime_config(path: Path) -> dict[str, Any]:
         int(raw.get("hybrid_hard_stop_cents", 0)),
         int(raw.get("opposite_take_profit_cents", 0)),
         str(raw.get("shadow_profile")),
+        int(raw.get("delayed_entry_max_trigger_cents", 0)),
+        raw.get("opposite_initial_limit_min_cents"),
+        raw.get("opposite_initial_limit_max_cents"),
+        int(raw.get("delayed_entry_max_limit_cents", 0)),
     )
-    allowed_boundaries = {
+    allowed_contracts = {
         (
-            "0.50", "0.50", 50, 50, 50, 50,
-            "opposite_ladder_53_58_take_profit_50",
+            "0.51", "0.51", 51, 51, 51, 51,
+            "opposite_ladder_53_58_flatten_51", 58, None, None, 57,
         ),
         (
             "0.51", "0.51", 51, 51, 51, 51,
-            CANONICAL_LIVE_SHADOW_PROFILE,
+            CANONICAL_LIVE_SHADOW_PROFILE, 57, 43, 47, 57,
         ),
     }
-    if prior_boundary not in allowed_boundaries:
-        raise ValueError(f"refusing unrecognized runtime exit contract: {prior_boundary}")
+    if prior_contract not in allowed_contracts:
+        raise ValueError(f"refusing unrecognized runtime ladder contract: {prior_contract}")
     raw.update({
         "stop_price": "0.51",
         "stop_baseline_entry_price": "0.51",
@@ -778,10 +795,15 @@ def enforce_active_runtime_config(path: Path) -> dict[str, Any]:
         "hybrid_maker_exit_cents": 51,
         "hybrid_hard_stop_cents": 51,
         "opposite_take_profit_cents": 51,
+        "delayed_entry_max_trigger_cents": 57,
+        "delayed_entry_max_limit_cents": 57,
+        "opposite_initial_limit_min_cents": 43,
+        "opposite_initial_limit_max_cents": 47,
         "shadow_profile": CANONICAL_LIVE_SHADOW_PROFILE,
         "selection_basis": (
-            "sticky_side_delayed_53_58_then_trade_opposite_at_ask_minus_1_and_"
-            "40_30_20_10_doubling_gtc_flatten_when_either_side_touches_51"
+            "first_fresh_post60_sticky_ask_53_57_terminal_gate_then_trade_opposite_"
+            "at_exact_complement_47_43_and_40_30_20_10_doubling_gtc_flatten_"
+            "when_either_side_touches_51"
         ),
     })
     validated = load_config_from_value(raw)
@@ -834,6 +856,7 @@ def load_config_from_value(value: dict[str, Any]) -> dict[str, Any]:
         "stop_baseline_entry_price", "entry_execution_mode", "entry_limit_offset_cents", "shadow_fill_model",
         "maker_order_time_in_force", "entry_order_lifetime", "entry_timeout_seconds",
         "opening_quote_capture_seconds", "delayed_entry_start_seconds", "delayed_entry_max_limit_cents",
+        "opposite_initial_limit_min_cents", "opposite_initial_limit_max_cents",
         "delayed_entry_max_trigger_cents", "opposite_take_profit_cents",
         "shadow_entry_level_min_cents", "shadow_entry_level_max_cents", "shadow_entry_level_step_cents",
         "hybrid_stop_enabled", "hybrid_stop_trigger_cents", "hybrid_maker_exit_cents",
@@ -864,7 +887,9 @@ def load_config_from_value(value: dict[str, Any]) -> dict[str, Any]:
     temporary.setdefault("delayed_entry_threshold_cents", 53)
     temporary.setdefault("delayed_entry_start_seconds", 60)
     temporary.setdefault("delayed_entry_max_limit_cents", 57)
-    temporary.setdefault("delayed_entry_max_trigger_cents", 58)
+    temporary.setdefault("delayed_entry_max_trigger_cents", 57)
+    temporary.setdefault("opposite_initial_limit_min_cents", 43)
+    temporary.setdefault("opposite_initial_limit_max_cents", 47)
     temporary.setdefault("opposite_take_profit_cents", 51)
     temporary.setdefault("opposite_ladder_enabled", True)
     temporary.setdefault("recovery_enabled", False)
@@ -2422,17 +2447,25 @@ class LiveEngine:
     def freeze_opposite_ladder_plan(
         self, feed: KalshiLiveFeed, record: dict[str, Any], now: float,
     ) -> dict[str, Any] | None:
-        """Freeze one v14 plan from the first fresh delayed quote in 53–58c.
+        """Freeze or reject from the first fresh post-60-second quote pair.
 
-        The band is observed on the sticky prediction side.  Every order is
-        then a BUY on the opposite side.  The first order is one cent below
-        the opposite-side executable ask; the other four prices are fixed.
+        The sticky prediction-side ask must be 53c..57c inclusive at that
+        single decision point. Outside the band is a terminal no-entry for the
+        market. Inside the band, every order is a BUY on the opposite side and
+        the first tick is the exact complement ``100 - sticky ask`` (47c..43c).
+        The independently observed opposite ask remains the post-only safety
+        reference; it never moves the frozen entry tick.
         """
 
         ladder = record.setdefault("opposite_ladder", {})
         existing = ladder.get("plan")
         if isinstance(existing, dict):
             return existing
+        # A restored revision-2 record without a frozen plan has no exchange
+        # intent to preserve. Mark it revision 3 before making the new,
+        # exposure-narrowing one-time decision. Frozen revision-2 plans return
+        # above and continue under their original durable contract.
+        ladder["contract_version"] = OPPOSITE_LADDER_CONTRACT_VERSION
         opened = float(record["market_open_epoch"])
         start_seconds = int(self.config["delayed_entry_start_seconds"])
         if now < opened + start_seconds:
@@ -2475,12 +2508,41 @@ class LiveEngine:
         lower = int(self.config["delayed_entry_threshold_cents"])
         upper = int(self.config["delayed_entry_max_trigger_cents"])
         if not lower <= sticky_ask <= upper:
+            decided_at = utc_now()
+            reason = "first_post60_sticky_ask_outside_53_57_band"
             ladder.update({
-                "wait_reason": "sticky_side_ask_outside_53_58_band",
+                "state": "FILTERED", "wait_reason": None,
+                "filtered_reason": reason, "filtered_at": decided_at,
                 "last_sticky_ask_cents": sticky_ask,
                 "last_opposite_ask_cents": opposite_ask,
-                "last_quote_at": utc_now(),
+                "last_quote_at": decided_at,
             })
+            record["delayed_entry_decision"] = {
+                "status": "REJECTED", "reason": reason,
+                "sticky_side": sticky_side, "trade_side": trade_side,
+                "sticky_ask_cents": sticky_ask,
+                "opposite_ask_cents": opposite_ask,
+                "trigger_min_cents": lower, "trigger_max_cents": upper,
+                "quote_exchange_epoch": max(sticky_epoch, opposite_epoch),
+                "seconds_after_open": round(max(sticky_epoch, opposite_epoch) - opened, 6),
+                "decided_at": decided_at,
+            }
+            self.transition(record, "ENTRY_FILTERED", reason)
+            if self.state.get("active_market") == record["ticker"]:
+                self.state["active_market"] = None
+            self.audit(
+                "opposite_ladder_entry_filtered", ticker=record["ticker"],
+                sticky_side=sticky_side, trade_side=trade_side,
+                sticky_ask_cents=sticky_ask, opposite_ask_cents=opposite_ask,
+                trigger_min_cents=lower, trigger_max_cents=upper,
+                terminal_for_market=True,
+            )
+            LOG.warning(
+                "OPPOSITE LADDER SKIP | ticker=%s sticky_prediction=%s first_post60_ask=%sc "
+                "required_band=%s..%sc trade_side=%s orders_sent=0 terminal_for_market=true",
+                record["ticker"], sticky_side.upper(), sticky_ask, lower, upper,
+                trade_side.upper(),
+            )
             return None
         plan = build_opposite_ladder_plan(
             sticky_side=sticky_side,
@@ -2502,6 +2564,11 @@ class LiveEngine:
         })
         ladder.update({"state": "PLAN_FROZEN", "plan": plan, "wait_reason": None})
         initial = plan["orders"][0]
+        initial_cents = int(initial["price_cents"])
+        minimum_initial = int(self.config["opposite_initial_limit_min_cents"])
+        maximum_initial = int(self.config["opposite_initial_limit_max_cents"])
+        if not minimum_initial <= initial_cents <= maximum_initial:
+            raise RuntimeError("frozen opposite-side initial order escaped the reviewed 43c..47c band")
         record.update({
             "initial_signal_price_cents": opposite_ask,
             "initial_signal_price": format(cents_price(opposite_ask), "f"),
@@ -2525,10 +2592,15 @@ class LiveEngine:
                 opposite_epoch, timezone.utc,
             ).isoformat(),
             "delayed_entry_decision": {
-                "status": "ELIGIBLE", "reason": "sticky_side_ask_inside_53_58_band",
+                "status": "ELIGIBLE", "reason": "first_post60_sticky_ask_inside_53_57_band",
                 "sticky_side": sticky_side, "trade_side": trade_side,
                 "sticky_ask_cents": sticky_ask, "opposite_ask_cents": opposite_ask,
-                "limit_price_cents": initial["price_cents"], "decided_at": frozen_at,
+                "limit_price_cents": initial_cents,
+                "limit_price_basis": "100_minus_sticky_ask",
+                "trigger_min_cents": lower, "trigger_max_cents": upper,
+                "initial_limit_min_cents": minimum_initial,
+                "initial_limit_max_cents": maximum_initial,
+                "terminal_decision": True, "decided_at": frozen_at,
             },
         })
         self.audit(
@@ -2539,8 +2611,9 @@ class LiveEngine:
         )
         LOG.warning("=" * 68)
         LOG.warning(
-            "OPPOSITE LADDER SIGNAL | ticker=%s sticky_prediction=%s sticky_ask=%sc "
-            "trade_side=%s opposite_ask=%sc initial_limit=%sc base=%s",
+            "OPPOSITE LADDER SIGNAL | ticker=%s sticky_prediction=%s first_post60_ask=%sc "
+            "required_band=53..57c trade_side=%s observed_opposite_ask=%sc "
+            "initial_limit=%sc basis=100-minus-sticky-ask allowed_initial=43..47c base=%s",
             record["ticker"], sticky_side.upper(), sticky_ask, trade_side.upper(),
             opposite_ask, initial["price_cents"], plan["base_shares"],
         )

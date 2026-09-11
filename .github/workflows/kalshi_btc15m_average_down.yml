@@ -5,7 +5,7 @@ name: Kalshi KXBTC15M Opposite Ladder v14 Live
 # not assume a cron invocation occurred at exactly a 15-minute open.
 run-name: >-
   Kalshi KXBTC15M Opposite Ladder v14 —
-  ${{ inputs.reconcile_only && 'RECONCILE_ONLY opposite_ladder_53_58_flatten_51' || (inputs.live_enabled && vars.KALSHI_LIVE_ENABLED == 'true' && vars.KALSHI_SHADOW_ONLY == 'false') && 'LIVE opposite_ladder_53_58_flatten_51' || inputs.live_enabled && 'LIVE_REQUEST_BLOCKED opposite_ladder_53_58_flatten_51' || 'DRY_RUN opposite_ladder_53_58_flatten_51' }}
+  ${{ inputs.reconcile_only && 'RECONCILE_ONLY opposite_ladder_53_57_flatten_51' || (inputs.live_enabled && vars.KALSHI_LIVE_ENABLED == 'true' && vars.KALSHI_SHADOW_ONLY == 'false') && 'LIVE opposite_ladder_53_57_flatten_51' || inputs.live_enabled && 'LIVE_REQUEST_BLOCKED opposite_ladder_53_57_flatten_51' || 'DRY_RUN opposite_ladder_53_57_flatten_51' }}
 
 on:
   # The separately serialized watchdog owns the five-minute recovery
@@ -150,7 +150,7 @@ jobs:
       - name: Assert canonical opposite-ladder strategy contract
         run: |
           set -euo pipefail
-          python -c 'from pathlib import Path; from kalshi_live_trader import ACTIVE_CONFIG_SCHEMA_VERSION, ACTIVE_STRATEGY_VERSION, ENTRY_DELIVERY_CONTRACT_VERSION, OPPOSITE_LADDER_CONTRACT_VERSION, enforce_active_runtime_config; c=enforce_active_runtime_config(Path("selected_live_strategy.json")); assert c["strategy_version"] == ACTIVE_STRATEGY_VERSION; assert c["config_schema_version"] == ACTIVE_CONFIG_SCHEMA_VERSION == 14; assert ENTRY_DELIVERY_CONTRACT_VERSION == 1; assert OPPOSITE_LADDER_CONTRACT_VERSION == 2; assert c["entry_execution_mode"] == "opposite_side_doubling_ladder"; assert c["delayed_entry_start_seconds"] == 60; assert (c["delayed_entry_threshold_cents"], c["delayed_entry_max_trigger_cents"]) == (53,58); assert c["entry_limit_offset_cents"] == 1; assert c["maker_order_time_in_force"] == "good_till_canceled"; assert c["entry_order_lifetime"] == "until_filled_or_market_close"; assert c["entry_timeout_seconds"] == 0; assert c["opposite_take_profit_cents"] == 51; assert c["recovery_enabled"] is False and c["base_scaling_enabled"] is False; assert "max_position" not in c and "max_position_per_base_share" not in c and "position_cap_enabled" not in c; print("OPPOSITE_LADDER_V14_REV2_CONTRACT=OK | sticky_band=53..58 trade_side=opposite orders=ask-1@1x,40@2x,30@4x,20@8x,10@16x tif=GTC post_only=true exit=either_boundary:trade_bid>=51_or_sticky_ask<=51,cancel_then_reduce_only_IOC recovery=disabled cap=absent")'
+          python -c 'from pathlib import Path; from kalshi_live_trader import ACTIVE_CONFIG_SCHEMA_VERSION, ACTIVE_STRATEGY_VERSION, ENTRY_DELIVERY_CONTRACT_VERSION, OPPOSITE_LADDER_CONTRACT_VERSION, enforce_active_runtime_config; c=enforce_active_runtime_config(Path("selected_live_strategy.json")); assert c["strategy_version"] == ACTIVE_STRATEGY_VERSION; assert c["config_schema_version"] == ACTIVE_CONFIG_SCHEMA_VERSION == 14; assert ENTRY_DELIVERY_CONTRACT_VERSION == 1; assert OPPOSITE_LADDER_CONTRACT_VERSION == 3; assert c["entry_execution_mode"] == "opposite_side_doubling_ladder"; assert c["delayed_entry_start_seconds"] == 60; assert (c["delayed_entry_threshold_cents"], c["delayed_entry_max_trigger_cents"]) == (53,57); assert (c["opposite_initial_limit_min_cents"], c["opposite_initial_limit_max_cents"]) == (43,47); assert c["entry_limit_offset_cents"] == 1; assert c["maker_order_time_in_force"] == "good_till_canceled"; assert c["entry_order_lifetime"] == "until_filled_or_market_close"; assert c["entry_timeout_seconds"] == 0; assert c["opposite_take_profit_cents"] == 51; assert c["recovery_enabled"] is False and c["base_scaling_enabled"] is False; assert "max_position" not in c and "max_position_per_base_share" not in c and "position_cap_enabled" not in c; print("OPPOSITE_LADDER_V14_REV3_CONTRACT=OK | first_post60_sticky_band=53..57 terminal_skip_outside=true trade_side=opposite initial=100-sticky_ask=47..43@1x rungs=40@2x,30@4x,20@8x,10@16x tif=GTC post_only=true exit=either_boundary:trade_bid>=51_or_sticky_ask<=51,cancel_then_reduce_only_IOC recovery=disabled cap=absent")'
 
       - name: Write Kalshi RSA private key
         env:
@@ -197,7 +197,7 @@ jobs:
           RUN_SECONDS: "18000"
           REQUESTED_LIVE: ${{ !inputs.reconcile_only && inputs.live_enabled && vars.KALSHI_LIVE_ENABLED == 'true' && vars.KALSHI_SHADOW_ONLY == 'false' }}
           RECONCILE_ONLY: ${{ inputs.reconcile_only || false }}
-          SHADOW_PROFILE: "opposite_ladder_53_58_flatten_51"
+          SHADOW_PROFILE: "opposite_ladder_53_57_flatten_51"
           INITIAL_SHARES: ${{ inputs.initial_shares || '' }}
           FRESH_STATE_RESET: ${{ inputs.fresh_state_reset || false }}
         run: |
@@ -210,7 +210,7 @@ jobs:
             audit_file=data/kalshi_live_opposite_ladder_v14_audit.jsonl
           else
             case "$SHADOW_PROFILE" in
-              opposite_ladder_53_58_flatten_51) : ;;
+              opposite_ladder_53_57_flatten_51) : ;;
               *) echo "::error::Unknown shadow profile: $SHADOW_PROFILE"; exit 2 ;;
             esac
             # v14 deliberately starts a new namespace. Older recovery/cap and
@@ -264,7 +264,7 @@ jobs:
           REPOSITORY: ${{ github.repository }}
           REQUESTED_LIVE: ${{ !inputs.reconcile_only && inputs.live_enabled && vars.KALSHI_LIVE_ENABLED == 'true' && vars.KALSHI_SHADOW_ONLY == 'false' }}
           RECONCILE_ONLY: ${{ inputs.reconcile_only || false }}
-          SHADOW_PROFILE: "opposite_ladder_53_58_flatten_51"
+          SHADOW_PROFILE: "opposite_ladder_53_57_flatten_51"
         run: |
           set -euo pipefail
           [ "$RECONCILE_ONLY" = "true" ] && exit 0
