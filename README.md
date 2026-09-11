@@ -6,7 +6,7 @@ This repository’s active Kalshi path is a KXBTC15M **sticky-direction, live-ca
 
 It is not a pure Monte Carlo backtest. Historical KXBTC15M settlement outcomes and their timestamps are fixed; only intramarket facts unavailable from the public settlement API—resting-order fills, adverse-path depth, stop activation, and exit execution—are simulated.
 
-The active GitHub Actions worker is [`kalshi_live_trader.py`](kalshi_live_trader.py). Retired Prophet, equity-regime, loss-skip, and ladder code paths are retained only as retired material and are not called by the hybrid live, watchdog, controlled-restart, audit, or emergency-cancel workflows.
+The active GitHub Actions worker is [`kalshi_live_trader.py`](kalshi_live_trader.py). Retired Prophet, equity-regime, loss-skip, recovery-sizing, and older averaging-down paths are retained only as archived material and are not called by the v14 worker, watchdog, controlled-restart, audit, or emergency-cancel workflows.
 
 ## Read this before interpreting a result
 
@@ -19,7 +19,87 @@ The active GitHub Actions worker is [`kalshi_live_trader.py`](kalshi_live_trader
 
 All dollar results below are gross unless explicitly marked otherwise. Fees, live queue position, partial fills, cancellations, latency, and stop slippage can reduce or eliminate the modeled edge.
 
-## Current live/shadow configuration
+## Current production configuration: opposite-side GTC ladder v14
+
+[`selected_live_strategy.json`](selected_live_strategy.json) is the canonical
+configuration. The executable contract is
+`kxbtc15m-opposite-ladder-live-v14` / schema `14`; the worker, watchdog,
+controlled restart and checkpoint publisher all assert that exact version and
+use the isolated `runtime-state-kxbtc15m-opposite-ladder-v14` ref. Older state
+namespaces contain evidence only and cannot be restored into this worker.
+
+| Setting | Production contract |
+| --- | --- |
+| Series | `KXBTC15M`, discovered from exchange metadata |
+| Sticky signal | Seed inverse; keep a losing prediction; flip only after that prediction wins |
+| Qualification | At/after 60 seconds, sticky-side executable ask must be 53–58¢ inclusive |
+| Traded side | The side opposite the sticky prediction |
+| Initial order | Post-only GTC at the opposite-side executable ask minus 1¢, quantity `1 × base` |
+| Preposted rungs | Post-only GTC orders at 40/30/20/10¢, quantities `2/4/8/16 × base` |
+| Submission timing | All five immutable order intents are persisted and submitted in the same event-loop pass |
+| Exit boundary | Opposite-side bid ≥50¢ or equivalent sticky-side ask ≤50¢ |
+| Exit action | Latch, cancel/reconcile every unfilled rung, then reduce-only IOC only the authoritative filled exposure; repeat residual reconciliation until flat |
+| Recovery/base scaling | Disabled |
+| Position cap | None; the complete ladder is exactly `31 × base` shares |
+| Workflow input | Only `initial_shares` changes strategy sizing; blank preserves the durable base |
+| Live gates | Explicit workflow live switch plus `KALSHI_LIVE_ENABLED=true` and `KALSHI_SHADOW_ONLY=false` |
+
+For base `1.00`, a qualifying sticky NO ask of 53¢ implies an opposite YES
+ask of 48¢ and the exact plan is:
+
+```text
+BUY YES  1.00 @ 47¢ GTC post-only
+BUY YES  2.00 @ 40¢ GTC post-only
+BUY YES  4.00 @ 30¢ GTC post-only
+BUY YES  8.00 @ 20¢ GTC post-only
+BUY YES 16.00 @ 10¢ GTC post-only
+```
+
+The same mapping is symmetric when the sticky prediction is YES: the worker
+buys NO. A base of `2.00` produces quantities `2/4/8/16/32`; it does not enable
+a recovery multiplier or a cap. Funding preflight uses the maximum cash needed
+for all five orders before any intent is sent.
+
+A definitive initial-order rejection is retried every second with the same
+frozen side, price and quantity and a new deterministic attempt ID, while the
+four rung orders remain managed independently. A timed-out/unknown POST is not
+blindly duplicated: the worker continuously reconciles its exact durable client
+ID against exchange orders, fills and position, then resumes only after the
+result is known. Retrying an unknown order without reconciliation could create
+duplicate exposure and is deliberately forbidden. Retries stop at market close
+or once the 50¢ exit boundary is latched.
+
+The GTC orders have no strategy timeout. They remain until filled, market close,
+or the 50¢ boundary. A submission is never counted as a fill. Live exposure and
+fees come only from exchange fills; shadow fills require conservative public
+trade-through evidence. Partial fills contribute only their actual quantity.
+
+The exit latch is durable and has priority over new entries. The bot first
+cancels and confirms all still-resting ladder quantities, refreshes fills and
+the authoritative market position, and then submits a reduce-only IOC at the
+current executable price. If it fills partly, the next reconciliation submits
+only the remaining authoritative exposure. It never converts that residual to
+a stale GTC sell that could later reverse the position.
+
+Local state and the JSONL ledger are atomically flushed and `fsync`ed after
+material events. Remote snapshots publish every 30 seconds and on handoff to:
+
+| Mode | State | Ledger |
+| --- | --- | --- |
+| Live | `data/kalshi_live_opposite_ladder_v14_state.json` | `data/kalshi_live_opposite_ladder_v14_audit.jsonl` |
+| Shadow | `data/kalshi_shadow_opposite_ladder_v14_state.json` | `data/kalshi_shadow_opposite_ladder_v14_audit.jsonl` |
+
+The five-hour worker hands off only inside the middle 13 minutes of a market.
+The five-minute watchdog preserves the previously explicit LIVE/DRY_RUN mode,
+uses current `main`, and dispatches only this v14 lane. `cancel-in-progress` is
+false, so a successor cannot kill a worker during order management.
+
+## Archived v13 implementation record (not executable)
+
+Everything in this section documents the retired selected-side delayed-band
+worker and its research evidence. It is retained for auditability only. Do not
+use its workflow inputs, state paths, recovery sizing, cap, or 51¢ stop as a
+description of the v14 production worker above.
 
 [`selected_live_strategy.json`](selected_live_strategy.json) is the canonical base configuration. The active contract is `kxbtc15m-delayed-band-live-v13` / schema `13`. It promotes the observed delayed-entry cohort into the shared shadow/live execution engine; it is not an auxiliary analytics order. Python and GitHub Actions independently assert the version, entry band, GTC/post-only entry type, 2.50× sizing, and direct 51¢ protective-exit contract before execution. v12 and earlier checkpoints use different paths and a different runtime branch, so an old worker cannot reinterpret them as v13 state.
 
@@ -678,67 +758,97 @@ Each output directory contains the full machine-readable result set:
 | `plots/` | Calibration, equity, drawdown, bankroll, parameter, stop, Pareto, and walk-forward charts |
 | `optimization_summary.md` | Human-readable rankings and explicit notice that settlement-only rows cannot be promoted to the delayed live profile |
 
-The optimizer uses common random numbers for competing configurations, keeps every actual directional settlement fixed, and applies the same `strategy_core.py` recovery/base transitions as the live worker. It reports P&L, drawdown, bankroll, cap-binding, recovery-cycle, fill, zero-fill, and stop distributions. Calibration uncertainty can be added with `--calibration-uncertainty-draws N`. Because the settlement API cannot reproduce the v13 quote-timed 52–57¢ entry cohort, generic optimizer rows are no longer automatically exported as live configuration; only a row explicitly tagged `execution_profile=delayed_53_57_exit_51` can use the guarded export function.
+The historical optimizer uses common random numbers for competing archived
+recovery configurations and keeps every actual directional settlement fixed.
+It reports P&L, drawdown, bankroll, fill, zero-fill and stop distributions.
+Calibration uncertainty can be added with `--calibration-uncertainty-draws N`.
+Those settlement-only rows cannot reproduce the quote-timed v14 ladder and are
+never promoted into its live configuration. The active worker instead shares
+the pure `opposite_ladder_core.py` plan between live and shadow adapters.
 
 ## Production behavior and persistence
 
-- The live engine and historical replay share the recovery/base-sizing transitions. A filled trade updates realized net P&L; a zero fill is exactly $0 and changes neither the recovery exponent nor permanent base.
-- Recovery exponent increases after **every filled closed trade** while cumulative recovery-cycle P&L remains negative. It resets only when that cumulative amount reaches at least $0.
-- `max_recovery_exponent=0` is the explicit disabled sentinel. The shared shadow/live engine does not stop the 2.50× sequence at an arbitrary exponent; the effective base-linked position limit, funding check, recovery-loss breaker, and daily-loss breaker remain active.
-- Permanent-base steps use realized net P&L only. No unrealized value, cancelled order, or zero fill can scale the base.
-- Startup reconciles Kalshi balance, open managed orders, positions, fills, and settlements before any entry. During runtime, an ambiguous entry response leaves the worker and risk management online while only new exposure is interlocked. Exact client-order, fill and position checks repeat every reconciliation interval; known orders/positions are adopted and closed-market no-order cases automatically resume later entries. Kalshi remains authoritative.
-- Client order IDs are deterministic, partial fills use actual quantities, exits are reduce-only where supported, and the same market cannot be counted twice after restart.
-- The worker discovers a bounded previous/current/upcoming market window every second using `min_close_ts`/`max_close_ts`, subscribes the API-provided successor before open, and keeps the ending market subscribed for final 99¢ executable-bid inference. The first complete opening ask establishes eligibility; the first fresh qualifying ask at/after 60 seconds freezes one deterministic ask-minus-1¢ GTC order. There is no IOC entry fallback and later quotes cannot move the limit.
-- The direct protective exit defaults to 51¢. The obligation is persisted before entry cancellation; it cannot be unlatched by a cancel error, quote rebound, or restart. No 52¢ maker exit is submitted. A partial IOC is followed by a fresh authoritative position read and another reduce-only IOC for only the residual—never a stale GTC conversion. Actual entry and exit fills, quantities, fees, and residual exposure drive accounting.
-- Shadow and live state are isolated at `data/kalshi_shadow_delayed_band_v13_*` and `data/kalshi_live_delayed_band_v13_*`. The v13 shadow lane starts at $1,000 and the configured initial base (1.00 share by default), and tracks realized P&L, peak equity, maximum drawdown, entry filtering, false stops, and timing.
-- Every audit JSONL record is appended, flushed, and `fsync`ed before the worker resumes order/position management. Its companion strategy state is atomically written and `fsync`ed immediately after every audit event; therefore a state transition, fill observation, protective-exit event, funding failure, settlement, reconciliation result, and handoff is checkpointed locally while the worker is running—not merely at its end. Remote checkpoints are coalesced every 30 seconds and force-update one parentless `runtime-state-kxbtc15m-delayed-v13` snapshot with an exact lease. Snapshot schema v2 deterministically gzip-compresses each durable file in independent 8 MiB source chunks, verifies every compressed and uncompressed digest/size on restore, and reuses unchanged append-only ledger chunks. This prevents GitHub's 100 MiB single-blob limit from breaking a handoff as the ledger grows. The branch contains only allow-listed KXBTC15M payload chunks plus its manifest; it cannot accumulate ordinary code history or inherit older strategy state.
-- Each market ledger record includes the immutable first price-only opening reference, its completeness status, separately timed first displayed-depth book, derived limit, exchange/client order IDs, partial fills, and maker/taker status where exposed. Timing includes exchange-price lag, worker-observation lag, depth-after-price lag, market-open-to-submission, market-open-to-first-fill, submission-to-first-fill, entry completion, first-fill-to-trigger, trigger-to-maker submission, and trigger-to-observed-flat position. Heartbeats use separate bounded `ORDER HEALTH`, `LIVE ACCOUNT`, `HEARTBEAT`, `ENTRY STATUS`, `LIVE PERFORMANCE`, `STOP STATUS`, and `RESEARCH COHORT` lines so GitHub does not truncate safety-critical fields. `LIVE PERFORMANCE` includes actual fees and rolling payoff-implied break-even rates. Five-minute tables print every 40–49¢ level, winner capture/misses, drawdown buckets, and hybrid-stop outcomes. They also print, separately for every hypothetical stop from 40¢ through 49¢, the number/rate of frozen initial prices at or below that stop, plus exact-price and actual configured safety-rejection counts. Those are no-entry diagnostics, not the retired directional loss-skip rule and not ordinary GTC zero-fills.
-- A five-hour worker checkpoints and queues its successor only in the middle 13 minutes of a market—from one minute after open through one minute before close. One concurrency group serializes the strategy, and the watchdog is mode-preserving and v13-lane-only; it cannot restore v12 or convert shadow into live.
-- Workflow-dispatch parameter overrides are validated and written back to `selected_live_strategy.json` before execution, then included in the material-event and end-of-run checkpoints. A change is accepted only while exchange/order state is flat. If recovery P&L is negative, its saved multiplier/base parameters remain authoritative until that recovery cycle resets; the new settings then govern the fresh cycle. Any non-approved config-hash difference still fails closed. The watchdog is the sole five-minute scheduler; the long worker has no independent cron, preventing redundant five-hour jobs from accumulating behind the singleton concurrency group.
+- The pure `opposite_ladder_core.py` plan fixes integer-cent prices and
+  two-decimal `Decimal` quantities. Live and shadow modes consume the same plan;
+  only their execution adapters differ.
+- At qualification, all five order intents are saved before submission and all
+  five are attempted in the same event-loop pass. Each role has its own
+  deterministic client-order ID, acknowledgment, fill and retry history.
+- A rejected initial order retries every second without suppressing already
+  accepted rungs. An unknown response pauses only additional exposure for that
+  unresolved intent while exact order/fill/position reconciliation continues;
+  this prevents a blind retry from duplicating a real order.
+- GTC entry remainders remain until fill, the 50¢ boundary or market close.
+  Cancellations are confirmed before an exit is sized. Live fills and fees are
+  exchange-authoritative; partial fills never become fictional full exposure.
+- The 50¢ boundary latch survives price recovery, process restart and worker
+  handoff. Reduce-only IOC attempts are sized from the refreshed authoritative
+  position, and a partial IOC causes another refresh and residual-only retry.
+- There is no recovery exponent, permanent-base scaling or position-cap field
+  in the v14 live contract. `initial_shares` directly scales all five quantities.
+- Startup reconciles shard balance, managed orders, positions, fills and recent
+  settlements before new exposure. Deterministic order IDs and processed
+  settlement IDs prevent duplicate entry/accounting after restart.
+- The previous/current/upcoming markets are refreshed every second; the ending
+  market remains subscribed for final 99¢ outcome inference and the upcoming
+  market is subscribed before open whenever the exchange exposes it.
+- Every material audit event is appended, flushed and `fsync`ed; state is
+  atomically replaced and `fsync`ed. Remote snapshots publish at most every 30
+  seconds and at handoff to the parentless
+  `runtime-state-kxbtc15m-opposite-ladder-v14` branch.
+- A five-hour worker queues its successor only from one minute after open to one
+  minute before close. One concurrency group serializes workers, and the
+  watchdog is mode-preserving and v14-only.
 
 ### GitHub Actions inputs
 
-The production worker presents nine manual inputs. Blank strategy values preserve the version already stored in `runtime-state-kxbtc15m-delayed-v13`, so watchdog and five-hour handoffs cannot overwrite a deliberate setting with an old default.
+The production worker exposes only the controls needed by this contract. A
+blank `initial_shares` value preserves the version already stored in
+`runtime-state-kxbtc15m-opposite-ladder-v14`; watchdog and five-hour handoffs do
+not replace it with an older default.
 
 | Input | Meaning |
 | --- | --- |
 | `live_enabled` | Requests live execution, but only when both repository safety gates also permit it; default `false` |
 | `reconcile_only` | Reconcile authoritative Kalshi state without opening exposure |
+| `fresh_state_reset` | One-run reset allowed only after authoritative flat checks; never forwarded to the successor |
 | `initial_shares` | Two-decimal starting base for a brand-new state; current default `1.00` |
-| `scaling_multiplier` | Sets both recovery sizing and geometric profit-threshold growth |
-| `max_share_cap` | Fixed absolute maximum quantity used only when base-linked capping is disabled; blank preserves it |
-| `max_cap_per_base_share` | Cap per permanent-base share; default 100, so base 1 → cap 100 and base 2 → cap 200; 0 selects fixed-cap mode; blank preserves |
-| `profit_threshold` | First realized-net-profit threshold for a permanent base increase |
-| `shares_added_after_profit_threshold` | Two-decimal permanent base increment after each threshold crossing |
-| `max_stop_loss_cents` | Direct protective-exit trigger from 10 through 51; current default 51; no maker-exit phase |
 
-The controlled-restart workflow exposes only `source_run_id` and `target_live`. Run duration, sticky-direction lane, GTC order lifetime, quote timing, 40–49¢ analytics, checkpoint cadence, maximum position, and all other safety limits remain canonical configuration rather than routine UI knobs.
+The controlled-restart workflow exposes only `source_run_id` and `target_live`.
+Run duration, sticky signal, 53–58¢ gate, prices, GTC lifetime, ladder
+multiples, 50¢ boundary and checkpoint cadence are immutable configuration,
+not routine UI knobs.
 
 `KALSHI_SHADOW_ONLY=true` hard-forces `MODE=DRY_RUN`; `KALSHI_SHADOW_ONLY=false` does not independently enable live trading. To switch deliberately, set `KALSHI_SHADOW_ONLY=false` and `KALSHI_LIVE_ENABLED=true`, then run the controlled-restart workflow with `target_live=true` while the named source lane is flat. The handoff refuses boundary timing or persisted exposure, dispatches the current `main`, preserves state, and the replacement reconciles before creating risk. Reversing either repository gate disables live placement again. Credentials are referenced only by the names `KALSHI_PROD_API_KEY` and `KALSHI_PRIVATE_KEY`; they are never written to state, logs, artifacts, source, or README.
 
 ## Tests and operational commands
 
 ```bash
-# Shared-core, replay, path, reconciliation, legacy hybrid regression, v13 delayed-band, and live safety suite.
-PYTHONPATH=. .venv/bin/python -m unittest -v \
-  tests.test_strategy_core tests.test_live_execution tests.test_maker_hybrid_v11 tests.test_delayed_band_v12 tests.test_reconciliation \
-  tests.test_recovery_sizing tests.test_execution_path_model tests.test_historical_replay \
-  tests.test_order_smoke_test tests.test_startup_order_check
+# Complete regression suite, including pure v14 plan and mocked live execution.
+PYTHONPATH=. .venv/bin/python -m unittest discover -s tests -v
 
-# Canonical v13 shadow run (isolated $1,000 state, never real orders).
+# Canonical v14 shadow run (isolated $1,000 state, never real orders).
 KALSHI_API_KEY_ID=... KALSHI_PEM_PATH=kalshi_private_key.pem \
   .venv/bin/python kalshi_live_trader.py --config selected_live_strategy.json \
-  --state-file data/kalshi_shadow_delayed_band_v13_state.json \
-  --audit-ledger data/kalshi_shadow_delayed_band_v13_audit.jsonl \
-  --shadow-profile delayed_53_57_exit_51 --stop-price 0.51 --trading-mode shadow --dry-run --run-seconds 120
+  --state-file data/kalshi_shadow_opposite_ladder_v14_state.json \
+  --audit-ledger data/kalshi_shadow_opposite_ladder_v14_audit.jsonl \
+  --shadow-profile opposite_ladder_53_58_take_profit_50 \
+  --trading-mode shadow --dry-run --run-seconds 120
 
 # Read-only reconciliation; it never creates an entry.
 KALSHI_API_KEY_ID=... KALSHI_PEM_PATH=kalshi_private_key.pem \
   .venv/bin/python kalshi_live_trader.py --config selected_live_strategy.json \
-  --state-file data/kalshi_live_delayed_band_v13_state.json --trading-mode live --reconcile-only
+  --state-file data/kalshi_live_opposite_ladder_v14_state.json \
+  --audit-ledger data/kalshi_live_opposite_ladder_v14_audit.jsonl \
+  --trading-mode live --reconcile-only
 ```
 
-The test suite covers fixed outcomes, no loss-skip behavior, sticky hold/flip transitions, Decimal sizing, strict zero-fill invariants, recovery/base transitions, caps, funding checks, startup reconciliation, deterministic idempotency, provisional outcome timing, immutable ask-minus-one entry, no-fill/full/partial/cancelled maker entries, all 40–49¢ levels, winner drawdowns, touch-versus-fill separation, the direct 51¢ exit, partial-IOC residual retries, legacy hybrid regressions, duplicate ticks, restart with a pending exit, post-exit settlement analytics, shadow/live state parity, workflow anti-regression assertions, and the hard shadow-only live gate.
+The suite covers sticky hold/flip transitions, exact Decimal ladder sizing,
+simultaneous five-order delivery, rejection retry without rung suppression,
+unknown-response reconciliation, funding checks, deterministic idempotency,
+partial fills, cancel-before-exit ordering, either-side 50¢ boundary detection,
+partial-IOC residual retries, restart recovery, shadow/live parity, workflow
+anti-regression assertions, checkpoint integrity, and the hard live gates.
 
 ## Remaining risks
 

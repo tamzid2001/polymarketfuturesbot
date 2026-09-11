@@ -246,6 +246,9 @@ class LiveExecutionTests(unittest.TestCase):
             "hybrid_hard_stop_cents": 44,
             "recovery_multiplier": "1.01",
             "threshold_growth_multiplier": "1.01",
+            "max_position": "100.00",
+            "max_position_per_base_share": None,
+            "position_cap_enabled": True,
             "delayed_entry_start_seconds": 0,
         })
 
@@ -2088,10 +2091,10 @@ class LiveExecutionTests(unittest.TestCase):
             DELAYED_V13_RUNTIME_STATE_REF,
             [
                 "selected_live_strategy.json",
-                "data/kalshi_live_delayed_band_v13_state.json",
-                "data/kalshi_live_delayed_band_v13_audit.jsonl",
-                "data/kalshi_shadow_delayed_band_v13_state.json",
-                "data/kalshi_shadow_delayed_band_v13_audit.jsonl",
+                "data/kalshi_live_opposite_ladder_v14_state.json",
+                "data/kalshi_live_opposite_ladder_v14_audit.jsonl",
+                "data/kalshi_shadow_opposite_ladder_v14_state.json",
+                "data/kalshi_shadow_opposite_ladder_v14_audit.jsonl",
             ],
         )
         with self.assertRaisesRegex(ValueError, "non-owned durable paths"):

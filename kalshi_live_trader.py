@@ -1,12 +1,10 @@
 """Production KXBTC15M hybrid live trader.
 
-This runner intentionally replaces the old ladder runner in the GitHub
-workflow.  It reuses the established Kalshi V2 REST/WebSocket/auth transport,
-but owns no Prophet, loss-skip, or ladder behavior. Shadow-account metrics are
-isolated from live state and use the same execution state machine.
-
-The only sizing transitions are from :mod:`strategy_core`, which is also used
-by the historical settlement replay.
+This runner replaces the retired recovery runner in the GitHub workflow.  It
+reuses the established Kalshi V2 REST/WebSocket/auth transport and executes the
+pure fixed-point plan from :mod:`opposite_ladder_core`.  Shadow-account metrics
+remain isolated from live state.  Prophet, directional-loss skipping, recovery
+sizing, permanent base scaling, and position caps are not part of v14.
 """
 
 from __future__ import annotations
@@ -40,6 +38,11 @@ from kalshi_btc15m_average_down import (
     timestamp_epoch,
 )
 from live_state import append_unique, config_hash, load_state, save_state, utc_now
+from opposite_ladder_core import (
+    build_opposite_ladder_plan,
+    opposite_side,
+    take_profit_triggered,
+)
 from strategy_core import (
     delayed_band_entry_decision,
     StrategyParameters,
@@ -62,16 +65,14 @@ ORDER_PREFIX = "kxbtc15m-hybrid-v1-"
 # silently reinterpret an older selected configuration after a restart or a
 # watchdog handoff.  Bump both values deliberately with a reviewed migration
 # whenever the shared live/backtest strategy semantics change.
-# v13 is a hard compatibility boundary for the delayed >=53c cohort: the
-# immutable opening ask must be below 53c; the first fresh qualifying ask at
-# or after 60 seconds freezes one post-only GTC limit one cent lower; limits
-# above 57c are filtered; and filled exposure uses a direct, reduce-only IOC
-# protective exit once the executable selected-side bid reaches 51c or lower.
-# An older worker cannot silently load this
-# configuration or runtime namespace; it fails closed before it can submit an
-# order.
-ACTIVE_STRATEGY_VERSION = "kxbtc15m-delayed-band-live-v13"
-ACTIVE_CONFIG_SCHEMA_VERSION = 13
+# v14 is a hard compatibility boundary.  At/after 60 seconds, a sticky-side
+# ask in the inclusive 53c..58c band freezes five post-only GTC BUY orders on
+# the opposite side: opposite ask minus 1c at 1x base and 40/30/20/10c at
+# 2/4/8/16x base.  Recovery, permanent-base scaling, and position caps are not
+# part of this contract.  An older worker cannot load the v14 configuration or
+# runtime namespace.
+ACTIVE_STRATEGY_VERSION = "kxbtc15m-opposite-ladder-live-v14"
+ACTIVE_CONFIG_SCHEMA_VERSION = 14
 # Operational release guard used by the production workflow.  Version 3 means
 # opening entry prices come from the buffered price-only stream, not the first
 # later complete-depth book.  This can advance without reinterpreting recovery
@@ -90,6 +91,7 @@ DELAYED_ENTRY_LADDER_CONTRACT_VERSION = 4
 LIVE_STOP_SAFETY_CONTRACT_VERSION = 3
 POSITION_CAP_CONTRACT_VERSION = 2
 ENTRY_DELIVERY_CONTRACT_VERSION = 1
+OPPOSITE_LADDER_CONTRACT_VERSION = 1
 # A definitive HTTP rejection proves that the matching engine did not create
 # an order. Keep the frozen strategy intent alive and retry it at a bounded
 # cadence while the same market remains safe. Unknown POST outcomes are never
@@ -317,11 +319,11 @@ def _decimal_string(value: Any, name: str) -> str:
 
 DECIMAL_CONFIG_FIELDS = {
     "entry_price", "stop_price", "starting_base", "recovery_multiplier", "first_base_threshold",
-    "threshold_growth_multiplier", "base_increment", "max_position", "provisional_outcome_threshold",
+    "threshold_growth_multiplier", "base_increment", "provisional_outcome_threshold",
     "max_recovery_cycle_loss", "max_daily_realized_loss", "starting_shadow_balance", "maker_price_offset",
     "stop_baseline_entry_price",
 }
-OPTIONAL_DECIMAL_CONFIG_FIELDS = {"max_position_per_base_share"}
+OPTIONAL_DECIMAL_CONFIG_FIELDS: set[str] = set()
 INTEGER_CONFIG_FIELDS = {
     "signal_delay_seconds", "entry_timeout_seconds", "entry_lateness_seconds", "outcome_observation_seconds",
     "max_recovery_exponent", "max_api_failures", "handoff_guard_seconds", "opening_quote_max_observations",
@@ -330,6 +332,7 @@ INTEGER_CONFIG_FIELDS = {
     "shadow_entry_level_step_cents", "hybrid_stop_trigger_cents", "hybrid_maker_exit_cents",
     "hybrid_hard_stop_cents", "opening_quote_capture_seconds", "delayed_entry_threshold_cents",
     "delayed_entry_start_seconds", "delayed_entry_max_limit_cents",
+    "delayed_entry_max_trigger_cents", "opposite_take_profit_cents",
 }
 FLOAT_CONFIG_FIELDS = {
     "stop_poll_interval", "reconciliation_interval", "max_outcome_quote_age_seconds", "max_stale_quote_seconds",
@@ -349,8 +352,9 @@ SHADOW_STOP_PROFILE_PRICES = {
     "sticky_stop_40": Decimal("0.40"),
     "delayed_53_57_stop_50": Decimal("0.50"),
     "delayed_53_57_exit_51": Decimal("0.51"),
+    "opposite_ladder_53_58_take_profit_50": Decimal("0.50"),
 }
-CANONICAL_LIVE_SHADOW_PROFILE = "delayed_53_57_exit_51"
+CANONICAL_LIVE_SHADOW_PROFILE = "opposite_ladder_53_58_take_profit_50"
 
 
 def price_to_cents(value: Decimal | str, name: str = "price") -> int:
@@ -487,16 +491,16 @@ def assert_active_strategy_contract(value: dict[str, Any]) -> None:
 
 
 def validate_entry_price_contract(value: dict[str, Any]) -> None:
-    """Validate the immutable maker-entry and direct protective-exit contract."""
+    """Validate the immutable v14 opposite-side ladder contract."""
 
     entry = decimal(value["entry_price"])
     offset = decimal(value["maker_price_offset"])
     stop = decimal(value["stop_price"])
     stop_baseline = decimal(value["stop_baseline_entry_price"])
-    if not stop < entry < Decimal("1"):
-        raise ValueError("reference entry_price must satisfy stop < entry_price < 1")
-    if value.get("entry_execution_mode") != "delayed_threshold_band_maker":
-        raise ValueError("the active strategy requires entry_execution_mode=delayed_threshold_band_maker")
+    if not Decimal("0") < entry < Decimal("1"):
+        raise ValueError("reference entry_price must be within the contract range")
+    if value.get("entry_execution_mode") != "opposite_side_doubling_ladder":
+        raise ValueError("the active strategy requires entry_execution_mode=opposite_side_doubling_ladder")
     if value.get("maker_order_time_in_force") != "good_till_canceled":
         raise ValueError("the active strategy requires maker_order_time_in_force=good_till_canceled")
     if value.get("entry_order_lifetime") != "until_filled_or_market_close":
@@ -509,8 +513,8 @@ def validate_entry_price_contract(value: dict[str, Any]) -> None:
         raise ValueError(
             "max_recovery_exponent must be 0; the active strategy disables the exponent circuit breaker"
         )
-    if stop_baseline != Decimal("0.50"):
-        raise ValueError("the hybrid strategy requires stop_baseline_entry_price to equal exactly 0.50")
+    if stop_baseline != Decimal("0.50") or stop != Decimal("0.50"):
+        raise ValueError("the opposite ladder requires a fixed 50c take-profit threshold")
     profile = str(value.get("shadow_profile") or CANONICAL_LIVE_SHADOW_PROFILE)
     expected_profile_stop = SHADOW_STOP_PROFILE_PRICES.get(profile)
     if expected_profile_stop is None:
@@ -524,11 +528,10 @@ def validate_entry_price_contract(value: dict[str, Any]) -> None:
     trading_mode = str(value.get("trading_mode") or "shadow")
     if profile != CANONICAL_LIVE_SHADOW_PROFILE and trading_mode != "shadow":
         raise ValueError("comparison stop profiles are shadow-only and cannot be loaded in live mode")
-    if profile == CANONICAL_LIVE_SHADOW_PROFILE:
-        if value.get("stop_policy") != "direct_ioc_at_trigger":
-            raise ValueError("the active strategy requires stop_policy=direct_ioc_at_trigger")
-    elif value.get("stop_policy") != "hybrid_maker_then_hard_stop":
-        raise ValueError("legacy comparison profiles require stop_policy=hybrid_maker_then_hard_stop")
+    if profile != CANONICAL_LIVE_SHADOW_PROFILE:
+        raise ValueError("v14 accepts only the opposite-side ladder profile")
+    if value.get("stop_policy") != "opposite_side_take_profit_ioc":
+        raise ValueError("the active strategy requires stop_policy=opposite_side_take_profit_ioc")
     if int(value["entry_limit_offset_cents"]) < 0:
         raise ValueError("entry_limit_offset_cents cannot be negative")
     level_min = int(value["shadow_entry_level_min_cents"])
@@ -541,24 +544,14 @@ def validate_entry_price_contract(value: dict[str, Any]) -> None:
     hard_stop = int(value["hybrid_hard_stop_cents"])
     if not 1 <= trigger <= 99:
         raise ValueError("direct protective-exit price must be a valid integer-cent tick")
-    if profile == CANONICAL_LIVE_SHADOW_PROFILE:
-        if not 10 <= trigger <= 51 or (maker_exit, hard_stop) != (trigger, trigger):
-            raise ValueError("the canonical delayed band requires one direct 10c-51c protective-exit price")
-        if stop != cents_price(trigger):
-            raise ValueError("the canonical delayed band stop_price must equal the direct trigger")
-    else:
-        profile_cents = price_to_cents(expected_profile_stop, "shadow profile stop")
-        if (hard_stop, trigger, maker_exit) != (
-            profile_cents, profile_cents + 1, profile_cents + 2,
-        ):
-            raise ValueError(
-                "experimental shadow profiles require hard/trigger/maker stops "
-                "at profile/profile+1c/profile+2c"
-            )
+    if (trigger, maker_exit, hard_stop) != (50, 50, 50):
+        raise ValueError("v14 take-profit trigger/exit compatibility fields must all equal 50c")
+    if int(value.get("opposite_take_profit_cents", 0)) != 50:
+        raise ValueError("v14 requires opposite_take_profit_cents=50")
     if not _bool(value.get("hybrid_stop_enabled", True)):
-        raise ValueError("the active v13 strategy requires protective exit monitoring")
+        raise ValueError("the active v14 strategy requires take-profit monitoring")
     if value.get("shadow_fill_model") != "conservative_public_trade_through":
-        raise ValueError("v13 shadow mode requires conservative_public_trade_through")
+        raise ValueError("v14 shadow mode requires conservative_public_trade_through")
     if offset < Decimal("0"):
         raise ValueError("maker_price_offset cannot be negative")
     if int(value["opening_quote_max_observations"]) < 1:
@@ -569,29 +562,30 @@ def validate_entry_price_contract(value: dict[str, Any]) -> None:
         raise ValueError("the active analytics contract requires delayed_entry_threshold_cents=53")
     if int(value.get("delayed_entry_start_seconds", -1)) != 60:
         raise ValueError("the active delayed entry contract requires delayed_entry_start_seconds=60")
+    if int(value.get("delayed_entry_max_trigger_cents", 0)) != 58:
+        raise ValueError("the active opposite ladder requires a 58c inclusive sticky-side trigger ceiling")
     if int(value.get("delayed_entry_max_limit_cents", 0)) != 57:
-        raise ValueError("the active delayed entry contract requires delayed_entry_max_limit_cents=57")
+        raise ValueError("the compatibility limit ceiling must remain 57c")
+    if not _bool(value.get("opposite_ladder_enabled", False)):
+        raise ValueError("opposite_ladder_enabled must be true")
+    if _bool(value.get("recovery_enabled", True)):
+        raise ValueError("v14 removes recovery sizing")
+    if _bool(value.get("position_cap_enabled", False)):
+        raise ValueError("v14 removes the position cap")
+    if _bool(value.get("base_scaling_enabled", True)):
+        raise ValueError("v14 uses only the fixed operator base input")
 
 
 def validate_sizing_config(value: dict[str, Any]) -> None:
-    """Validate the small set of sizing values exposed by GitHub Actions."""
+    """Validate the sole v14 sizing input: a fixed two-decimal base."""
 
     starting_base = decimal(value["starting_base"])
-    base_increment = decimal(value["base_increment"])
-    max_position = decimal(value["max_position"])
     if starting_base != round_shares(starting_base):
         raise ValueError("starting_base must have at most two decimal places")
-    if base_increment != round_shares(base_increment):
-        raise ValueError("base_increment must have at most two decimal places")
-    strategy_parameters(value)  # shared finite, positive, two-decimal cap validation
     if starting_base <= Decimal("0"):
         raise ValueError("starting_base must be positive")
-    if decimal(value["recovery_multiplier"]) < Decimal("1"):
-        raise ValueError("recovery_multiplier must be at least 1")
-    if decimal(value["threshold_growth_multiplier"]) < Decimal("1"):
-        raise ValueError("threshold_growth_multiplier must be at least 1")
-    if decimal(value["first_base_threshold"]) <= Decimal("0") or base_increment <= Decimal("0"):
-        raise ValueError("profit threshold and base increment must be positive")
+    if decimal(value["recovery_multiplier"]) != Decimal("1"):
+        raise ValueError("v14 recovery_multiplier compatibility field must equal 1")
 
 
 def load_config(path: Path) -> dict[str, Any]:
@@ -600,10 +594,11 @@ def load_config(path: Path) -> dict[str, Any]:
         raise ValueError("live strategy configuration must be a JSON object")
     required = {
         "strategy_version", "series", "entry_price", "stop_price", "starting_base", "recovery_multiplier",
-        "first_base_threshold", "threshold_growth_multiplier", "base_increment", "max_position",
+        "first_base_threshold", "threshold_growth_multiplier", "base_increment",
         "stop_policy", "stop_baseline_entry_price", "entry_execution_mode", "entry_limit_offset_cents",
         "maker_order_time_in_force", "entry_order_lifetime", "entry_timeout_seconds",
         "opening_quote_capture_seconds", "delayed_entry_start_seconds", "delayed_entry_max_limit_cents",
+        "delayed_entry_max_trigger_cents", "opposite_take_profit_cents",
         "shadow_fill_model", "shadow_entry_level_min_cents", "shadow_entry_level_max_cents",
         "shadow_entry_level_step_cents", "hybrid_stop_enabled", "hybrid_stop_trigger_cents",
         "hybrid_maker_exit_cents", "hybrid_hard_stop_cents", "trading_mode", "config_schema_version",
@@ -611,11 +606,13 @@ def load_config(path: Path) -> dict[str, Any]:
     missing = required - value.keys()
     if missing:
         raise ValueError(f"live strategy configuration is missing: {', '.join(sorted(missing))}")
-    # New and legacy configs default to the reviewed permanent-base-linked
-    # cap.  An operator can persist an explicit JSON null (workflow value 0)
-    # to retain a fixed ``max_position`` instead.
-    value.setdefault("max_position_per_base_share", "100.00")
     assert_active_strategy_contract(value)
+    # v14 sizes the immutable 1/2/4/8/16 order ladder directly from
+    # ``starting_base``.  Strip retired cap keys restored from an early v14
+    # checkpoint so they cannot remain part of the active config/hash.
+    value.pop("max_position", None)
+    value.pop("max_position_per_base_share", None)
+    value.pop("position_cap_enabled", None)
     if value["series"] != "KXBTC15M":
         raise ValueError("this production runner is intentionally limited to KXBTC15M")
     for name in DECIMAL_CONFIG_FIELDS & value.keys():
@@ -634,8 +631,8 @@ def load_config(path: Path) -> dict[str, Any]:
     value.setdefault("shadow_fill_model", "conservative_public_trade_through")
     value.setdefault("starting_shadow_balance", "1000.00")
     value.setdefault("maker_price_offset", "0.01")
-    value.setdefault("stop_policy", "direct_ioc_at_trigger")
-    value.setdefault("entry_execution_mode", "delayed_threshold_band_maker")
+    value.setdefault("stop_policy", "opposite_side_take_profit_ioc")
+    value.setdefault("entry_execution_mode", "opposite_side_doubling_ladder")
     value.setdefault("maker_order_time_in_force", "good_till_canceled")
     value.setdefault("stop_baseline_entry_price", "0.50")
     value.setdefault("signal_delay_seconds", 0)
@@ -653,6 +650,11 @@ def load_config(path: Path) -> dict[str, Any]:
     value.setdefault("delayed_entry_threshold_cents", 53)
     value.setdefault("delayed_entry_start_seconds", 60)
     value.setdefault("delayed_entry_max_limit_cents", 57)
+    value.setdefault("delayed_entry_max_trigger_cents", 58)
+    value.setdefault("opposite_take_profit_cents", 50)
+    value.setdefault("opposite_ladder_enabled", True)
+    value.setdefault("recovery_enabled", False)
+    value.setdefault("base_scaling_enabled", False)
     value.setdefault("entry_lateness_seconds", 60)
     value.setdefault("stop_poll_interval", 1.0)
     value.setdefault("reconciliation_interval", 5.0)
@@ -676,9 +678,9 @@ def load_config(path: Path) -> dict[str, Any]:
     value.setdefault("shadow_entry_level_max_cents", 49)
     value.setdefault("shadow_entry_level_step_cents", 1)
     value.setdefault("hybrid_stop_enabled", True)
-    value.setdefault("hybrid_stop_trigger_cents", 51)
-    value.setdefault("hybrid_maker_exit_cents", 51)
-    value.setdefault("hybrid_hard_stop_cents", 51)
+    value.setdefault("hybrid_stop_trigger_cents", 50)
+    value.setdefault("hybrid_maker_exit_cents", 50)
+    value.setdefault("hybrid_hard_stop_cents", 50)
     value.setdefault("trading_mode", "shadow")
     # State and audit writes are fsynced locally for every material event.
     # This only bounds GitHub checkpoint publication, avoiding a Git push for
@@ -747,10 +749,11 @@ def load_config_from_value(value: dict[str, Any]) -> dict[str, Any]:
         temporary[name] = float(temporary[name])
     required = {
         "strategy_version", "series", "entry_price", "stop_price", "starting_base", "recovery_multiplier",
-        "first_base_threshold", "threshold_growth_multiplier", "base_increment", "max_position", "stop_policy",
+        "first_base_threshold", "threshold_growth_multiplier", "base_increment", "stop_policy",
         "stop_baseline_entry_price", "entry_execution_mode", "entry_limit_offset_cents", "shadow_fill_model",
         "maker_order_time_in_force", "entry_order_lifetime", "entry_timeout_seconds",
         "opening_quote_capture_seconds", "delayed_entry_start_seconds", "delayed_entry_max_limit_cents",
+        "delayed_entry_max_trigger_cents", "opposite_take_profit_cents",
         "shadow_entry_level_min_cents", "shadow_entry_level_max_cents", "shadow_entry_level_step_cents",
         "hybrid_stop_enabled", "hybrid_stop_trigger_cents", "hybrid_maker_exit_cents",
         "hybrid_hard_stop_cents", "trading_mode", "config_schema_version",
@@ -758,14 +761,17 @@ def load_config_from_value(value: dict[str, Any]) -> dict[str, Any]:
     if required - temporary.keys():
         raise ValueError("invalid overridden live strategy configuration")
     assert_active_strategy_contract(temporary)
+    temporary.pop("max_position", None)
+    temporary.pop("max_position_per_base_share", None)
+    temporary.pop("position_cap_enabled", None)
     # Reuse the normal rules without doing a file round-trip.
     if temporary["series"] != "KXBTC15M":
         raise ValueError("invalid strategy series")
     temporary.setdefault("shadow_fill_model", "conservative_public_trade_through")
     temporary.setdefault("starting_shadow_balance", "1000.00")
     temporary.setdefault("maker_price_offset", "0.01")
-    temporary.setdefault("stop_policy", "direct_ioc_at_trigger")
-    temporary.setdefault("entry_execution_mode", "delayed_threshold_band_maker")
+    temporary.setdefault("stop_policy", "opposite_side_take_profit_ioc")
+    temporary.setdefault("entry_execution_mode", "opposite_side_doubling_ladder")
     temporary.setdefault("maker_order_time_in_force", "good_till_canceled")
     temporary.setdefault("stop_baseline_entry_price", "0.50")
     temporary.setdefault("signal_mode", "sticky_until_directional_win")
@@ -777,6 +783,11 @@ def load_config_from_value(value: dict[str, Any]) -> dict[str, Any]:
     temporary.setdefault("delayed_entry_threshold_cents", 53)
     temporary.setdefault("delayed_entry_start_seconds", 60)
     temporary.setdefault("delayed_entry_max_limit_cents", 57)
+    temporary.setdefault("delayed_entry_max_trigger_cents", 58)
+    temporary.setdefault("opposite_take_profit_cents", 50)
+    temporary.setdefault("opposite_ladder_enabled", True)
+    temporary.setdefault("recovery_enabled", False)
+    temporary.setdefault("base_scaling_enabled", False)
     temporary.setdefault("entry_lateness_seconds", 60)
     temporary.setdefault("handoff_guard_seconds", 60)
     temporary.setdefault("opening_quote_max_observations", 500)
@@ -788,9 +799,9 @@ def load_config_from_value(value: dict[str, Any]) -> dict[str, Any]:
     temporary.setdefault("shadow_entry_level_max_cents", 49)
     temporary.setdefault("shadow_entry_level_step_cents", 1)
     temporary.setdefault("hybrid_stop_enabled", True)
-    temporary.setdefault("hybrid_stop_trigger_cents", 51)
-    temporary.setdefault("hybrid_maker_exit_cents", 51)
-    temporary.setdefault("hybrid_hard_stop_cents", 51)
+    temporary.setdefault("hybrid_stop_trigger_cents", 50)
+    temporary.setdefault("hybrid_maker_exit_cents", 50)
+    temporary.setdefault("hybrid_hard_stop_cents", 50)
     temporary.setdefault("trading_mode", "shadow")
     validate_entry_price_contract(temporary)
     validate_sizing_config(temporary)
@@ -810,13 +821,17 @@ def load_config_from_value(value: dict[str, Any]) -> dict[str, Any]:
 
 
 def strategy_parameters(config: dict[str, Any]) -> StrategyParameters:
+    # StrategyParameters is still shared with archived historical/recovery
+    # replay code.  The live v14 ladder has no cap fields; this unreachable
+    # internal bound only satisfies that legacy type and is never applied to
+    # a v14 ladder order.
     return StrategyParameters(
         recovery_multiplier=Decimal(config["recovery_multiplier"]),
         first_base_threshold=Decimal(config["first_base_threshold"]),
         threshold_growth_multiplier=Decimal(config["threshold_growth_multiplier"]),
         base_increment=Decimal(config["base_increment"]),
         starting_base=Decimal(config["starting_base"]),
-        max_position=Decimal(config["max_position"]),
+        max_position=Decimal(str(config.get("max_position", "999999999.99"))),
         max_position_per_base_share=(
             None
             if config.get("max_position_per_base_share") in (None, "", "0", "0.00")
@@ -1080,7 +1095,6 @@ class LiveEngine:
             "workflow_run_id": os.getenv("GITHUB_RUN_ID"),
             "source_commit": os.getenv("KALSHI_SOURCE_SHA") or os.getenv("GITHUB_SHA"),
             "stop_safety_contract": LIVE_STOP_SAFETY_CONTRACT_VERSION,
-            "position_cap_contract": POSITION_CAP_CONTRACT_VERSION,
             "observed_at": utc_now(),
         }
         self.parameters = strategy_parameters(config)
@@ -1128,7 +1142,7 @@ class LiveEngine:
             checkpoint_paths.insert(0, config_path)
         startup_order_check_journal = Path(os.getenv(
             "KALSHI_STARTUP_ORDER_CHECK_JOURNAL",
-            "data/.kalshi_live_delayed_band_v13_startup_order_check/order-smoke-test.json",
+            "data/.kalshi_live_opposite_ladder_v14_startup_order_check/order-smoke-test.json",
         ))
         if not dry_run and startup_order_check_journal.exists():
             # Once the pre-worker create/cancel proof succeeds, retain it in
@@ -1236,6 +1250,7 @@ class LiveEngine:
         original_reason = str(breaker.get("reason") or "")
         if not breaker.get("blocked") or original_reason not in {
             "maker_entry_submission_unknown", "maker_entry_submission_rejected",
+            "opposite_ladder_submission_unknown",
             "entry_cancellation_unconfirmed",
             "hard_stop_unflattened_at_market_close",
         }:
@@ -1307,29 +1322,45 @@ class LiveEngine:
 
     def entry_submission_health(self) -> dict[str, Any]:
         """Submission evidence is separate from analytical touches and fills."""
-        orders = [order for record in self.state.get("markets", {}).values()
-                  for order in record.get("entry_orders", [])]
+        records = [
+            record for record in self.state.get("markets", {}).values()
+            if isinstance(record, dict)
+        ]
+        orders = [order for record in records for order in record.get("entry_orders", [])]
+        ladder_retries = sum(
+            max(0, len([
+                order for order in record.get("entry_orders", [])
+                if isinstance(order, dict) and order.get("ladder_role") == role
+            ]) - 1)
+            for record in records
+            for role in {str(order.get("ladder_role")) for order in record.get("entry_orders", []) if order.get("ladder_role")}
+        )
         health = {
             "mode": self.execution_mode,
             "recorded_entry_attempts": len(orders),
             "exchange_acknowledgments": sum(bool(order.get("order_id")) for order in orders),
             "definitive_rejections": sum(order.get("submission_outcome") == "rejected" for order in orders),
-            "market_scoped_retries": sum(
+            "market_scoped_retries": ladder_retries + sum(
                 max(0, int(record.get("entry_retry", {}).get("retry_submission_count", 0)))
                 for record in self.state.get("markets", {}).values()
                 if isinstance(record, dict) and isinstance(record.get("entry_retry"), dict)
             ),
             "retry_pending_markets": sum(
-                isinstance(record, dict)
-                and record.get("status") == "SIGNAL_PENDING"
-                and isinstance(record.get("entry_retry"), dict)
-                and record["entry_retry"].get("status") == "RETRY_PENDING"
-                for record in self.state.get("markets", {}).values()
+                bool(
+                    isinstance(record.get("opposite_ladder"), dict)
+                    and record["opposite_ladder"].get("retry_pending")
+                )
+                or (
+                    record.get("status") == "SIGNAL_PENDING"
+                    and isinstance(record.get("entry_retry"), dict)
+                    and record["entry_retry"].get("status") == "RETRY_PENDING"
+                )
+                for record in records
             ),
             "abandoned_at_or_below_51c": sum(
                 isinstance(record, dict)
                 and record.get("status_reason") == "entry_abandoned_at_or_below_51c"
-                for record in self.state.get("markets", {}).values()
+                for record in records
             ),
             "unresolved_submissions": sum(
                 not order.get("order_id") and order.get("status") in {"submit_failed", "submitting"}
@@ -1520,8 +1551,9 @@ class LiveEngine:
         })
         source_record = self.state["markets"].get(provisional["ticker"])
         source_record_side = (
-            str(source_record.get("signal_side"))
-            if isinstance(source_record, dict) and source_record.get("signal_side") in {"yes", "no"}
+            str(source_record.get("sticky_signal_side") or source_record.get("signal_side"))
+            if isinstance(source_record, dict)
+            and (source_record.get("sticky_signal_side") or source_record.get("signal_side")) in {"yes", "no"}
             else None
         )
         prior_side = source_record_side or (
@@ -1529,32 +1561,39 @@ class LiveEngine:
             if signal_state.get("active_side") in {"yes", "no"}
             else None
         )
-        side, directional_transition = sticky_directional_prediction(prior_side, source)
+        sticky_side, directional_transition = sticky_directional_prediction(prior_side, source)
+        opposite_ladder = self.config.get("entry_execution_mode") == "opposite_side_doubling_ladder"
+        side = opposite_side(sticky_side) if opposite_ladder else sticky_side
         signal_state.update({
-            "mode": self.config["signal_mode"], "active_side": side,
+            "mode": self.config["signal_mode"], "active_side": sticky_side,
             "last_source_market": provisional["ticker"], "last_source_outcome": source,
             "last_transition": directional_transition, "updated_at": utc_now(),
         })
         parameters = self.current_parameters()
-        quantity, capped = prescribed_quantity(parameters, self.state.get("sizing"))
-        base_before = sizing_state(parameters, self.state.get("sizing")).base_share_count
-        effective_cap = parameters.effective_max_position(base_before)
+        if opposite_ladder:
+            base_before = round_shares(Decimal(self.config["starting_base"]))
+            quantity, capped = base_before, False
+        else:
+            quantity, capped = prescribed_quantity(parameters, self.state.get("sizing"))
+            base_before = sizing_state(parameters, self.state.get("sizing")).base_share_count
+            effective_cap = parameters.effective_max_position(base_before)
         record = {
             "ticker": ticker,
             "market_open_epoch": market["open_epoch"], "market_close_epoch": market["close_epoch"],
             **target_details,
             "source_market_ticker": provisional["ticker"], "provisional_outcome": source,
             "provisional_outcome_details": provisional, "signal_side": side,
+            "sticky_signal_side": sticky_side, "trade_side": side,
             "signal_mode": self.config["signal_mode"], "prior_signal_side": prior_side,
             "directional_transition": directional_transition,
             "signal_timestamp": utc_now(), "intended_quantity": format(quantity, "f"),
             "quantity_capped": capped, "base_before": format(base_before, "f"),
-            "position_cap_mode": (
-                "permanent_base_linked" if parameters.max_position_per_base_share is not None else "fixed"
+            "recovery_exponent_before": (
+                0 if opposite_ladder else sizing_state(parameters, self.state.get("sizing")).recovery_exponent
             ),
-            "effective_position_cap": format(effective_cap, "f"),
-            "recovery_exponent_before": sizing_state(parameters, self.state.get("sizing")).recovery_exponent,
-            "recovery_cycle_pnl_before": str(self.state.get("sizing", {}).get("recovery_cycle_pnl", "0")),
+            "recovery_cycle_pnl_before": (
+                "0" if opposite_ladder else str(self.state.get("sizing", {}).get("recovery_cycle_pnl", "0"))
+            ),
             "status": "SIGNAL_PENDING", "entry_orders": [], "exit_orders": [], "actual_quantity": "0.00",
             # This is a durable summary of what actually opened exposure.
             # ``market_ioc`` means a price-protected IOC at the fresh
@@ -1578,7 +1617,26 @@ class LiveEngine:
                 "market_ioc_order_ids": [],
             },
             "strategy_version": self.config["strategy_version"], "config_hash": config_hash(self.config),
-            "config_snapshot": self.current_parameters().as_dict(), "created_at": utc_now(),
+            "config_snapshot": (
+                {
+                    "starting_base": format(base_before, "f"),
+                    "ladder_quantity_multiples": ["1", "2", "4", "8", "16"],
+                    "position_cap": None,
+                    "recovery": None,
+                }
+                if opposite_ladder else self.current_parameters().as_dict()
+            ),
+            "created_at": utc_now(),
+            "opposite_ladder": ({
+                "contract_version": OPPOSITE_LADDER_CONTRACT_VERSION,
+                "state": "WAITING_FOR_DELAYED_STICKY_BAND",
+                "trigger_min_cents": int(self.config["delayed_entry_threshold_cents"]),
+                "trigger_max_cents": int(self.config["delayed_entry_max_trigger_cents"]),
+                "take_profit_cents": int(self.config["opposite_take_profit_cents"]),
+                "base_shares": format(base_before, "f"),
+                "plan": None,
+                "exit_latched": False,
+            } if opposite_ladder else None),
             "entry_execution_mode": self.config["entry_execution_mode"],
             # The actual entry tick is frozen from the first fresh selected-
             # side executable ask observed after the exchange opens.  It is
@@ -1754,6 +1812,14 @@ class LiveEngine:
                 "position_closed_observed_epoch": None,
             },
         }
+        if not opposite_ladder:
+            record.update({
+                "position_cap_mode": (
+                    "permanent_base_linked"
+                    if parameters.max_position_per_base_share is not None else "fixed"
+                ),
+                "effective_position_cap": format(effective_cap, "f"),
+            })
         self.state["markets"][ticker] = record
         self.state["active_market"] = ticker
         self.audit(
@@ -1762,7 +1828,8 @@ class LiveEngine:
             provisional_observation_window=provisional.get("observation_window_seconds"),
             provisional_qualifying_bid=provisional.get("qualifying_bid"),
             prior_signal_side=prior_side, directional_transition=directional_transition,
-            prediction=side, intended_quantity=format(quantity, "f"),
+            prediction=sticky_side if opposite_ladder else side,
+            trade_side=side, intended_quantity=format(quantity, "f"),
             btc_target_price=record.get("btc_target_price"),
             btc_target_price_display=record.get("btc_target_price_display"),
             btc_target_comparison=record.get("btc_target_comparison"),
@@ -1780,7 +1847,9 @@ class LiveEngine:
             provisional.get("quote_age_seconds"),
         )
         exit_description = (
-            f"direct_ioc_at_or_below_{self.config['hybrid_stop_trigger_cents']}c"
+            f"opposite_trade_bid_at_or_above_{self.config['opposite_take_profit_cents']}c"
+            if opposite_ladder
+            else f"direct_ioc_at_or_below_{self.config['hybrid_stop_trigger_cents']}c"
             if self.config["stop_policy"] == "direct_ioc_at_trigger"
             else (
                 f"hybrid_{self.config['hybrid_stop_trigger_cents']}c/"
@@ -1790,9 +1859,10 @@ class LiveEngine:
         )
         LOG.warning(
             "NEW MARKET SIGNAL | ticker=%s source=%s provisional=%s prior_side=%s transition=%s "
-            "prediction=%s btc_target=%s comparison=%s qty=%s entry_mode=%s exit_policy=%s",
+            "prediction=%s trade_opposite=%s btc_target=%s comparison=%s base=%s entry_mode=%s exit_policy=%s",
             ticker, provisional["ticker"], source.upper(), prior_side and prior_side.upper(), directional_transition,
-            side.upper(), record.get("btc_target_price_display"), record.get("btc_target_comparison"),
+            (sticky_side if opposite_ladder else side).upper(), side.upper(),
+            record.get("btc_target_price_display"), record.get("btc_target_comparison"),
             quantity, self.config["entry_execution_mode"], exit_description,
         )
         self.checkpoint("signal_created")
@@ -2264,6 +2334,146 @@ class LiveEngine:
         LOG.warning("=" * 60)
         self.checkpoint("delayed_entry_price_frozen")
         return limit_price
+
+    def freeze_opposite_ladder_plan(
+        self, feed: KalshiLiveFeed, record: dict[str, Any], now: float,
+    ) -> dict[str, Any] | None:
+        """Freeze one v14 plan from the first fresh delayed quote in 53–58c.
+
+        The band is observed on the sticky prediction side.  Every order is
+        then a BUY on the opposite side.  The first order is one cent below
+        the opposite-side executable ask; the other four prices are fixed.
+        """
+
+        ladder = record.setdefault("opposite_ladder", {})
+        existing = ladder.get("plan")
+        if isinstance(existing, dict):
+            return existing
+        opened = float(record["market_open_epoch"])
+        start_seconds = int(self.config["delayed_entry_start_seconds"])
+        if now < opened + start_seconds:
+            ladder["wait_reason"] = "delayed_observation_window_not_complete"
+            return None
+        sticky_side = str(record["sticky_signal_side"])
+        trade_side = str(record["trade_side"])
+        sticky_quote, sticky_state = feed.executable_shadow_quote(
+            record["ticker"], sticky_side, 0.0,
+            float(self.config["max_stale_quote_seconds"]),
+        )
+        opposite_quote, opposite_state = feed.executable_shadow_quote(
+            record["ticker"], trade_side, 0.0,
+            float(self.config["max_stale_quote_seconds"]),
+        )
+        if sticky_quote is None or opposite_quote is None:
+            ladder["wait_reason"] = (
+                f"fresh_books_unavailable:sticky={sticky_state},opposite={opposite_state}"
+            )
+            return None
+        sticky_epoch = executable_quote_epoch(sticky_quote)
+        opposite_epoch = executable_quote_epoch(opposite_quote)
+        if (
+            sticky_epoch is None or opposite_epoch is None
+            or sticky_epoch < opened + start_seconds
+            or opposite_epoch < opened + start_seconds
+        ):
+            ladder["wait_reason"] = "waiting_for_fresh_post_window_books"
+            return None
+        try:
+            sticky_ask = price_to_cents(
+                str(sticky_quote["economic_price"]), "sticky-side delayed ask",
+            )
+            opposite_ask = price_to_cents(
+                str(opposite_quote["economic_price"]), "opposite-side delayed ask",
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            ladder["wait_reason"] = str(exc)
+            return None
+        lower = int(self.config["delayed_entry_threshold_cents"])
+        upper = int(self.config["delayed_entry_max_trigger_cents"])
+        if not lower <= sticky_ask <= upper:
+            ladder.update({
+                "wait_reason": "sticky_side_ask_outside_53_58_band",
+                "last_sticky_ask_cents": sticky_ask,
+                "last_opposite_ask_cents": opposite_ask,
+                "last_quote_at": utc_now(),
+            })
+            return None
+        plan = build_opposite_ladder_plan(
+            sticky_side=sticky_side,
+            sticky_ask_cents=sticky_ask,
+            opposite_ask_cents=opposite_ask,
+            base_shares=self.config["starting_base"],
+            trigger_min_cents=lower,
+            trigger_max_cents=upper,
+            initial_offset_cents=int(self.config["entry_limit_offset_cents"]),
+        ).as_dict()
+        frozen_at = utc_now()
+        plan.update({
+            "frozen_at": frozen_at,
+            "sticky_quote_exchange_epoch": sticky_epoch,
+            "opposite_quote_exchange_epoch": opposite_epoch,
+            "seconds_after_open": round(max(sticky_epoch, opposite_epoch) - opened, 6),
+            "sticky_quote": sticky_quote,
+            "opposite_quote": opposite_quote,
+        })
+        ladder.update({"state": "PLAN_FROZEN", "plan": plan, "wait_reason": None})
+        initial = plan["orders"][0]
+        record.update({
+            "initial_signal_price_cents": opposite_ask,
+            "initial_signal_price": format(cents_price(opposite_ask), "f"),
+            "initial_signal_price_timestamp": frozen_at,
+            "initial_signal_price_exchange_timestamp": datetime.fromtimestamp(
+                opposite_epoch, timezone.utc,
+            ).isoformat(),
+            "initial_signal_price_lag_seconds": plan["seconds_after_open"],
+            "entry_limit_cents": initial["price_cents"],
+            "maker_entry_price": initial["price"],
+            "opening_entry_quantity": initial["quantity"],
+            "opening_entry_price": initial["price"],
+            "opening_entry_cost": format(
+                exact_entry_notional(initial["quantity"], initial["price"]), "f",
+            ),
+            "opening_entry_cost_recorded_at": frozen_at,
+            "intended_quantity": plan["maximum_quantity"],
+            "ladder_maximum_quantity": plan["maximum_quantity"],
+            "minimum_selected_price_cents": opposite_ask,
+            "minimum_selected_price_timestamp": datetime.fromtimestamp(
+                opposite_epoch, timezone.utc,
+            ).isoformat(),
+            "delayed_entry_decision": {
+                "status": "ELIGIBLE", "reason": "sticky_side_ask_inside_53_58_band",
+                "sticky_side": sticky_side, "trade_side": trade_side,
+                "sticky_ask_cents": sticky_ask, "opposite_ask_cents": opposite_ask,
+                "limit_price_cents": initial["price_cents"], "decided_at": frozen_at,
+            },
+        })
+        self.audit(
+            "opposite_ladder_plan_frozen", ticker=record["ticker"],
+            sticky_side=sticky_side, trade_side=trade_side,
+            sticky_ask_cents=sticky_ask, opposite_ask_cents=opposite_ask,
+            plan=plan,
+        )
+        LOG.warning("=" * 68)
+        LOG.warning(
+            "OPPOSITE LADDER SIGNAL | ticker=%s sticky_prediction=%s sticky_ask=%sc "
+            "trade_side=%s opposite_ask=%sc initial_limit=%sc base=%s",
+            record["ticker"], sticky_side.upper(), sticky_ask, trade_side.upper(),
+            opposite_ask, initial["price_cents"], plan["base_shares"],
+        )
+        LOG.warning(
+            "LADDER PLAN | %s",
+            " | ".join(
+                f"BUY {trade_side.upper()} {item['quantity']}@{item['price_cents']}c GTC"
+                for item in plan["orders"]
+            ),
+        )
+        LOG.warning(
+            "TAKE PROFIT | trigger=executable %s bid >=%sc action=cancel_all_entries_then_reduce_only_IOC_flatten",
+            trade_side.upper(), int(self.config["opposite_take_profit_cents"]),
+        )
+        LOG.warning("=" * 68)
+        self.checkpoint("opposite_ladder_plan_frozen")
+        return plan
 
     def ensure_delayed_entry_tracking(
         self,
@@ -4762,6 +4972,7 @@ class LiveEngine:
         baseline = Decimal(str(record.get("stop_baseline_entry_price") or self.config["stop_baseline_entry_price"]))
         if record.get("stop_policy", self.config["stop_policy"]) not in {
             "hybrid_maker_then_hard_stop", "direct_ioc_at_trigger",
+            "opposite_side_take_profit_ioc",
         }:
             self.trip("unsupported_persisted_stop_policy")
             return None
@@ -5853,6 +6064,18 @@ class LiveEngine:
             remaining = Decimal(str(order.get("remaining_count") or "0"))
             if remaining <= 0:
                 continue
+            # A definitive exchange rejection (or a locally deferred intent)
+            # never became a resting order and therefore cannot fill later.
+            # Close only that local attempt; accepted/unknown intents still
+            # require exchange cancellation/reconciliation below.
+            if order.get("submission_outcome") in {"rejected", "not_submitted"}:
+                order.update({
+                    "remaining_count": "0.00",
+                    "status": "rejected_terminal" if order.get("submission_outcome") == "rejected" else "not_submitted",
+                    "cancellation_reason": "no_exchange_order_created",
+                    "canceled_at": utc_now(),
+                })
+                continue
             # A dry-run maker record has no exchange order ID by design. It is
             # simulated public-trade evidence, not an exchange order. Once a
             # risk or market-close cancellation closes it locally, later
@@ -5951,6 +6174,8 @@ class LiveEngine:
         order, and the evidence is kept in the separate shadow ledger.
         """
 
+        if record.get("entry_execution_mode") == "opposite_side_doubling_ladder":
+            return self.refresh_shadow_opposite_ladder(feed, record)
         order = next(iter(record.get("entry_orders", [])), None)
         if not isinstance(order, dict):
             return Decimal("0")
@@ -6002,6 +6227,91 @@ class LiveEngine:
         self.note_entry_execution_summary(record, "shadow_trade_through_refresh")
         return fill
 
+    def refresh_shadow_opposite_ladder(
+        self, feed: KalshiLiveFeed, record: dict[str, Any],
+    ) -> Decimal:
+        """Allocate each public trade once across the resting shadow ladder.
+
+        Higher bids receive volume first.  This conservative deterministic
+        queue proxy never uses one public-trade quantity to fill multiple
+        shadow rungs and never infers a fill from an ask/bid touch alone.
+        """
+
+        orders = [
+            order for order in record.get("entry_orders", [])
+            if isinstance(order, dict) and order.get("entry_phase") == "maker"
+        ]
+        if not orders:
+            return Decimal("0")
+        ladder = record.setdefault("opposite_ladder", {})
+        processed = set(str(value) for value in ladder.get("shadow_processed_trade_ids", []))
+        timestamps = [_iso_epoch(order.get("submitted_at")) for order in orders]
+        earliest = min((value for value in timestamps if value is not None), default=None)
+        if earliest is None:
+            return Decimal(str(record.get("actual_quantity") or "0"))
+        try:
+            created = datetime.fromtimestamp(earliest, timezone.utc)
+            events = feed.public_trades_after(record["ticker"], created)
+        except (AttributeError, TypeError, ValueError):
+            return Decimal(str(record.get("actual_quantity") or "0"))
+        side = str(record["trade_side"])
+        for index, event in enumerate(events):
+            identity = str(event.get("trade_id") or f"{event.get('ts_ms')}:{index}")
+            if identity in processed:
+                continue
+            try:
+                price = Decimal(str(event[f"{side}_price"]))
+                available = Decimal(str(event["count"]))
+            except (ArithmeticError, KeyError, TypeError, ValueError):
+                continue
+            if available <= 0:
+                continue
+            for order in sorted(orders, key=lambda item: Decimal(str(item["position_price"])), reverse=True):
+                if available <= 0:
+                    break
+                if str(order.get("status")) in {"shadow_cancelled", "canceled"}:
+                    continue
+                limit = Decimal(str(order["position_price"]))
+                if not Decimal("0") < price <= limit:
+                    continue
+                requested = Decimal(str(order["quantity"]))
+                prior = Decimal(str(order.get("fill_count") or "0"))
+                remaining = max(Decimal("0"), requested - prior)
+                if remaining <= 0:
+                    continue
+                affordable = (self.shadow_available_cash() / limit).quantize(
+                    Decimal("0.01"), rounding=ROUND_DOWN,
+                )
+                delta = round_shares(min(remaining, available, affordable))
+                if delta <= 0:
+                    continue
+                filled = prior + delta
+                order.update({
+                    "fill_count": format(filled, "f"),
+                    "remaining_count": format(requested - filled, "f"),
+                    "average_fill_price": format(limit, "f"),
+                    "status": "shadow_filled" if filled >= requested else "shadow_partially_filled",
+                    "last_shadow_fill_trade_id": identity,
+                })
+                self.reserve_shadow_entry_cash(delta, limit)
+                available -= delta
+            processed.add(identity)
+        ladder["shadow_processed_trade_ids"] = list(processed)[-4096:]
+        previous_total = Decimal(str(record.get("actual_quantity") or "0"))
+        total = sum((Decimal(str(order.get("fill_count") or "0")) for order in orders), Decimal("0"))
+        record["actual_quantity"] = format(total, "f")
+        self.state["current_position"] = record["actual_quantity"]
+        if total > 0:
+            cost = sum(
+                Decimal(str(order.get("fill_count") or "0")) * Decimal(str(order["position_price"]))
+                for order in orders
+            )
+            self.state["average_entry"] = format(cost / total, "f")
+            record["actual_average_entry_price"] = self.state["average_entry"]
+        self.note_entry_fill_observed(record, previous_total, total, "shadow_opposite_ladder_trade_through")
+        self.note_entry_execution_summary(record, "shadow_opposite_ladder_refresh")
+        return total
+
     def opening_quote_capture_deadline(self, record: dict[str, Any]) -> float:
         """Bound high-frequency opening telemetry without expiring the GTC."""
 
@@ -6024,6 +6334,8 @@ class LiveEngine:
             return
         self.transition(record, "ZERO_FILL", reason)
         record["exit_classification"] = "ENTRY_NOT_FILLED"
+        if all(Decimal(str(order.get("remaining_count") or "0")) <= 0 for order in record.get("entry_orders", [])):
+            self.state["current_order_id"] = None
         self.state["sizing"] = zero_fill_snapshot(self.current_parameters(), self.state.get("sizing"))
         self.note_zero_fill()
         self.refresh_entry_execution_metrics()
@@ -6762,7 +7074,190 @@ class LiveEngine:
             shadow=self.dry_run,
         )
 
+    async def submit_opposite_ladder_entries(
+        self, rest: KalshiREST, feed: KalshiLiveFeed, record: dict[str, Any], now: float,
+    ) -> None:
+        """Create every missing v14 GTC maker order without duplicating a rung."""
+
+        ladder = record.setdefault("opposite_ladder", {})
+        if ladder.get("exit_latched") or now >= float(record["market_close_epoch"]):
+            return
+        plan = self.freeze_opposite_ladder_plan(feed, record, now)
+        if not isinstance(plan, dict):
+            return
+        side = str(record["trade_side"])
+        planned_orders = list(plan.get("orders") or [])
+        if not ladder.get("funding_preflight_complete"):
+            required = Decimal(str(plan["maximum_cash_required"]))
+            if self.dry_run:
+                exchange_index, available = None, self.shadow_available_cash()
+            else:
+                try:
+                    exchange_index, available = await rest.market_entry_funding(record["ticker"])
+                except Exception as exc:
+                    ladder["funding_preflight"] = {
+                        "at": utc_now(), "status": "UNAVAILABLE",
+                        "error_type": type(exc).__name__, "required_cash": format(required, "f"),
+                    }
+                    return
+            ladder["funding_preflight"] = {
+                "at": utc_now(), "status": "PASS" if available >= required else "INSUFFICIENT",
+                "exchange_index": exchange_index, "available_balance": format(available, "f"),
+                "required_cash": format(required, "f"),
+            }
+            LOG.warning(
+                "OPPOSITE LADDER FUNDING | ticker=%s shard=%s available=$%s maximum_required=$%s status=%s",
+                record["ticker"], exchange_index, format(available, "f"), format(required, "f"),
+                ladder["funding_preflight"]["status"],
+            )
+            if available < required:
+                self.transition(record, "FUNDING_FAILURE", "insufficient_cash_for_complete_opposite_ladder")
+                return
+            if not self.dry_run:
+                position = await rest.position_for_ticker(record["ticker"])
+                if position is None:
+                    ladder["funding_preflight"]["status"] = "POSITION_READ_UNAVAILABLE"
+                    return
+                if abs(Decimal(str(position))) > 0:
+                    self.trip("existing_position_before_opposite_ladder")
+                    return
+            ladder["funding_preflight_complete"] = True
+            self.audit("opposite_ladder_funding_passed", ticker=record["ticker"], **ladder["funding_preflight"])
+
+        accepted = 0
+        unresolved = False
+        retry_pending = False
+        for desired in planned_orders:
+            role = str(desired["role"])
+            attempts = [
+                order for order in record.get("entry_orders", [])
+                if isinstance(order, dict) and order.get("ladder_role") == role
+            ]
+            if any(order.get("order_id") or order.get("status") == "shadow_resting" for order in attempts):
+                accepted += 1
+                continue
+            if any(
+                order.get("submission_outcome") not in {"rejected", "not_submitted"}
+                and order.get("status") in {"submitting", "submit_failed", "paused"}
+                for order in attempts
+            ):
+                unresolved = True
+                continue
+            latest_attempt = attempts[-1] if attempts else None
+            if (
+                isinstance(latest_attempt, dict)
+                and latest_attempt.get("submission_outcome") == "rejected"
+                and now < float(latest_attempt.get("next_retry_epoch") or 0)
+            ):
+                retry_pending = True
+                continue
+            limit = cents_price(int(desired["price_cents"]))
+            quantity = round_shares(Decimal(str(desired["quantity"])))
+            fresh_quote, quote_state = feed.executable_shadow_quote(
+                record["ticker"], side, 0.0, float(self.config["max_stale_quote_seconds"]),
+            )
+            fresh_ask = None
+            if fresh_quote is not None:
+                try:
+                    fresh_ask = Decimal(str(fresh_quote["economic_price"]))
+                except (ArithmeticError, KeyError, TypeError, ValueError):
+                    fresh_ask = None
+            if fresh_ask is None or fresh_ask <= limit:
+                retry_pending = True
+                ladder["last_submission_wait"] = {
+                    "at": utc_now(), "role": role,
+                    "reason": "fresh_book_unavailable" if fresh_ask is None else "post_only_would_cross",
+                    "fresh_trade_side_ask": None if fresh_ask is None else format(fresh_ask, "f"),
+                    "limit": format(limit, "f"), "quote_state": quote_state,
+                }
+                continue
+            ordinal = len(attempts)
+            client_id = deterministic_client_order_id(
+                record["ticker"], side, f"opposite-ladder-{role}-{ordinal}", self.config,
+            )
+            intent = {
+                "order_id": None, "client_order_id": client_id, "ticker": record["ticker"],
+                "side": side, "quantity": format(quantity, "f"),
+                "position_price": format(limit, "f"), "time_in_force": "good_till_canceled",
+                "post_only": True, "reduce_only": False, "expiration_time": None,
+                "fill_count": "0", "remaining_count": format(quantity, "f"),
+                "fees_paid": "0", "entry_phase": "maker", "ladder_role": role,
+                "status": "shadow_resting" if self.dry_run else "submitting",
+                "submission_outcome": "accepted" if self.dry_run else "unknown",
+                "submitted_at": utc_now(),
+            }
+            record.setdefault("entry_orders", []).append(intent)
+            self.note_entry_order_submitted(record, intent, role)
+            self.audit(
+                "opposite_ladder_order_intent", ticker=record["ticker"], role=role,
+                side=side, client_order_id=client_id, price=format(limit, "f"),
+                quantity=format(quantity, "f"), attempt=ordinal, post_only=True,
+                time_in_force="good_till_canceled",
+            )
+            if not self.dry_run:
+                response = await rest.create_order(
+                    ticker=record["ticker"], side=side, position_price=float(limit),
+                    quantity=float(quantity), tif="good_till_canceled", expiration_time=None,
+                    dry_run=False, order_key=f"opposite-ladder-{role}", post_only=True,
+                    client_order_id_override=client_id,
+                )
+                intent.update(response)
+                intent["client_order_id"] = client_id
+                intent["entry_phase"] = "maker"
+                intent["ladder_role"] = role
+                if intent.get("order_id"):
+                    intent["submission_outcome"] = "accepted"
+                elif intent.get("submission_outcome") == "rejected":
+                    intent.update({
+                        "retryable": True,
+                        "next_retry_epoch": now + ENTRY_REJECTION_RETRY_SECONDS,
+                        "retry_interval_seconds": ENTRY_REJECTION_RETRY_SECONDS,
+                    })
+                    retry_pending = True
+                    LOG.warning(
+                        "OPPOSITE LADDER RETRY | ticker=%s role=%s price=%sc quantity=%s "
+                        "http_status=%s error_code=%s next=bounded_market_retry",
+                        record["ticker"], role, desired["price_cents"], desired["quantity"],
+                        intent.get("http_status"), intent.get("error_code"),
+                    )
+                    continue
+                else:
+                    unresolved = True
+                    # Never create a second ambiguous intent in the same
+                    # pass. Reconcile this deterministic client ID first;
+                    # later rungs are posted on the next safe pass.
+                    break
+            accepted += 1
+            LOG.warning(
+                "OPPOSITE LADDER ORDER %s | ticker=%s role=%s BUY=%s price=%sc quantity=%s "
+                "tif=GTC post_only=true order_id=%s fill=%s remaining=%s",
+                "SHADOW" if self.dry_run else "ACK", record["ticker"], role,
+                side.upper(), desired["price_cents"], desired["quantity"],
+                intent.get("order_id"), intent.get("fill_count"), intent.get("remaining_count"),
+            )
+
+        ladder.update({
+            "state": "SUBMISSION_UNRESOLVED" if unresolved else "RESTING",
+            "accepted_order_count": accepted,
+            "planned_order_count": len(planned_orders),
+            "retry_pending": retry_pending,
+            "last_submission_pass_at": utc_now(),
+        })
+        self.state["current_order_id"] = next(
+            (order.get("order_id") for order in record.get("entry_orders", []) if order.get("order_id")),
+            None,
+        )
+        if unresolved:
+            self.trip("opposite_ladder_submission_unknown")
+            self.transition(record, "RECONCILIATION_PENDING", "opposite_ladder_submission_unknown")
+        elif accepted or retry_pending:
+            self.transition(record, "ENTRY_PENDING", "opposite_ladder_gtc_orders_managed")
+
     async def submit_entry(self, rest: KalshiREST, feed: KalshiLiveFeed, record: dict[str, Any], now: float) -> None:
+        if self.config["entry_execution_mode"] == "opposite_side_doubling_ladder":
+            if record.get("status") in {"SIGNAL_PENDING", "ENTRY_PENDING", "ENTRY_PARTIAL", "POSITION_OPEN"}:
+                await self.submit_opposite_ladder_entries(rest, feed, record, now)
+            return
         if record.get("status") != "SIGNAL_PENDING":
             return
         # Opening-price evidence is observational and remains active even
@@ -7085,7 +7580,9 @@ class LiveEngine:
                 return
             residual = abs(signed)
         if residual <= 0:
-            direct = record.get("stop_policy", self.config["stop_policy"]) == "direct_ioc_at_trigger"
+            direct = record.get("stop_policy", self.config["stop_policy"]) in {
+                "direct_ioc_at_trigger", "opposite_side_take_profit_ioc",
+            }
             classification = (
                 "DIRECT_PROTECTIVE_EXIT" if direct else
                 (("MAKER_EXIT_PARTIAL_THEN_HARD_STOP" if maker_filled > 0
@@ -7095,7 +7592,9 @@ class LiveEngine:
             record["hybrid_stop"]["state"] = classification
             await self.finalize_stop(record)
             return
-        direct = record.get("stop_policy", self.config["stop_policy"]) == "direct_ioc_at_trigger"
+        direct = record.get("stop_policy", self.config["stop_policy"]) in {
+            "direct_ioc_at_trigger", "opposite_side_take_profit_ioc",
+        }
         exit_key = "direct-protective-exit" if direct else "hybrid-hard-stop"
         client_id = deterministic_client_order_id(
             record["ticker"], side, f"{exit_key}-{len(prior_hard_orders)}", self.config,
@@ -7153,7 +7652,9 @@ class LiveEngine:
         if remaining <= 0:
             classification = (
                 "DIRECT_PROTECTIVE_EXIT"
-                if record.get("stop_policy", self.config["stop_policy"]) == "direct_ioc_at_trigger"
+                if record.get("stop_policy", self.config["stop_policy"]) in {
+                    "direct_ioc_at_trigger", "opposite_side_take_profit_ioc",
+                }
                 else "MAKER_EXIT_PARTIAL_THEN_HARD_STOP" if maker_filled > 0 else "HARD_STOP_ONLY"
             )
             record["exit_classification"] = classification
@@ -7199,9 +7700,22 @@ class LiveEngine:
             self.audit("realized_pnl_blocked", ticker=record["ticker"], method=method, settlement_id=settlement_id)
             return
         self.note_entry_execution_summary(record, "realized_trade_finalization")
-        parameters = self.record_parameters(record)
+        opposite_ladder = self.config["entry_execution_mode"] == "opposite_side_doubling_ladder"
+        parameters = self.current_parameters() if opposite_ladder else self.record_parameters(record)
         before = dict(self.state.get("sizing") or {})
-        after, changes = apply_realized_filled_trade(parameters, before, net)
+        if opposite_ladder:
+            base = format(round_shares(Decimal(self.config["starting_base"])), "f")
+            after = {
+                "base_share_count": base,
+                "recovery_exponent": 0,
+                "recovery_cycle_pnl": "0",
+                "profit_since_last_base_scale": "0",
+                "next_base_threshold": self.config["first_base_threshold"],
+                "completed_trade_count": int(before.get("completed_trade_count", 0)) + 1,
+            }
+            changes = {"recovery_reset": False, "base_increased": False}
+        else:
+            after, changes = apply_realized_filled_trade(parameters, before, net)
         self.state["sizing"] = after
         if Decimal(str(after["recovery_cycle_pnl"])) < 0:
             self.state["cycle_strategy_parameters"] = parameters.as_dict()
@@ -7222,30 +7736,39 @@ class LiveEngine:
             metrics["reserved_cash"] = format(max(Decimal("0"), Decimal(str(metrics["reserved_cash"])) - entry_cash), "f")
             metrics["max_drawdown"] = format(max(Decimal(str(metrics["max_drawdown"])), peak - balance), "f")
             metrics["completed_trades"] = int(metrics["completed_trades"]) + 1
-            count_key = "stop_count" if method == "stop" else "settlement_count"
+            count_key = (
+                "stop_count" if method in {"stop", "opposite_take_profit"}
+                else "settlement_count"
+            )
             metrics[count_key] = int(metrics[count_key]) + 1
         append_unique(self.state["processed_settlements"], settlement_id)
         record.update({
             "realized_net_pnl": format(net, "f"), "realized_method": method, "completed_at": utc_now(),
             "recovery_cycle_pnl_after": after["recovery_cycle_pnl"], "recovery_exponent_after": after["recovery_exponent"],
             "base_after": after["base_share_count"], "next_base_threshold_after": after["next_base_threshold"],
-            "effective_position_cap_after": format(
-                self.current_parameters().effective_max_position(after["base_share_count"]), "f"
-            ),
         })
+        if not opposite_ladder:
+            record["effective_position_cap_after"] = format(
+                self.current_parameters().effective_max_position(after["base_share_count"]), "f",
+            )
         self.realized_performance_metrics()
         self.transition(record, "CLOSED", method)
         if self.state.get("active_market") == record["ticker"]:
             self.state["active_market"] = None
         self.state.update({"current_order_id": None, "current_position": "0.00", "average_entry": None, "last_completed_trade": record["ticker"]})
-        self.audit(
-            "trade_closed", ticker=record["ticker"], method=method, net_pnl=format(net, "f"),
-            quantity=record.get("actual_quantity"), recovery_reset=changes["recovery_reset"],
-            base_increased=changes["base_increased"], entry_execution_type=record["entry_execution_type"],
-            effective_position_cap_before=record.get("effective_position_cap"),
-            effective_position_cap_after=record["effective_position_cap_after"],
-            entry_execution_summary=record["entry_execution_summary"],
-        )
+        close_audit = {
+            "ticker": record["ticker"], "method": method, "net_pnl": format(net, "f"),
+            "quantity": record.get("actual_quantity"), "recovery_reset": changes["recovery_reset"],
+            "base_increased": changes["base_increased"],
+            "entry_execution_type": record["entry_execution_type"],
+            "entry_execution_summary": record["entry_execution_summary"],
+        }
+        if not opposite_ladder:
+            close_audit.update({
+                "effective_position_cap_before": record.get("effective_position_cap"),
+                "effective_position_cap_after": record.get("effective_position_cap_after"),
+            })
+        self.audit("trade_closed", **close_audit)
         if self.dry_run:
             metrics = self.shadow_metrics()
             LOG.warning(
@@ -7262,14 +7785,124 @@ class LiveEngine:
         self.note_stop_position_closed(record)
         proceeds, exit_fees = self.exit_proceeds(record)
         net = proceeds - exit_fees - self.entry_cost(record)
-        self.record_realized(record, net, "stop", f"{record['ticker']}:stop")
+        method = "opposite_take_profit" if record.get("exit_purpose") == "opposite_take_profit" else "stop"
+        self.record_realized(record, net, method, f"{record['ticker']}:{method}")
 
     async def manage_stop(self, rest: KalshiREST, feed: KalshiLiveFeed, record: dict[str, Any]) -> None:
+        if record.get("entry_execution_mode") == "opposite_side_doubling_ladder":
+            await self.manage_opposite_take_profit(rest, feed, record)
+            return
         if record.get("status") == "ENTRY_CANCEL_UNCONFIRMED":
             pending = record.get("entry_cancel_pending")
             if isinstance(pending, dict) and pending.get("next_action") == "stop":
                 await self.resume_unconfirmed_entry_cancellation(rest, feed, record)
             return
+        await self.manage_legacy_stop(rest, feed, record)
+
+    async def manage_opposite_take_profit(
+        self, rest: KalshiREST, feed: KalshiLiveFeed, record: dict[str, Any],
+    ) -> None:
+        """Cancel the ladder and flatten actual opposite-side fills at 50c.
+
+        Either equivalent executable boundary latches the exit: traded-side
+        BID >=50c or sticky-side ASK <=50c.  The opposite contract merely
+        starting below 50c does not trigger an exit.  Once latched it never
+        rearms; residual reduce-only IOC attempts use the latest executable
+        bid and can never reverse the position.
+        """
+
+        ladder = record.setdefault("opposite_ladder", {})
+        status = str(record.get("status") or "")
+        if status not in {
+            "ENTRY_PENDING", "ENTRY_PARTIAL", "POSITION_OPEN",
+            "ENTRY_CANCEL_UNCONFIRMED", "HARD_STOP_PENDING",
+        }:
+            return
+        if status == "ENTRY_CANCEL_UNCONFIRMED":
+            pending = record.get("entry_cancel_pending")
+            if isinstance(pending, dict) and pending.get("next_action") == "stop":
+                await self.resume_unconfirmed_entry_cancellation(rest, feed, record)
+            return
+        bid = self.selected_quote(feed, record["ticker"], str(record["trade_side"]), "bid")
+        sticky_ask = self.selected_quote(
+            feed, record["ticker"], str(record["sticky_signal_side"]), "ask",
+        )
+        threshold_cents = int(self.config["opposite_take_profit_cents"])
+        bid_cents = None
+        sticky_ask_cents = None
+        if bid is not None:
+            try:
+                bid_cents = price_to_cents(bid, "opposite-side executable bid")
+            except ValueError:
+                bid_cents = None
+        if sticky_ask is not None:
+            try:
+                sticky_ask_cents = price_to_cents(
+                    sticky_ask, "sticky-side executable ask",
+                )
+            except ValueError:
+                sticky_ask_cents = None
+        if not ladder.get("exit_latched"):
+            if not take_profit_triggered(
+                bid_cents, threshold_cents,
+                sticky_side_ask_cents=sticky_ask_cents,
+            ):
+                return
+            ladder.update({
+                "exit_latched": True, "state": "TAKE_PROFIT_LATCHED",
+                "take_profit_triggered_at": utc_now(),
+                "trigger_executable_bid_cents": bid_cents,
+                "trigger_sticky_ask_cents": sticky_ask_cents,
+            })
+            record["exit_purpose"] = "opposite_take_profit"
+            record.setdefault("hybrid_stop", {}).update({
+                "stop_exit_latched": True, "hard_stop_latched": True,
+                "triggered_at": utc_now(), "state": "TAKE_PROFIT_LATCHED",
+            })
+            self.audit(
+                "opposite_take_profit_latched", ticker=record["ticker"],
+                trade_side=record["trade_side"],
+                executable_bid=None if bid is None else format(bid, "f"),
+                sticky_side=record["sticky_signal_side"],
+                sticky_executable_ask=(
+                    None if sticky_ask is None else format(sticky_ask, "f")
+                ),
+                threshold_cents=threshold_cents,
+            )
+            LOG.warning(
+                "OPPOSITE TAKE PROFIT LATCHED | ticker=%s held_side=%s executable_bid=%sc "
+                "sticky_side=%s executable_ask=%sc threshold=%sc "
+                "action=cancel_all_ladder_orders_then_flatten_actual_position",
+                record["ticker"], str(record["trade_side"]).upper(), bid_cents,
+                str(record["sticky_signal_side"]).upper(), sticky_ask_cents,
+                threshold_cents,
+            )
+        if not await self.cancel_entry_orders_and_confirm(
+            rest, record, next_action="stop", executable_bid=bid,
+        ):
+            ladder["state"] = "ENTRY_CANCELLATION_PENDING"
+            return
+        filled = self.refresh_shadow_entry(feed, record) if self.dry_run else await self.refresh_entry(rest, record)
+        if not self.dry_run:
+            position = await rest.position_for_ticker(record["ticker"])
+            if position is None:
+                self.trip("opposite_take_profit_position_reconciliation_failed")
+                return
+            filled = max(filled, abs(Decimal(str(position))))
+            record["actual_quantity"] = format(filled, "f")
+            self.state["current_position"] = record["actual_quantity"]
+        if filled <= 0:
+            ladder["state"] = "CLOSED_NO_FILL"
+            self.finish_entry_attempt(record, Decimal("0"), "opposite_take_profit_before_any_fill")
+            return
+        if bid is None:
+            return
+        ladder["state"] = "TAKE_PROFIT_EXIT_PENDING"
+        await self.submit_hybrid_hard_stop(rest, feed, record, bid)
+
+    async def manage_legacy_stop(
+        self, rest: KalshiREST, feed: KalshiLiveFeed, record: dict[str, Any],
+    ) -> None:
         active_stop_states = {
             "ENTRY_PARTIAL", "POSITION_OPEN", "MAKER_EXIT_PENDING", "MAKER_EXIT_PARTIAL",
             "MAKER_EXIT_CANCEL_UNCONFIRMED", "HARD_STOP_PENDING",
@@ -8340,24 +8973,28 @@ class LiveEngine:
                 LOG.warning(
                     "LIVE ACCOUNT | mode=%s aggregate_balance=$%s market_shard=%s "
                     "shard_available=$%s read=%s current_position=%s open_orders=%s "
-                    "cumulative_net=$%s fees=$%s can_open_new_risk=%s",
+                    "cumulative_net=$%s fees=$%s worker_online=true safety_alert=%s",
                     "DRY_RUN" if self.dry_run else "LIVE",
                     account.get("aggregate_balance"), account.get("exchange_index"),
                     account.get("market_shard_available"), account.get("read_status"),
                     self.state.get("current_position"),
                     (self.state.get("last_reconciliation") or {}).get("managed_open_orders"),
                     self.state.get("cumulative_realized_pnl"), fees["total_fees_paid"],
-                    not health["breaker_blocked"],
+                    health["breaker_reason"],
                 )
+                ladder = record.get("opposite_ladder", {}) if isinstance(record, dict) else {}
+                plan = ladder.get("plan", {}) if isinstance(ladder.get("plan"), dict) else {}
                 LOG.warning(
-                    "HEARTBEAT | mode=%s ticker=%s state=%s side=%s base=%s exponent=%d "
-                    "target=%s cap=%s deficit=%s threshold=%s active=%s close_in=%s",
+                    "HEARTBEAT | mode=%s ticker=%s state=%s sticky_side=%s trade_side=%s "
+                    "base=%s ladder_quantities=%s recovery=DISABLED cap=NONE "
+                    "orders_acknowledged=%s/%s exit_latched=%s active=%s close_in=%s",
                     "DRY_RUN" if self.dry_run else "LIVE",
-                    active and active["ticker"], record.get("status"), record.get("signal_side"),
-                    sizing.base_share_count, sizing.recovery_exponent, sizing.prescribed_quantity(),
-                    self.current_parameters().effective_max_position(sizing.base_share_count),
-                    sizing.recovery_cycle_pnl,
-                    sizing.next_base_threshold, self.state.get("active_market"), gtc_market_close_in,
+                    active and active["ticker"], record.get("status"),
+                    record.get("sticky_signal_side"), record.get("trade_side"),
+                    self.config["starting_base"],
+                    "/".join(str(item.get("quantity")) for item in plan.get("orders", [])) or "pending",
+                    ladder.get("accepted_order_count", 0), ladder.get("planned_order_count", 5),
+                    bool(ladder.get("exit_latched")), self.state.get("active_market"), gtc_market_close_in,
                 )
                 LOG.warning(
                     "ENTRY STATUS | ticker=%s decision=%s opening_ask=%s trigger_ask=%s "
@@ -8396,13 +9033,13 @@ class LiveEngine:
                         stats["total_fees_paid"],
                     )
                 LOG.warning(
-                    "STOP STATUS | ticker=%s contract=%sc/%sc/%sc state=%s class=%s "
-                    "entry_qty=%s maker_filled=%s hard_filled=%s stop_from_fill_p50=%s",
-                    active and active["ticker"], self.config["hybrid_stop_trigger_cents"],
-                    self.config["hybrid_maker_exit_cents"], self.config["hybrid_hard_stop_cents"],
-                    hybrid.get("state"), record.get("exit_classification"),
-                    record.get("actual_quantity"), hybrid.get("maker_filled_quantity"),
-                    hybrid.get("hard_filled_quantity"), stop_latency.get("median_seconds"),
+                    "EXIT STATUS | ticker=%s boundary=trade_bid>=50c_or_sticky_ask<=50c "
+                    "state=%s class=%s entry_filled_qty=%s exit_filled_qty=%s "
+                    "authoritative_position=%s residual_retry=reduce_only_IOC",
+                    active and active["ticker"], ladder.get("state"),
+                    record.get("exit_classification"), record.get("actual_quantity"),
+                    format(self.exit_filled_quantity(record), "f"),
+                    self.state.get("current_position"),
                 )
                 LOG.warning(
                     "PROTECTIVE EXIT HEALTH | protective_latched=%s hard_latched=%s "
@@ -8462,8 +9099,8 @@ class LiveEngine:
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
     result.add_argument("--config", type=Path, default=Path("live_strategy_config.json"))
-    result.add_argument("--state-file", type=Path, default=Path("data/kalshi_live_delayed_band_v13_state.json"))
-    result.add_argument("--audit-ledger", type=Path, default=Path("data/kalshi_live_delayed_band_v13_audit.jsonl"))
+    result.add_argument("--state-file", type=Path, default=Path("data/kalshi_live_opposite_ladder_v14_state.json"))
+    result.add_argument("--audit-ledger", type=Path, default=Path("data/kalshi_live_opposite_ladder_v14_audit.jsonl"))
     result.add_argument("--run-seconds", type=float, default=19_200)
     result.add_argument("--persist-config", action="store_true")
     result.add_argument("--reconcile-only", action="store_true")
@@ -8541,15 +9178,14 @@ async def async_main(args: argparse.Namespace) -> int:
     if args.persist_config:
         save_config(args.config, config)
         LOG.warning(
-            "CONFIG SAVED LOCALLY | initial_shares=%s recovery_multiplier=%s threshold_growth_multiplier=%s "
-            "initial_or_fixed_share_cap=%s cap_per_base_share=%s first_profit_threshold=%s "
-            "shares_added=%s hard_stop_cents=%s "
+            "CONFIG SAVED LOCALLY | initial_base_shares=%s recovery=DISABLED position_cap=DISABLED "
+            "base_scaling=DISABLED sticky_trigger_band=%s-%sc opposite_initial=ask_minus_%sc "
+            "rungs=40c@2x,30c@4x,20c@8x,10c@16x take_profit_bid=%sc "
             "mode=%s hash=%s | blank_inputs=preserve_restored_values remote_persistence=requires_successful_checkpoint "
-            "existing_base_and_recovery=preserved",
-            config["starting_base"], config["recovery_multiplier"], config["threshold_growth_multiplier"],
-            config["max_position"], config.get("max_position_per_base_share"),
-            config["first_base_threshold"], config["base_increment"],
-            config["hybrid_hard_stop_cents"], expected_mode, config_hash(config)[:12],
+            "v13_recovery_state=NOT_IMPORTED",
+            config["starting_base"], config["delayed_entry_threshold_cents"],
+            config["delayed_entry_max_trigger_cents"], config["entry_limit_offset_cents"],
+            config["opposite_take_profit_cents"], expected_mode, config_hash(config)[:12],
         )
     migrations = state.get("config_migrations", [])
     if migrations and migrations[-1].get("kind") == "disable_recovery_exponent_breaker":

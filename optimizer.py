@@ -115,48 +115,44 @@ def export_selected_live_strategy(path: Path, row: dict[str, Any], *, selection_
     result, not an unattended-live default.
     """
 
-    if row.get("execution_profile") != "delayed_53_57_exit_51":
+    if row.get("execution_profile") != "opposite_ladder_53_58_take_profit_50":
         raise ValueError(
-            "live export requires execution_profile=delayed_53_57_exit_51; "
-            "settlement-only optimizer rows cannot prove delayed fills or protective exits"
+            "live export requires execution_profile=opposite_ladder_53_58_take_profit_50; "
+            "generic settlement/Monte Carlo rows cannot activate the v14 live ladder"
         )
-    stop = row.get("stop_price")
-    if stop in {None, "no_stop"} or round(float(stop), 2) != 0.51:
-        raise ValueError("v13 production exports only the reviewed direct 51c exit profile")
-    if round(float(row.get("entry_price", 0)), 2) != 0.52:
-        raise ValueError("v13 entry_price is the 52c minimum reference for the delayed limit band")
-    shadow_profile = "delayed_53_57_exit_51"
+    base = Decimal(str(row.get("starting_base", "1.00")))
+    if base.quantize(Decimal("0.01")) != base or not base.is_finite() or base <= 0:
+        raise ValueError("starting_base must be a positive two-decimal quantity")
+    shadow_profile = "opposite_ladder_53_58_take_profit_50"
     config = {
-        "config_schema_version": 13,
-        "strategy_version": "kxbtc15m-delayed-band-live-v13",
+        "config_schema_version": 14,
+        "strategy_version": "kxbtc15m-opposite-ladder-live-v14",
         "selection_basis": selection_basis,
         "series": "KXBTC15M",
         "signal_delay_seconds": 0,
         "signal_mode": "sticky_until_directional_win",
         "shadow_profile": shadow_profile,
-        "entry_price": f"{float(row['entry_price']):.2f}",
-        "stop_price": f"{float(stop):.2f}",
-        "stop_policy": "direct_ioc_at_trigger",
+        "entry_price": "0.47",
+        "stop_price": "0.50",
+        "stop_policy": "opposite_side_take_profit_ioc",
         "hybrid_stop_enabled": True,
-        "hybrid_stop_trigger_cents": 51,
-        "hybrid_maker_exit_cents": 51,
-        "hybrid_hard_stop_cents": 51,
+        "hybrid_stop_trigger_cents": 50,
+        "hybrid_maker_exit_cents": 50,
+        "hybrid_hard_stop_cents": 50,
+        "opposite_take_profit_cents": 50,
+        "opposite_ladder_enabled": True,
         "stop_baseline_entry_price": "0.50",
-        "entry_execution_mode": "delayed_threshold_band_maker",
+        "entry_execution_mode": "opposite_side_doubling_ladder",
         "maker_order_time_in_force": "good_till_canceled",
         "entry_order_lifetime": "until_filled_or_market_close",
         "entry_limit_offset_cents": 1,
-        "starting_base": format(Decimal(str(row.get("starting_base", "1.00"))), "f"),
-        "recovery_multiplier": f"{float(row['recovery_multiplier']):.2f}",
-        "first_base_threshold": f"{float(row['first_base_threshold']):.2f}",
-        "threshold_growth_multiplier": f"{float(row['threshold_growth_multiplier']):.2f}",
-        "base_increment": f"{float(row['base_increment']):.2f}",
-        "max_position": format(Decimal(str(row.get("max_position", "100.00"))), "f"),
-        "max_position_per_base_share": (
-            None
-            if row.get("max_position_per_base_share") in (None, "", 0, "0", "0.00")
-            else format(Decimal(str(row["max_position_per_base_share"])), "f")
-        ),
+        "starting_base": format(base, ".2f"),
+        "recovery_multiplier": "1.00",
+        "recovery_enabled": False,
+        "first_base_threshold": "999999999.00",
+        "threshold_growth_multiplier": "1.00",
+        "base_increment": "1.00",
+        "base_scaling_enabled": False,
         "starting_shadow_balance": "1000.00",
         "live_enabled": False,
         "dry_run": True,
@@ -167,8 +163,8 @@ def export_selected_live_strategy(path: Path, row: dict[str, Any], *, selection_
         "maker_price_offset": "0.01",
         "entry_lateness_seconds": 60,
         "handoff_guard_seconds": 60,
-        "stop_poll_interval": 1.0,
-        "reconciliation_interval": 5.0,
+        "stop_poll_interval": 0.5,
+        "reconciliation_interval": 2.0,
         "market_discovery_interval_seconds": 1.0,
         "outcome_observation_seconds": 5,
         "provisional_outcome_threshold": "0.99",
@@ -178,11 +174,12 @@ def export_selected_live_strategy(path: Path, row: dict[str, Any], *, selection_
         "delayed_entry_threshold_cents": 53,
         "delayed_entry_start_seconds": 60,
         "delayed_entry_max_limit_cents": 57,
+        "delayed_entry_max_trigger_cents": 58,
         "delayed_entry_tracking_enabled": True,
         "max_recovery_exponent": 0,
-        "max_recovery_cycle_loss": "100.00",
-        "max_daily_realized_loss": "100.00",
-        "max_api_failures": 5,
+        "max_recovery_cycle_loss": "999999999.00",
+        "max_daily_realized_loss": "999999999.00",
+        "max_api_failures": 20,
         "allow_capital_downsize": False,
         "shadow_fill_model": "conservative_public_trade_through",
         "shadow_entry_level_min_cents": 40,

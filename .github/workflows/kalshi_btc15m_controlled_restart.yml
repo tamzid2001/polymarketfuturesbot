@@ -1,4 +1,4 @@
-name: Controlled Restart — Kalshi KXBTC15M Direct 51c
+name: Controlled Restart — Kalshi KXBTC15M Opposite Ladder v14
 
 # Manual, serialized handoff onto the current main branch. The source lane
 # must be flat and inside the same middle-13-minute safety window used by the
@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       source_run_id:
-        description: "Running KXBTC15M direct-exit Actions run to replace."
+        description: "Running KXBTC15M opposite-ladder Actions run to replace."
         required: true
         type: string
       target_live:
@@ -40,7 +40,7 @@ jobs:
       - name: Restore latest bounded runtime state
         run: |
           set -euo pipefail
-          runtime_ref=runtime-state-kxbtc15m-delayed-v13
+          runtime_ref=runtime-state-kxbtc15m-opposite-ladder-v14
           set +e
           git ls-remote --exit-code --heads origin "refs/heads/$runtime_ref" >/dev/null
           runtime_ref_status=$?
@@ -49,13 +49,13 @@ jobs:
             git fetch --no-tags origin "refs/heads/$runtime_ref"
             restore_sha="$(git rev-parse FETCH_HEAD)"
             python3 live_checkpoint.py --restore-sha "$restore_sha" --runtime-ref "$runtime_ref"
-            echo "RUNTIME_STATE_OWNER=kalshi-kxbtc15m-delayed-v13"
+            echo "RUNTIME_STATE_OWNER=kalshi-kxbtc15m-opposite-ladder-v14"
             echo "RUNTIME_STATE_RESTORED=$runtime_ref"
           elif [ "$runtime_ref_status" -eq 2 ]; then
-            echo "::error::No v13 runtime checkpoint exists; start a fresh worker before controlled restart"
+            echo "::error::No v14 runtime checkpoint exists; start a fresh worker before controlled restart"
             exit 2
           else
-            echo "::error::Unable to determine v13 runtime ref status; refusing unsafe fallback"
+            echo "::error::Unable to determine v14 runtime ref status; refusing unsafe fallback"
             exit 2
           fi
 
@@ -64,7 +64,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           SOURCE_RUN_ID: ${{ inputs.source_run_id }}
           TARGET_LIVE: ${{ inputs.target_live }}
-          SHADOW_PROFILE: "delayed_53_57_exit_51"
+          SHADOW_PROFILE: "opposite_ladder_53_58_take_profit_50"
           LIVE_GATE: ${{ vars.KALSHI_LIVE_ENABLED || 'false' }}
           SHADOW_ONLY_LOCK: ${{ vars.KALSHI_SHADOW_ONLY || 'true' }}
         run: |
@@ -74,7 +74,7 @@ jobs:
           workflow="$(jq -r '.workflowName' <<<"$source_json")"
           source_status="$(jq -r '.status' <<<"$source_json")"
           title="$(jq -r '.displayTitle' <<<"$source_json")"
-          [ "$workflow" = "Kalshi KXBTC15M Direct 51c Live" ] || {
+          [ "$workflow" = "Kalshi KXBTC15M Opposite Ladder v14 Live" ] || {
             echo "::error::source_run_id is not a KXBTC15M production worker"; exit 2;
           }
           [ "$source_status" = "in_progress" ] || {
@@ -86,14 +86,14 @@ jobs:
               echo "::error::Live handoff requires KALSHI_LIVE_ENABLED=true and KALSHI_SHADOW_ONLY=false"; exit 2;
             }
           fi
-          if [[ "$title" == *"LIVE delayed_53_57_exit_51" ]]; then
-            state_file=data/kalshi_live_delayed_band_v13_state.json
+          if [[ "$title" == *"LIVE opposite_ladder_53_58_take_profit_50" ]]; then
+            state_file=data/kalshi_live_opposite_ladder_v14_state.json
           else
             expected_title="DRY_RUN $SHADOW_PROFILE"
             [[ "$title" == *"$expected_title"* ]] || {
               echo "::error::source title does not match requested shadow profile"; exit 2;
             }
-            state_file=data/kalshi_shadow_delayed_band_v13_state.json
+            state_file=data/kalshi_shadow_opposite_ladder_v14_state.json
           fi
           [ -f "$state_file" ] || { echo "::error::Missing durable state: $state_file"; exit 2; }
 
@@ -214,7 +214,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           SOURCE_RUN_ID: ${{ inputs.source_run_id }}
           TARGET_LIVE: ${{ inputs.target_live }}
-          SHADOW_PROFILE: "delayed_53_57_exit_51"
+          SHADOW_PROFILE: "opposite_ladder_53_58_take_profit_50"
         run: |
           set -euo pipefail
           source_title="$(gh run view "$SOURCE_RUN_ID" --repo "$GITHUB_REPOSITORY" \
@@ -257,7 +257,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TARGET_LIVE: ${{ inputs.target_live }}
-          SHADOW_PROFILE: "delayed_53_57_exit_51"
+          SHADOW_PROFILE: "opposite_ladder_53_58_take_profit_50"
         run: |
           set -euo pipefail
           if [ "$TARGET_LIVE" = "true" ]; then
