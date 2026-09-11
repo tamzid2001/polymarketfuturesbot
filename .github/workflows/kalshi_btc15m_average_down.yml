@@ -178,6 +178,7 @@ jobs:
           # independently reconciled on the market's authoritative shard.
           python kalshi_startup_order_check.py --execute \
             --worker-id "$GITHUB_RUN_ID" \
+            --journal-root data/.kalshi_live_opposite_ladder_v14_startup_order_check \
             --state-file data/kalshi_live_opposite_ladder_v14_state.json \
             --audit-ledger data/kalshi_live_opposite_ladder_v14_audit.jsonl \
             --config selected_live_strategy.json \
