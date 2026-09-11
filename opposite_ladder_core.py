@@ -93,14 +93,20 @@ def build_opposite_ladder_plan(
     opposite_ask_cents: int,
     base_shares: Decimal | str,
     trigger_min_cents: int = 53,
-    trigger_max_cents: int = 58,
+    trigger_max_cents: int = 57,
     initial_offset_cents: int = 1,
 ) -> OppositeLadderPlan:
     """Build the exact five-order plan after a delayed sticky-side trigger.
 
-    Example: sticky NO/DOWN ask=53c and opposite YES/UP ask=48c produces
-    YES bids at 47c x base, 40c x 2*base, 30c x 4*base, 20c x 8*base,
-    and 10c x 16*base.
+    The first order is the exact complementary bid implied by the sticky-side
+    ask: ``100 - sticky_ask``.  With the reviewed 53c..57c gate this makes the
+    first opposite-side order exactly 47c..43c.  ``opposite_ask_cents`` is
+    retained as the independently observed executable ask used by adapters to
+    prove that the derived limit remains post-only; it does not redefine the
+    frozen entry tick when the spread is wider than one cent.
+
+    Example: sticky NO/DOWN ask=53c produces a YES bid at 47c x base, then
+    40c x 2*base, 30c x 4*base, 20c x 8*base, and 10c x 16*base.
     """
 
     sticky = str(sticky_side).lower()
@@ -117,11 +123,11 @@ def build_opposite_ladder_plan(
         raise ValueError("sticky-side ask is outside the configured trigger band")
     if not 1 <= opposite_ask <= 99:
         raise ValueError("opposite-side ask must be 1 through 99 cents")
-    if offset < 0:
-        raise ValueError("initial offset cannot be negative")
-    initial = opposite_ask - offset
-    if not 1 <= initial <= 99:
-        raise ValueError("derived opposite-side initial limit is outside valid ticks")
+    if offset != 1:
+        raise ValueError("the reviewed opposite-side contract requires a one-cent maker offset")
+    initial = 100 - sticky_ask
+    if not 43 <= initial <= 47:
+        raise ValueError("derived opposite-side initial limit must be 43c through 47c")
     orders = [OppositeLadderOrder("initial_minus_offset", initial, base)]
     orders.extend(
         OppositeLadderOrder(f"rung_{price_cents}", price_cents, two_decimal_shares(base * multiple))

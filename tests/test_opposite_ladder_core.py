@@ -26,10 +26,11 @@ class OppositeLadderCoreTests(unittest.TestCase):
 
     def test_yes_prediction_buys_no_symmetrically(self):
         plan = build_opposite_ladder_plan(
-            sticky_side="yes", sticky_ask_cents=56, opposite_ask_cents=45,
+            sticky_side="yes", sticky_ask_cents=56, opposite_ask_cents=47,
             base_shares="1.00",
         )
         self.assertEqual(plan.trade_side, "no")
+        # A wider observed spread cannot move the reviewed complementary tick.
         self.assertEqual(plan.orders[0].price_cents, 44)
 
     def test_base_two_scales_every_rung_and_has_no_cap(self):
@@ -45,17 +46,29 @@ class OppositeLadderCoreTests(unittest.TestCase):
         self.assertEqual(plan.maximum_quantity, Decimal("62.00"))
 
     def test_trigger_band_is_inclusive(self):
-        for trigger in (53, 58):
+        for trigger in (53, 57):
             build_opposite_ladder_plan(
                 sticky_side="no", sticky_ask_cents=trigger,
                 opposite_ask_cents=48, base_shares="1.00",
             )
-        for trigger in (52, 59):
+        for trigger in (52, 58):
             with self.assertRaises(ValueError):
                 build_opposite_ladder_plan(
                     sticky_side="no", sticky_ask_cents=trigger,
                     opposite_ask_cents=48, base_shares="1.00",
                 )
+
+    def test_every_eligible_sticky_ask_maps_exactly_to_47_through_43(self):
+        self.assertEqual(
+            [
+                build_opposite_ladder_plan(
+                    sticky_side="no", sticky_ask_cents=sticky,
+                    opposite_ask_cents=60, base_shares="1.00",
+                ).orders[0].price_cents
+                for sticky in range(53, 58)
+            ],
+            [47, 46, 45, 44, 43],
+        )
 
     def test_flatten_uses_opposite_side_executable_51c_bid(self):
         self.assertFalse(take_profit_triggered(50))

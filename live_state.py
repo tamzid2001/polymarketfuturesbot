@@ -31,6 +31,10 @@ TUNABLE_STRATEGY_FIELDS = {
     "hybrid_hard_stop_cents",
     "stop_baseline_entry_price",
     "opposite_take_profit_cents",
+    "delayed_entry_max_trigger_cents",
+    "delayed_entry_max_limit_cents",
+    "opposite_initial_limit_min_cents",
+    "opposite_initial_limit_max_cents",
     "shadow_profile",
     "selection_basis",
 }
@@ -283,6 +287,29 @@ def load_state(path: Path, config: dict[str, Any]) -> dict[str, Any]:
             str(config.get("max_position_per_base_share")) == "100.00"
             and value.get("config_hash") == config_hash(pre_base_linked_cap_config)
         )
+        # Revision 3 narrows the first fresh post-60-second sticky-side gate
+        # from 53c..58c to 53c..57c and freezes the first opposite-side limit
+        # as the exact complement (43c..47c). Existing frozen plans/orders are
+        # self-contained in their market records and remain managed; an
+        # unplanned active market receives only the new, exposure-narrowing
+        # terminal decision. Accept only the exact revision-2 config hash.
+        pre_strict_opposite_band_config = dict(config)
+        pre_strict_opposite_band_config["delayed_entry_max_trigger_cents"] = 58
+        pre_strict_opposite_band_config["delayed_entry_max_limit_cents"] = 57
+        pre_strict_opposite_band_config.pop("opposite_initial_limit_min_cents", None)
+        pre_strict_opposite_band_config.pop("opposite_initial_limit_max_cents", None)
+        pre_strict_opposite_band_config["shadow_profile"] = "opposite_ladder_53_58_flatten_51"
+        pre_strict_opposite_band_config["selection_basis"] = (
+            "sticky_side_delayed_53_58_then_trade_opposite_at_ask_minus_1_and_"
+            "40_30_20_10_doubling_gtc_flatten_when_either_side_touches_51"
+        )
+        is_strict_opposite_band_migration = (
+            int(config.get("delayed_entry_max_trigger_cents", 0)) == 57
+            and int(config.get("opposite_initial_limit_min_cents", 0)) == 43
+            and int(config.get("opposite_initial_limit_max_cents", 0)) == 47
+            and int(config.get("delayed_entry_max_limit_cents", 0)) == 57
+            and value.get("config_hash") == config_hash(pre_strict_opposite_band_config)
+        )
         prior_snapshot = value.get("active_config_snapshot")
         changed_fields: set[str] = set()
         if isinstance(prior_snapshot, dict):
@@ -307,6 +334,7 @@ def load_state(path: Path, config: dict[str, Any]) -> dict[str, Any]:
             is_delayed_entry_analytics_migration,
             is_chunked_checkpoint_interval_migration,
             is_base_linked_cap_migration,
+            is_strict_opposite_band_migration,
             is_reviewed_tuning,
         )):
             raise RuntimeError("live state configuration hash differs from active configuration; fail closed")
@@ -372,6 +400,21 @@ def load_state(path: Path, config: dict[str, Any]) -> dict[str, Any]:
                 "policy": (
                     "active records and negative recovery cycles keep their frozen cap; "
                     "fresh cycles use permanent_base_times_cap_per_base_share"
+                ),
+            })
+        if is_strict_opposite_band_migration:
+            migrations.append({
+                "at": utc_now(),
+                "kind": "narrow_opposite_ladder_to_terminal_53_57_gate",
+                "previous_trigger_band_cents": [53, 58],
+                "trigger_band_cents": [53, 57],
+                "initial_limit_band_cents": [43, 47],
+                "initial_limit_basis": "100_minus_sticky_ask",
+                "previous_config_hash": value.get("config_hash"),
+                "config_hash": expected_hash,
+                "policy": (
+                    "existing frozen plans and orders remain managed; unplanned and future "
+                    "markets use the exposure-narrowing terminal post-60-second gate"
                 ),
             })
         if is_reviewed_tuning:

@@ -278,7 +278,7 @@ class PositionCapTests(unittest.TestCase):
 
     def test_optimizer_v14_export_omits_retired_live_cap_fields(self):
         self.assertEqual(ParameterSet(2.5, 350, .5, max_position=200.25).reference_configuration().max_position, D("200.25"))
-        row = {"execution_profile": "opposite_ladder_53_58_flatten_51", "starting_base": "1.00"}
+        row = {"execution_profile": "opposite_ladder_53_57_flatten_51", "starting_base": "1.00"}
         with TemporaryDirectory() as directory:
             path = Path(directory) / "config.json"
             export_selected_live_strategy(path, row, selection_basis="offline_test")

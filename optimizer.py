@@ -115,15 +115,15 @@ def export_selected_live_strategy(path: Path, row: dict[str, Any], *, selection_
     result, not an unattended-live default.
     """
 
-    if row.get("execution_profile") != "opposite_ladder_53_58_flatten_51":
+    if row.get("execution_profile") != "opposite_ladder_53_57_flatten_51":
         raise ValueError(
-            "live export requires execution_profile=opposite_ladder_53_58_flatten_51; "
+            "live export requires execution_profile=opposite_ladder_53_57_flatten_51; "
             "generic settlement/Monte Carlo rows cannot activate the v14 live ladder"
         )
     base = Decimal(str(row.get("starting_base", "1.00")))
     if base.quantize(Decimal("0.01")) != base or not base.is_finite() or base <= 0:
         raise ValueError("starting_base must be a positive two-decimal quantity")
-    shadow_profile = "opposite_ladder_53_58_flatten_51"
+    shadow_profile = "opposite_ladder_53_57_flatten_51"
     config = {
         "config_schema_version": 14,
         "strategy_version": "kxbtc15m-opposite-ladder-live-v14",
@@ -174,7 +174,9 @@ def export_selected_live_strategy(path: Path, row: dict[str, Any], *, selection_
         "delayed_entry_threshold_cents": 53,
         "delayed_entry_start_seconds": 60,
         "delayed_entry_max_limit_cents": 57,
-        "delayed_entry_max_trigger_cents": 58,
+        "delayed_entry_max_trigger_cents": 57,
+        "opposite_initial_limit_min_cents": 43,
+        "opposite_initial_limit_max_cents": 47,
         "delayed_entry_tracking_enabled": True,
         "max_recovery_exponent": 0,
         "max_recovery_cycle_loss": "999999999.00",

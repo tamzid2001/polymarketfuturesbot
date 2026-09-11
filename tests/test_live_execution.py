@@ -872,46 +872,47 @@ class LiveExecutionTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "configuration hash differs"):
             load_state(temporary, changed)
 
-    def test_v14_51c_upgrade_preserves_flat_runtime_and_repairs_terminal_pointer(self) -> None:
+    def test_v14_revision3_band_upgrade_preserves_active_unplanned_record(self) -> None:
         root = Path(tempfile.mkdtemp())
         config_path = root / "selected_live_strategy.json"
         state_path = root / "state.json"
         prior = load_config(ROOT / "selected_live_strategy.json")
         prior.update({
-            "stop_price": "0.50",
-            "stop_baseline_entry_price": "0.50",
-            "hybrid_stop_trigger_cents": 50,
-            "hybrid_maker_exit_cents": 50,
-            "hybrid_hard_stop_cents": 50,
-            "opposite_take_profit_cents": 50,
-            "shadow_profile": "opposite_ladder_53_58_take_profit_50",
-            "selection_basis": "prior-reviewed-v14-contract",
+            "delayed_entry_max_trigger_cents": 58,
+            "delayed_entry_max_limit_cents": 57,
+            "shadow_profile": "opposite_ladder_53_58_flatten_51",
+            "selection_basis": (
+                "sticky_side_delayed_53_58_then_trade_opposite_at_ask_minus_1_and_"
+                "40_30_20_10_doubling_gtc_flatten_when_either_side_touches_51"
+            ),
         })
+        prior.pop("opposite_initial_limit_min_cents")
+        prior.pop("opposite_initial_limit_max_cents")
         config_path.write_text(json.dumps(prior), encoding="utf-8")
         state = default_state(prior)
-        state["current_order_id"] = "last-canceled-rung"
-        state["markets"]["KXBTC15M-prior"] = {
-            "ticker": "KXBTC15M-prior", "status": "ZERO_FILL",
-            "entry_orders": [{
-                "order_id": "last-canceled-rung", "status": "canceled",
-                "remaining_count": "0.00", "fill_count": "0.00",
-            }],
-            "exit_orders": [],
+        state["active_market"] = "KXBTC15M-active-unplanned"
+        state["markets"]["KXBTC15M-active-unplanned"] = {
+            "ticker": "KXBTC15M-active-unplanned", "status": "SIGNAL_PENDING",
+            "entry_orders": [], "exit_orders": [], "actual_quantity": "0.00",
+            "opposite_ladder": {"contract_version": 2, "plan": None},
         }
         save_state(state_path, state)
 
         upgraded_config = enforce_active_runtime_config(config_path)
         upgraded_state = load_state(state_path, upgraded_config)
 
-        self.assertIsNone(upgraded_state["current_order_id"])
+        self.assertEqual(upgraded_config["delayed_entry_max_trigger_cents"], 57)
+        self.assertEqual(upgraded_config["opposite_initial_limit_min_cents"], 43)
+        self.assertEqual(upgraded_config["opposite_initial_limit_max_cents"], 47)
+        self.assertEqual(upgraded_state["active_market"], "KXBTC15M-active-unplanned")
+        self.assertEqual(
+            upgraded_state["markets"]["KXBTC15M-active-unplanned"]["status"],
+            "SIGNAL_PENDING",
+        )
         self.assertEqual(upgraded_state["active_config_snapshot"], upgraded_config)
         self.assertEqual(
             upgraded_state["config_migrations"][-1]["kind"],
-            "apply_reviewed_flat_state_strategy_tuning",
-        )
-        self.assertEqual(
-            upgraded_state["state_repairs"][-1]["kind"],
-            "clear_terminal_current_order_pointer",
+            "narrow_opposite_ladder_to_terminal_53_57_gate",
         )
 
     def test_discovery_preloads_api_successor_from_bounded_close_window(self) -> None:
