@@ -58,7 +58,7 @@ jobs:
             --json databaseId,status,conclusion,updatedAt,displayTitle,event)"
 
           if [ "$KALSHI_SHADOW_ONLY" = "true" ]; then
-              profile=opposite_ladder_53_58_take_profit_50
+              profile=opposite_ladder_53_58_flatten_51
               profile_runs="$(jq --arg title "DRY_RUN $profile" '[.[] | select((.displayTitle // "") | contains($title))]' <<<"$runs")"
               active="$(jq '[.[] | select(.status == "in_progress" or .status == "queued" or .status == "waiting")] | length' <<<"$profile_runs")"
               if [ "$active" -gt 0 ]; then
@@ -88,8 +88,8 @@ jobs:
             echo "WATCHDOG HOLD | active_or_queued_production_runs=$active; refusing overlap."
             exit 0
           fi
-          latest="$(jq -c '[.[] | select((.displayTitle // "") | test("(DRY_RUN|LIVE) opposite_ladder_53_58_take_profit_50$"))] | sort_by(.updatedAt // "") | last // {}' <<<"$runs")"
-          prior_live="$(jq -r '(.displayTitle // "") | endswith("LIVE opposite_ladder_53_58_take_profit_50")' <<<"$latest")"
+          latest="$(jq -c '[.[] | select((.displayTitle // "") | test("(DRY_RUN|LIVE) opposite_ladder_53_58_flatten_51$"))] | sort_by(.updatedAt // "") | last // {}' <<<"$runs")"
+          prior_live="$(jq -r '(.displayTitle // "") | endswith("LIVE opposite_ladder_53_58_flatten_51")' <<<"$latest")"
           # Repository flags grant permission; they are not a start command.
           # Live recovery requires a prior explicitly requested LIVE worker.
           if [ "$KALSHI_LIVE_ENABLED" = "true" ] && [ "$KALSHI_SHADOW_ONLY" = "false" ] && [ "$prior_live" = "true" ]; then

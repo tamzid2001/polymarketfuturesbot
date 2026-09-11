@@ -64,7 +64,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           SOURCE_RUN_ID: ${{ inputs.source_run_id }}
           TARGET_LIVE: ${{ inputs.target_live }}
-          SHADOW_PROFILE: "opposite_ladder_53_58_take_profit_50"
+          SHADOW_PROFILE: "opposite_ladder_53_58_flatten_51"
           LIVE_GATE: ${{ vars.KALSHI_LIVE_ENABLED || 'false' }}
           SHADOW_ONLY_LOCK: ${{ vars.KALSHI_SHADOW_ONLY || 'true' }}
         run: |
@@ -86,7 +86,7 @@ jobs:
               echo "::error::Live handoff requires KALSHI_LIVE_ENABLED=true and KALSHI_SHADOW_ONLY=false"; exit 2;
             }
           fi
-          if [[ "$title" == *"LIVE opposite_ladder_53_58_take_profit_50" ]]; then
+          if [[ "$title" == *"LIVE opposite_ladder_53_58_flatten_51" ]]; then
             state_file=data/kalshi_live_opposite_ladder_v14_state.json
           else
             expected_title="DRY_RUN $SHADOW_PROFILE"
@@ -214,7 +214,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           SOURCE_RUN_ID: ${{ inputs.source_run_id }}
           TARGET_LIVE: ${{ inputs.target_live }}
-          SHADOW_PROFILE: "opposite_ladder_53_58_take_profit_50"
+          SHADOW_PROFILE: "opposite_ladder_53_58_flatten_51"
         run: |
           set -euo pipefail
           source_title="$(gh run view "$SOURCE_RUN_ID" --repo "$GITHUB_REPOSITORY" \
@@ -257,7 +257,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TARGET_LIVE: ${{ inputs.target_live }}
-          SHADOW_PROFILE: "opposite_ladder_53_58_take_profit_50"
+          SHADOW_PROFILE: "opposite_ladder_53_58_flatten_51"
         run: |
           set -euo pipefail
           if [ "$TARGET_LIVE" = "true" ]; then

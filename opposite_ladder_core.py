@@ -139,17 +139,16 @@ def build_opposite_ladder_plan(
 
 def take_profit_triggered(
     trade_side_bid_cents: int | None,
-    threshold_cents: int = 50,
+    threshold_cents: int = 51,
     *,
     sticky_side_ask_cents: int | None = None,
 ) -> bool:
     """Return whether either executable representation reached the boundary.
 
-    In Kalshi's binary book, selling the traded opposite contract at 50c is
-    economically equivalent to buying the sticky contract at 50c.  Accept
-    either fresh executable observation: traded-side BID >= threshold or
-    sticky-side ASK <= threshold.  The opposite side merely starting below
-    50c is deliberately not an exit trigger.
+    Revision 2 intentionally watches both routes into the midpoint band:
+    traded-side BID >= threshold or sticky-side ASK <= threshold.  At 51c
+    those are separate triggers, not complementary-price aliases.  The traded
+    opposite side merely starting below 51c is deliberately not an exit.
     """
 
     threshold = int(threshold_cents)

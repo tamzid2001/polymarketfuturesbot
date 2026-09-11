@@ -2459,14 +2459,24 @@ class KalshiREST:
             order = field(response, "order")
             if order is None:
                 return
-            record["fill_count"] = round(order_fill_count(order), 2)
+            cancellation_confirmed = record.get("cancel_acknowledged") is True
+            record["fill_count"] = round(max(
+                float(record.get("fill_count") or 0.0), order_fill_count(order),
+            ), 2)
             remaining = order_remaining_count(order)
-            if remaining is not None:
+            if cancellation_confirmed:
+                # Cancel V2 already proved this order cannot fill again. Keep
+                # monotonic local terminality if a read replica briefly
+                # returns the pre-cancel resting representation.
+                record["remaining_count"] = 0.0
+            elif remaining is not None:
                 record["remaining_count"] = round(remaining, 2)
             record["average_fill_price"] = order_average_position_price(order, record["side"], record["position_price"])
             record["fees_paid"] = max(float(record.get("fees_paid") or 0.0), order_fee_total(order))
             status = normalized_order_status(field(order, "status"))
-            if status:
+            if cancellation_confirmed:
+                record["status"] = "canceled"
+            elif status:
                 record["status"] = status
             prior_observed_side = record.get("observed_outcome_side")
             observed_side = exchange_outcome_side(order)
@@ -2546,16 +2556,25 @@ class KalshiREST:
             if order is None:
                 return False
             held_side = str(record.get("held_side") or record.get("side") or "")
-            record["fill_count"] = round(order_fill_count(order), 2)
+            cancellation_confirmed = record.get("cancel_acknowledged") is True
+            record["fill_count"] = round(max(
+                float(record.get("fill_count") or 0.0), order_fill_count(order),
+            ), 2)
             remaining = order_remaining_count(order)
-            if remaining is not None:
+            if cancellation_confirmed:
+                # A successful Cancel V2 acknowledgment is authoritative.
+                # A briefly stale GET must not resurrect the canceled order.
+                record["remaining_count"] = 0.0
+            elif remaining is not None:
                 record["remaining_count"] = round(remaining, 2)
             record["average_fill_price"] = order_average_position_price(
                 order, held_side, float(record.get("position_price") or 0.0),
             )
             record["fees_paid"] = max(float(record.get("fees_paid") or 0.0), order_fee_total(order))
             status = normalized_order_status(field(order, "status"))
-            if status:
+            if cancellation_confirmed:
+                record["status"] = "canceled"
+            elif status:
                 record["status"] = status
             record["last_checked_at"] = now_iso()
             record["submission_outcome"] = "accepted"
@@ -2617,6 +2636,7 @@ class KalshiREST:
             record["canceled_at"] = now_iso()
             record["remaining_count"] = 0.0
             record["cancel_reduced_by"] = field(response, "reduced_by")
+            record["cancel_acknowledged"] = True
             LOG.info(
                 "CANCELED | %s ticker=%s shard=%s reduced_by=%s",
                 order_id, ticker, exchange_index, record.get("cancel_reduced_by"),

@@ -112,6 +112,33 @@ class LiveStopSafetyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(record["status"], "CLOSED")
         self.assertEqual(record["exit_classification"], "DIRECT_PROTECTIVE_EXIT")
 
+    async def test_confirmed_cancel_is_not_resurrected_by_stale_order_lookup(self):
+        class StaleOrders:
+            async def get_order(self, _order_id):
+                return {"order": {
+                    "order_id": "canceled", "status": "resting",
+                    "fill_count": "0.00", "remaining_count": "1.00",
+                }}
+
+        rest = object.__new__(KalshiREST)
+        rest.orders = StaleOrders()
+        entry = {
+            "order_id": "canceled", "ticker": "KXBTC15M-test", "side": "yes",
+            "position_price": "0.47", "status": "canceled",
+            "fill_count": "0.25", "remaining_count": "0.00",
+            "fees_paid": "0", "cancel_acknowledged": True,
+        }
+        await rest.refresh_order(entry)
+        self.assertEqual(entry["status"], "canceled")
+        self.assertEqual(entry["remaining_count"], 0.0)
+        self.assertEqual(entry["fill_count"], 0.25)
+
+        exit_order = dict(entry, held_side="yes", exit_phase="hard_stop")
+        self.assertTrue(await rest.refresh_exit_order(exit_order))
+        self.assertEqual(exit_order["status"], "canceled")
+        self.assertEqual(exit_order["remaining_count"], 0.0)
+        self.assertEqual(exit_order["fill_count"], 0.25)
+
     async def test_gap_through_hard_stop_exits_same_pass_without_maker(self):
         for shadow in (False, True):
             engine, record, rest, feed = self.setup_trade(shadow=shadow)

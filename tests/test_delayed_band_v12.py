@@ -149,7 +149,7 @@ class DelayedBandV13Tests(unittest.TestCase):
         self.assertEqual(
             (config["hybrid_stop_trigger_cents"], config["hybrid_maker_exit_cents"],
              config["hybrid_hard_stop_cents"]),
-            (50, 50, 50),
+            (51, 51, 51),
         )
         self.assertEqual(config["stop_policy"], "opposite_side_take_profit_ioc")
         self.assertFalse(config["live_enabled"])

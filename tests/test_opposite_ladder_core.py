@@ -57,14 +57,14 @@ class OppositeLadderCoreTests(unittest.TestCase):
                     opposite_ask_cents=48, base_shares="1.00",
                 )
 
-    def test_take_profit_uses_opposite_side_executable_bid(self):
-        self.assertFalse(take_profit_triggered(49))
-        self.assertTrue(take_profit_triggered(50))
+    def test_flatten_uses_opposite_side_executable_51c_bid(self):
+        self.assertFalse(take_profit_triggered(50))
+        self.assertTrue(take_profit_triggered(51))
         self.assertTrue(take_profit_triggered(61))
 
-    def test_take_profit_accepts_equivalent_sticky_side_ask_boundary(self):
-        self.assertFalse(take_profit_triggered(49, sticky_side_ask_cents=51))
-        self.assertTrue(take_profit_triggered(49, sticky_side_ask_cents=50))
+    def test_flatten_accepts_independent_sticky_side_51c_ask_boundary(self):
+        self.assertFalse(take_profit_triggered(50, sticky_side_ask_cents=52))
+        self.assertTrue(take_profit_triggered(50, sticky_side_ask_cents=51))
         self.assertTrue(take_profit_triggered(None, sticky_side_ask_cents=49))
 
     def test_side_validation(self):

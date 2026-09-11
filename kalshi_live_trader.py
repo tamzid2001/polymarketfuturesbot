@@ -37,7 +37,15 @@ from kalshi_btc15m_average_down import (
     order_remaining_count,
     timestamp_epoch,
 )
-from live_state import append_unique, config_hash, load_state, save_state, utc_now
+from live_state import (
+    append_unique,
+    clear_stale_current_order_pointer,
+    config_hash,
+    current_order_pointer_requires_recovery,
+    load_state,
+    save_state,
+    utc_now,
+)
 from opposite_ladder_core import (
     build_opposite_ladder_plan,
     opposite_side,
@@ -69,8 +77,9 @@ ORDER_PREFIX = "kxbtc15m-hybrid-v1-"
 # ask in the inclusive 53c..58c band freezes five post-only GTC BUY orders on
 # the opposite side: opposite ask minus 1c at 1x base and 40/30/20/10c at
 # 2/4/8/16x base.  Recovery, permanent-base scaling, and position caps are not
-# part of this contract.  An older worker cannot load the v14 configuration or
-# runtime namespace.
+# part of this contract. Contract revision 2 latches the flatten path when the
+# held-side executable bid reaches 51c OR the sticky-side executable ask falls
+# to 51c. An older revision cannot load the revised canonical configuration.
 ACTIVE_STRATEGY_VERSION = "kxbtc15m-opposite-ladder-live-v14"
 ACTIVE_CONFIG_SCHEMA_VERSION = 14
 # Operational release guard used by the production workflow.  Version 3 means
@@ -91,7 +100,7 @@ DELAYED_ENTRY_LADDER_CONTRACT_VERSION = 4
 LIVE_STOP_SAFETY_CONTRACT_VERSION = 3
 POSITION_CAP_CONTRACT_VERSION = 2
 ENTRY_DELIVERY_CONTRACT_VERSION = 1
-OPPOSITE_LADDER_CONTRACT_VERSION = 1
+OPPOSITE_LADDER_CONTRACT_VERSION = 2
 # A definitive HTTP rejection proves that the matching engine did not create
 # an order. Keep the frozen strategy intent alive and retry it at a bounded
 # cadence while the same market remains safe. Unknown POST outcomes are never
@@ -353,8 +362,9 @@ SHADOW_STOP_PROFILE_PRICES = {
     "delayed_53_57_stop_50": Decimal("0.50"),
     "delayed_53_57_exit_51": Decimal("0.51"),
     "opposite_ladder_53_58_take_profit_50": Decimal("0.50"),
+    "opposite_ladder_53_58_flatten_51": Decimal("0.51"),
 }
-CANONICAL_LIVE_SHADOW_PROFILE = "opposite_ladder_53_58_take_profit_50"
+CANONICAL_LIVE_SHADOW_PROFILE = "opposite_ladder_53_58_flatten_51"
 
 
 def price_to_cents(value: Decimal | str, name: str = "price") -> int:
@@ -513,8 +523,8 @@ def validate_entry_price_contract(value: dict[str, Any]) -> None:
         raise ValueError(
             "max_recovery_exponent must be 0; the active strategy disables the exponent circuit breaker"
         )
-    if stop_baseline != Decimal("0.50") or stop != Decimal("0.50"):
-        raise ValueError("the opposite ladder requires a fixed 50c take-profit threshold")
+    if stop_baseline != Decimal("0.51") or stop != Decimal("0.51"):
+        raise ValueError("the opposite ladder requires a fixed two-sided 51c flatten threshold")
     profile = str(value.get("shadow_profile") or CANONICAL_LIVE_SHADOW_PROFILE)
     expected_profile_stop = SHADOW_STOP_PROFILE_PRICES.get(profile)
     if expected_profile_stop is None:
@@ -544,10 +554,10 @@ def validate_entry_price_contract(value: dict[str, Any]) -> None:
     hard_stop = int(value["hybrid_hard_stop_cents"])
     if not 1 <= trigger <= 99:
         raise ValueError("direct protective-exit price must be a valid integer-cent tick")
-    if (trigger, maker_exit, hard_stop) != (50, 50, 50):
-        raise ValueError("v14 take-profit trigger/exit compatibility fields must all equal 50c")
-    if int(value.get("opposite_take_profit_cents", 0)) != 50:
-        raise ValueError("v14 requires opposite_take_profit_cents=50")
+    if (trigger, maker_exit, hard_stop) != (51, 51, 51):
+        raise ValueError("v14 revision 2 flatten compatibility fields must all equal 51c")
+    if int(value.get("opposite_take_profit_cents", 0)) != 51:
+        raise ValueError("v14 revision 2 requires opposite_take_profit_cents=51")
     if not _bool(value.get("hybrid_stop_enabled", True)):
         raise ValueError("the active v14 strategy requires take-profit monitoring")
     if value.get("shadow_fill_model") != "conservative_public_trade_through":
@@ -634,7 +644,7 @@ def load_config(path: Path) -> dict[str, Any]:
     value.setdefault("stop_policy", "opposite_side_take_profit_ioc")
     value.setdefault("entry_execution_mode", "opposite_side_doubling_ladder")
     value.setdefault("maker_order_time_in_force", "good_till_canceled")
-    value.setdefault("stop_baseline_entry_price", "0.50")
+    value.setdefault("stop_baseline_entry_price", "0.51")
     value.setdefault("signal_delay_seconds", 0)
     value.setdefault("signal_mode", "sticky_until_directional_win")
     value.setdefault("shadow_profile", CANONICAL_LIVE_SHADOW_PROFILE)
@@ -651,7 +661,7 @@ def load_config(path: Path) -> dict[str, Any]:
     value.setdefault("delayed_entry_start_seconds", 60)
     value.setdefault("delayed_entry_max_limit_cents", 57)
     value.setdefault("delayed_entry_max_trigger_cents", 58)
-    value.setdefault("opposite_take_profit_cents", 50)
+    value.setdefault("opposite_take_profit_cents", 51)
     value.setdefault("opposite_ladder_enabled", True)
     value.setdefault("recovery_enabled", False)
     value.setdefault("base_scaling_enabled", False)
@@ -678,9 +688,9 @@ def load_config(path: Path) -> dict[str, Any]:
     value.setdefault("shadow_entry_level_max_cents", 49)
     value.setdefault("shadow_entry_level_step_cents", 1)
     value.setdefault("hybrid_stop_enabled", True)
-    value.setdefault("hybrid_stop_trigger_cents", 50)
-    value.setdefault("hybrid_maker_exit_cents", 50)
-    value.setdefault("hybrid_hard_stop_cents", 50)
+    value.setdefault("hybrid_stop_trigger_cents", 51)
+    value.setdefault("hybrid_maker_exit_cents", 51)
+    value.setdefault("hybrid_hard_stop_cents", 51)
     value.setdefault("trading_mode", "shadow")
     # State and audit writes are fsynced locally for every material event.
     # This only bounds GitHub checkpoint publication, avoiding a Git push for
@@ -706,6 +716,77 @@ def load_config(path: Path) -> dict[str, Any]:
 def save_config(path: Path, config: dict[str, Any]) -> None:
     from live_state import save_json_atomic
     save_json_atomic(path, config)
+
+
+def enforce_active_runtime_config(path: Path) -> dict[str, Any]:
+    """Upgrade only the reviewed v14 boundary fields restored at handoff.
+
+    Runtime checkpoints intentionally persist operator configuration.  That
+    means the first worker after this release can restore the prior 50c
+    contract over the repository's new defaults.  Accept only the exact v14
+    opposite-ladder shape, then atomically replace the boundary fields with
+    revision 2's two-sided 51c contract.  Any unrelated or unrecognized
+    configuration remains a hard error.
+    """
+
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise ValueError("runtime strategy configuration must be an object")
+    expected = {
+        "strategy_version": ACTIVE_STRATEGY_VERSION,
+        "config_schema_version": ACTIVE_CONFIG_SCHEMA_VERSION,
+        "entry_execution_mode": "opposite_side_doubling_ladder",
+        "delayed_entry_threshold_cents": 53,
+        "delayed_entry_max_trigger_cents": 58,
+        "delayed_entry_start_seconds": 60,
+        "entry_limit_offset_cents": 1,
+        "maker_order_time_in_force": "good_till_canceled",
+        "entry_order_lifetime": "until_filled_or_market_close",
+    }
+    mismatches = {
+        key: (raw.get(key), value)
+        for key, value in expected.items()
+        if raw.get(key) != value
+    }
+    if mismatches:
+        raise ValueError(f"refusing to rewrite noncanonical runtime config: {mismatches}")
+    prior_boundary = (
+        str(raw.get("stop_price")),
+        str(raw.get("stop_baseline_entry_price")),
+        int(raw.get("hybrid_stop_trigger_cents", 0)),
+        int(raw.get("hybrid_maker_exit_cents", 0)),
+        int(raw.get("hybrid_hard_stop_cents", 0)),
+        int(raw.get("opposite_take_profit_cents", 0)),
+        str(raw.get("shadow_profile")),
+    )
+    allowed_boundaries = {
+        (
+            "0.50", "0.50", 50, 50, 50, 50,
+            "opposite_ladder_53_58_take_profit_50",
+        ),
+        (
+            "0.51", "0.51", 51, 51, 51, 51,
+            CANONICAL_LIVE_SHADOW_PROFILE,
+        ),
+    }
+    if prior_boundary not in allowed_boundaries:
+        raise ValueError(f"refusing unrecognized runtime exit contract: {prior_boundary}")
+    raw.update({
+        "stop_price": "0.51",
+        "stop_baseline_entry_price": "0.51",
+        "hybrid_stop_trigger_cents": 51,
+        "hybrid_maker_exit_cents": 51,
+        "hybrid_hard_stop_cents": 51,
+        "opposite_take_profit_cents": 51,
+        "shadow_profile": CANONICAL_LIVE_SHADOW_PROFILE,
+        "selection_basis": (
+            "sticky_side_delayed_53_58_then_trade_opposite_at_ask_minus_1_and_"
+            "40_30_20_10_doubling_gtc_flatten_when_either_side_touches_51"
+        ),
+    })
+    validated = load_config_from_value(raw)
+    save_config(path, validated)
+    return validated
 
 
 def apply_overrides(config: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
@@ -773,7 +854,7 @@ def load_config_from_value(value: dict[str, Any]) -> dict[str, Any]:
     temporary.setdefault("stop_policy", "opposite_side_take_profit_ioc")
     temporary.setdefault("entry_execution_mode", "opposite_side_doubling_ladder")
     temporary.setdefault("maker_order_time_in_force", "good_till_canceled")
-    temporary.setdefault("stop_baseline_entry_price", "0.50")
+    temporary.setdefault("stop_baseline_entry_price", "0.51")
     temporary.setdefault("signal_mode", "sticky_until_directional_win")
     temporary.setdefault("shadow_profile", CANONICAL_LIVE_SHADOW_PROFILE)
     temporary.setdefault("entry_timeout_seconds", 0)
@@ -784,7 +865,7 @@ def load_config_from_value(value: dict[str, Any]) -> dict[str, Any]:
     temporary.setdefault("delayed_entry_start_seconds", 60)
     temporary.setdefault("delayed_entry_max_limit_cents", 57)
     temporary.setdefault("delayed_entry_max_trigger_cents", 58)
-    temporary.setdefault("opposite_take_profit_cents", 50)
+    temporary.setdefault("opposite_take_profit_cents", 51)
     temporary.setdefault("opposite_ladder_enabled", True)
     temporary.setdefault("recovery_enabled", False)
     temporary.setdefault("base_scaling_enabled", False)
@@ -799,9 +880,9 @@ def load_config_from_value(value: dict[str, Any]) -> dict[str, Any]:
     temporary.setdefault("shadow_entry_level_max_cents", 49)
     temporary.setdefault("shadow_entry_level_step_cents", 1)
     temporary.setdefault("hybrid_stop_enabled", True)
-    temporary.setdefault("hybrid_stop_trigger_cents", 50)
-    temporary.setdefault("hybrid_maker_exit_cents", 50)
-    temporary.setdefault("hybrid_hard_stop_cents", 50)
+    temporary.setdefault("hybrid_stop_trigger_cents", 51)
+    temporary.setdefault("hybrid_maker_exit_cents", 51)
+    temporary.setdefault("hybrid_hard_stop_cents", 51)
     temporary.setdefault("trading_mode", "shadow")
     validate_entry_price_contract(temporary)
     validate_sizing_config(temporary)
@@ -1847,7 +1928,10 @@ class LiveEngine:
             provisional.get("quote_age_seconds"),
         )
         exit_description = (
-            f"opposite_trade_bid_at_or_above_{self.config['opposite_take_profit_cents']}c"
+            (
+                f"flatten_if_trade_bid_at_or_above_{self.config['opposite_take_profit_cents']}c_"
+                f"or_sticky_ask_at_or_below_{self.config['opposite_take_profit_cents']}c"
+            )
             if opposite_ladder
             else f"direct_ioc_at_or_below_{self.config['hybrid_stop_trigger_cents']}c"
             if self.config["stop_policy"] == "direct_ioc_at_trigger"
@@ -2468,8 +2552,10 @@ class LiveEngine:
             ),
         )
         LOG.warning(
-            "TAKE PROFIT | trigger=executable %s bid >=%sc action=cancel_all_entries_then_reduce_only_IOC_flatten",
+            "FLATTEN BOUNDARY | trigger=executable %s bid >=%sc OR executable %s ask <=%sc "
+            "action=cancel_all_entries_then_reduce_only_IOC_flatten",
             trade_side.upper(), int(self.config["opposite_take_profit_cents"]),
+            sticky_side.upper(), int(self.config["opposite_take_profit_cents"]),
         )
         LOG.warning("=" * 68)
         self.checkpoint("opposite_ladder_plan_frozen")
@@ -5237,6 +5323,33 @@ class LiveEngine:
                 "reason": "outside_middle_13_minute_window", "ticker": active["ticker"],
                 "window_start_epoch": window_start, "window_end_epoch": window_end,
             }
+        cleared_order_id = clear_stale_current_order_pointer(self.state)
+        if cleared_order_id:
+            self.state.setdefault("state_repairs", []).append({
+                "at": utc_now(),
+                "kind": "clear_terminal_current_order_pointer_before_handoff",
+                "order_id": cleared_order_id,
+                "policy": "matched durable order was terminal with zero remaining quantity",
+            })
+            self.audit(
+                "terminal_current_order_pointer_cleared",
+                order_id=cleared_order_id,
+                reason="safe_handoff_validation",
+            )
+        try:
+            current_position = Decimal(str(self.state.get("current_position") or "0"))
+        except (ArithmeticError, TypeError, ValueError):
+            return False, {
+                "reason": "invalid_current_position_requires_reconciliation",
+                "ticker": active["ticker"],
+            }
+        if current_position != 0 or current_order_pointer_requires_recovery(self.state):
+            return False, {
+                "reason": "top_level_order_or_position_requires_current_worker",
+                "ticker": active["ticker"],
+                "current_order_id": self.state.get("current_order_id"),
+                "current_position": format(current_position, "f"),
+            }
         blocking_states = set(ACTIVE_STATES)
         breaker_blocked = bool(self.state.get("circuit_breaker", {}).get("blocked"))
         blockers = []
@@ -7802,11 +7915,12 @@ class LiveEngine:
     async def manage_opposite_take_profit(
         self, rest: KalshiREST, feed: KalshiLiveFeed, record: dict[str, Any],
     ) -> None:
-        """Cancel the ladder and flatten actual opposite-side fills at 50c.
+        """Cancel the ladder and flatten fills at the two-sided 51c boundary.
 
-        Either equivalent executable boundary latches the exit: traded-side
-        BID >=50c or sticky-side ASK <=50c.  The opposite contract merely
-        starting below 50c does not trigger an exit.  Once latched it never
+        Either executable boundary latches the exit: traded-side BID >=51c or
+        sticky-side ASK <=51c. The two observations are intentionally
+        independent at 51c. The opposite contract merely starting below 51c
+        does not trigger an exit. Once latched it never
         rearms; residual reduce-only IOC attempts use the latest executable
         bid and can never reverse the position.
         """
@@ -7870,7 +7984,7 @@ class LiveEngine:
                 threshold_cents=threshold_cents,
             )
             LOG.warning(
-                "OPPOSITE TAKE PROFIT LATCHED | ticker=%s held_side=%s executable_bid=%sc "
+                "OPPOSITE FLATTEN LATCHED | ticker=%s held_side=%s executable_bid=%sc "
                 "sticky_side=%s executable_ask=%sc threshold=%sc "
                 "action=cancel_all_ladder_orders_then_flatten_actual_position",
                 record["ticker"], str(record["trade_side"]).upper(), bid_cents,
@@ -9033,10 +9147,11 @@ class LiveEngine:
                         stats["total_fees_paid"],
                     )
                 LOG.warning(
-                    "EXIT STATUS | ticker=%s boundary=trade_bid>=50c_or_sticky_ask<=50c "
+                    "EXIT STATUS | ticker=%s boundary=trade_bid>=%sc_or_sticky_ask<=%sc "
                     "state=%s class=%s entry_filled_qty=%s exit_filled_qty=%s "
                     "authoritative_position=%s residual_retry=reduce_only_IOC",
-                    active and active["ticker"], ladder.get("state"),
+                    active and active["ticker"], self.config["opposite_take_profit_cents"],
+                    self.config["opposite_take_profit_cents"], ladder.get("state"),
                     record.get("exit_classification"), record.get("actual_quantity"),
                     format(self.exit_filled_quantity(record), "f"),
                     self.state.get("current_position"),

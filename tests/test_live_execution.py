@@ -22,7 +22,8 @@ from live_checkpoint import (
 from kalshi_btc15m_average_down import KalshiLiveFeed
 from kalshi_live_trader import (
     BTC_TARGET_CAPTURE_CONTRACT_VERSION, LiveEngine, ProvisionalOutcomeTracker, QuoteObservation,
-    btc_target_metadata, deterministic_client_order_id, epoch, live_mode_allowed, load_config,
+    btc_target_metadata, deterministic_client_order_id, enforce_active_runtime_config,
+    epoch, live_mode_allowed, load_config,
     startup_order_check_allows_worker,
     market_metadata,
 )
@@ -870,6 +871,48 @@ class LiveExecutionTests(unittest.TestCase):
         changed = dict(self.config, recovery_multiplier="1.02", threshold_growth_multiplier="1.02")
         with self.assertRaisesRegex(RuntimeError, "configuration hash differs"):
             load_state(temporary, changed)
+
+    def test_v14_51c_upgrade_preserves_flat_runtime_and_repairs_terminal_pointer(self) -> None:
+        root = Path(tempfile.mkdtemp())
+        config_path = root / "selected_live_strategy.json"
+        state_path = root / "state.json"
+        prior = load_config(ROOT / "selected_live_strategy.json")
+        prior.update({
+            "stop_price": "0.50",
+            "stop_baseline_entry_price": "0.50",
+            "hybrid_stop_trigger_cents": 50,
+            "hybrid_maker_exit_cents": 50,
+            "hybrid_hard_stop_cents": 50,
+            "opposite_take_profit_cents": 50,
+            "shadow_profile": "opposite_ladder_53_58_take_profit_50",
+            "selection_basis": "prior-reviewed-v14-contract",
+        })
+        config_path.write_text(json.dumps(prior), encoding="utf-8")
+        state = default_state(prior)
+        state["current_order_id"] = "last-canceled-rung"
+        state["markets"]["KXBTC15M-prior"] = {
+            "ticker": "KXBTC15M-prior", "status": "ZERO_FILL",
+            "entry_orders": [{
+                "order_id": "last-canceled-rung", "status": "canceled",
+                "remaining_count": "0.00", "fill_count": "0.00",
+            }],
+            "exit_orders": [],
+        }
+        save_state(state_path, state)
+
+        upgraded_config = enforce_active_runtime_config(config_path)
+        upgraded_state = load_state(state_path, upgraded_config)
+
+        self.assertIsNone(upgraded_state["current_order_id"])
+        self.assertEqual(upgraded_state["active_config_snapshot"], upgraded_config)
+        self.assertEqual(
+            upgraded_state["config_migrations"][-1]["kind"],
+            "apply_reviewed_flat_state_strategy_tuning",
+        )
+        self.assertEqual(
+            upgraded_state["state_repairs"][-1]["kind"],
+            "clear_terminal_current_order_pointer",
+        )
 
     def test_discovery_preloads_api_successor_from_bounded_close_window(self) -> None:
         async def scenario() -> None:
@@ -1895,6 +1938,34 @@ class LiveExecutionTests(unittest.TestCase):
         self.assertFalse(engine.handoff_ready(1_841)[0])
         engine.state["markets"]["KXBTC15M-current"]["status"] = "CLOSED"
         self.assertTrue(engine.handoff_ready(1_300)[0])
+
+    def test_handoff_repairs_only_a_proven_terminal_order_pointer(self) -> None:
+        engine = self.engine()
+        engine.markets = [{
+            "ticker": "KXBTC15M-current", "open_epoch": 1_000,
+            "close_epoch": 1_900, "status": "active",
+        }]
+        engine.state["current_order_id"] = "confirmed-canceled-order"
+        engine.state["markets"]["KXBTC15M-closed"] = {
+            "ticker": "KXBTC15M-closed", "status": "ZERO_FILL",
+            "entry_orders": [{
+                "order_id": "confirmed-canceled-order", "status": "canceled",
+                "remaining_count": "0.00", "fill_count": "0.00",
+            }],
+            "exit_orders": [],
+        }
+
+        ready, _ = engine.handoff_ready(1_300)
+
+        self.assertTrue(ready)
+        self.assertIsNone(engine.state["current_order_id"])
+        self.assertEqual(
+            engine.state["state_repairs"][-1]["kind"],
+            "clear_terminal_current_order_pointer_before_handoff",
+        )
+
+        engine.state["current_order_id"] = "unknown-order"
+        self.assertFalse(engine.handoff_ready(1_300)[0])
 
     def test_latched_breaker_signal_without_order_or_position_does_not_force_six_hour_timeout(self) -> None:
         engine = self.engine()

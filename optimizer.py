@@ -115,15 +115,15 @@ def export_selected_live_strategy(path: Path, row: dict[str, Any], *, selection_
     result, not an unattended-live default.
     """
 
-    if row.get("execution_profile") != "opposite_ladder_53_58_take_profit_50":
+    if row.get("execution_profile") != "opposite_ladder_53_58_flatten_51":
         raise ValueError(
-            "live export requires execution_profile=opposite_ladder_53_58_take_profit_50; "
+            "live export requires execution_profile=opposite_ladder_53_58_flatten_51; "
             "generic settlement/Monte Carlo rows cannot activate the v14 live ladder"
         )
     base = Decimal(str(row.get("starting_base", "1.00")))
     if base.quantize(Decimal("0.01")) != base or not base.is_finite() or base <= 0:
         raise ValueError("starting_base must be a positive two-decimal quantity")
-    shadow_profile = "opposite_ladder_53_58_take_profit_50"
+    shadow_profile = "opposite_ladder_53_58_flatten_51"
     config = {
         "config_schema_version": 14,
         "strategy_version": "kxbtc15m-opposite-ladder-live-v14",
@@ -133,15 +133,15 @@ def export_selected_live_strategy(path: Path, row: dict[str, Any], *, selection_
         "signal_mode": "sticky_until_directional_win",
         "shadow_profile": shadow_profile,
         "entry_price": "0.47",
-        "stop_price": "0.50",
+        "stop_price": "0.51",
         "stop_policy": "opposite_side_take_profit_ioc",
         "hybrid_stop_enabled": True,
-        "hybrid_stop_trigger_cents": 50,
-        "hybrid_maker_exit_cents": 50,
-        "hybrid_hard_stop_cents": 50,
-        "opposite_take_profit_cents": 50,
+        "hybrid_stop_trigger_cents": 51,
+        "hybrid_maker_exit_cents": 51,
+        "hybrid_hard_stop_cents": 51,
+        "opposite_take_profit_cents": 51,
         "opposite_ladder_enabled": True,
-        "stop_baseline_entry_price": "0.50",
+        "stop_baseline_entry_price": "0.51",
         "entry_execution_mode": "opposite_side_doubling_ladder",
         "maker_order_time_in_force": "good_till_canceled",
         "entry_order_lifetime": "until_filled_or_market_close",
