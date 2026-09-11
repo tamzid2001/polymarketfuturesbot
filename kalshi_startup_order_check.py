@@ -40,10 +40,10 @@ from live_checkpoint import DELAYED_V13_RUNTIME_STATE_REF, publish_runtime_snaps
 from live_state import default_state, save_state, utc_now
 
 
-DEFAULT_ROOT = Path("data/.kalshi_live_delayed_band_v13_startup_order_check")
-DEFAULT_STATE = Path("data/kalshi_live_delayed_band_v13_state.json")
+DEFAULT_ROOT = Path("data/.kalshi_live_opposite_ladder_v14_startup_order_check")
+DEFAULT_STATE = Path("data/kalshi_live_opposite_ladder_v14_state.json")
 DEFAULT_CONFIG = Path("selected_live_strategy.json")
-DEFAULT_AUDIT = Path("data/kalshi_live_delayed_band_v13_audit.jsonl")
+DEFAULT_AUDIT = Path("data/kalshi_live_opposite_ladder_v14_audit.jsonl")
 WORKER_ID = re.compile(r"[A-Za-z0-9_.:-]{1,128}\Z")
 TERMINAL_PASS = "CANCELED_NO_FILL"
 BOUNDARY_WAIT_SECONDS = 90

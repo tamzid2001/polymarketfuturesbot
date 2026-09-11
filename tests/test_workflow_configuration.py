@@ -91,6 +91,10 @@ class WorkflowConfigurationTests(unittest.TestCase):
         self.assertIn("vars.KALSHI_LIVE_ENABLED == 'true'", probe_block)
         self.assertIn("vars.KALSHI_SHADOW_ONLY == 'false'", probe_block)
         self.assertIn("kalshi_startup_order_check.py --execute", probe_block)
+        self.assertIn(
+            "--journal-root data/.kalshi_live_opposite_ladder_v14_startup_order_check",
+            probe_block,
+        )
         worker_block = workflow[workflow.index(worker):]
         self.assertIn('KALSHI_STARTUP_ORDER_CHECK_ENABLED: "true"', worker_block)
         journal = "data/.kalshi_live_opposite_ladder_v14_startup_order_check/order-smoke-test.json"
