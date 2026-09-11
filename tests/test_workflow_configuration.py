@@ -19,19 +19,15 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class WorkflowConfigurationTests(unittest.TestCase):
-    def test_equivalent_multiplier_text_is_valid_without_accounting_rounding(self):
+    def test_equivalent_base_text_is_valid_without_accounting_rounding(self):
         config = load_config(ROOT / "selected_live_strategy.json")
-        for value in ("2.5", "2.50", "2.500", "2.5125"):
-            updated = apply_overrides(config, argparse.Namespace(recovery_multiplier=value))
-            self.assertEqual(Decimal(updated["recovery_multiplier"]), Decimal(value))
+        for value in ("2.5", "2.50", "2.500"):
+            updated = apply_overrides(config, argparse.Namespace(starting_base=value))
+            self.assertEqual(Decimal(updated["starting_base"]), Decimal(value))
 
     def test_changed_inputs_and_blank_next_run_roundtrip_through_runtime_branch(self):
         config = load_config(ROOT / "selected_live_strategy.json")
-        names = dict(starting_base="2.00", recovery_multiplier="2.5", threshold_growth_multiplier="2.5",
-                     max_position="200.00", max_position_per_base_share="125.00",
-                     first_base_threshold="400", base_increment="0.25",
-                     stop_price="0.40", hybrid_hard_stop_cents=40,
-                     hybrid_stop_trigger_cents=40, hybrid_maker_exit_cents=40)
+        names = dict(starting_base="2.00")
         changed = apply_overrides(config, argparse.Namespace(**names))
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -52,28 +48,20 @@ class WorkflowConfigurationTests(unittest.TestCase):
                 for key, value in names.items():
                     self.assertEqual(Decimal(str(next_run[key])), Decimal(str(value)), key)
 
-    def test_tuning_stop_and_sizing_preserves_negative_cycle_and_existing_base(self):
+    def test_v14_base_override_does_not_enable_recovery_or_caps(self):
         config = load_config(ROOT / "selected_live_strategy.json")
-        old = strategy_parameters(config)
-        state = default_state(config)
-        state["sizing"], _ = apply_realized_filled_trade(old, {}, "-1")
-        state["cycle_strategy_parameters"] = old.as_dict()
-        original = deepcopy(state["sizing"])
-        updated = apply_overrides(config, argparse.Namespace(starting_base="2.00", recovery_multiplier="1.75",
-            threshold_growth_multiplier="1.75", max_position="200", stop_price="0.40",
-            hybrid_hard_stop_cents=40, hybrid_stop_trigger_cents=40, hybrid_maker_exit_cents=40))
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "state.json"
-            save_state(path, state)
-            restored = load_state(path, updated)
-            self.assertEqual(restored["sizing"], original)
-            engine = LiveEngine(updated, restored, path, path.with_suffix(".jsonl"), dry_run=True)
-            self.assertEqual(engine.current_parameters().recovery_multiplier, old.recovery_multiplier)
-            self.assertEqual(engine.current_parameters().max_position, old.max_position)
+        updated = apply_overrides(config, argparse.Namespace(starting_base="2.00"))
+        self.assertEqual(updated["starting_base"], "2.00")
+        self.assertEqual(updated["recovery_multiplier"], "1.00")
+        self.assertFalse(updated["recovery_enabled"])
+        self.assertFalse(updated["base_scaling_enabled"])
+        self.assertNotIn("max_position", updated)
+        self.assertNotIn("max_position_per_base_share", updated)
+        self.assertNotIn("position_cap_enabled", updated)
 
     def test_changed_inputs_refused_while_order_or_position_unresolved(self):
         config = load_config(ROOT / "selected_live_strategy.json")
-        updated = apply_overrides(config, argparse.Namespace(max_position="200"))
+        updated = apply_overrides(config, argparse.Namespace(starting_base="2.00"))
         for field, value in (("current_position", "0.01"), ("current_order_id", "test-order")):
             with tempfile.TemporaryDirectory() as directory:
                 state = default_state(config)
@@ -86,7 +74,7 @@ class WorkflowConfigurationTests(unittest.TestCase):
     def test_workflow_tests_source_defaults_before_restoring_operator_settings(self):
         text = (ROOT / ".github/workflows/kalshi_btc15m_average_down.yml").read_text()
         self.assertLess(text.index("name: Verify shared live strategy engine"), text.index("name: Restore latest bounded runtime state"))
-        self.assertLess(text.index("name: Restore latest bounded runtime state"), text.index("name: Assert canonical direct-exit strategy contract"))
+        self.assertLess(text.index("name: Restore latest bounded runtime state"), text.index("name: Assert canonical opposite-ladder strategy contract"))
         self.assertIn("steps.runtime_restore.outcome == 'success'", text)
         self.assertNotIn('--stop-price "$profile_stop"', text)
         self.assertIn("ref: main", text)
@@ -95,7 +83,7 @@ class WorkflowConfigurationTests(unittest.TestCase):
     def test_live_startup_probe_is_gated_ordered_and_durable(self):
         workflow = (ROOT / ".github/workflows/kalshi_btc15m_average_down.yml").read_text()
         probe = "name: Verify live create and cancel path on the market shard"
-        worker = "name: Run KXBTC15M direct-exit worker"
+        worker = "name: Run KXBTC15M opposite-ladder worker"
         self.assertLess(workflow.index(probe), workflow.index(worker))
         probe_block = workflow[workflow.index(probe):workflow.index(worker)]
         self.assertIn("!inputs.reconcile_only", probe_block)
@@ -105,7 +93,7 @@ class WorkflowConfigurationTests(unittest.TestCase):
         self.assertIn("kalshi_startup_order_check.py --execute", probe_block)
         worker_block = workflow[workflow.index(worker):]
         self.assertIn('KALSHI_STARTUP_ORDER_CHECK_ENABLED: "true"', worker_block)
-        journal = "data/.kalshi_live_delayed_band_v13_startup_order_check/order-smoke-test.json"
+        journal = "data/.kalshi_live_opposite_ladder_v14_startup_order_check/order-smoke-test.json"
         self.assertGreaterEqual(workflow.count(journal), 2)
 
     def test_fresh_state_reset_is_explicit_live_only_and_not_forwarded(self):
@@ -131,9 +119,8 @@ class WorkflowConfigurationTests(unittest.TestCase):
     def test_production_workflow_pins_resilient_entry_delivery_contract(self):
         workflow = (ROOT / ".github/workflows/kalshi_btc15m_average_down.yml").read_text()
         self.assertIn("ENTRY_DELIVERY_CONTRACT_VERSION == 1", workflow)
-        self.assertIn("definitive_400_404=retry_each_second", workflow)
-        self.assertIn("local_pause=retry", workflow)
-        self.assertIn("abandon=fresh_ask_at_or_below_51c", workflow)
+        self.assertIn("OPPOSITE_LADDER_CONTRACT_VERSION == 1", workflow)
+        self.assertIn("orders=ask-1@1x,40@2x,30@4x,20@8x,10@16x", workflow)
 
     def test_checkpoint_does_not_require_runner_git_identity_setup(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -146,7 +133,7 @@ class WorkflowConfigurationTests(unittest.TestCase):
                                 ["git", "-C", str(work), "config", "user.useConfigOnly", "true"],
                                 ["git", "-C", str(work), "remote", "add", "origin", str(remote)]):
                     subprocess.run(command, capture_output=True, check=True)
-                state = work / "data/kalshi_live_delayed_band_v13_state.json"
+                state = work / "data/kalshi_live_opposite_ladder_v14_state.json"
                 state.parent.mkdir()
                 state.write_text('{"test":"early_failure"}\n')
                 self.assertTrue(publish_runtime_snapshot((state,), "early-failure", root=work,

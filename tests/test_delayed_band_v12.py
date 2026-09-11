@@ -111,7 +111,17 @@ class EntryRest:
 
 class DelayedBandV13Tests(unittest.TestCase):
     def setUp(self) -> None:
-        self.config = load_config(ROOT / "selected_live_strategy.json")
+        self.production_config = load_config(ROOT / "selected_live_strategy.json")
+        self.config = dict(self.production_config)
+        # Keep the retired v13 entry routine covered as a forensic regression
+        # fixture; this dictionary is never accepted by production load_config.
+        self.config.update({
+            "entry_execution_mode": "delayed_threshold_band_maker",
+            "stop_policy": "direct_ioc_at_trigger",
+            "hybrid_stop_trigger_cents": 51,
+            "hybrid_maker_exit_cents": 51,
+            "hybrid_hard_stop_cents": 51,
+        })
 
     def engine(self, *, dry_run: bool = True) -> LiveEngine:
         directory = Path(tempfile.mkdtemp())
@@ -128,20 +138,23 @@ class DelayedBandV13Tests(unittest.TestCase):
         )
 
     def test_exact_production_contract_is_shadow_safe_by_default(self) -> None:
-        self.assertEqual(self.config["strategy_version"], "kxbtc15m-delayed-band-live-v13")
-        self.assertEqual(self.config["entry_execution_mode"], "delayed_threshold_band_maker")
-        self.assertEqual(Decimal(self.config["recovery_multiplier"]), Decimal("2.50"))
-        self.assertEqual(Decimal(self.config["starting_base"]), Decimal("1.00"))
-        self.assertEqual(Decimal(self.config["max_position"]), Decimal("100.00"))
+        config = self.production_config
+        self.assertEqual(config["strategy_version"], "kxbtc15m-opposite-ladder-live-v14")
+        self.assertEqual(config["entry_execution_mode"], "opposite_side_doubling_ladder")
+        self.assertEqual(Decimal(config["recovery_multiplier"]), Decimal("1.00"))
+        self.assertEqual(Decimal(config["starting_base"]), Decimal("1.00"))
+        self.assertNotIn("max_position", config)
+        self.assertNotIn("max_position_per_base_share", config)
+        self.assertNotIn("position_cap_enabled", config)
         self.assertEqual(
-            (self.config["hybrid_stop_trigger_cents"], self.config["hybrid_maker_exit_cents"],
-             self.config["hybrid_hard_stop_cents"]),
-            (51, 51, 51),
+            (config["hybrid_stop_trigger_cents"], config["hybrid_maker_exit_cents"],
+             config["hybrid_hard_stop_cents"]),
+            (50, 50, 50),
         )
-        self.assertEqual(self.config["stop_policy"], "direct_ioc_at_trigger")
-        self.assertFalse(self.config["live_enabled"])
-        self.assertTrue(self.config["dry_run"])
-        self.assertEqual(self.config["trading_mode"], "shadow")
+        self.assertEqual(config["stop_policy"], "opposite_side_take_profit_ioc")
+        self.assertFalse(config["live_enabled"])
+        self.assertTrue(config["dry_run"])
+        self.assertEqual(config["trading_mode"], "shadow")
 
     def test_waits_until_sixty_seconds_then_submits_one_gtc_post_only_limit(self) -> None:
         async def scenario():

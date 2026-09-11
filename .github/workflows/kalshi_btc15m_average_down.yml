@@ -1,11 +1,11 @@
-name: Kalshi KXBTC15M Direct 51c Live
+name: Kalshi KXBTC15M Opposite Ladder v14 Live
 
 # The watchdog only keeps a worker available. The Python worker maintains the
 # WebSocket and reacts to Kalshi's market timestamps at each boundary; it does
 # not assume a cron invocation occurred at exactly a 15-minute open.
 run-name: >-
-  Kalshi KXBTC15M Direct 51c —
-  ${{ inputs.reconcile_only && 'RECONCILE_ONLY delayed_53_57_exit_51' || (inputs.live_enabled && vars.KALSHI_LIVE_ENABLED == 'true' && vars.KALSHI_SHADOW_ONLY == 'false') && 'LIVE delayed_53_57_exit_51' || inputs.live_enabled && 'LIVE_REQUEST_BLOCKED delayed_53_57_exit_51' || 'DRY_RUN delayed_53_57_exit_51' }}
+  Kalshi KXBTC15M Opposite Ladder v14 —
+  ${{ inputs.reconcile_only && 'RECONCILE_ONLY opposite_ladder_53_58_take_profit_50' || (inputs.live_enabled && vars.KALSHI_LIVE_ENABLED == 'true' && vars.KALSHI_SHADOW_ONLY == 'false') && 'LIVE opposite_ladder_53_58_take_profit_50' || inputs.live_enabled && 'LIVE_REQUEST_BLOCKED opposite_ladder_53_58_take_profit_50' || 'DRY_RUN opposite_ladder_53_58_take_profit_50' }}
 
 on:
   # The separately serialized watchdog owns the five-minute recovery
@@ -24,42 +24,12 @@ on:
         type: boolean
         default: false
       fresh_state_reset:
-        description: "ONE RUN ONLY: reset base/recovery/P&L/fees/metrics after authoritative flat checks. Audit ledger is preserved. Default off."
+        description: "ONE RUN ONLY: reset v14 metrics after authoritative flat checks. Normally leave off; v14 has a fresh namespace."
         required: true
         type: boolean
         default: false
       initial_shares:
-        description: "Initial two-decimal shares for a brand-new strategy state. Blank preserves the durable setting."
-        required: false
-        type: string
-        default: ""
-      scaling_multiplier:
-        description: "Recovery and geometric threshold multiplier (default 2.50). Blank preserves the durable setting."
-        required: false
-        type: string
-        default: ""
-      max_share_cap:
-        description: "Initial/fixed maximum shares. With cap-per-base enabled, 100 at base 1 becomes 200 at base 2. Blank preserves."
-        required: false
-        type: string
-        default: ""
-      max_cap_per_base_share:
-        description: "Cap contracts per permanent base share. Default 100: base 1=>cap 100, base 2=>cap 200. Use 0 for fixed max_share_cap; blank preserves."
-        required: false
-        type: string
-        default: ""
-      profit_threshold:
-        description: "Realized net profit required for the first permanent share increase. Blank preserves the durable setting."
-        required: false
-        type: string
-        default: ""
-      shares_added_after_profit_threshold:
-        description: "Shares permanently added after each profit threshold. Blank preserves the last successfully checkpointed value."
-        required: false
-        type: string
-        default: ""
-      max_stop_loss_cents:
-        description: "Direct protective-exit trigger in cents (10-51). Blank preserves 51c. No maker-exit phase."
+        description: "Base multiplier for all five orders: base×(1/2/4/8/16). Blank preserves the durable value."
         required: false
         type: string
         default: ""
@@ -132,8 +102,10 @@ jobs:
       - name: Verify shared live strategy engine
         run: |
           set -euo pipefail
-          python -m py_compile strategy_core.py live_state.py audit_ledger.py kalshi_live_trader.py optimizer.py kalshi_order_smoke_test.py kalshi_startup_order_check.py
+          python -m py_compile strategy_core.py opposite_ladder_core.py live_state.py audit_ledger.py kalshi_live_trader.py optimizer.py kalshi_order_smoke_test.py kalshi_startup_order_check.py
           PYTHONPATH=. python -m unittest -v \
+            tests.test_opposite_ladder_core \
+            tests.test_opposite_ladder_live \
             tests.test_strategy_core \
             tests.test_position_cap \
             tests.test_live_execution \
@@ -155,7 +127,7 @@ jobs:
         id: runtime_restore
         run: |
           set -euo pipefail
-          runtime_ref=runtime-state-kxbtc15m-delayed-v13
+          runtime_ref=runtime-state-kxbtc15m-opposite-ladder-v14
           set +e
           git ls-remote --exit-code --heads origin "refs/heads/$runtime_ref" >/dev/null
           runtime_ref_status=$?
@@ -164,22 +136,21 @@ jobs:
             git fetch --no-tags origin "refs/heads/$runtime_ref"
             restore_sha="$(git rev-parse FETCH_HEAD)"
             python3 live_checkpoint.py --restore-sha "$restore_sha" --runtime-ref "$runtime_ref"
-            echo "RUNTIME_STATE_OWNER=kalshi-kxbtc15m-delayed-v13"
+            echo "RUNTIME_STATE_OWNER=kalshi-kxbtc15m-opposite-ladder-v14"
             echo "RUNTIME_STATE_RESTORED=$runtime_ref"
           elif [ "$runtime_ref_status" -eq 2 ]; then
-            echo "RUNTIME_STATE_BOOTSTRAP=fresh_v13_namespace"
+            echo "RUNTIME_STATE_BOOTSTRAP=fresh_v14_namespace"
           else
-            echo "::error::Unable to determine v13 runtime ref status; refusing unsafe fallback"
+            echo "::error::Unable to determine v14 runtime ref status; refusing unsafe fallback"
             exit 2
           fi
           test "$(git rev-parse HEAD)" = "$KALSHI_SOURCE_SHA"
           git diff --exit-code -- '*.py' '.github/workflows/' 'tests/' 'requirements_kalshi_settlement_trader.txt'
 
-      - name: Assert canonical direct-exit strategy contract
+      - name: Assert canonical opposite-ladder strategy contract
         run: |
           set -euo pipefail
-          python -c 'from kalshi_live_trader import ENTRY_DELIVERY_CONTRACT_VERSION, LIVE_STOP_SAFETY_CONTRACT_VERSION, POSITION_CAP_CONTRACT_VERSION; assert ENTRY_DELIVERY_CONTRACT_VERSION == 1; assert LIVE_STOP_SAFETY_CONTRACT_VERSION == 3; assert POSITION_CAP_CONTRACT_VERSION == 2; print("ENTRY_DELIVERY_CONTRACT=1 | definitive_400_404=retry_each_second local_pause=retry unknown_post=exact_reconciliation abandon=fresh_ask_at_or_below_51c"); print("LIVE_STOP_SAFETY_CONTRACT=3 | policy=direct_ioc_at_trigger maker_exit=disabled trigger_latched_before_cancel=true cancel_404=order_fill_position_reconcile partial_ioc=authoritative_residual_retry settlement_leak=incident"); print("POSITION_CAP_CONTRACT=2 | mode=base_linked_default")'
-          python -c 'from kalshi_live_trader import ACTIVE_CONFIG_SCHEMA_VERSION, ACTIVE_STRATEGY_VERSION, BTC_TARGET_CAPTURE_CONTRACT_VERSION, DELAYED_ENTRY_LADDER_CONTRACT_VERSION, LIVE_STOP_SAFETY_CONTRACT_VERSION, OPENING_PRICE_CAPTURE_CONTRACT_VERSION, load_config; c = load_config(__import__("pathlib").Path("selected_live_strategy.json")); assert c["strategy_version"] == ACTIVE_STRATEGY_VERSION; assert c["config_schema_version"] == ACTIVE_CONFIG_SCHEMA_VERSION == 13; assert OPENING_PRICE_CAPTURE_CONTRACT_VERSION == 3; assert BTC_TARGET_CAPTURE_CONTRACT_VERSION == 2; assert DELAYED_ENTRY_LADDER_CONTRACT_VERSION == 4; assert LIVE_STOP_SAFETY_CONTRACT_VERSION == 3; assert c["entry_execution_mode"] == "delayed_threshold_band_maker"; assert c["maker_order_time_in_force"] == "good_till_canceled"; assert c["entry_order_lifetime"] == "until_filled_or_market_close"; assert c["entry_timeout_seconds"] == 0; assert c["opening_quote_capture_seconds"] == 60; assert c["delayed_entry_start_seconds"] == 60; assert c["delayed_entry_threshold_cents"] == 53; assert c["delayed_entry_max_limit_cents"] == 57; assert c["entry_limit_offset_cents"] == 1; assert c["shadow_profile"] == "delayed_53_57_exit_51"; assert c["stop_policy"] == "direct_ioc_at_trigger"; assert (c["hybrid_stop_trigger_cents"], c["hybrid_maker_exit_cents"], c["hybrid_hard_stop_cents"]) == (51, 51, 51); assert c["max_recovery_exponent"] == 0; assert c["durable_checkpoint_interval_seconds"] == 30.0; print("CANONICAL_DELAYED_BAND_STRATEGY_CONTRACT=OK | opening_ask_below=53c post_window=60s first_qualifying_ask>=53c entry=ask_minus_1c max_limit=57c maker_tif=GTC lifetime=until_fill_or_market_close protective_exit=direct_reduce_only_ioc_at_51c recovery=validated_config base=validated_config cap=permanent_base_linked checkpoint=v2_chunked_30s"); print("CONFIGURED_INITIAL_SHARE_CAP=" + c["max_position"]); print("CONFIGURED_CAP_PER_BASE_SHARE=" + str(c.get("max_position_per_base_share")))'
+          python -c 'from kalshi_live_trader import ACTIVE_CONFIG_SCHEMA_VERSION, ACTIVE_STRATEGY_VERSION, ENTRY_DELIVERY_CONTRACT_VERSION, OPPOSITE_LADDER_CONTRACT_VERSION, load_config; c=load_config(__import__("pathlib").Path("selected_live_strategy.json")); assert c["strategy_version"] == ACTIVE_STRATEGY_VERSION; assert c["config_schema_version"] == ACTIVE_CONFIG_SCHEMA_VERSION == 14; assert ENTRY_DELIVERY_CONTRACT_VERSION == 1; assert OPPOSITE_LADDER_CONTRACT_VERSION == 1; assert c["entry_execution_mode"] == "opposite_side_doubling_ladder"; assert c["delayed_entry_start_seconds"] == 60; assert (c["delayed_entry_threshold_cents"], c["delayed_entry_max_trigger_cents"]) == (53,58); assert c["entry_limit_offset_cents"] == 1; assert c["maker_order_time_in_force"] == "good_till_canceled"; assert c["entry_order_lifetime"] == "until_filled_or_market_close"; assert c["entry_timeout_seconds"] == 0; assert c["opposite_take_profit_cents"] == 50; assert c["recovery_enabled"] is False and c["base_scaling_enabled"] is False; assert "max_position" not in c and "max_position_per_base_share" not in c and "position_cap_enabled" not in c; print("OPPOSITE_LADDER_V14_CONTRACT=OK | sticky_band=53..58 trade_side=opposite orders=ask-1@1x,40@2x,30@4x,20@8x,10@16x tif=GTC post_only=true exit=either_boundary:trade_bid>=50_or_sticky_ask<=50,cancel_then_reduce_only_IOC recovery=disabled cap=absent")'
 
       - name: Write Kalshi RSA private key
         env:
@@ -198,7 +169,7 @@ jobs:
           KALSHI_LIVE_ENABLED: ${{ vars.KALSHI_LIVE_ENABLED || 'false' }}
           KALSHI_SHADOW_ONLY: ${{ vars.KALSHI_SHADOW_ONLY || 'true' }}
           KALSHI_STARTUP_ORDER_CHECK_ENABLED: "true"
-          KALSHI_RUNTIME_STATE_REF: "runtime-state-kxbtc15m-delayed-v13"
+          KALSHI_RUNTIME_STATE_REF: "runtime-state-kxbtc15m-opposite-ladder-v14"
         run: |
           set -euo pipefail
           # One 1.00-share/1c post-only probe is journaled before POST. The
@@ -207,12 +178,12 @@ jobs:
           # independently reconciled on the market's authoritative shard.
           python kalshi_startup_order_check.py --execute \
             --worker-id "$GITHUB_RUN_ID" \
-            --state-file data/kalshi_live_delayed_band_v13_state.json \
-            --audit-ledger data/kalshi_live_delayed_band_v13_audit.jsonl \
+            --state-file data/kalshi_live_opposite_ladder_v14_state.json \
+            --audit-ledger data/kalshi_live_opposite_ladder_v14_audit.jsonl \
             --config selected_live_strategy.json \
-            --runtime-ref runtime-state-kxbtc15m-delayed-v13
+            --runtime-ref runtime-state-kxbtc15m-opposite-ladder-v14
 
-      - name: Run KXBTC15M direct-exit worker
+      - name: Run KXBTC15M opposite-ladder worker
         env:
           KALSHI_API_KEY_ID: ${{ secrets.KALSHI_PROD_API_KEY }}
           KALSHI_PEM_PATH: kalshi_private_key.pem
@@ -221,18 +192,12 @@ jobs:
           KALSHI_SHADOW_ONLY: ${{ vars.KALSHI_SHADOW_ONLY || 'true' }}
           KALSHI_STARTUP_ORDER_CHECK_ENABLED: "true"
           KALSHI_CHECKPOINT_PUBLISH: "true"
-          KALSHI_RUNTIME_STATE_REF: "runtime-state-kxbtc15m-delayed-v13"
+          KALSHI_RUNTIME_STATE_REF: "runtime-state-kxbtc15m-opposite-ladder-v14"
           RUN_SECONDS: "18000"
           REQUESTED_LIVE: ${{ !inputs.reconcile_only && inputs.live_enabled && vars.KALSHI_LIVE_ENABLED == 'true' && vars.KALSHI_SHADOW_ONLY == 'false' }}
           RECONCILE_ONLY: ${{ inputs.reconcile_only || false }}
-          SHADOW_PROFILE: "delayed_53_57_exit_51"
+          SHADOW_PROFILE: "opposite_ladder_53_58_take_profit_50"
           INITIAL_SHARES: ${{ inputs.initial_shares || '' }}
-          SCALING_MULTIPLIER: ${{ inputs.scaling_multiplier || '' }}
-          MAX_SHARE_CAP: ${{ inputs.max_share_cap || '' }}
-          MAX_CAP_PER_BASE_SHARE: ${{ inputs.max_cap_per_base_share || '' }}
-          PROFIT_THRESHOLD: ${{ inputs.profit_threshold || '' }}
-          SHARES_ADDED_AFTER_PROFIT_THRESHOLD: ${{ inputs.shares_added_after_profit_threshold || '' }}
-          MAX_STOP_LOSS_CENTS: ${{ inputs.max_stop_loss_cents || '' }}
           FRESH_STATE_RESET: ${{ inputs.fresh_state_reset || false }}
         run: |
           set -euo pipefail
@@ -240,17 +205,17 @@ jobs:
           # intentionally reads the live state but still cannot submit an
           # entry because the Python worker receives --reconcile-only.
           if [ "$REQUESTED_LIVE" = "true" ] || [ "$RECONCILE_ONLY" = "true" ]; then
-            state_file=data/kalshi_live_delayed_band_v13_state.json
-            audit_file=data/kalshi_live_delayed_band_v13_audit.jsonl
+            state_file=data/kalshi_live_opposite_ladder_v14_state.json
+            audit_file=data/kalshi_live_opposite_ladder_v14_audit.jsonl
           else
             case "$SHADOW_PROFILE" in
-              delayed_53_57_exit_51) : ;;
+              opposite_ladder_53_58_take_profit_50) : ;;
               *) echo "::error::Unknown shadow profile: $SHADOW_PROFILE"; exit 2 ;;
             esac
-            # v13 deliberately starts a new namespace. Older opening-entry and
-            # comparison-stop evidence cannot become executable state.
-            state_file="data/kalshi_shadow_delayed_band_v13_state.json"
-            audit_file="data/kalshi_shadow_delayed_band_v13_audit.jsonl"
+            # v14 deliberately starts a new namespace. Older recovery/cap and
+            # selected-side entry state can never become executable state.
+            state_file="data/kalshi_shadow_opposite_ladder_v14_state.json"
+            audit_file="data/kalshi_shadow_opposite_ladder_v14_audit.jsonl"
           fi
           args=(--config selected_live_strategy.json
                 --state-file "$state_file"
@@ -266,26 +231,6 @@ jobs:
           [ "$RECONCILE_ONLY" = "true" ] && args+=(--reconcile-only)
           [ "$FRESH_STATE_RESET" = "true" ] && args+=(--reset-state)
           [ -z "$INITIAL_SHARES" ] || args+=(--starting-base "$INITIAL_SHARES")
-          [ -z "$MAX_SHARE_CAP" ] || args+=(--max-position "$MAX_SHARE_CAP")
-          [ -z "$MAX_CAP_PER_BASE_SHARE" ] || args+=(--max-position-per-base-share "$MAX_CAP_PER_BASE_SHARE")
-          if [ -n "$SCALING_MULTIPLIER" ]; then
-            args+=(--recovery-multiplier "$SCALING_MULTIPLIER")
-            args+=(--threshold-growth-multiplier "$SCALING_MULTIPLIER")
-          fi
-          [ -z "$PROFIT_THRESHOLD" ] || args+=(--first-base-threshold "$PROFIT_THRESHOLD")
-          [ -z "$SHARES_ADDED_AFTER_PROFIT_THRESHOLD" ] || args+=(--base-increment "$SHARES_ADDED_AFTER_PROFIT_THRESHOLD")
-          if [ -n "$MAX_STOP_LOSS_CENTS" ]; then
-            [[ "$MAX_STOP_LOSS_CENTS" =~ ^[0-9]+$ ]] || {
-              echo "::error::max_stop_loss_cents must be an integer from 10 through 51"; exit 2;
-            }
-            [ "$MAX_STOP_LOSS_CENTS" -ge 10 ] && [ "$MAX_STOP_LOSS_CENTS" -le 51 ] || {
-              echo "::error::max_stop_loss_cents must be an integer from 10 through 51"; exit 2;
-            }
-            args+=(--stop-price "$(printf '0.%02d' "$MAX_STOP_LOSS_CENTS")")
-            args+=(--hybrid-hard-stop-cents "$MAX_STOP_LOSS_CENTS")
-            args+=(--hybrid-stop-trigger-cents "$MAX_STOP_LOSS_CENTS")
-            args+=(--hybrid-maker-exit-cents "$MAX_STOP_LOSS_CENTS")
-          fi
           if [ "$REQUESTED_LIVE" = "true" ]; then
             python kalshi_live_trader.py "${args[@]}" --live-enabled
           else
@@ -297,13 +242,13 @@ jobs:
         run: |
           set -euo pipefail
           for attempt in 1 2 3; do
-            if python live_checkpoint.py --reason end-of-run --runtime-ref runtime-state-kxbtc15m-delayed-v13 \
+            if python live_checkpoint.py --reason end-of-run --runtime-ref runtime-state-kxbtc15m-opposite-ladder-v14 \
               selected_live_strategy.json \
-              data/kalshi_live_delayed_band_v13_state.json \
-              data/kalshi_live_delayed_band_v13_audit.jsonl \
-              data/.kalshi_live_delayed_band_v13_startup_order_check/order-smoke-test.json \
-              data/kalshi_shadow_delayed_band_v13_state.json \
-              data/kalshi_shadow_delayed_band_v13_audit.jsonl; then
+              data/kalshi_live_opposite_ladder_v14_state.json \
+              data/kalshi_live_opposite_ladder_v14_audit.jsonl \
+              data/.kalshi_live_opposite_ladder_v14_startup_order_check/order-smoke-test.json \
+              data/kalshi_shadow_opposite_ladder_v14_state.json \
+              data/kalshi_shadow_opposite_ladder_v14_audit.jsonl; then
               exit 0
             fi
             sleep "$attempt"
@@ -318,14 +263,14 @@ jobs:
           REPOSITORY: ${{ github.repository }}
           REQUESTED_LIVE: ${{ !inputs.reconcile_only && inputs.live_enabled && vars.KALSHI_LIVE_ENABLED == 'true' && vars.KALSHI_SHADOW_ONLY == 'false' }}
           RECONCILE_ONLY: ${{ inputs.reconcile_only || false }}
-          SHADOW_PROFILE: "delayed_53_57_exit_51"
+          SHADOW_PROFILE: "opposite_ladder_53_58_take_profit_50"
         run: |
           set -euo pipefail
           [ "$RECONCILE_ONLY" = "true" ] && exit 0
           if [ "$REQUESTED_LIVE" = "true" ]; then
-            state_file=data/kalshi_live_delayed_band_v13_state.json
+            state_file=data/kalshi_live_opposite_ladder_v14_state.json
           else
-            state_file=data/kalshi_shadow_delayed_band_v13_state.json
+            state_file=data/kalshi_shadow_opposite_ladder_v14_state.json
           fi
           ready="$(python -c 'import json, pathlib; p=pathlib.Path("'"$state_file"'"); print(str(bool(json.loads(p.read_text()).get("handoff", {}).get("ready"))).lower() if p.exists() else "false")')"
           if [ "$ready" != "true" ]; then
@@ -350,13 +295,13 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: kalshi-kxbtc15m-direct-exit-${{ github.run_id }}
+          name: kalshi-kxbtc15m-opposite-ladder-${{ github.run_id }}
           path: |
             selected_live_strategy.json
-            data/kalshi_live_delayed_band_v13_state.json
-            data/kalshi_live_delayed_band_v13_audit.jsonl
-            data/.kalshi_live_delayed_band_v13_startup_order_check/order-smoke-test.json
-            data/kalshi_shadow_delayed_band_v13_state.json
-            data/kalshi_shadow_delayed_band_v13_audit.jsonl
+            data/kalshi_live_opposite_ladder_v14_state.json
+            data/kalshi_live_opposite_ladder_v14_audit.jsonl
+            data/.kalshi_live_opposite_ladder_v14_startup_order_check/order-smoke-test.json
+            data/kalshi_shadow_opposite_ladder_v14_state.json
+            data/kalshi_shadow_opposite_ladder_v14_audit.jsonl
           if-no-files-found: warn
           retention-days: 30
