@@ -115,44 +115,60 @@ def export_selected_live_strategy(path: Path, row: dict[str, Any], *, selection_
     result, not an unattended-live default.
     """
 
-    if row.get("execution_profile") != "opposite_ladder_53_57_flatten_51":
+    if row.get("execution_profile") != "delayed_53_57_exit_51":
         raise ValueError(
-            "live export requires execution_profile=opposite_ladder_53_57_flatten_51; "
-            "generic settlement/Monte Carlo rows cannot activate the v14 live ladder"
+            "live export requires execution_profile=delayed_53_57_exit_51; "
+            "settlement-only optimizer rows cannot prove delayed fills or protective exits"
         )
-    base = Decimal(str(row.get("starting_base", "1.00")))
-    if base.quantize(Decimal("0.01")) != base or not base.is_finite() or base <= 0:
-        raise ValueError("starting_base must be a positive two-decimal quantity")
-    shadow_profile = "opposite_ladder_53_57_flatten_51"
+    def decimal_text(value: Any) -> str:
+        amount = Decimal(str(value))
+        if not amount.is_finite():
+            raise ValueError("live export requires finite Decimal parameters")
+        result = format(amount, "f")
+        if "." not in result:
+            return result + ".00"
+        return result + "0" if len(result.rsplit(".", 1)[1]) == 1 else result
+
+    stop = row.get("stop_price")
+    if stop in {None, "no_stop"} or Decimal(str(stop)) != Decimal("0.51"):
+        raise ValueError("v15 production exports only the reviewed direct 51c exit profile")
+    if Decimal(str(row.get("entry_price", 0))) != Decimal("0.52"):
+        raise ValueError("v15 entry_price is the 52c minimum reference for the delayed limit band")
+    shadow_profile = "delayed_53_57_exit_51"
     config = {
-        "config_schema_version": 14,
-        "strategy_version": "kxbtc15m-opposite-ladder-live-v14",
+        "config_schema_version": 15,
+        "strategy_version": "kxbtc15m-delayed-band-live-v15",
+        "opposite_ladder_enabled": False,
+        "recovery_enabled": True,
+        "base_scaling_enabled": True,
         "selection_basis": selection_basis,
         "series": "KXBTC15M",
         "signal_delay_seconds": 0,
         "signal_mode": "sticky_until_directional_win",
         "shadow_profile": shadow_profile,
-        "entry_price": "0.47",
-        "stop_price": "0.51",
-        "stop_policy": "opposite_side_take_profit_ioc",
+        "entry_price": decimal_text(row["entry_price"]),
+        "stop_price": decimal_text(stop),
+        "stop_policy": "direct_ioc_at_trigger",
         "hybrid_stop_enabled": True,
         "hybrid_stop_trigger_cents": 51,
         "hybrid_maker_exit_cents": 51,
         "hybrid_hard_stop_cents": 51,
-        "opposite_take_profit_cents": 51,
-        "opposite_ladder_enabled": True,
-        "stop_baseline_entry_price": "0.51",
-        "entry_execution_mode": "opposite_side_doubling_ladder",
+        "stop_baseline_entry_price": "0.50",
+        "entry_execution_mode": "delayed_threshold_band_maker",
         "maker_order_time_in_force": "good_till_canceled",
         "entry_order_lifetime": "until_filled_or_market_close",
         "entry_limit_offset_cents": 1,
-        "starting_base": format(base, ".2f"),
-        "recovery_multiplier": "1.00",
-        "recovery_enabled": False,
-        "first_base_threshold": "999999999.00",
-        "threshold_growth_multiplier": "1.00",
-        "base_increment": "1.00",
-        "base_scaling_enabled": False,
+        "starting_base": decimal_text(row.get("starting_base", "1.00")),
+        "recovery_multiplier": decimal_text(row["recovery_multiplier"]),
+        "first_base_threshold": decimal_text(row["first_base_threshold"]),
+        "threshold_growth_multiplier": decimal_text(row["threshold_growth_multiplier"]),
+        "base_increment": decimal_text(row["base_increment"]),
+        "max_position": decimal_text(row.get("max_position", "100.00")),
+        "max_position_per_base_share": (
+            None
+            if row.get("max_position_per_base_share") in (None, "", 0, "0", "0.00")
+            else decimal_text(row["max_position_per_base_share"])
+        ),
         "starting_shadow_balance": "1000.00",
         "live_enabled": False,
         "dry_run": True,
@@ -174,14 +190,11 @@ def export_selected_live_strategy(path: Path, row: dict[str, Any], *, selection_
         "delayed_entry_threshold_cents": 53,
         "delayed_entry_start_seconds": 60,
         "delayed_entry_max_limit_cents": 57,
-        "delayed_entry_max_trigger_cents": 57,
-        "opposite_initial_limit_min_cents": 43,
-        "opposite_initial_limit_max_cents": 47,
         "delayed_entry_tracking_enabled": True,
         "max_recovery_exponent": 0,
-        "max_recovery_cycle_loss": "999999999.00",
-        "max_daily_realized_loss": "999999999.00",
-        "max_api_failures": 20,
+        "max_recovery_cycle_loss": "100.00",
+        "max_daily_realized_loss": "100.00",
+        "max_api_failures": 5,
         "allow_capital_downsize": False,
         "shadow_fill_model": "conservative_public_trade_through",
         "shadow_entry_level_min_cents": 40,

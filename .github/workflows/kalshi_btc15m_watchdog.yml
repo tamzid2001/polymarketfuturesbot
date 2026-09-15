@@ -1,17 +1,17 @@
-name: Kalshi KXBTC15M Opposite Ladder v14 Live Watchdog
+name: Kalshi KXBTC15M Direct 51c v15 Live Watchdog
 
-# A recovery safety net for the opposite-ladder trader. Normal five-hour workers only
+# A recovery safety net for the direct-exit trader. Normal five-hour workers only
 # hand off in the middle 13 minutes of a KXBTC15M market. This workflow is a
 # recovery path for a failed/missing worker; it never bypasses the live gate.
-# While KALSHI_SHADOW_ONLY=true, only the canonical v14 opposite-ladder lane is
-# maintained. Older recovery, cap, selected-side, and stop lanes are never dispatched.
+# While KALSHI_SHADOW_ONLY=true, only the canonical delayed 53-57c v15 lane is
+# maintained. Older opening-entry and comparison-stop lanes are never dispatched.
 on:
   schedule:
     # Avoid minute zero, when GitHub Actions is most likely to delay or drop
     # scheduled jobs under load.
     - cron: "2-59/5 * * * *"
   workflow_run:
-    workflows: ["Kalshi KXBTC15M Opposite Ladder v14 Live"]
+    workflows: ["Kalshi KXBTC15M Direct 51c v15 Live"]
     types: [completed]
   workflow_dispatch:
 
@@ -24,7 +24,7 @@ permissions:
   contents: read
 
 jobs:
-  ensure-opposite-ladder-runner:
+  ensure-direct-exit-runner:
     # A successful worker queues its own safe handoff. Failed workers and an
     # absent scheduled worker are recovered in their prior/safe mode.
     if: >-
@@ -57,9 +57,13 @@ jobs:
             --workflow kalshi_btc15m_average_down.yml --limit 100 \
             --json databaseId,status,conclusion,updatedAt,displayTitle,event)"
 
+          # Never inherit permission to start a new strategy release from a
+          # retired v13/v14 run. A v15 live recovery needs explicit v15 history.
+          v15_runs="$(jq '[.[] | select((.displayTitle // "") | startswith("Kalshi KXBTC15M Direct 51c v15"))]' <<<"$runs")"
+
           if [ "$KALSHI_SHADOW_ONLY" = "true" ]; then
-              profile=opposite_ladder_53_57_flatten_51
-              profile_runs="$(jq --arg title "DRY_RUN $profile" '[.[] | select((.displayTitle // "") | contains($title))]' <<<"$runs")"
+              profile=delayed_53_57_exit_51
+              profile_runs="$(jq --arg title "DRY_RUN $profile" '[.[] | select((.displayTitle // "") | contains($title))]' <<<"$v15_runs")"
               active="$(jq '[.[] | select(.status == "in_progress" or .status == "queued" or .status == "waiting")] | length' <<<"$profile_runs")"
               if [ "$active" -gt 0 ]; then
                 echo "WATCHDOG HOLD | profile=$profile active_or_queued=$active"
@@ -88,19 +92,16 @@ jobs:
             echo "WATCHDOG HOLD | active_or_queued_production_runs=$active; refusing overlap."
             exit 0
           fi
-          # Recognize one revision-2 LIVE title only as handoff evidence. Every
-          # dispatch still checks out main and runs revision 3; the watchdog
-          # cannot revive revision-2 source or configuration.
-          latest="$(jq -c '[.[] | select((.displayTitle // "") | test("(DRY_RUN|LIVE) opposite_ladder_53_(57|58)_flatten_51$"))] | sort_by(.updatedAt // "") | last // {}' <<<"$runs")"
-          prior_live="$(jq -r '(.displayTitle // "") | test("LIVE opposite_ladder_53_(57|58)_flatten_51$")' <<<"$latest")"
+          latest="$(jq -c '[.[] | select((.displayTitle // "") | test("(DRY_RUN|LIVE) delayed_53_57_exit_51$"))] | sort_by(.updatedAt // "") | last // {}' <<<"$v15_runs")"
+          prior_live="$(jq -r '(.displayTitle // "") | endswith("LIVE delayed_53_57_exit_51")' <<<"$latest")"
           # Repository flags grant permission; they are not a start command.
           # Live recovery requires a prior explicitly requested LIVE worker.
           if [ "$KALSHI_LIVE_ENABLED" = "true" ] && [ "$KALSHI_SHADOW_ONLY" = "false" ] && [ "$prior_live" = "true" ]; then
             gh workflow run kalshi_btc15m_average_down.yml --repo "$REPOSITORY" --ref main \
               -f live_enabled=true -f reconcile_only=false
-            echo "WATCHDOG DISPATCHED | gated live opposite-ladder recovery queued."
+            echo "WATCHDOG DISPATCHED | gated live direct-exit recovery queued."
           else
             gh workflow run kalshi_btc15m_average_down.yml --repo "$REPOSITORY" --ref main \
               -f live_enabled=false -f reconcile_only=false
-            echo "WATCHDOG DISPATCHED | shadow opposite-ladder recovery queued."
+            echo "WATCHDOG DISPATCHED | shadow direct-exit recovery queued."
           fi

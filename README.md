@@ -6,7 +6,7 @@ This repository’s active Kalshi path is a KXBTC15M **sticky-direction, live-ca
 
 It is not a pure Monte Carlo backtest. Historical KXBTC15M settlement outcomes and their timestamps are fixed; only intramarket facts unavailable from the public settlement API—resting-order fills, adverse-path depth, stop activation, and exit execution—are simulated.
 
-The active GitHub Actions worker is [`kalshi_live_trader.py`](kalshi_live_trader.py). Retired Prophet, equity-regime, loss-skip, recovery-sizing, and older averaging-down paths are retained only as archived material and are not called by the v14 worker, watchdog, controlled-restart, audit, or emergency-cancel workflows.
+The active GitHub Actions worker is [`kalshi_live_trader.py`](kalshi_live_trader.py). **v15 restores the selected sticky-side delayed-entry strategy with 2.50× recovery and a permanent-base-linked cap.** It keeps the latest V2 order API, shard-aware funding, stop-exit reconciliation, first-quote capture, and durable checkpoint fixes. Prophet, equity-regime, directional-loss skipping, and opposite-side live ladders are not called by the active strategy.
 
 ## Read this before interpreting a result
 
@@ -19,7 +19,109 @@ The active GitHub Actions worker is [`kalshi_live_trader.py`](kalshi_live_trader
 
 All dollar results below are gross unless explicitly marked otherwise. Fees, live queue position, partial fills, cancellations, latency, and stop slippage can reduce or eliminate the modeled edge.
 
-## Current production configuration: opposite-side GTC ladder v14
+## Current production configuration: restored delayed strategy v15
+
+This is a forward restoration of the last pre-ladder strategy, not a checkout
+of old runner code. [`selected_live_strategy.json`](selected_live_strategy.json)
+and [`live_strategy_config.json`](live_strategy_config.json) use
+`kxbtc15m-delayed-band-live-v15` / schema `15`. Python and Actions validate this
+release independently; older configuration files are rejected, not silently
+converted into v15.
+
+| Setting | Restored default / exact rule |
+| --- | --- |
+| Series | `KXBTC15M`, actual exchange market metadata |
+| Direction | Trade the **sticky prediction itself**; keep it after a directional loss and flip after a directional win |
+| Opening eligibility | The immutable first captured selected-side ask must be **below 53¢**, with complete pre-open subscription coverage |
+| Delayed signal | Wait at least 60 seconds after open; observe the first fresh executable selected-side ask ≥53¢ |
+| Entry band | Ask 53–58¢ → frozen ask-minus-1¢ **limit 52–57¢ inclusive** |
+| Ceiling behavior | A first qualifying ask ≥59¢ produces a limit above 57¢: terminal filter, not a later cheaper entry |
+| Entry order | One post-only GTC limit on the selected sticky side; no strategy-time expiry, no taker fallback, no live ladder |
+| Starting permanent base | `1.00` share for a new v15 state |
+| Recovery | `base × 2.50^exponent`, `Decimal` / two-decimal `ROUND_HALF_UP` |
+| Recovery transition | Every filled, fully realized trade increments the exponent while cumulative cycle net P&L remains negative; reset only at ≥$0 |
+| Zero fills | No recovery or permanent-base change |
+| Cap | `100.00 × permanent_base`: base 1→100 shares; base 1.5→150; base 2→200 |
+| Protective exit | Selected-side executable bid **≤51¢** latches a direct protective exit; no resting 52¢ maker-exit phase |
+| Exit execution | Confirm entry cancellation, reconcile actual fills/position, then reduce-only IOC at the current executable bid; retry only authoritative residual exposure until flat |
+| Permanent-base scaling | First realized-net-profit threshold `$350.00`, threshold growth `2.50×`, permanent increment `+0.50` share |
+| Shadow balance | Separate `$1,000.00` shadow state; no shadow mutation of live state |
+| Checkpoints | Material changes atomically saved/fsynced locally; bounded remote snapshots every 30 seconds and at handoff |
+
+For example, a delayed YES ask of 56¢ places a BUY YES GTC at 55¢. It does
+**not** buy NO at 44¢. The reference is frozen: later prices do not move that
+order. If the ask is still below 53¢ after 60 seconds, the bot continues
+observing until a qualifying quote or market close; it does not backdate an
+order. Maker submission is not a fill. Actual fills, fees, and settlement
+accounting remain exchange-authoritative; shadow fills use the existing
+conservative subsequent public-trade-through evidence, not an assumed touch.
+
+**51¢ is an exit trigger, not a guaranteed execution price.** Gaps, unavailable
+liquidity, API outages, and market close can prevent a stop from executing at
+51¢ or before settlement. Partial IOC exits are reconciled and retried for
+only the remaining position; an unknown POST is reconciled by its exact
+durable client ID before retry, never blindly duplicated. Operational loss,
+funding, and unknown-risk controls remain in place.
+
+### Pause and resume controls
+
+At the September 15 restoration, production was deliberately **paused**:
+`KALSHI_MAINTENANCE_MODE=true`; both the production workflow and watchdog were
+disabled. The previous worker stopped, its final checkpoint succeeded, and a
+read-only exchange position audit confirmed it was flat. Merging this release
+does not resume trading or send a test order.
+
+The workflow gate blocks both live and shadow trading while maintenance is
+on, before the startup order probe; read-only reconciliation remains allowed.
+Handoff checks the **current** maintenance flag and workflow state, so a pause
+set during a five-hour run prevents a successor. `cancel-in-progress: false`
+preserves singleton order management. The watchdog dispatches only current
+`main`, never restores runner code from a runtime ref, and requires a previous
+explicit **v15** live run before recovering in live mode.
+
+To resume later, explicitly enable the production workflow/watchdog, set
+maintenance false, and manually select `live_enabled=true`. Live still
+requires `KALSHI_LIVE_ENABLED=true` and `KALSHI_SHADOW_ONLY=false`; an unchecked
+live switch is shadow-only. No resume is performed by this update.
+
+### Durable settings and state isolation
+
+| Mode | State | Append-only audit ledger |
+| --- | --- | --- |
+| Live | `data/kalshi_live_delayed_band_v15_state.json` | `data/kalshi_live_delayed_band_v15_audit.jsonl` |
+| Shadow | `data/kalshi_shadow_delayed_band_v15_state.json` | `data/kalshi_shadow_delayed_band_v15_audit.jsonl` |
+
+Only allowlisted data/config from `runtime-state-kxbtc15m-delayed-v15` are
+restored. Archived v13/v14 refs and ledgers are preserved and are **not
+imported**. In particular, the archived v13 exponent 17 / −$64.934590 recovery
+cycle is not silently applied to a new v15 run. No v15 state exists until a
+future run initializes it; a new state starts at base 1.00 / exponent 0 /
+cycle P&L 0. This starts a new accounting namespace; it does not erase previous
+account losses, reset the wallet balance, or delete old audit evidence.
+
+Workflow inputs are `live_enabled`, `reconcile_only`, `fresh_state_reset`,
+`initial_shares`, `scaling_multiplier`, `max_share_cap`,
+`max_cap_per_base_share`, `profit_threshold`,
+`shares_added_after_profit_threshold`, and `max_stop_loss_cents`.
+**Blank numeric inputs preserve the last successfully checkpointed v15
+setting**; absent v15 state uses source defaults. A changed initial share
+input does not overwrite an existing permanent base or unresolved recovery
+cycle. Sizing parameter changes apply to a fresh cycle, while an existing
+negative cycle retains its originating parameters. Explicit reset requires
+authoritative flat checks and preserves the ledger. Setting
+`max_cap_per_base_share=0` opts into a fixed `max_share_cap`; otherwise the
+per-base cap controls effective exposure. The protective trigger is
+configurable (10–51¢), with this restored release defaulting to 51¢.
+
+The optimizer's selected delayed-profile export uses the same v15 config
+format and shared pure sizing/recovery functions. The older statistical and
+research tables below remain historical evidence, not a new v15 backtest or
+a profit guarantee.
+
+## Archived opposite-side GTC ladder v14 (not active production)
+
+The following describes the retired opposite-side ladder release. Its orders,
+inputs, cap policy, and state paths are not the active v15 strategy above.
 
 [`selected_live_strategy.json`](selected_live_strategy.json) is the canonical
 configuration. The executable contract is
