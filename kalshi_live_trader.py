@@ -1,10 +1,10 @@
 """Production KXBTC15M hybrid live trader.
 
-This runner replaces the retired recovery runner in the GitHub workflow.  It
-reuses the established Kalshi V2 REST/WebSocket/auth transport and executes the
-pure fixed-point plan from :mod:`opposite_ladder_core`.  Shadow-account metrics
-remain isolated from live state.  Prophet, directional-loss skipping, recovery
-sizing, permanent base scaling, and position caps are not part of v14.
+The v15 release restores the reviewed v13 same-side delayed maker strategy
+without rolling back the later V2 transport, reconciliation, or durability
+fixes. Recovery/base/cap accounting remains shared with historical replay via
+:mod:`strategy_core`. Shadow and live use separate durable namespaces. The
+opposite-side v14 ladder is retained only for offline regression coverage.
 """
 
 from __future__ import annotations
@@ -73,17 +73,15 @@ ORDER_PREFIX = "kxbtc15m-hybrid-v1-"
 # silently reinterpret an older selected configuration after a restart or a
 # watchdog handoff.  Bump both values deliberately with a reviewed migration
 # whenever the shared live/backtest strategy semantics change.
-# v14 is a hard compatibility boundary.  At/after 60 seconds, a sticky-side
-# ask in the inclusive 53c..57c band freezes five post-only GTC BUY orders on
-# the opposite side: exact complement 100-minus-sticky-ask (47c..43c) at 1x
-# base and 40/30/20/10c at
-# 2/4/8/16x base.  Recovery, permanent-base scaling, and position caps are not
-# part of this contract. Contract revision 3 preserves revision 2's flatten
-# path, which latches when the
-# held-side executable bid reaches 51c OR the sticky-side executable ask falls
-# to 51c. An older revision cannot load the revised canonical configuration.
-ACTIVE_STRATEGY_VERSION = "kxbtc15m-opposite-ladder-live-v14"
-ACTIVE_CONFIG_SCHEMA_VERSION = 14
+# v15 is a forward restoration of v13's SAME-side delayed strategy, not an
+# old-code checkout. A fresh delayed >=53c ask freezes one ask-minus-1c maker
+# order, capped at 57c. Recovery uses base*2.5**exponent until net recovery;
+# the default cap is permanent_base*100. The direct 51c exit latches and
+# retries only authoritative residual exposure. v13/v14 checkpoints are
+# archived separately and are never silently reinterpreted as v15 state.
+ACTIVE_STRATEGY_VERSION = "kxbtc15m-delayed-band-live-v15"
+ACTIVE_CONFIG_SCHEMA_VERSION = 15
+RESTORED_SAME_SIDE_CONTRACT_VERSION = 1
 # Operational release guard used by the production workflow.  Version 3 means
 # opening entry prices come from the buffered price-only stream, not the first
 # later complete-depth book.  This can advance without reinterpreting recovery
@@ -336,9 +334,9 @@ DECIMAL_CONFIG_FIELDS = {
     "entry_price", "stop_price", "starting_base", "recovery_multiplier", "first_base_threshold",
     "threshold_growth_multiplier", "base_increment", "provisional_outcome_threshold",
     "max_recovery_cycle_loss", "max_daily_realized_loss", "starting_shadow_balance", "maker_price_offset",
-    "stop_baseline_entry_price",
+    "stop_baseline_entry_price", "max_position",
 }
-OPTIONAL_DECIMAL_CONFIG_FIELDS: set[str] = set()
+OPTIONAL_DECIMAL_CONFIG_FIELDS = {"max_position_per_base_share"}
 INTEGER_CONFIG_FIELDS = {
     "signal_delay_seconds", "entry_timeout_seconds", "entry_lateness_seconds", "outcome_observation_seconds",
     "max_recovery_exponent", "max_api_failures", "handoff_guard_seconds", "opening_quote_max_observations",
@@ -368,11 +366,8 @@ SHADOW_STOP_PROFILE_PRICES = {
     "sticky_stop_40": Decimal("0.40"),
     "delayed_53_57_stop_50": Decimal("0.50"),
     "delayed_53_57_exit_51": Decimal("0.51"),
-    "opposite_ladder_53_58_take_profit_50": Decimal("0.50"),
-    "opposite_ladder_53_58_flatten_51": Decimal("0.51"),
-    "opposite_ladder_53_57_flatten_51": Decimal("0.51"),
 }
-CANONICAL_LIVE_SHADOW_PROFILE = "opposite_ladder_53_57_flatten_51"
+CANONICAL_LIVE_SHADOW_PROFILE = "delayed_53_57_exit_51"
 
 
 def price_to_cents(value: Decimal | str, name: str = "price") -> int:
@@ -509,16 +504,20 @@ def assert_active_strategy_contract(value: dict[str, Any]) -> None:
 
 
 def validate_entry_price_contract(value: dict[str, Any]) -> None:
-    """Validate the immutable v14 opposite-side ladder contract."""
+    """Validate the immutable maker-entry and direct protective-exit contract."""
 
     entry = decimal(value["entry_price"])
     offset = decimal(value["maker_price_offset"])
     stop = decimal(value["stop_price"])
     stop_baseline = decimal(value["stop_baseline_entry_price"])
-    if not Decimal("0") < entry < Decimal("1"):
-        raise ValueError("reference entry_price must be within the contract range")
-    if value.get("entry_execution_mode") != "opposite_side_doubling_ladder":
-        raise ValueError("the active strategy requires entry_execution_mode=opposite_side_doubling_ladder")
+    if not stop < entry < Decimal("1"):
+        raise ValueError("reference entry_price must satisfy stop < entry_price < 1")
+    if value.get("entry_execution_mode") != "delayed_threshold_band_maker":
+        raise ValueError("the active strategy requires entry_execution_mode=delayed_threshold_band_maker")
+    if _bool(value.get("opposite_ladder_enabled", False)):
+        raise ValueError("v15 forbids opposite-side ladder orders")
+    if not _bool(value.get("recovery_enabled", True)) or not _bool(value.get("base_scaling_enabled", True)):
+        raise ValueError("v15 requires shared recovery and realized-profit base scaling")
     if value.get("maker_order_time_in_force") != "good_till_canceled":
         raise ValueError("the active strategy requires maker_order_time_in_force=good_till_canceled")
     if value.get("entry_order_lifetime") != "until_filled_or_market_close":
@@ -531,8 +530,8 @@ def validate_entry_price_contract(value: dict[str, Any]) -> None:
         raise ValueError(
             "max_recovery_exponent must be 0; the active strategy disables the exponent circuit breaker"
         )
-    if stop_baseline != Decimal("0.51") or stop != Decimal("0.51"):
-        raise ValueError("the opposite ladder requires a fixed two-sided 51c flatten threshold")
+    if stop_baseline != Decimal("0.50"):
+        raise ValueError("the hybrid strategy requires stop_baseline_entry_price to equal exactly 0.50")
     profile = str(value.get("shadow_profile") or CANONICAL_LIVE_SHADOW_PROFILE)
     expected_profile_stop = SHADOW_STOP_PROFILE_PRICES.get(profile)
     if expected_profile_stop is None:
@@ -546,12 +545,13 @@ def validate_entry_price_contract(value: dict[str, Any]) -> None:
     trading_mode = str(value.get("trading_mode") or "shadow")
     if profile != CANONICAL_LIVE_SHADOW_PROFILE and trading_mode != "shadow":
         raise ValueError("comparison stop profiles are shadow-only and cannot be loaded in live mode")
-    if profile != CANONICAL_LIVE_SHADOW_PROFILE:
-        raise ValueError("v14 accepts only the opposite-side ladder profile")
-    if value.get("stop_policy") != "opposite_side_take_profit_ioc":
-        raise ValueError("the active strategy requires stop_policy=opposite_side_take_profit_ioc")
+    if profile == CANONICAL_LIVE_SHADOW_PROFILE:
+        if value.get("stop_policy") != "direct_ioc_at_trigger":
+            raise ValueError("the active strategy requires stop_policy=direct_ioc_at_trigger")
+    elif value.get("stop_policy") != "hybrid_maker_then_hard_stop":
+        raise ValueError("legacy comparison profiles require stop_policy=hybrid_maker_then_hard_stop")
     if int(value["entry_limit_offset_cents"]) != 1:
-        raise ValueError("the active opposite ladder requires entry_limit_offset_cents=1")
+        raise ValueError("v15 requires an exact one-cent-below maker limit")
     level_min = int(value["shadow_entry_level_min_cents"])
     level_max = int(value["shadow_entry_level_max_cents"])
     level_step = int(value["shadow_entry_level_step_cents"])
@@ -562,14 +562,24 @@ def validate_entry_price_contract(value: dict[str, Any]) -> None:
     hard_stop = int(value["hybrid_hard_stop_cents"])
     if not 1 <= trigger <= 99:
         raise ValueError("direct protective-exit price must be a valid integer-cent tick")
-    if (trigger, maker_exit, hard_stop) != (51, 51, 51):
-        raise ValueError("v14 revision 2 flatten compatibility fields must all equal 51c")
-    if int(value.get("opposite_take_profit_cents", 0)) != 51:
-        raise ValueError("v14 revision 2 requires opposite_take_profit_cents=51")
+    if profile == CANONICAL_LIVE_SHADOW_PROFILE:
+        if not 10 <= trigger <= 51 or (maker_exit, hard_stop) != (trigger, trigger):
+            raise ValueError("the canonical delayed band requires one direct 10c-51c protective-exit price")
+        if stop != cents_price(trigger):
+            raise ValueError("the canonical delayed band stop_price must equal the direct trigger")
+    else:
+        profile_cents = price_to_cents(expected_profile_stop, "shadow profile stop")
+        if (hard_stop, trigger, maker_exit) != (
+            profile_cents, profile_cents + 1, profile_cents + 2,
+        ):
+            raise ValueError(
+                "experimental shadow profiles require hard/trigger/maker stops "
+                "at profile/profile+1c/profile+2c"
+            )
     if not _bool(value.get("hybrid_stop_enabled", True)):
-        raise ValueError("the active v14 strategy requires take-profit monitoring")
+        raise ValueError("the active v15 strategy requires protective exit monitoring")
     if value.get("shadow_fill_model") != "conservative_public_trade_through":
-        raise ValueError("v14 shadow mode requires conservative_public_trade_through")
+        raise ValueError("v15 shadow mode requires conservative_public_trade_through")
     if offset < Decimal("0"):
         raise ValueError("maker_price_offset cannot be negative")
     if int(value["opening_quote_max_observations"]) < 1:
@@ -580,34 +590,28 @@ def validate_entry_price_contract(value: dict[str, Any]) -> None:
         raise ValueError("the active analytics contract requires delayed_entry_threshold_cents=53")
     if int(value.get("delayed_entry_start_seconds", -1)) != 60:
         raise ValueError("the active delayed entry contract requires delayed_entry_start_seconds=60")
-    if int(value.get("delayed_entry_max_trigger_cents", 0)) != 57:
-        raise ValueError("the active opposite ladder requires a 57c inclusive sticky-side trigger ceiling")
-    if int(value.get("opposite_initial_limit_min_cents", 0)) != 43:
-        raise ValueError("the active opposite ladder requires a 43c initial-limit floor")
-    if int(value.get("opposite_initial_limit_max_cents", 0)) != 47:
-        raise ValueError("the active opposite ladder requires a 47c initial-limit ceiling")
     if int(value.get("delayed_entry_max_limit_cents", 0)) != 57:
-        raise ValueError("the compatibility delayed-entry limit ceiling must remain 57c")
-    if not _bool(value.get("opposite_ladder_enabled", False)):
-        raise ValueError("opposite_ladder_enabled must be true")
-    if _bool(value.get("recovery_enabled", True)):
-        raise ValueError("v14 removes recovery sizing")
-    if _bool(value.get("position_cap_enabled", False)):
-        raise ValueError("v14 removes the position cap")
-    if _bool(value.get("base_scaling_enabled", True)):
-        raise ValueError("v14 uses only the fixed operator base input")
+        raise ValueError("the active delayed entry contract requires delayed_entry_max_limit_cents=57")
 
 
 def validate_sizing_config(value: dict[str, Any]) -> None:
-    """Validate the sole v14 sizing input: a fixed two-decimal base."""
+    """Validate the small set of sizing values exposed by GitHub Actions."""
 
     starting_base = decimal(value["starting_base"])
+    base_increment = decimal(value["base_increment"])
     if starting_base != round_shares(starting_base):
         raise ValueError("starting_base must have at most two decimal places")
+    if base_increment != round_shares(base_increment):
+        raise ValueError("base_increment must have at most two decimal places")
+    strategy_parameters(value)  # shared finite, positive, two-decimal cap validation
     if starting_base <= Decimal("0"):
         raise ValueError("starting_base must be positive")
-    if decimal(value["recovery_multiplier"]) != Decimal("1"):
-        raise ValueError("v14 recovery_multiplier compatibility field must equal 1")
+    if decimal(value["recovery_multiplier"]) < Decimal("1"):
+        raise ValueError("recovery_multiplier must be at least 1")
+    if decimal(value["threshold_growth_multiplier"]) < Decimal("1"):
+        raise ValueError("threshold_growth_multiplier must be at least 1")
+    if decimal(value["first_base_threshold"]) <= Decimal("0") or base_increment <= Decimal("0"):
+        raise ValueError("profit threshold and base increment must be positive")
 
 
 def load_config(path: Path) -> dict[str, Any]:
@@ -616,12 +620,10 @@ def load_config(path: Path) -> dict[str, Any]:
         raise ValueError("live strategy configuration must be a JSON object")
     required = {
         "strategy_version", "series", "entry_price", "stop_price", "starting_base", "recovery_multiplier",
-        "first_base_threshold", "threshold_growth_multiplier", "base_increment",
+        "first_base_threshold", "threshold_growth_multiplier", "base_increment", "max_position",
         "stop_policy", "stop_baseline_entry_price", "entry_execution_mode", "entry_limit_offset_cents",
         "maker_order_time_in_force", "entry_order_lifetime", "entry_timeout_seconds",
         "opening_quote_capture_seconds", "delayed_entry_start_seconds", "delayed_entry_max_limit_cents",
-        "opposite_initial_limit_min_cents", "opposite_initial_limit_max_cents",
-        "delayed_entry_max_trigger_cents", "opposite_take_profit_cents",
         "shadow_fill_model", "shadow_entry_level_min_cents", "shadow_entry_level_max_cents",
         "shadow_entry_level_step_cents", "hybrid_stop_enabled", "hybrid_stop_trigger_cents",
         "hybrid_maker_exit_cents", "hybrid_hard_stop_cents", "trading_mode", "config_schema_version",
@@ -629,13 +631,11 @@ def load_config(path: Path) -> dict[str, Any]:
     missing = required - value.keys()
     if missing:
         raise ValueError(f"live strategy configuration is missing: {', '.join(sorted(missing))}")
+    # New and legacy configs default to the reviewed permanent-base-linked
+    # cap.  An operator can persist an explicit JSON null (workflow value 0)
+    # to retain a fixed ``max_position`` instead.
+    value.setdefault("max_position_per_base_share", "100.00")
     assert_active_strategy_contract(value)
-    # v14 sizes the immutable 1/2/4/8/16 order ladder directly from
-    # ``starting_base``.  Strip retired cap keys restored from an early v14
-    # checkpoint so they cannot remain part of the active config/hash.
-    value.pop("max_position", None)
-    value.pop("max_position_per_base_share", None)
-    value.pop("position_cap_enabled", None)
     if value["series"] != "KXBTC15M":
         raise ValueError("this production runner is intentionally limited to KXBTC15M")
     for name in DECIMAL_CONFIG_FIELDS & value.keys():
@@ -654,10 +654,10 @@ def load_config(path: Path) -> dict[str, Any]:
     value.setdefault("shadow_fill_model", "conservative_public_trade_through")
     value.setdefault("starting_shadow_balance", "1000.00")
     value.setdefault("maker_price_offset", "0.01")
-    value.setdefault("stop_policy", "opposite_side_take_profit_ioc")
-    value.setdefault("entry_execution_mode", "opposite_side_doubling_ladder")
+    value.setdefault("stop_policy", "direct_ioc_at_trigger")
+    value.setdefault("entry_execution_mode", "delayed_threshold_band_maker")
     value.setdefault("maker_order_time_in_force", "good_till_canceled")
-    value.setdefault("stop_baseline_entry_price", "0.51")
+    value.setdefault("stop_baseline_entry_price", "0.50")
     value.setdefault("signal_delay_seconds", 0)
     value.setdefault("signal_mode", "sticky_until_directional_win")
     value.setdefault("shadow_profile", CANONICAL_LIVE_SHADOW_PROFILE)
@@ -673,13 +673,6 @@ def load_config(path: Path) -> dict[str, Any]:
     value.setdefault("delayed_entry_threshold_cents", 53)
     value.setdefault("delayed_entry_start_seconds", 60)
     value.setdefault("delayed_entry_max_limit_cents", 57)
-    value.setdefault("delayed_entry_max_trigger_cents", 57)
-    value.setdefault("opposite_initial_limit_min_cents", 43)
-    value.setdefault("opposite_initial_limit_max_cents", 47)
-    value.setdefault("opposite_take_profit_cents", 51)
-    value.setdefault("opposite_ladder_enabled", True)
-    value.setdefault("recovery_enabled", False)
-    value.setdefault("base_scaling_enabled", False)
     value.setdefault("entry_lateness_seconds", 60)
     value.setdefault("stop_poll_interval", 1.0)
     value.setdefault("reconciliation_interval", 5.0)
@@ -734,81 +727,14 @@ def save_config(path: Path, config: dict[str, Any]) -> None:
 
 
 def enforce_active_runtime_config(path: Path) -> dict[str, Any]:
-    """Upgrade only reviewed v14 opposite-ladder contracts at handoff.
+    """Accept only the forward v15 same-side release, never restored v14 code.
 
-    A runtime checkpoint can restore revision 2's 53c..58c band over the
-    repository default.  Accept only that exact predecessor (or revision 3
-    itself), then atomically install the terminal 53c..57c decision and its
-    exact complementary 43c..47c initial-entry band.  Unrelated configuration
-    remains a hard error.
+    Each release has its own runtime ref. The v15 worker must not restore an
+    opposite-ladder config or import either archived v13/v14 risk/accounting.
+    Blank operator inputs preserve only successfully checkpointed v15 values.
     """
 
-    raw = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(raw, dict):
-        raise ValueError("runtime strategy configuration must be an object")
-    expected = {
-        "strategy_version": ACTIVE_STRATEGY_VERSION,
-        "config_schema_version": ACTIVE_CONFIG_SCHEMA_VERSION,
-        "entry_execution_mode": "opposite_side_doubling_ladder",
-        "delayed_entry_threshold_cents": 53,
-        "delayed_entry_start_seconds": 60,
-        "entry_limit_offset_cents": 1,
-        "maker_order_time_in_force": "good_till_canceled",
-        "entry_order_lifetime": "until_filled_or_market_close",
-    }
-    mismatches = {
-        key: (raw.get(key), value)
-        for key, value in expected.items()
-        if raw.get(key) != value
-    }
-    if mismatches:
-        raise ValueError(f"refusing to rewrite noncanonical runtime config: {mismatches}")
-    prior_contract = (
-        str(raw.get("stop_price")),
-        str(raw.get("stop_baseline_entry_price")),
-        int(raw.get("hybrid_stop_trigger_cents", 0)),
-        int(raw.get("hybrid_maker_exit_cents", 0)),
-        int(raw.get("hybrid_hard_stop_cents", 0)),
-        int(raw.get("opposite_take_profit_cents", 0)),
-        str(raw.get("shadow_profile")),
-        int(raw.get("delayed_entry_max_trigger_cents", 0)),
-        raw.get("opposite_initial_limit_min_cents"),
-        raw.get("opposite_initial_limit_max_cents"),
-        int(raw.get("delayed_entry_max_limit_cents", 0)),
-    )
-    allowed_contracts = {
-        (
-            "0.51", "0.51", 51, 51, 51, 51,
-            "opposite_ladder_53_58_flatten_51", 58, None, None, 57,
-        ),
-        (
-            "0.51", "0.51", 51, 51, 51, 51,
-            CANONICAL_LIVE_SHADOW_PROFILE, 57, 43, 47, 57,
-        ),
-    }
-    if prior_contract not in allowed_contracts:
-        raise ValueError(f"refusing unrecognized runtime ladder contract: {prior_contract}")
-    raw.update({
-        "stop_price": "0.51",
-        "stop_baseline_entry_price": "0.51",
-        "hybrid_stop_trigger_cents": 51,
-        "hybrid_maker_exit_cents": 51,
-        "hybrid_hard_stop_cents": 51,
-        "opposite_take_profit_cents": 51,
-        "delayed_entry_max_trigger_cents": 57,
-        "delayed_entry_max_limit_cents": 57,
-        "opposite_initial_limit_min_cents": 43,
-        "opposite_initial_limit_max_cents": 47,
-        "shadow_profile": CANONICAL_LIVE_SHADOW_PROFILE,
-        "selection_basis": (
-            "first_fresh_post60_sticky_ask_53_57_terminal_gate_then_trade_opposite_"
-            "at_exact_complement_47_43_and_40_30_20_10_doubling_gtc_flatten_"
-            "when_either_side_touches_51"
-        ),
-    })
-    validated = load_config_from_value(raw)
-    save_config(path, validated)
-    return validated
+    return load_config(path)
 
 
 def apply_overrides(config: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
@@ -852,12 +778,10 @@ def load_config_from_value(value: dict[str, Any]) -> dict[str, Any]:
         temporary[name] = float(temporary[name])
     required = {
         "strategy_version", "series", "entry_price", "stop_price", "starting_base", "recovery_multiplier",
-        "first_base_threshold", "threshold_growth_multiplier", "base_increment", "stop_policy",
+        "first_base_threshold", "threshold_growth_multiplier", "base_increment", "max_position", "stop_policy",
         "stop_baseline_entry_price", "entry_execution_mode", "entry_limit_offset_cents", "shadow_fill_model",
         "maker_order_time_in_force", "entry_order_lifetime", "entry_timeout_seconds",
         "opening_quote_capture_seconds", "delayed_entry_start_seconds", "delayed_entry_max_limit_cents",
-        "opposite_initial_limit_min_cents", "opposite_initial_limit_max_cents",
-        "delayed_entry_max_trigger_cents", "opposite_take_profit_cents",
         "shadow_entry_level_min_cents", "shadow_entry_level_max_cents", "shadow_entry_level_step_cents",
         "hybrid_stop_enabled", "hybrid_stop_trigger_cents", "hybrid_maker_exit_cents",
         "hybrid_hard_stop_cents", "trading_mode", "config_schema_version",
@@ -865,19 +789,16 @@ def load_config_from_value(value: dict[str, Any]) -> dict[str, Any]:
     if required - temporary.keys():
         raise ValueError("invalid overridden live strategy configuration")
     assert_active_strategy_contract(temporary)
-    temporary.pop("max_position", None)
-    temporary.pop("max_position_per_base_share", None)
-    temporary.pop("position_cap_enabled", None)
     # Reuse the normal rules without doing a file round-trip.
     if temporary["series"] != "KXBTC15M":
         raise ValueError("invalid strategy series")
     temporary.setdefault("shadow_fill_model", "conservative_public_trade_through")
     temporary.setdefault("starting_shadow_balance", "1000.00")
     temporary.setdefault("maker_price_offset", "0.01")
-    temporary.setdefault("stop_policy", "opposite_side_take_profit_ioc")
-    temporary.setdefault("entry_execution_mode", "opposite_side_doubling_ladder")
+    temporary.setdefault("stop_policy", "direct_ioc_at_trigger")
+    temporary.setdefault("entry_execution_mode", "delayed_threshold_band_maker")
     temporary.setdefault("maker_order_time_in_force", "good_till_canceled")
-    temporary.setdefault("stop_baseline_entry_price", "0.51")
+    temporary.setdefault("stop_baseline_entry_price", "0.50")
     temporary.setdefault("signal_mode", "sticky_until_directional_win")
     temporary.setdefault("shadow_profile", CANONICAL_LIVE_SHADOW_PROFILE)
     temporary.setdefault("entry_timeout_seconds", 0)
@@ -887,13 +808,6 @@ def load_config_from_value(value: dict[str, Any]) -> dict[str, Any]:
     temporary.setdefault("delayed_entry_threshold_cents", 53)
     temporary.setdefault("delayed_entry_start_seconds", 60)
     temporary.setdefault("delayed_entry_max_limit_cents", 57)
-    temporary.setdefault("delayed_entry_max_trigger_cents", 57)
-    temporary.setdefault("opposite_initial_limit_min_cents", 43)
-    temporary.setdefault("opposite_initial_limit_max_cents", 47)
-    temporary.setdefault("opposite_take_profit_cents", 51)
-    temporary.setdefault("opposite_ladder_enabled", True)
-    temporary.setdefault("recovery_enabled", False)
-    temporary.setdefault("base_scaling_enabled", False)
     temporary.setdefault("entry_lateness_seconds", 60)
     temporary.setdefault("handoff_guard_seconds", 60)
     temporary.setdefault("opening_quote_max_observations", 500)
@@ -927,17 +841,13 @@ def load_config_from_value(value: dict[str, Any]) -> dict[str, Any]:
 
 
 def strategy_parameters(config: dict[str, Any]) -> StrategyParameters:
-    # StrategyParameters is still shared with archived historical/recovery
-    # replay code.  The live v14 ladder has no cap fields; this unreachable
-    # internal bound only satisfies that legacy type and is never applied to
-    # a v14 ladder order.
     return StrategyParameters(
         recovery_multiplier=Decimal(config["recovery_multiplier"]),
         first_base_threshold=Decimal(config["first_base_threshold"]),
         threshold_growth_multiplier=Decimal(config["threshold_growth_multiplier"]),
         base_increment=Decimal(config["base_increment"]),
         starting_base=Decimal(config["starting_base"]),
-        max_position=Decimal(str(config.get("max_position", "999999999.99"))),
+        max_position=Decimal(config["max_position"]),
         max_position_per_base_share=(
             None
             if config.get("max_position_per_base_share") in (None, "", "0", "0.00")
@@ -1201,6 +1111,8 @@ class LiveEngine:
             "workflow_run_id": os.getenv("GITHUB_RUN_ID"),
             "source_commit": os.getenv("KALSHI_SOURCE_SHA") or os.getenv("GITHUB_SHA"),
             "stop_safety_contract": LIVE_STOP_SAFETY_CONTRACT_VERSION,
+            "position_cap_contract": POSITION_CAP_CONTRACT_VERSION,
+            "restored_same_side_contract": RESTORED_SAME_SIDE_CONTRACT_VERSION,
             "observed_at": utc_now(),
         }
         self.parameters = strategy_parameters(config)
@@ -1248,7 +1160,7 @@ class LiveEngine:
             checkpoint_paths.insert(0, config_path)
         startup_order_check_journal = Path(os.getenv(
             "KALSHI_STARTUP_ORDER_CHECK_JOURNAL",
-            "data/.kalshi_live_opposite_ladder_v14_startup_order_check/order-smoke-test.json",
+            "data/.kalshi_live_delayed_band_v15_startup_order_check/order-smoke-test.json",
         ))
         if not dry_run and startup_order_check_journal.exists():
             # Once the pre-worker create/cancel proof succeeds, retain it in
@@ -1968,11 +1880,13 @@ class LiveEngine:
         )
         LOG.warning(
             "NEW MARKET SIGNAL | ticker=%s source=%s provisional=%s prior_side=%s transition=%s "
-            "prediction=%s trade_opposite=%s btc_target=%s comparison=%s base=%s entry_mode=%s exit_policy=%s",
+            "prediction=%s trade_side=%s btc_target=%s comparison=%s base=%s target_qty=%s "
+            "exponent=%s entry_mode=%s exit_policy=%s",
             ticker, provisional["ticker"], source.upper(), prior_side and prior_side.upper(), directional_transition,
             (sticky_side if opposite_ladder else side).upper(), side.upper(),
             record.get("btc_target_price_display"), record.get("btc_target_comparison"),
-            quantity, self.config["entry_execution_mode"], exit_description,
+            base_before, quantity, record["recovery_exponent_before"],
+            self.config["entry_execution_mode"], exit_description,
         )
         self.checkpoint("signal_created")
         return record
@@ -7456,7 +7370,7 @@ class LiveEngine:
         if now >= float(record["market_close_epoch"]):
             self.finish_entry_attempt(record, Decimal("0"), "market_closed_before_delayed_entry")
             return
-        # Current config validation permits only v13.  The v11 name remains
+        # Current config validation permits only v15. The v11 name remains
         # reachable for pinned regression fixtures that instantiate LiveEngine
         # directly; it cannot be loaded by a production worker.
         if self.config["entry_execution_mode"] not in {
@@ -9169,19 +9083,15 @@ class LiveEngine:
                     self.state.get("cumulative_realized_pnl"), fees["total_fees_paid"],
                     health["breaker_reason"],
                 )
-                ladder = record.get("opposite_ladder", {}) if isinstance(record, dict) else {}
-                plan = ladder.get("plan", {}) if isinstance(ladder.get("plan"), dict) else {}
                 LOG.warning(
-                    "HEARTBEAT | mode=%s ticker=%s state=%s sticky_side=%s trade_side=%s "
-                    "base=%s ladder_quantities=%s recovery=DISABLED cap=NONE "
-                    "orders_acknowledged=%s/%s exit_latched=%s active=%s close_in=%s",
+                    "HEARTBEAT | mode=%s ticker=%s state=%s side=%s base=%s exponent=%d "
+                    "target=%s cap=%s cap_per_base=%s deficit=%s threshold=%s active=%s close_in=%s",
                     "DRY_RUN" if self.dry_run else "LIVE",
-                    active and active["ticker"], record.get("status"),
-                    record.get("sticky_signal_side"), record.get("trade_side"),
-                    self.config["starting_base"],
-                    "/".join(str(item.get("quantity")) for item in plan.get("orders", [])) or "pending",
-                    ladder.get("accepted_order_count", 0), ladder.get("planned_order_count", 5),
-                    bool(ladder.get("exit_latched")), self.state.get("active_market"), gtc_market_close_in,
+                    active and active["ticker"], record.get("status"), record.get("signal_side"),
+                    sizing.base_share_count, sizing.recovery_exponent, sizing.prescribed_quantity(),
+                    self.current_parameters().effective_max_position(sizing.base_share_count),
+                    self.current_parameters().max_position_per_base_share, sizing.recovery_cycle_pnl,
+                    sizing.next_base_threshold, self.state.get("active_market"), gtc_market_close_in,
                 )
                 LOG.warning(
                     "ENTRY STATUS | ticker=%s decision=%s opening_ask=%s trigger_ask=%s "
@@ -9220,11 +9130,10 @@ class LiveEngine:
                         stats["total_fees_paid"],
                     )
                 LOG.warning(
-                    "EXIT STATUS | ticker=%s boundary=trade_bid>=%sc_or_sticky_ask<=%sc "
+                    "EXIT STATUS | ticker=%s trigger=selected_bid<=%sc policy=direct_ioc_at_trigger "
                     "state=%s class=%s entry_filled_qty=%s exit_filled_qty=%s "
                     "authoritative_position=%s residual_retry=reduce_only_IOC",
-                    active and active["ticker"], self.config["opposite_take_profit_cents"],
-                    self.config["opposite_take_profit_cents"], ladder.get("state"),
+                    active and active["ticker"], self.config["hybrid_stop_trigger_cents"], hybrid.get("state"),
                     record.get("exit_classification"), record.get("actual_quantity"),
                     format(self.exit_filled_quantity(record), "f"),
                     self.state.get("current_position"),
@@ -9287,8 +9196,8 @@ class LiveEngine:
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
     result.add_argument("--config", type=Path, default=Path("live_strategy_config.json"))
-    result.add_argument("--state-file", type=Path, default=Path("data/kalshi_live_opposite_ladder_v14_state.json"))
-    result.add_argument("--audit-ledger", type=Path, default=Path("data/kalshi_live_opposite_ladder_v14_audit.jsonl"))
+    result.add_argument("--state-file", type=Path, default=Path("data/kalshi_live_delayed_band_v15_state.json"))
+    result.add_argument("--audit-ledger", type=Path, default=Path("data/kalshi_live_delayed_band_v15_audit.jsonl"))
     result.add_argument("--run-seconds", type=float, default=19_200)
     result.add_argument("--persist-config", action="store_true")
     result.add_argument("--reconcile-only", action="store_true")
@@ -9366,14 +9275,15 @@ async def async_main(args: argparse.Namespace) -> int:
     if args.persist_config:
         save_config(args.config, config)
         LOG.warning(
-            "CONFIG SAVED LOCALLY | initial_base_shares=%s recovery=DISABLED position_cap=DISABLED "
-            "base_scaling=DISABLED sticky_trigger_band=%s-%sc opposite_initial=ask_minus_%sc "
-            "rungs=40c@2x,30c@4x,20c@8x,10c@16x take_profit_bid=%sc "
+            "CONFIG SAVED LOCALLY | initial_shares=%s recovery_multiplier=%s threshold_growth_multiplier=%s "
+            "initial_or_fixed_share_cap=%s cap_per_base_share=%s first_profit_threshold=%s "
+            "shares_added=%s hard_stop_cents=%s "
             "mode=%s hash=%s | blank_inputs=preserve_restored_values remote_persistence=requires_successful_checkpoint "
-            "v13_recovery_state=NOT_IMPORTED",
-            config["starting_base"], config["delayed_entry_threshold_cents"],
-            config["delayed_entry_max_trigger_cents"], config["entry_limit_offset_cents"],
-            config["opposite_take_profit_cents"], expected_mode, config_hash(config)[:12],
+            "existing_v15_base_and_recovery=preserved archived_v13_v14_state=NOT_IMPORTED",
+            config["starting_base"], config["recovery_multiplier"], config["threshold_growth_multiplier"],
+            config["max_position"], config.get("max_position_per_base_share"),
+            config["first_base_threshold"], config["base_increment"],
+            config["hybrid_hard_stop_cents"], expected_mode, config_hash(config)[:12],
         )
     migrations = state.get("config_migrations", [])
     if migrations and migrations[-1].get("kind") == "disable_recovery_exponent_breaker":

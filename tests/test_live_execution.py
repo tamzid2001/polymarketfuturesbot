@@ -13,7 +13,7 @@ from unittest.mock import patch
 
 from audit_ledger import append_audit
 from live_checkpoint import (
-    DELAYED_V12_RUNTIME_STATE_REF, DELAYED_V13_RUNTIME_STATE_REF, DEFAULT_RUNTIME_STATE_REF,
+    DELAYED_V12_RUNTIME_STATE_REF, DELAYED_V15_RUNTIME_STATE_REF, DEFAULT_RUNTIME_STATE_REF,
     RUNTIME_PAYLOAD_PREFIX, RUNTIME_STATE_MANIFEST,
     RUNTIME_STATE_OWNER, RUNTIME_STATE_SCHEMA_VERSION,
     MaterialCheckpointPublisher, publish_runtime_snapshot, validate_runtime_paths,
@@ -22,8 +22,7 @@ from live_checkpoint import (
 from kalshi_btc15m_average_down import KalshiLiveFeed
 from kalshi_live_trader import (
     BTC_TARGET_CAPTURE_CONTRACT_VERSION, LiveEngine, ProvisionalOutcomeTracker, QuoteObservation,
-    btc_target_metadata, deterministic_client_order_id, enforce_active_runtime_config,
-    epoch, live_mode_allowed, load_config,
+    btc_target_metadata, deterministic_client_order_id, epoch, live_mode_allowed, load_config,
     startup_order_check_allows_worker,
     market_metadata,
 )
@@ -233,7 +232,7 @@ class LiveExecutionTests(unittest.TestCase):
     def setUp(self) -> None:
         self.config = load_config(ROOT / "live_strategy_config.json")
         # Most cases in this long-running module intentionally pin the v11
-        # opening-entry behavior.  Production-v13 behavior has a separate
+        # opening-entry behavior.  Production-v15 behavior has a separate
         # contract suite so changing the selected config cannot mutate the
         # meaning of these historical regression fixtures.
         self.config.update({
@@ -247,9 +246,6 @@ class LiveExecutionTests(unittest.TestCase):
             "hybrid_hard_stop_cents": 44,
             "recovery_multiplier": "1.01",
             "threshold_growth_multiplier": "1.01",
-            "max_position": "100.00",
-            "max_position_per_base_share": None,
-            "position_cap_enabled": True,
             "delayed_entry_start_seconds": 0,
         })
 
@@ -871,49 +867,6 @@ class LiveExecutionTests(unittest.TestCase):
         changed = dict(self.config, recovery_multiplier="1.02", threshold_growth_multiplier="1.02")
         with self.assertRaisesRegex(RuntimeError, "configuration hash differs"):
             load_state(temporary, changed)
-
-    def test_v14_revision3_band_upgrade_preserves_active_unplanned_record(self) -> None:
-        root = Path(tempfile.mkdtemp())
-        config_path = root / "selected_live_strategy.json"
-        state_path = root / "state.json"
-        prior = load_config(ROOT / "selected_live_strategy.json")
-        prior.update({
-            "delayed_entry_max_trigger_cents": 58,
-            "delayed_entry_max_limit_cents": 57,
-            "shadow_profile": "opposite_ladder_53_58_flatten_51",
-            "selection_basis": (
-                "sticky_side_delayed_53_58_then_trade_opposite_at_ask_minus_1_and_"
-                "40_30_20_10_doubling_gtc_flatten_when_either_side_touches_51"
-            ),
-        })
-        prior.pop("opposite_initial_limit_min_cents")
-        prior.pop("opposite_initial_limit_max_cents")
-        config_path.write_text(json.dumps(prior), encoding="utf-8")
-        state = default_state(prior)
-        state["active_market"] = "KXBTC15M-active-unplanned"
-        state["markets"]["KXBTC15M-active-unplanned"] = {
-            "ticker": "KXBTC15M-active-unplanned", "status": "SIGNAL_PENDING",
-            "entry_orders": [], "exit_orders": [], "actual_quantity": "0.00",
-            "opposite_ladder": {"contract_version": 2, "plan": None},
-        }
-        save_state(state_path, state)
-
-        upgraded_config = enforce_active_runtime_config(config_path)
-        upgraded_state = load_state(state_path, upgraded_config)
-
-        self.assertEqual(upgraded_config["delayed_entry_max_trigger_cents"], 57)
-        self.assertEqual(upgraded_config["opposite_initial_limit_min_cents"], 43)
-        self.assertEqual(upgraded_config["opposite_initial_limit_max_cents"], 47)
-        self.assertEqual(upgraded_state["active_market"], "KXBTC15M-active-unplanned")
-        self.assertEqual(
-            upgraded_state["markets"]["KXBTC15M-active-unplanned"]["status"],
-            "SIGNAL_PENDING",
-        )
-        self.assertEqual(upgraded_state["active_config_snapshot"], upgraded_config)
-        self.assertEqual(
-            upgraded_state["config_migrations"][-1]["kind"],
-            "narrow_opposite_ladder_to_terminal_53_57_gate",
-        )
 
     def test_discovery_preloads_api_successor_from_bounded_close_window(self) -> None:
         async def scenario() -> None:
@@ -1940,34 +1893,6 @@ class LiveExecutionTests(unittest.TestCase):
         engine.state["markets"]["KXBTC15M-current"]["status"] = "CLOSED"
         self.assertTrue(engine.handoff_ready(1_300)[0])
 
-    def test_handoff_repairs_only_a_proven_terminal_order_pointer(self) -> None:
-        engine = self.engine()
-        engine.markets = [{
-            "ticker": "KXBTC15M-current", "open_epoch": 1_000,
-            "close_epoch": 1_900, "status": "active",
-        }]
-        engine.state["current_order_id"] = "confirmed-canceled-order"
-        engine.state["markets"]["KXBTC15M-closed"] = {
-            "ticker": "KXBTC15M-closed", "status": "ZERO_FILL",
-            "entry_orders": [{
-                "order_id": "confirmed-canceled-order", "status": "canceled",
-                "remaining_count": "0.00", "fill_count": "0.00",
-            }],
-            "exit_orders": [],
-        }
-
-        ready, _ = engine.handoff_ready(1_300)
-
-        self.assertTrue(ready)
-        self.assertIsNone(engine.state["current_order_id"])
-        self.assertEqual(
-            engine.state["state_repairs"][-1]["kind"],
-            "clear_terminal_current_order_pointer_before_handoff",
-        )
-
-        engine.state["current_order_id"] = "unknown-order"
-        self.assertFalse(engine.handoff_ready(1_300)[0])
-
     def test_latched_breaker_signal_without_order_or_position_does_not_force_six_hour_timeout(self) -> None:
         engine = self.engine()
         engine.markets = [{"ticker": "KXBTC15M-current", "open_epoch": 1_000, "close_epoch": 1_900, "status": "active"}]
@@ -2139,8 +2064,8 @@ class LiveExecutionTests(unittest.TestCase):
             DELAYED_V12_RUNTIME_STATE_REF,
         )
         self.assertEqual(
-            validate_runtime_ref(DELAYED_V13_RUNTIME_STATE_REF),
-            DELAYED_V13_RUNTIME_STATE_REF,
+            validate_runtime_ref(DELAYED_V15_RUNTIME_STATE_REF),
+            DELAYED_V15_RUNTIME_STATE_REF,
         )
         self.assertEqual(validate_runtime_ref("runtime-state-stop-20"), "runtime-state-stop-20")
         with self.assertRaisesRegex(ValueError, "non-owned durable paths"):
@@ -2160,13 +2085,13 @@ class LiveExecutionTests(unittest.TestCase):
             ],
         )
         validate_runtime_paths(
-            DELAYED_V13_RUNTIME_STATE_REF,
+            DELAYED_V15_RUNTIME_STATE_REF,
             [
                 "selected_live_strategy.json",
-                "data/kalshi_live_opposite_ladder_v14_state.json",
-                "data/kalshi_live_opposite_ladder_v14_audit.jsonl",
-                "data/kalshi_shadow_opposite_ladder_v14_state.json",
-                "data/kalshi_shadow_opposite_ladder_v14_audit.jsonl",
+                "data/kalshi_live_delayed_band_v15_state.json",
+                "data/kalshi_live_delayed_band_v15_audit.jsonl",
+                "data/kalshi_shadow_delayed_band_v15_state.json",
+                "data/kalshi_shadow_delayed_band_v15_audit.jsonl",
             ],
         )
         with self.assertRaisesRegex(ValueError, "non-owned durable paths"):

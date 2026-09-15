@@ -36,7 +36,7 @@ from kalshi_order_smoke_test import (
     find_order, plan_for, preflight, quote_stream, reconcile, validate_market,
 )
 from kalshi_shard_admin import ApiError, Journal, epoch, money, operation_lock, pages, shard
-from live_checkpoint import DELAYED_V13_RUNTIME_STATE_REF, publish_runtime_snapshot
+from live_checkpoint import DELAYED_V15_RUNTIME_STATE_REF, publish_runtime_snapshot
 from live_state import (
     clear_stale_current_order_pointer,
     current_order_pointer_requires_recovery,
@@ -46,10 +46,10 @@ from live_state import (
 )
 
 
-DEFAULT_ROOT = Path("data/.kalshi_live_opposite_ladder_v14_startup_order_check")
-DEFAULT_STATE = Path("data/kalshi_live_opposite_ladder_v14_state.json")
+DEFAULT_ROOT = Path("data/.kalshi_live_delayed_band_v15_startup_order_check")
+DEFAULT_STATE = Path("data/kalshi_live_delayed_band_v15_state.json")
 DEFAULT_CONFIG = Path("selected_live_strategy.json")
-DEFAULT_AUDIT = Path("data/kalshi_live_opposite_ladder_v14_audit.jsonl")
+DEFAULT_AUDIT = Path("data/kalshi_live_delayed_band_v15_audit.jsonl")
 WORKER_ID = re.compile(r"[A-Za-z0-9_.:-]{1,128}\Z")
 TERMINAL_PASS = "CANCELED_NO_FILL"
 BOUNDARY_WAIT_SECONDS = 90
@@ -539,7 +539,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--state-file", type=Path, default=DEFAULT_STATE)
     result.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     result.add_argument("--audit-ledger", type=Path, default=DEFAULT_AUDIT)
-    result.add_argument("--runtime-ref", default=DELAYED_V13_RUNTIME_STATE_REF)
+    result.add_argument("--runtime-ref", default=DELAYED_V15_RUNTIME_STATE_REF)
     return result
 
 

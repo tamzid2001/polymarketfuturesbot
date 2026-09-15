@@ -29,9 +29,8 @@ from typing import BinaryIO
 DEFAULT_RUNTIME_STATE_REF = "runtime-state-kxbtc15m"
 DELAYED_V12_RUNTIME_STATE_REF = "runtime-state-kxbtc15m-delayed-v12"
 OPPOSITE_LADDER_V14_RUNTIME_STATE_REF = "runtime-state-kxbtc15m-opposite-ladder-v14"
-# Compatibility alias for older test/import callers.  It points only at the
-# fresh v14 namespace and never at the retired v13 branch.
-DELAYED_V13_RUNTIME_STATE_REF = OPPOSITE_LADDER_V14_RUNTIME_STATE_REF
+DELAYED_V13_RUNTIME_STATE_REF = "runtime-state-kxbtc15m-delayed-v13"
+DELAYED_V15_RUNTIME_STATE_REF = "runtime-state-kxbtc15m-delayed-v15"
 RUNTIME_STATE_OWNER = "kalshi-kxbtc15m"
 RUNTIME_STATE_MANIFEST = ".kxbtc15m-runtime-state.json"
 RUNTIME_PAYLOAD_PREFIX = ".kxbtc15m-runtime-payload"
@@ -39,7 +38,7 @@ RUNTIME_STATE_SCHEMA_VERSION = 2
 RUNTIME_CHUNK_BYTES = 8 * 1024 * 1024
 RUNTIME_CACHE_MAX_FILES = 40
 _ALLOWED_RUNTIME_STATE_REF = re.compile(
-    r"runtime-state-(?:kxbtc15m(?:-delayed-v(?:12|13)|-opposite-ladder-v14)?|stop-(?:10|20|25|30|35))\Z"
+    r"runtime-state-(?:kxbtc15m(?:-delayed-v(?:12|13|15)|-opposite-ladder-v14)?|stop-(?:10|20|25|30|35))\Z"
 )
 _CANONICAL_RUNTIME_PATHS = frozenset({
     "selected_live_strategy.json",
@@ -64,6 +63,16 @@ _OPPOSITE_LADDER_V14_RUNTIME_PATHS = frozenset({
     "data/kalshi_shadow_opposite_ladder_v14_state.json",
     "data/kalshi_shadow_opposite_ladder_v14_audit.jsonl",
 })
+_DELAYED_RUNTIME_PATHS = {
+    f"runtime-state-kxbtc15m-delayed-v{version}": frozenset({
+        "selected_live_strategy.json",
+        f"data/kalshi_live_delayed_band_v{version}_state.json",
+        f"data/kalshi_live_delayed_band_v{version}_audit.jsonl",
+        f"data/.kalshi_live_delayed_band_v{version}_startup_order_check/order-smoke-test.json",
+        f"data/kalshi_shadow_delayed_band_v{version}_state.json",
+        f"data/kalshi_shadow_delayed_band_v{version}_audit.jsonl",
+    }) for version in (13, 15)
+}
 
 
 def validate_runtime_ref(runtime_ref: str) -> str:
@@ -83,6 +92,8 @@ def validate_runtime_paths(runtime_ref: str, relative_paths: list[str]) -> None:
         allowed = _DELAYED_V12_RUNTIME_PATHS
     elif runtime_ref == OPPOSITE_LADDER_V14_RUNTIME_STATE_REF:
         allowed = _OPPOSITE_LADDER_V14_RUNTIME_PATHS
+    elif runtime_ref in _DELAYED_RUNTIME_PATHS:
+        allowed = _DELAYED_RUNTIME_PATHS[runtime_ref]
     else:
         stop_cents = runtime_ref.rsplit("-", 1)[-1]
         allowed = frozenset({

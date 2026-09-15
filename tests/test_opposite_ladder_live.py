@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import tempfile
 import time
 import unittest
@@ -134,7 +135,9 @@ class PartialExitRest(Rest):
 
 class OppositeLadderLiveTests(unittest.TestCase):
     def setUp(self):
-        self.config = load_config(ROOT / "selected_live_strategy.json")
+        # Archived v14 execution is covered only through mocked adapters.
+        # The production config loader intentionally refuses this contract.
+        self.config = json.loads((ROOT / "tests/fixtures/opposite_ladder_v14_strategy.json").read_text())
 
     def engine(self, *, dry_run=True):
         root = Path(tempfile.mkdtemp())
